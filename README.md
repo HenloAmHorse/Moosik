@@ -1,4 +1,4 @@
-# Moosik Player
+# Moosik
 
 <p align="center">
   <img src="screenshots/icon.png" width="120" alt="Moosik Player icon"/>
