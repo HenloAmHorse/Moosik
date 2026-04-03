@@ -174,7 +174,7 @@ pub struct EqPresetLibrary {
 
 impl EqPresetLibrary {
     fn preset_path() -> PathBuf {
-        home_dir().join(".moosik_player").join("eq_presets.json")
+        home_dir().join(".moosik").join("eq_presets.json")
     }
 
     pub fn load() -> Self {
@@ -1269,7 +1269,7 @@ impl SpectrumAnalyzer {
 
 /// Returns (file_count, total_bytes) for all .spectrumcache files.
 fn cache_dir_stats() -> (usize, u64) {
-    let dir = home_dir().join(".moosik_player").join("cache");
+    let dir = home_dir().join(".moosik").join("cache");
     let Ok(entries) = std::fs::read_dir(&dir) else { return (0, 0); };
     let mut count = 0usize;
     let mut bytes = 0u64;
@@ -1303,7 +1303,7 @@ fn cache_path_for(path: &PathBuf, n_bars: usize, pad_factor: usize, overlap: f32
         InterpolationMode::Akima => 4, InterpolationMode::Lanczos => 5,
     };
     home_dir()
-        .join(".moosik_player")
+        .join(".moosik")
         .join("cache")
         .join(format!("{:016x}_b{}_p{}_o{}_m{}_i{}.spectrumcache", hash, n_bars, pad_factor, overlap_k, mapping_id, interp_id))
 }

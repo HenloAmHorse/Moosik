@@ -75,14 +75,14 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Moosik Player")
+            .with_title("Moosik")
             .with_inner_size([800.0, 600.0])
             .with_min_inner_size([600.0, 400.0])
             .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(
-        "Moosik Player",
+        "Moosik",
         options,
         Box::new(|cc| Ok(Box::new(MoosikApp::new(cc)))),
     )
