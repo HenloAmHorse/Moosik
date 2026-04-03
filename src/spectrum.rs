@@ -367,6 +367,8 @@ pub struct EqSource<S: rodio::Source<Item = f32>> {
     local_enabled: bool,
     channels:      u16,
     ch_idx:        u16,   // 0 = left, 1 = right (for stereo interleaving)
+    // Check for EQ updates every N samples to avoid per-sample mutex contention.
+    check_counter: u16,
 }
 
 impl<S> EqSource<S>
@@ -382,6 +384,7 @@ where S: rodio::Source<Item = f32>
             local_enabled: false,
             channels,
             ch_idx: 0,
+            check_counter: 0,
         };
         // Initial sync so sample_rate is correct
         {
@@ -425,9 +428,15 @@ where S: rodio::Source<Item = f32>
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
         let sample = self.inner.next()?;
-        // Cheap version check before taking the lock
-        let cur_ver = self.eq.lock().unwrap().version;
-        if cur_ver != self.local_version { self.sync_filters(); }
+        // Only check for EQ updates every 512 samples (~12ms at 44.1kHz).
+        // Locking every sample causes mutex contention with the UI thread,
+        // starving the audio thread and producing buffer-underrun noise.
+        self.check_counter += 1;
+        if self.check_counter >= 512 {
+            self.check_counter = 0;
+            let cur_ver = self.eq.lock().unwrap().version;
+            if cur_ver != self.local_version { self.sync_filters(); }
+        }
         let ch = self.ch_idx;
         let out = self.apply(sample, ch);
         self.ch_idx = (self.ch_idx + 1) % self.channels.max(1);
