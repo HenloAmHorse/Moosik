@@ -12,7 +12,7 @@ The waveform is a [sinc function](https://en.wikipedia.org/wiki/Sinc_function) �
 
 The background is **Eigengrau** (#16161d) — the color the human brain perceives in total darkness.
 
-The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-temperature blackbody radiator.
+The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-temperature blackbody radiator, which emits all frequencies equally. A perfectly flat spectrum. The EQ ideal.
 
 <p align="center">
   <img src="screenshots/player.png" alt="Player UI" width="700"/>

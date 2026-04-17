@@ -18,6 +18,9 @@ rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [profile.release]
 opt-level = 3
 lto = "thin"          # cross-crate inlining — faster decode + FFT

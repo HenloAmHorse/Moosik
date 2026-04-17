@@ -1,4 +1,4 @@
-use egui::{Color32, Pos2, Rect, Shape, Stroke, Vec2};
+use egui::{Color32, Pos2, Rect, Shape, Stroke};
 use rustfft::{FftPlanner, num_complex::Complex};
 use rodio::Source;
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_FFT_SIZE: usize = 8192;
@@ -223,9 +223,7 @@ impl EqPresetLibrary {
                 if self.default_id == Some(r.id) { self.default_id = None; }
             }
             PresetScope::Local => {
-                if let Some(k) = track {
-                    if let Some(v) = self.per_track.get_mut(k) { v.retain(|p| p.id != r.id); }
-                }
+                if let Some(k) = track && let Some(v) = self.per_track.get_mut(k) { v.retain(|p| p.id != r.id); }
             }
         }
         self.last_used.retain(|_, lu| lu != r);
@@ -386,18 +384,29 @@ where S: rodio::Source<Item = f32>
             ch_idx: 0,
             check_counter: 0,
         };
-        // Initial sync so sample_rate is correct
+        // Initial sync — blocking is fine here, audio thread hasn't started yet.
         {
             let mut state = this.eq.lock().unwrap();
             state.sample_rate = sr;
             state.bump();
+            // Build filters inline so we never block in next().
+            this.local_version = state.version;
+            this.local_enabled = state.enabled;
+            if state.enabled && !state.bands.is_empty() {
+                let active: Vec<&EqBand> = state.bands.iter().filter(|b| b.enabled).collect();
+                this.filters_l = active.iter().map(|b| { let (bv, av) = eq_biquad_coeffs(b, sr); Biquad::new(bv, av) }).collect();
+                this.filters_r = active.iter().map(|b| { let (bv, av) = eq_biquad_coeffs(b, sr); Biquad::new(bv, av) }).collect();
+            }
         }
-        this.sync_filters();
         this
     }
 
+    /// Try to sync filter state from shared EQ. Uses try_lock so the audio
+    /// thread NEVER blocks — if the UI holds the mutex, we skip this cycle
+    /// and retry 512 samples later (~11 ms). Imperceptible for EQ changes.
     fn sync_filters(&mut self) {
-        let eq = self.eq.lock().unwrap();
+        let Ok(eq) = self.eq.try_lock() else { return; };
+        if eq.version == self.local_version { return; } // nothing changed
         self.local_version = eq.version;
         self.local_enabled = eq.enabled;
         if !eq.enabled || eq.bands.is_empty() {
@@ -407,7 +416,6 @@ where S: rodio::Source<Item = f32>
         }
         let sr = eq.sample_rate;
         let active: Vec<&EqBand> = eq.bands.iter().filter(|b| b.enabled).collect();
-        // Rebuild with fresh state (tiny click on change, acceptable for interactive EQ)
         self.filters_l = active.iter().map(|b| { let (bv, av) = eq_biquad_coeffs(b, sr); Biquad::new(bv, av) }).collect();
         self.filters_r = active.iter().map(|b| { let (bv, av) = eq_biquad_coeffs(b, sr); Biquad::new(bv, av) }).collect();
     }
@@ -428,14 +436,13 @@ where S: rodio::Source<Item = f32>
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
         let sample = self.inner.next()?;
-        // Only check for EQ updates every 512 samples (~12ms at 44.1kHz).
-        // Locking every sample causes mutex contention with the UI thread,
-        // starving the audio thread and producing buffer-underrun noise.
+        // Poll for EQ changes every 512 samples (~11 ms at 44.1 kHz).
+        // sync_filters uses try_lock — the audio thread NEVER blocks on the
+        // UI mutex, so this cannot cause buffer underruns or noise.
         self.check_counter += 1;
         if self.check_counter >= 512 {
             self.check_counter = 0;
-            let cur_ver = self.eq.lock().unwrap().version;
-            if cur_ver != self.local_version { self.sync_filters(); }
+            self.sync_filters();
         }
         let ch = self.ch_idx;
         let out = self.apply(sample, ch);
@@ -627,7 +634,7 @@ fn compute_chroma(norms: &[f32], sr: u32, fft_size: usize) -> [f32; 12] {
     let scale = fft_size as f32;
     for (i, &v) in norms.iter().enumerate().skip(1) {
         let freq = i as f32 * sr as f32 / fft_size as f32;
-        if freq < 110.0 || freq > 4_186.0 { continue; }
+        if !(110.0..=4_186.0).contains(&freq) { continue; }
         // Log-magnitude compression to de-emphasise dominant low-freq bins
         let log_v = (1.0 + v * scale).log2();
         let pc = ((12.0 * (freq / 261.63_f32).log2()).round() as i32).rem_euclid(12) as usize;
@@ -909,6 +916,11 @@ pub struct SpectrumAnalyzer {
     pub sample_buf: SampleBuf,
     window_coeffs: Vec<f32>,
     fft_plan: Arc<dyn rustfft::Fft<f32>>,
+    /// Lightweight plan for real-time display: always fft_size × 2.
+    /// The full fft_plan (fft_size × pad_factor) is used only for pre-process
+    /// (runs in a background thread). Keeping real-time at 2× ensures the
+    /// UI thread never spends more than ~0.5 ms on an FFT frame.
+    rt_fft_plan: Arc<dyn rustfft::Fft<f32>>,
     pub magnitudes: Vec<f32>,
     smoothed: Vec<f32>,
     pub sample_rate: u32,
@@ -945,6 +957,9 @@ pub struct SpectrumAnalyzer {
 
     // Waterfall
     pub waterfall: Vec<Vec<f32>>,
+    pub waterfall_dirty: bool,
+    /// When false, push_waterfall() is a no-op (used when the waterfall viz is not active).
+    pub waterfall_enabled: bool,
     /// Raw FFT bin magnitudes (half-spectrum) from the most recent real-time frame.
     /// Used by the spectrogram and octave-band RTA views.
     pub last_fft_norms: Vec<f32>,
@@ -956,11 +971,13 @@ impl SpectrumAnalyzer {
         const DEFAULT_PAD: usize = 16;
         let mut planner = FftPlanner::new();
         let fft_plan = planner.plan_fft_forward(fft_size * DEFAULT_PAD);
+        let rt_fft_plan = planner.plan_fft_forward(fft_size * 2);
         let window_coeffs = make_window(fft_size, &WindowFn::Hann);
         Self {
             sample_buf,
             window_coeffs,
             fft_plan,
+            rt_fft_plan,
             magnitudes: vec![0.0f32; DEFAULT_BAR_COUNT],
             smoothed: vec![0.0f32; DEFAULT_BAR_COUNT],
             sample_rate: 44_100,
@@ -983,6 +1000,8 @@ impl SpectrumAnalyzer {
             is_analyzing: Arc::new(AtomicBool::new(false)),
             analysis_progress: Arc::new(AtomicUsize::new(0)),
             waterfall: Vec::new(),
+            waterfall_dirty: false,
+            waterfall_enabled: false,
             last_fft_norms: Vec::new(),
         }
     }
@@ -991,25 +1010,13 @@ impl SpectrumAnalyzer {
     pub fn rebuild_fft(&mut self) {
         let mut planner = FftPlanner::new();
         self.fft_plan = planner.plan_fft_forward(self.fft_size * self.pad_factor);
+        self.rt_fft_plan = planner.plan_fft_forward(self.fft_size * 2);
         self.window_coeffs = make_window(self.fft_size, &self.window_fn);
     }
 
-    fn run_fft(&self, samples: &[f32]) -> Vec<Complex<f32>> {
-        let padded_size = self.fft_size * self.pad_factor;
-        let zero_pad = padded_size - self.fft_size;
-        let mut buf: Vec<Complex<f32>> = samples
-            .iter()
-            .zip(self.window_coeffs.iter())
-            .map(|(s, w)| Complex { re: s * w, im: 0.0 })
-            .chain(std::iter::repeat(Complex { re: 0.0, im: 0.0 }).take(zero_pad))
-            .collect();
-        self.fft_plan.process(&mut buf);
-        buf
-    }
 
-    fn bins_to_bars(&self, fft_out: &[Complex<f32>], sr: u32, n_bars: usize) -> Vec<f32> {
+    fn bins_to_bars(&self, fft_out: &[Complex<f32>], sr: u32, n_bars: usize, padded_size: usize) -> Vec<f32> {
         let fft_size = self.fft_size;
-        let padded_size = fft_size * self.pad_factor;
         let half = padded_size / 2;
         let log_min = self.min_freq.log10();
         let log_max = (sr as f32 / 2.0).min(self.max_freq).log10();
@@ -1050,7 +1057,8 @@ impl SpectrumAnalyzer {
                         let sigma   = ((fbin_hi - fbin_lo) * 0.5).max(0.5);
                         let mut wsum = 0.0_f32;
                         let mut weight = 0.0_f32;
-                        for b in b_start..=b_end {
+                        for (b_idx, &norm_b) in norms[b_start..=b_end].iter().enumerate() {
+                            let b = b_start + b_idx;
                             let w = match &self.bar_mapping {
                                 BarMappingMode::FlatOverlap => {
                                     (fbin_hi.min(b as f32 + 1.0) - fbin_lo.max(b as f32)).max(0.0)
@@ -1060,7 +1068,7 @@ impl SpectrumAnalyzer {
                                     (-(center_b - bc).powi(2) / (2.0 * sigma * sigma)).exp()
                                 }
                             };
-                            wsum += norms[b] * w; weight += w;
+                            wsum += norm_b * w; weight += w;
                         }
                         if weight > 0.0 { wsum / weight } else { 0.0 }
                     }
@@ -1075,6 +1083,12 @@ impl SpectrumAnalyzer {
 
     pub fn process_realtime(&mut self) {
         let fft_size = self.fft_size;
+        // Real-time FFT uses 2× padding only — keeps the UI thread's per-frame
+        // work at ~16 K points instead of 131 K (pad=16), eliminating the CPU
+        // spike that caused audio buffer underruns when the spectrum was open.
+        // The high-quality padded plan is used only by the background pre-process.
+        let rt_padded = fft_size * 2;
+
         let samples: Vec<f32> = {
             let buf = match self.sample_buf.lock() {
                 Ok(g) => g,
@@ -1087,12 +1101,20 @@ impl SpectrumAnalyzer {
             buf[start..].to_vec()
         };
 
-        let fft_out = self.run_fft(&samples);
-        let half = self.fft_size * self.pad_factor / 2;
-        self.last_fft_norms = fft_out[..half].iter().map(|c| c.norm()).collect();
+        let zero_pad = rt_padded - fft_size;
+        let mut buf: Vec<Complex<f32>> = samples
+            .iter()
+            .zip(self.window_coeffs.iter())
+            .map(|(s, w)| Complex { re: s * w, im: 0.0 })
+            .chain(std::iter::repeat_n(Complex { re: 0.0, im: 0.0 }, zero_pad))
+            .collect();
+        self.rt_fft_plan.process(&mut buf);
+
+        let half = rt_padded / 2;
+        self.last_fft_norms = buf[..half].iter().map(|c| c.norm()).collect();
         let sr = self.sample_rate;
         let n = self.bar_count;
-        let new_bars = self.bins_to_bars(&fft_out, sr, n);
+        let new_bars = self.bins_to_bars(&buf, sr, n, rt_padded);
         let alpha = self.smoothing;
         for (s, m) in self.smoothed.iter_mut().zip(new_bars.iter()) {
             *s = *s * alpha + m * (1.0 - alpha);
@@ -1104,17 +1126,15 @@ impl SpectrumAnalyzer {
     pub fn tick_pre(&mut self, elapsed: f64) {
         // Poll for completed background work
         let mut ready: Option<(Vec<Vec<f32>>, f64)> = None;
-        if let Some(ref rx) = self.pre_receiver {
-            if let Ok(msg) = rx.try_recv() {
-                match msg {
-                    PreMessage::Done { frames, frame_rate, waveform, analysis } => {
-                        ready = Some((frames, frame_rate));
-                        self.pending_waveform = Some(waveform);
-                        self.pending_analysis = Some(analysis);
-                    }
-                    PreMessage::Error(_) => {
-                        // is_analyzing already cleared by ClearOnDrop in thread
-                    }
+        if let Some(ref rx) = self.pre_receiver && let Ok(msg) = rx.try_recv() {
+            match msg {
+                PreMessage::Done { frames, frame_rate, waveform, analysis } => {
+                    ready = Some((frames, frame_rate));
+                    self.pending_waveform = Some(waveform);
+                    self.pending_analysis = Some(analysis);
+                }
+                PreMessage::Error(_) => {
+                    // is_analyzing already cleared by ClearOnDrop in thread
                 }
             }
         }
@@ -1199,10 +1219,12 @@ impl SpectrumAnalyzer {
     }
 
     fn push_waterfall(&mut self, row: Vec<f32>) {
+        if !self.waterfall_enabled { return; }
         self.waterfall.push(row);
         if self.waterfall.len() > WATERFALL_ROWS {
             self.waterfall.remove(0);
         }
+        self.waterfall_dirty = true;
     }
 
     /// Resize to a new bar count and clear all derived state.
@@ -1214,6 +1236,7 @@ impl SpectrumAnalyzer {
         self.smoothed = vec![0.0; n];
         self.eq_weights.clear();
         self.waterfall.clear();
+        self.waterfall_dirty = false;
         self.pre_frames.clear();
         self.pre_receiver = None;
         self.is_analyzing.store(false, Ordering::Relaxed);
@@ -1226,6 +1249,7 @@ impl SpectrumAnalyzer {
         self.smoothed = vec![0.0; n];
         self.eq_weights.clear();
         self.waterfall.clear();
+        self.waterfall_dirty = false;
         self.pre_frames.clear();
         self.pre_receiver = None;
         // Replace the Arcs rather than just storing false/0 into them.
@@ -1246,19 +1270,17 @@ impl SpectrumAnalyzer {
     /// without updating magnitudes. Called by SpectrumWindow before the
     /// is_playing guard so results arrive even when paused.
     pub fn try_receive_frames(&mut self) {
-        if let Some(ref rx) = self.pre_receiver {
-            if let Ok(msg) = rx.try_recv() {
-                match msg {
-                    PreMessage::Done { frames, frame_rate, waveform, analysis } => {
-                        self.pre_frames = frames;
-                        self.pre_frame_rate = frame_rate;
-                        self.pending_waveform = Some(waveform);
-                        self.pending_analysis = Some(analysis);
-                    }
-                    PreMessage::Error(_) => {}
+        if let Some(ref rx) = self.pre_receiver && let Ok(msg) = rx.try_recv() {
+            match msg {
+                PreMessage::Done { frames, frame_rate, waveform, analysis } => {
+                    self.pre_frames = frames;
+                    self.pre_frame_rate = frame_rate;
+                    self.pending_waveform = Some(waveform);
+                    self.pending_analysis = Some(analysis);
                 }
-                self.pre_receiver = None;
+                PreMessage::Error(_) => {}
             }
+            self.pre_receiver = None;
         }
     }
 }
@@ -1360,10 +1382,8 @@ fn save_cache(cache_path: &PathBuf, frames: &[Vec<f32>]) {
             data.extend_from_slice(&v.to_le_bytes());
         }
     }
-    if let Ok(mut f) = std::fs::File::create(cache_path) {
-        if f.write_all(&data).is_err() {
-            let _ = std::fs::remove_file(cache_path);
-        }
+    if let Ok(mut f) = std::fs::File::create(cache_path) && f.write_all(&data).is_err() {
+        let _ = std::fs::remove_file(cache_path);
     }
 }
 
@@ -1619,7 +1639,7 @@ fn preprocess_file(
             let mut buf: Vec<Complex<f32>> = slice.iter()
                 .zip(window.iter())
                 .map(|(s, w)| Complex { re: s * w, im: 0.0 })
-                .chain(std::iter::repeat(Complex { re: 0.0, im: 0.0 }).take(padded_size - fft_size))
+                .chain(std::iter::repeat_n(Complex { re: 0.0, im: 0.0 }, padded_size - fft_size))
                 .collect();
             fft.process(&mut buf);
             let norms: Vec<f32> = buf[..half].iter().map(|c| c.norm()).collect();
@@ -1649,7 +1669,8 @@ fn preprocess_file(
                             let sigma   = ((fbin_hi - fbin_lo) * 0.5).max(0.5);
                             let mut wsum = 0.0_f32;
                             let mut weight = 0.0_f32;
-                            for b in b_start..=b_end {
+                            for (b_idx, &norm_b) in norms[b_start..=b_end].iter().enumerate() {
+                                let b = b_start + b_idx;
                                 let w = match bar_mapping {
                                     BarMappingMode::FlatOverlap => {
                                         (fbin_hi.min(b as f32 + 1.0) - fbin_lo.max(b as f32)).max(0.0)
@@ -1659,7 +1680,7 @@ fn preprocess_file(
                                         (-(center_b - bc).powi(2) / (2.0 * sigma * sigma)).exp()
                                     }
                                 };
-                                wsum += norms[b] * w; weight += w;
+                                wsum += norm_b * w; weight += w;
                             }
                             if weight > 0.0 { wsum / weight } else { 0.0 }
                         }
@@ -1926,11 +1947,12 @@ fn cqt_kernel(norms: &[f32], bc: f32, q: f32, half: usize) -> f32 {
     let b_hi = ((bc + hw).ceil()  as usize).min(half - 1);
     let mut wsum   = 0.0f32;
     let mut weight = 0.0f32;
-    for b in b_lo..=b_hi {
+    for (b_idx, &norm_b) in norms[b_lo..=b_hi].iter().enumerate() {
+        let b = b_lo + b_idx;
         let x = (b as f32 + 0.5 - bc) / hw; // normalised to [−1, 1]
         if x.abs() < 1.0 {
             let w = 0.5 * (1.0 + (PI * x).cos()); // Hann
-            wsum   += norms[b] * w;
+            wsum   += norm_b * w;
             weight += w;
         }
     }
@@ -2192,23 +2214,45 @@ fn draw_eq_overlay(
 fn draw_bars(painter: &egui::Painter, mags: &[f32], rect: Rect, gap: f32) {
     let n = mags.len();
     if n == 0 { return; }
-    let ppp        = painter.ctx().pixels_per_point();
-    let phys_left  = (rect.left()  * ppp).round() as i32;
-    let phys_right = (rect.right() * ppp).round() as i32;
-    let phys_w     = (phys_right - phys_left).max(n as i32) as f32;
-    let phys_gap   = (gap * ppp).round().max(0.0) as i32;
-    for (i, &v) in mags.iter().enumerate() {
+    let ppp       = painter.ctx().pixels_per_point();
+    let phys_left = (rect.left()  * ppp).round() as i32;
+    let phys_w    = ((rect.right() * ppp).round() as i32 - phys_left).max(1);
+    let phys_gap  = (gap * ppp).round().max(0.0) as i32;
+
+    // Each column needs (1 + phys_gap) physical pixels to show a visible gap.
+    let min_col_w = (1 + phys_gap).max(1);
+    let draw_n    = ((phys_w / min_col_w) as usize).min(n).max(1);
+
+    // Build a single mesh for all bars — one painter.add() call instead of
+    // draw_n separate rect_filled() calls.  This eliminates the O(N) per-frame
+    // CPU cost that was causing periodic audio interruptions proportional to
+    // bar count (more bars → longer render → longer audio glitch → lower pitch).
+    let mut mesh = egui::Mesh::default();
+    mesh.reserve_triangles(draw_n * 2);
+    mesh.reserve_vertices(draw_n * 4);
+
+    for i in 0..draw_n {
+        let src_lo = (i * n) / draw_n;
+        let src_hi = (((i + 1) * n) / draw_n).min(n);
+        let v = mags[src_lo..src_hi].iter().cloned().fold(0.0_f32, f32::max);
+
         let h   = v * rect.height();
-        let px0 = (phys_left as f32 + (i     as f32 / n as f32) * phys_w).round() as i32;
-        let px1 = ((phys_left as f32 + ((i+1) as f32 / n as f32) * phys_w).round() as i32 - phys_gap).max(px0 + 1);
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(px0 as f32 / ppp, rect.bottom() - h),
-                Pos2::new(px1 as f32 / ppp, rect.bottom()),
-            ),
-            0.0, bar_color(v),
-        );
+        let px0 = phys_left + (i as i32 * phys_w) / draw_n as i32;
+        let px1 = (phys_left + ((i + 1) as i32 * phys_w) / draw_n as i32 - phys_gap).max(px0 + 1);
+
+        let x0 = px0 as f32 / ppp;
+        let x1 = px1 as f32 / ppp;
+        let y0 = rect.bottom() - h;
+        let y1 = rect.bottom();
+        let c  = bar_color(v);
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(Pos2::new(x0, y0), c);  // top-left
+        mesh.colored_vertex(Pos2::new(x1, y0), c);  // top-right
+        mesh.colored_vertex(Pos2::new(x1, y1), c);  // bottom-right
+        mesh.colored_vertex(Pos2::new(x0, y1), c);  // bottom-left
+        mesh.indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
     }
+    painter.add(Shape::mesh(mesh));
 }
 
 fn draw_line(painter: &egui::Painter, mags: &[f32], rect: Rect, color: Color32) {
@@ -2247,24 +2291,21 @@ fn draw_filled(painter: &egui::Painter, mags: &[f32], rect: Rect) {
     draw_line(painter, mags, rect, line_color);
 }
 
-fn draw_waterfall(painter: &egui::Painter, waterfall: &[Vec<f32>], rect: Rect) {
-    if waterfall.is_empty() { return; }
-    let _nrows = waterfall.len();
-    let row_h = rect.height() / WATERFALL_ROWS as f32;
+fn waterfall_to_color_image(waterfall: &[Vec<f32>]) -> Option<egui::ColorImage> {
+    let n = waterfall.first().map(|r| r.len()).unwrap_or(0);
+    if n == 0 { return None; }
+    let h = WATERFALL_ROWS;
+    let mut pixels = vec![Color32::BLACK; n * h];
     for (row_idx, row) in waterfall.iter().enumerate() {
-        let y = rect.bottom() - (row_idx + 1) as f32 * row_h;
-        let n = row.len();
-        if n == 0 { continue; }
-        let cell_w = rect.width() / n as f32;
-        for (col, &v) in row.iter().enumerate() {
-            let x = rect.left() + col as f32 * cell_w;
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w + 0.5, row_h + 0.5)),
-                0.0,
-                heat_color(v),
-            );
+        // row 0 is most recent (rendered at bottom in original draw_waterfall).
+        // In texture coordinates, row 0 is the top, so we flip.
+        let tex_row = h.saturating_sub(1 + row_idx);
+        let cols = row.len().min(n);
+        for col in 0..cols {
+            pixels[tex_row * n + col] = heat_color(row[col]);
         }
     }
+    Some(egui::ColorImage { size: [n, h], pixels })
 }
 
 fn draw_phasescope(painter: &egui::Painter, frames: &[[f32; 2]], rect: Rect, correlation: f32) {
@@ -2358,7 +2399,7 @@ fn draw_freq_labels(painter: &egui::Painter, plot_rect: Rect, sample_rate: u32, 
 
 /// Round `n` to the nearest power of two within [MIN_BAR_COUNT, MAX_BAR_COUNT].
 fn snap_pow2(n: usize) -> usize {
-    let clamped = n.max(MIN_BAR_COUNT).min(MAX_BAR_COUNT);
+    let clamped = n.clamp(MIN_BAR_COUNT, MAX_BAR_COUNT);
     // Find the closest power of two
     let lower = (1usize << clamped.ilog2()).max(MIN_BAR_COUNT);
     let upper = (lower * 2).min(MAX_BAR_COUNT);
@@ -2397,6 +2438,7 @@ pub struct SpectrumWindow {
     pub correlation: f32,
     spectrogram: Spectrogram,
     spectrogram_texture: Option<egui::TextureHandle>,
+    waterfall_texture: Option<egui::TextureHandle>,
     octave_bands: Vec<(f32, f32)>,
     octave_smoothed: Vec<f32>,
     pub show_chord: bool,
@@ -2404,6 +2446,7 @@ pub struct SpectrumWindow {
     chroma_ema: [f32; 12],        // exponential moving average for live chord smoothing
     auto_fft_size: usize,         // last FFT size chosen automatically; 0 = user overrode it
     phasescope_frames: Vec<[f32; 2]>, // snapshot captured in tick() — no lock/clone in show()
+    lufs_tick: u8, // simple counter for throttling LUFS computation
     pub interp_mode: InterpolationMode,
     pub pad_factor: usize,
     pub overlap: f32,
@@ -2462,7 +2505,7 @@ impl SpectrumWindow {
             max_freq: DEFAULT_MAX_FREQ,
             current_path: None,
             status_msg: String::new(),
-            max_fps: 60.0,
+            max_fps: 30.0,
             last_fft_time: None,
             current_fps: 0.0,
             waveform: None,
@@ -2470,6 +2513,7 @@ impl SpectrumWindow {
             spectral_ceiling: None,
             spectrogram: Spectrogram::new(),
             spectrogram_texture: None,
+            waterfall_texture: None,
             octave_bands: Vec::new(),
             octave_smoothed: Vec::new(),
             stereo_buf: new_stereo_buf(),
@@ -2481,6 +2525,7 @@ impl SpectrumWindow {
             chroma_ema: [0.0; 12],
             auto_fft_size: 0,
             phasescope_frames: Vec::new(),
+            lufs_tick: 0,
             interp_mode: InterpolationMode::None,
             pad_factor: 16,
             overlap: 0.875,
@@ -2614,7 +2659,7 @@ impl SpectrumWindow {
     }
 
     /// Call when loading a new track — tries to auto-load the right preset.
-    fn auto_load_preset_for(&mut self, path: &PathBuf) {
+    fn auto_load_preset_for(&mut self, path: &Path) {
         let key = path.to_string_lossy().into_owned();
         let pref = self.preset_library.last_used.get(&key).cloned()
             .or_else(|| self.preset_library.default_id.map(|id| PresetRef { scope: PresetScope::Global, id }));
@@ -2640,16 +2685,15 @@ impl SpectrumWindow {
 
     /// Call just before switching away from the current track.
     fn persist_last_used(&mut self) {
-        if let Some(key) = self.track_key() {
-            if let Some(ref r) = self.active_preset {
-                self.preset_library.last_used.insert(key, r.clone());
-                self.preset_library.save();
-            }
+        if let Some(key) = self.track_key()
+            && let Some(ref r) = self.active_preset {
+            self.preset_library.last_used.insert(key, r.clone());
+            self.preset_library.save();
         }
     }
 
     /// Call when a new track starts. `sample_rate` is from the rodio Decoder.
-    pub fn on_play(&mut self, path: &PathBuf, sample_rate: u32) {
+    pub fn on_play(&mut self, path: &Path, sample_rate: u32) {
         // Save the active preset for the track we're leaving.
         self.persist_last_used();
 
@@ -2666,7 +2710,7 @@ impl SpectrumWindow {
         self.analyzer.rebuild_fft();
         self.auto_fft_size = auto_fft;
 
-        self.current_path = Some(path.clone());
+        self.current_path = Some(path.to_path_buf());
         // Auto-load the last-used (or default) preset for the new track.
         self.auto_load_preset_for(path);
         self.analyzer.reset();
@@ -2687,7 +2731,7 @@ impl SpectrumWindow {
         self.needs_reanalysis = false;
         if let Ok(mut v) = self.stereo_buf.lock() { v.clear(); }
         // Always preprocess — needed for spectral ceiling even in real-time mode
-        self.analyzer.start_preprocess(path.clone());
+        self.analyzer.start_preprocess(path.to_path_buf());
         self.waveform_rx = None;
     }
 
@@ -2703,12 +2747,11 @@ impl SpectrumWindow {
     /// moves over the spectrum viewport).
     pub fn tick(&mut self, elapsed_secs: f64, is_playing: bool) {
         // Poll background results — always, even when paused
-        if let Some(ref rx) = self.waveform_rx {
-            if let Ok((wf, analysis)) = rx.try_recv() {
-                self.waveform = Some(wf);
-                self.track_analysis = Some(analysis);
-                self.waveform_rx = None;
-            }
+        if let Some(ref rx) = self.waveform_rx
+            && let Ok((wf, analysis)) = rx.try_recv() {
+            self.waveform = Some(wf);
+            self.track_analysis = Some(analysis);
+            self.waveform_rx = None;
         }
         self.analyzer.try_receive_frames();
         // Drain waveform + analysis that arrived via PreMessage::Done
@@ -2767,12 +2810,17 @@ impl SpectrumWindow {
         }
         self.last_fft_time = Some(now);
 
+        // Only maintain the waterfall ring-buffer when the waterfall view is actually displayed.
+        // Skipping it when not needed saves ~4KB/tick of allocation+shift work.
+        self.analyzer.waterfall_enabled = self.style == VizStyle::Waterfall;
+
         match self.mode {
             SpectrumMode::RealTime => {
                 self.analyzer.process_realtime();
-                // Feed spectrogram and octave bands from fresh FFT norms
+                // Feed spectrogram and octave bands from fresh FFT norms.
+                // Real-time uses 2× padding (not pad_factor) — match here.
                 if !self.analyzer.last_fft_norms.is_empty() {
-                    let eff_fft = self.analyzer.fft_size * self.analyzer.pad_factor;
+                    let eff_fft = self.analyzer.fft_size * 2;
                     self.spectrogram.push_frame(
                         &self.analyzer.last_fft_norms,
                         self.analyzer.sample_rate,
@@ -2798,17 +2846,27 @@ impl SpectrumWindow {
             SpectrumMode::PreProcess => self.analyzer.tick_pre(elapsed_secs),
         }
 
-        // Momentary LUFS (400 ms window from live sample buffer)
-        {
+        // Momentary LUFS (400 ms window from live sample buffer).
+        // Throttled: run at most every other tick so at 30 fps it updates at ~15 fps —
+        // plenty for a meter display. LUFS is also used by the main-window readout
+        // so we keep it running even when the spectrum panel is not in phasescope mode.
+        self.lufs_tick = self.lufs_tick.wrapping_add(1);
+        if self.lufs_tick.is_multiple_of(2) {
             let window = (self.analyzer.sample_rate as f64 * 0.4) as usize;
-            let samples = self.sample_buf.lock().unwrap_or_else(|p| p.into_inner());
-            if samples.len() >= window {
-                let start = samples.len() - window;
-                let slice = &samples[start..];
+            let lufs_slice: Vec<f32> = {
+                let guard = self.sample_buf.lock().unwrap_or_else(|p| p.into_inner());
+                if guard.len() >= window {
+                    let start = guard.len() - window;
+                    guard[start..].to_vec()
+                } else {
+                    Vec::new()
+                }
+            }; // lock released here
+            if !lufs_slice.is_empty() {
                 let mut kw = KWeightFilter::new(self.analyzer.sample_rate);
-                let mean_sq: f64 = slice.iter()
+                let mean_sq: f64 = lufs_slice.iter()
                     .map(|&s| { let y = kw.process(s) as f64; y * y })
-                    .sum::<f64>() / window as f64;
+                    .sum::<f64>() / lufs_slice.len() as f64;
                 self.momentary_lufs = if mean_sq > 1e-10 {
                     (-0.691 + 10.0 * mean_sq.log10()) as f32
                 } else {
@@ -2816,14 +2874,18 @@ impl SpectrumWindow {
                 };
             }
         }
-        // Stereo correlation + phasescope snapshot — one lock, no clone in show()
-        {
-            let frames = self.stereo_buf.lock().unwrap_or_else(|p| p.into_inner());
-            let n = frames.len().min(4096);
-            // Snapshot for phasescope while we hold the lock
-            let start = frames.len().saturating_sub(n);
-            self.phasescope_frames.clear();
-            self.phasescope_frames.extend_from_slice(&frames[start..]);
+        // Stereo correlation + phasescope snapshot.
+        // Only needed when the phasescope view is active — skip the 32 KB lock+memcpy
+        // and the 4096-iteration correlation computation in all other modes.
+        if self.style == VizStyle::Phasescope {
+            {
+                let guard = self.stereo_buf.lock().unwrap_or_else(|p| p.into_inner());
+                let n = guard.len().min(4096);
+                let start = guard.len().saturating_sub(n);
+                self.phasescope_frames.clear();
+                self.phasescope_frames.extend_from_slice(&guard[start..]);
+            } // lock released here
+            let n = self.phasescope_frames.len();
             if n >= 2 {
                 let (mut lr, mut ll, mut rr) = (0.0f64, 0.0f64, 0.0f64);
                 for &[l, r] in &self.phasescope_frames {
@@ -2849,6 +2911,8 @@ impl SpectrumWindow {
         self.analyzer.magnitudes = vec![0.0; n];
         self.analyzer.smoothed = vec![0.0; n];
         self.analyzer.waterfall.clear();
+        self.analyzer.waterfall_dirty = false;
+        self.waterfall_texture = None;
         // In pre-process mode, immediately snap the display to the new position
         if self.mode == SpectrumMode::PreProcess && !self.analyzer.pre_frames.is_empty() {
             let frame = ((elapsed_secs * self.analyzer.pre_frame_rate) as usize)
@@ -3129,15 +3193,13 @@ impl SpectrumWindow {
                             let has_path = self.current_path.is_some();
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🔄 Re-analyze now")).clicked()
-                            {
-                                if let Some(ref p) = self.current_path.clone() {
-                                    let cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
-                                    let _ = std::fs::remove_file(&cache);
-                                    self.analyzer.pre_frames.clear();
-                                    self.analyzer.start_preprocess(p.clone());
-                                    self.needs_reanalysis = false;
-                                    self.status_msg = String::new();
-                                }
+                                && let Some(ref p) = self.current_path.clone() {
+                                let cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
+                                let _ = std::fs::remove_file(&cache);
+                                self.analyzer.pre_frames.clear();
+                                self.analyzer.start_preprocess(p.clone());
+                                self.needs_reanalysis = false;
+                                self.status_msg = String::new();
                             }
                         });
                     }
@@ -3146,32 +3208,28 @@ impl SpectrumWindow {
                         let has_path  = self.current_path.is_some();
                         if ui.add_enabled(has_path && !analyzing,
                             egui::Button::new("🗑 Clear Cache")).clicked()
-                        {
-                            if let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
-                                let existed = cache.exists();
-                                let _ = std::fs::remove_file(&cache);
-                                self.analyzer.pre_frames.clear();
-                                self.needs_reanalysis = false;
-                                self.cache_stats_at = None;
-                                self.status_msg = if existed {
-                                    "Cache cleared.".into()
-                                } else {
-                                    "No cache file found.".into()
-                                };
-                            }
+                            && let Some(ref p) = self.current_path.clone() {
+                            let cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
+                            let existed = cache.exists();
+                            let _ = std::fs::remove_file(&cache);
+                            self.analyzer.pre_frames.clear();
+                            self.needs_reanalysis = false;
+                            self.cache_stats_at = None;
+                            self.status_msg = if existed {
+                                "Cache cleared.".into()
+                            } else {
+                                "No cache file found.".into()
+                            };
                         }
                         if ui.add_enabled(has_path && !analyzing,
                             egui::Button::new("🔄 Re-analyze")).clicked()
-                        {
-                            if let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
-                                let _ = std::fs::remove_file(&cache);
-                                self.analyzer.pre_frames.clear();
-                                self.analyzer.start_preprocess(p.clone());
-                                self.needs_reanalysis = false;
-                                self.status_msg = String::new();
-                            }
+                            && let Some(ref p) = self.current_path.clone() {
+                            let cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
+                            let _ = std::fs::remove_file(&cache);
+                            self.analyzer.pre_frames.clear();
+                            self.analyzer.start_preprocess(p.clone());
+                            self.needs_reanalysis = false;
+                            self.status_msg = String::new();
                         }
                         if analyzing {
                             let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
@@ -3251,20 +3309,18 @@ impl SpectrumWindow {
                                     egui::Button::new("💾 Bake to Cache"))
                                     .on_hover_text("Re-analyze with EQ applied and cache result.\nCreates a separate cache file keyed to these EQ settings.")
                                     .clicked()
-                                {
-                                    if let Some(ref p) = self.current_path.clone() {
-                                        let eq = self.eq_state.lock().unwrap();
-                                        let fp = eq.fingerprint();
-                                        drop(eq);
-                                        let mut cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
-                                        // Append EQ fingerprint to filename stem
-                                        let stem = cache.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                                        cache.set_file_name(format!("{}_eq{:016x}.spectrumcache", stem, fp));
-                                        let _ = std::fs::remove_file(&cache);
-                                        self.analyzer.pre_frames.clear();
-                                        self.analyzer.start_preprocess(p.clone());
-                                        self.needs_reanalysis = false;
-                                    }
+                                    && let Some(ref p) = self.current_path.clone() {
+                                    let eq = self.eq_state.lock().unwrap();
+                                    let fp = eq.fingerprint();
+                                    drop(eq);
+                                    let mut cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
+                                    // Append EQ fingerprint to filename stem
+                                    let stem = cache.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                                    cache.set_file_name(format!("{}_eq{:016x}.spectrumcache", stem, fp));
+                                    let _ = std::fs::remove_file(&cache);
+                                    self.analyzer.pre_frames.clear();
+                                    self.analyzer.start_preprocess(p.clone());
+                                    self.needs_reanalysis = false;
                                 }
                             });
 
@@ -3385,10 +3441,9 @@ impl SpectrumWindow {
 
                                     // ── Modified action buttons ──
                                     if self.preset_modified && self.pending_preset_switch.is_none() {
-                                        if self.active_preset.is_some() {
-                                            if ui.small_button("Update").on_hover_text("Overwrite active preset with current bands").clicked() {
-                                                self.overwrite_active_preset();
-                                            }
+                                        if self.active_preset.is_some()
+                                            && ui.small_button("Update").on_hover_text("Overwrite active preset with current bands").clicked() {
+                                            self.overwrite_active_preset();
                                         }
                                         if ui.small_button("Discard").on_hover_text("Revert bands to saved preset").clicked() {
                                             if let Some(r) = self.active_preset.clone() {
@@ -3440,9 +3495,9 @@ impl SpectrumWindow {
                                 // ── Per-preset actions (Rename, Duplicate, Delete, Set Default) ──
                                 if let Some(active_ref) = self.active_preset.clone() {
                                     // Rename state
-                                    if let Some((ref rename_ref, ref mut rename_buf)) = self.eq_rename_state.clone() {
-                                        if *rename_ref == active_ref {
-                                            ui.horizontal(|ui| {
+                                    if let Some((ref rename_ref, ref mut rename_buf)) = self.eq_rename_state.clone()
+                                        && *rename_ref == active_ref {
+                                        ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new("Rename:").size(11.0));
                                                 // We need mutable access — pull from field
                                                 if let Some((_, ref mut buf)) = self.eq_rename_state {
@@ -3452,9 +3507,7 @@ impl SpectrumWindow {
                                                 let ok = !new_name.is_empty();
                                                 if ui.add_enabled(ok, egui::Button::new("✓")).clicked() {
                                                     let key = self.track_key();
-                                                    if let Some(p) = self.preset_library.find_mut(&active_ref, key.as_deref()) {
-                                                        p.name = new_name;
-                                                    }
+                                                    if let Some(p) = self.preset_library.find_mut(&active_ref, key.as_deref()) { p.name = new_name; }
                                                     self.preset_library.save();
                                                     self.eq_rename_state = None;
                                                 }
@@ -3462,18 +3515,16 @@ impl SpectrumWindow {
                                                     self.eq_rename_state = None;
                                                 }
                                             });
-                                        }
                                     }
 
                                     ui.horizontal(|ui| {
                                         // Rename button
-                                        if self.eq_rename_state.is_none() || self.eq_rename_state.as_ref().map(|(r,_)| r) != Some(&active_ref) {
-                                            if ui.small_button("✏ Rename").clicked() {
-                                                let key = self.track_key();
-                                                let cur_name = self.preset_library.find(&active_ref, key.as_deref())
-                                                    .map(|p| p.name.clone()).unwrap_or_default();
-                                                self.eq_rename_state = Some((active_ref.clone(), cur_name));
-                                            }
+                                        if (self.eq_rename_state.is_none() || self.eq_rename_state.as_ref().map(|(r,_)| r) != Some(&active_ref))
+                                            && ui.small_button("✏ Rename").clicked() {
+                                            let key = self.track_key();
+                                            let cur_name = self.preset_library.find(&active_ref, key.as_deref())
+                                                .map(|p| p.name.clone()).unwrap_or_default();
+                                            self.eq_rename_state = Some((active_ref.clone(), cur_name));
                                         }
 
                                         // Duplicate
@@ -3674,8 +3725,32 @@ impl SpectrumWindow {
                         VizStyle::Line       => draw_line(&painter, mags, plot_rect,
                                                  Color32::from_rgb(80, 200, 255)),
                         VizStyle::FilledArea => draw_filled(&painter, mags, plot_rect),
-                        VizStyle::Waterfall  => draw_waterfall(&painter,
-                                                 &self.analyzer.waterfall, plot_rect),
+                        VizStyle::Waterfall  => {
+                            if self.analyzer.waterfall_dirty {
+                                if let Some(img) = waterfall_to_color_image(&self.analyzer.waterfall) {
+                                    if let Some(ref mut th) = self.waterfall_texture {
+                                        th.set(img, egui::TextureOptions::NEAREST);
+                                    } else {
+                                        let th = vp_ctx.load_texture(
+                                            "moosik_waterfall", img,
+                                            egui::TextureOptions::NEAREST,
+                                        );
+                                        self.waterfall_texture = Some(th);
+                                    }
+                                }
+                                self.analyzer.waterfall_dirty = false;
+                            }
+                            if let Some(ref th) = self.waterfall_texture {
+                                painter.image(
+                                    th.id(), plot_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::Pos2::new(1.0, 1.0),
+                                    ),
+                                    Color32::WHITE,
+                                );
+                            }
+                        },
                         VizStyle::Spectrogram => {
                             if self.spectrogram.dirty {
                                 let img = self.spectrogram.to_color_image();
@@ -3773,30 +3848,27 @@ impl SpectrumWindow {
                         }
 
                         // Right-click on node → remove
-                        if spec_response.secondary_clicked() {
-                            if let Some(idx) = self.eq_hovered_node {
-                                let mut eq = self.eq_state.lock().unwrap();
-                                if idx < eq.bands.len() { eq.bands.remove(idx); eq.bump(); }
-                                self.eq_hovered_node = None;
-                            }
+                        if spec_response.secondary_clicked()
+                            && let Some(idx) = self.eq_hovered_node {
+                            let mut eq = self.eq_state.lock().unwrap();
+                            if idx < eq.bands.len() { eq.bands.remove(idx); eq.bump(); }
+                            self.eq_hovered_node = None;
                         }
 
                         // Left-click on empty space → add band (up to 16)
-                        if spec_response.clicked() && self.eq_hovered_node.is_none() && self.eq_dragging_node.is_none() {
-                            if let Some(click) = spec_response.interact_pointer_pos() {
-                                if plot_rect.contains(click) {
-                                    let t = (click.x - plot_rect.left()) / plot_rect.width();
-                                    let freq = 10f32.powf(log_min + t * log_span).clamp(20.0, 20_000.0);
-                                    let db_per_px = EQ_DB_RANGE / (plot_rect.height() * 0.5);
-                                    let gain = ((plot_rect.center().y - click.y) * db_per_px).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
-                                    let mut eq = self.eq_state.lock().unwrap();
-                                    if eq.bands.len() < 16 {
-                                        let mut band = EqBand::default_peak(freq);
-                                        band.gain_db = gain;
-                                        eq.bands.push(band);
-                                        eq.bump();
-                                    }
-                                }
+                        if spec_response.clicked() && self.eq_hovered_node.is_none() && self.eq_dragging_node.is_none()
+                            && let Some(click) = spec_response.interact_pointer_pos()
+                            && plot_rect.contains(click) {
+                            let t = (click.x - plot_rect.left()) / plot_rect.width();
+                            let freq = 10f32.powf(log_min + t * log_span).clamp(20.0, 20_000.0);
+                            let db_per_px = EQ_DB_RANGE / (plot_rect.height() * 0.5);
+                            let gain = ((plot_rect.center().y - click.y) * db_per_px).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
+                            let mut eq = self.eq_state.lock().unwrap();
+                            if eq.bands.len() < 16 {
+                                let mut band = EqBand::default_peak(freq);
+                                band.gain_db = gain;
+                                eq.bands.push(band);
+                                eq.bump();
                             }
                         }
                     }

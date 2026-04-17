@@ -5,10 +5,12 @@ use egui::{Color32, RichText, Slider, Vec2};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use serde::{Deserialize, Serialize};
 use spectrum::{SampleBuf, SpectralCeiling, StereoBuf, TrackAnalysis, SpectrumSource, SpectrumWindow, EqSource, EqStateHandle};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -180,7 +182,7 @@ fn read_metadata(path: &PathBuf) -> TrackMeta {
 // Audio info helpers
 // ---------------------------------------------------------------------------
 
-fn codec_name(path: &PathBuf) -> &'static str {
+fn codec_name(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("flac") => "FLAC",
         Some("mp3")  => "MP3",
@@ -190,7 +192,7 @@ fn codec_name(path: &PathBuf) -> &'static str {
     }
 }
 
-fn is_lossless(path: &PathBuf) -> bool {
+fn is_lossless(path: &Path) -> bool {
     matches!(path.extension().and_then(|e| e.to_str()), Some("flac") | Some("wav"))
 }
 
@@ -200,7 +202,7 @@ fn channel_layout(n: u8) -> &'static str {
 }
 
 fn fmt_hz(sr: u32) -> String {
-    if sr % 1000 == 0 { format!("{}kHz", sr / 1000) }
+    if sr.is_multiple_of(1000) { format!("{}kHz", sr / 1000) }
     else { format!("{:.1}kHz", sr as f32 / 1000.0) }
 }
 
@@ -274,22 +276,20 @@ impl Engine {
     }
 
     fn pause(&mut self) {
-        if let Some(ref sink) = self.sink {
-            if !sink.is_paused() {
-                sink.pause();
-                if let Some(started) = self.started_at.take() {
-                    self.paused_elapsed += started.elapsed();
-                }
+        if let Some(ref sink) = self.sink
+            && !sink.is_paused() {
+            sink.pause();
+            if let Some(started) = self.started_at.take() {
+                self.paused_elapsed += started.elapsed();
             }
         }
     }
 
     fn resume(&mut self) {
-        if let Some(ref sink) = self.sink {
-            if sink.is_paused() {
-                sink.play();
-                self.started_at = Some(Instant::now());
-            }
+        if let Some(ref sink) = self.sink
+            && sink.is_paused() {
+            sink.play();
+            self.started_at = Some(Instant::now());
         }
     }
 
@@ -303,7 +303,7 @@ impl Engine {
     }
 
     fn is_finished(&self) -> bool {
-        self.sink.as_ref().map_or(false, |s| s.empty())
+        self.sink.as_ref().is_some_and(|s| s.empty())
     }
 
     fn elapsed(&self) -> Duration {
@@ -402,6 +402,17 @@ struct MoosikApp {
     spectrum_window: SpectrumWindow,
     info_open: bool,
     loop_mode: LoopMode,
+    // multi-select
+    selected: HashSet<usize>,
+    last_clicked: Option<usize>,
+    // drag-to-reorder
+    drag_src: Option<usize>,
+    drag_over_row: Option<usize>,
+    // named playlist store
+    playlist_store: Vec<SavedPlaylist>,
+    active_saved_playlist: Option<usize>,
+    show_save_playlist_input: bool,
+    playlist_name_buf: String,
 }
 
 impl MoosikApp {
@@ -412,8 +423,11 @@ impl MoosikApp {
         if let Some(ref mut e) = engine {
             e.eq = Some(spectrum_window.eq_state.clone());
         }
+        let saved_paths = load_last_playlist();
+        let playlist: Vec<Track> = saved_paths.into_iter().map(Track::load).collect();
+        let playlist_store = load_playlist_store();
         MoosikApp {
-            playlist: Vec::new(),
+            playlist,
             current_index: None,
             play_state: PlayState::Stopped,
             engine,
@@ -424,6 +438,14 @@ impl MoosikApp {
             spectrum_window,
             info_open: false,
             loop_mode: LoopMode::RepeatAll,
+            selected: HashSet::new(),
+            last_clicked: None,
+            drag_src: None,
+            drag_over_row: None,
+            playlist_store,
+            active_saved_playlist: None,
+            show_save_playlist_input: false,
+            playlist_name_buf: String::new(),
         }
     }
 
@@ -447,10 +469,9 @@ impl MoosikApp {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if matches!(ext.to_lowercase().as_str(), "flac" | "wav" | "mp3" | "ogg") {
-                        found.push(path);
-                    }
+                } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                    && matches!(ext.to_lowercase().as_str(), "flac" | "wav" | "mp3" | "ogg") {
+                    found.push(path);
                 }
             }
         }
@@ -566,6 +587,57 @@ impl MoosikApp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Playlist persistence
+// ---------------------------------------------------------------------------
+
+fn moosik_dir() -> PathBuf {
+    std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".moosik")
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SavedPlaylist {
+    name: String,
+    paths: Vec<PathBuf>,
+}
+
+fn save_last_playlist(tracks: &[Track]) {
+    let dir = moosik_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let paths: Vec<&PathBuf> = tracks.iter().map(|t| &t.path).collect();
+    if let Ok(json) = serde_json::to_string(&paths) {
+        let _ = std::fs::write(dir.join("last_playlist.json"), json);
+    }
+}
+
+fn load_last_playlist() -> Vec<PathBuf> {
+    let path = moosik_dir().join("last_playlist.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_playlist_store(playlists: &[SavedPlaylist]) {
+    let dir = moosik_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(json) = serde_json::to_string(playlists) {
+        let _ = std::fs::write(dir.join("playlists.json"), json);
+    }
+}
+
+fn load_playlist_store() -> Vec<SavedPlaylist> {
+    let path = moosik_dir().join("playlists.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 fn row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.label(egui::RichText::new(label).color(Color32::from_gray(150)).size(12.0));
     ui.label(egui::RichText::new(value).size(12.0));
@@ -632,16 +704,15 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, spectral_ceiling: Option<Spectr
         }
 
         // Lossless-only: uncompressed size + compression ratio
-        if !lossy {
-            if let (Some(sr), Some(ch), Some(bd), Some(dur)) =
+        if !lossy
+            && let (Some(sr), Some(ch), Some(bd), Some(dur)) =
                 (t.sample_rate, t.channels, t.bit_depth, t.duration)
-            {
-                let uncompressed = sr as u64 * ch as u64 * (bd as u64 / 8) * dur.as_secs();
-                row(ui, "Uncompressed", &fmt_size(uncompressed));
-                if uncompressed > 0 && t.file_size > 0 {
-                    let ratio = t.file_size as f64 / uncompressed as f64 * 100.0;
-                    row(ui, "Compression ratio", &format!("{ratio:.1}%  of uncompressed"));
-                }
+        {
+            let uncompressed = sr as u64 * ch as u64 * (bd as u64 / 8) * dur.as_secs();
+            row(ui, "Uncompressed", &fmt_size(uncompressed));
+            if uncompressed > 0 && t.file_size > 0 {
+                let ratio = t.file_size as f64 / uncompressed as f64 * 100.0;
+                row(ui, "Compression ratio", &format!("{ratio:.1}%  of uncompressed"));
             }
         }
 
@@ -711,9 +782,9 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, spectral_ceiling: Option<Spectr
     });
 
     // ── Loudness history graph ───────────────────────────────────────────
-    if let Some(a) = analysis {
-        if !a.loudness_history.is_empty() {
-            ui.add_space(8.0);
+    if let Some(a) = analysis
+        && !a.loudness_history.is_empty() {
+        ui.add_space(8.0);
             ui.label(egui::RichText::new("Loudness History (per second)")
                 .size(12.0).color(Color32::from_rgb(120, 180, 255)));
             ui.add_space(4.0);
@@ -765,7 +836,6 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, spectral_ceiling: Option<Spectr
                         egui::Stroke::new(1.5, Color32::from_rgb(80, 200, 120)),
                     ));
                 }
-            }
         }
     }
 }
@@ -781,10 +851,9 @@ impl eframe::App for MoosikApp {
         }
 
         // sync volume to engine on startup
-        if let Some(ref mut engine) = self.engine {
-            if (engine.volume - self.volume).abs() > 0.001 {
-                engine.set_volume(self.volume);
-            }
+        if let Some(ref mut engine) = self.engine
+            && (engine.volume - self.volume).abs() > 0.001 {
+            engine.set_volume(self.volume);
         }
 
         // Request repaint while playing or while background analysis is running.
@@ -807,28 +876,27 @@ impl eframe::App for MoosikApp {
         self.spectrum_window.show(ctx);
 
         // --- Info window (separate OS viewport) ---
-        if self.info_open {
-            if let Some(idx) = self.current_index {
-                let track = self.playlist[idx].clone();
-                let mut close = false;
-                let vp_id = egui::ViewportId::from_hash_of("moosik_info");
-                let vp_builder = egui::ViewportBuilder::default()
-                    .with_title(format!("Info — {}", track.title))
-                    .with_inner_size([460.0, 540.0])
-                    .with_resizable(true);
-                ctx.show_viewport_immediate(vp_id, vp_builder, |vp_ctx, _class| {
-                    if vp_ctx.input(|i| i.viewport().close_requested()) {
-                        close = true;
-                        return;
-                    }
-                    egui::CentralPanel::default().show(vp_ctx, |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            show_track_info(ui, &track, self.spectrum_window.spectral_ceiling.clone(), self.spectrum_window.track_analysis.as_ref());
-                        });
+        if self.info_open
+            && let Some(idx) = self.current_index {
+            let track = self.playlist[idx].clone();
+            let mut close = false;
+            let vp_id = egui::ViewportId::from_hash_of("moosik_info");
+            let vp_builder = egui::ViewportBuilder::default()
+                .with_title(format!("Info — {}", track.title))
+                .with_inner_size([460.0, 540.0])
+                .with_resizable(true);
+            ctx.show_viewport_immediate(vp_id, vp_builder, |vp_ctx, _class| {
+                if vp_ctx.input(|i| i.viewport().close_requested()) {
+                    close = true;
+                    return;
+                }
+                egui::CentralPanel::default().show(vp_ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        show_track_info(ui, &track, self.spectrum_window.spectral_ceiling.clone(), self.spectrum_window.track_analysis.as_ref());
                     });
                 });
-                if close { self.info_open = false; }
-            }
+            });
+            if close { self.info_open = false; }
         }
 
         // ---------------------------------------------------------------
@@ -898,21 +966,18 @@ impl eframe::App for MoosikApp {
             let track_y  = row_rect.center().y;
 
             // 1. Sync seek_pos from engine when the user is not interacting.
-            if !self.seeking {
-                if let Some(dur) = total {
-                    if dur.as_secs_f32() > 0.0 {
-                        self.seek_pos =
-                            (elapsed.as_secs_f32() / dur.as_secs_f32()).clamp(0.0, 1.0);
-                    }
-                }
+            if !self.seeking
+                && let Some(dur) = total
+                && dur.as_secs_f32() > 0.0 {
+                self.seek_pos =
+                    (elapsed.as_secs_f32() / dur.as_secs_f32()).clamp(0.0, 1.0);
             }
 
             // 2. Override with pointer position while the user is dragging or clicking.
-            if seek_resp.dragged() || seek_resp.clicked() {
-                if let Some(ptr) = seek_resp.interact_pointer_pos() {
-                    let span = (track_x1 - track_x0).max(1.0);
-                    self.seek_pos = ((ptr.x - track_x0) / span).clamp(0.0, 1.0);
-                }
+            if (seek_resp.dragged() || seek_resp.clicked())
+                && let Some(ptr) = seek_resp.interact_pointer_pos() {
+                let span = (track_x1 - track_x0).max(1.0);
+                self.seek_pos = ((ptr.x - track_x0) / span).clamp(0.0, 1.0);
             }
             if seek_resp.dragged() {
                 self.seeking = true;
@@ -1071,10 +1136,9 @@ impl eframe::App for MoosikApp {
                         .show_value(false)
                         .trailing_fill(true),
                 );
-                if vol_slider.changed() {
-                    if let Some(ref mut engine) = self.engine {
-                        engine.set_volume(self.volume);
-                    }
+                if vol_slider.changed()
+                    && let Some(ref mut engine) = self.engine {
+                    engine.set_volume(self.volume);
                 }
                 ui.label(
                     RichText::new(format!("{}%", (self.volume * 100.0) as u32))
@@ -1152,29 +1216,159 @@ impl eframe::App for MoosikApp {
         });
 
         // ---------------------------------------------------------------
-        // Central panel – playlist
+        // Central panel – playlist store + playlist
         // ---------------------------------------------------------------
         egui::CentralPanel::default().show(ctx, |ui| {
+            // ── Playlist store bar ──────────────────────────────────────
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                ui.label(RichText::new(format!("Playlist  ({} tracks)", self.playlist.len()))
-                    .size(13.0)
-                    .color(Color32::from_gray(160)));
+                let selected_text = self.active_saved_playlist
+                    .and_then(|i| self.playlist_store.get(i))
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("— unsaved —")
+                    .to_string();
+                egui::ComboBox::from_id_salt("pl_combo")
+                    .selected_text(&selected_text)
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(self.active_saved_playlist.is_none(), "— unsaved —").clicked() {
+                            self.active_saved_playlist = None;
+                        }
+                        for i in 0..self.playlist_store.len() {
+                            let name = self.playlist_store[i].name.clone();
+                            let is_sel = self.active_saved_playlist == Some(i);
+                            if ui.selectable_label(is_sel, &name).clicked() {
+                                let paths = self.playlist_store[i].paths.clone();
+                                self.stop();
+                                self.playlist = paths.into_iter().map(Track::load).collect();
+                                self.current_index = None;
+                                self.selected.clear();
+                                self.last_clicked = None;
+                                self.active_saved_playlist = Some(i);
+                                self.show_save_playlist_input = false;
+                            }
+                        }
+                    });
+                ui.add_space(4.0);
+                if let Some(idx) = self.active_saved_playlist {
+                    if !self.playlist.is_empty()
+                        && ui.small_button("🔄 Update").on_hover_text("Overwrite saved playlist").clicked()
+                    {
+                        let paths: Vec<PathBuf> = self.playlist.iter().map(|t| t.path.clone()).collect();
+                        self.playlist_store[idx].paths = paths;
+                        save_playlist_store(&self.playlist_store);
+                    }
+                    ui.add_space(2.0);
+                    if ui.small_button(RichText::new("🗑").color(Color32::from_rgb(200, 80, 80)))
+                        .on_hover_text("Delete saved playlist").clicked()
+                    {
+                        self.playlist_store.remove(idx);
+                        self.active_saved_playlist = None;
+                        save_playlist_store(&self.playlist_store);
+                    }
+                    ui.add_space(4.0);
+                }
+                if !self.playlist.is_empty() {
+                    let btn_label = if self.show_save_playlist_input { "✕" } else { "💾 Save As" };
+                    if ui.small_button(btn_label).clicked() {
+                        self.show_save_playlist_input = !self.show_save_playlist_input;
+                        if self.show_save_playlist_input && self.playlist_name_buf.is_empty() {
+                            self.playlist_name_buf = "My Playlist".to_string();
+                        }
+                    }
+                }
+            });
 
+            if self.show_save_playlist_input {
+                let mut do_save = false;
+                let mut do_cancel = false;
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label("Name:");
+                    let te = ui.add(
+                        egui::TextEdit::singleline(&mut self.playlist_name_buf).desired_width(140.0)
+                    );
+                    if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        do_save = true;
+                    }
+                    if ui.small_button("Save").clicked() { do_save = true; }
+                    if ui.small_button("Cancel").clicked() { do_cancel = true; }
+                });
+                if do_save {
+                    let name = self.playlist_name_buf.trim().to_string();
+                    if !name.is_empty() {
+                        let paths = self.playlist.iter().map(|t| t.path.clone()).collect();
+                        self.playlist_store.push(SavedPlaylist { name, paths });
+                        self.active_saved_playlist = Some(self.playlist_store.len() - 1);
+                        save_playlist_store(&self.playlist_store);
+                        self.show_save_playlist_input = false;
+                        self.playlist_name_buf.clear();
+                    }
+                }
+                if do_cancel {
+                    self.show_save_playlist_input = false;
+                }
+            }
+
+            ui.add_space(2.0);
+
+            // ── Playlist header ─────────────────────────────────────────
+            let n_sel = self.selected.len();
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new(format!("Playlist  ({} tracks)", self.playlist.len()))
+                    .size(13.0).color(Color32::from_gray(160)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
                     if !self.playlist.is_empty()
-                        && ui.small_button(RichText::new("Clear").color(Color32::from_rgb(200, 80, 80))).clicked()
+                        && ui.small_button(RichText::new("Clear All").color(Color32::from_rgb(200, 80, 80))).clicked()
                     {
                         self.stop();
                         self.playlist.clear();
                         self.current_index = None;
+                        self.selected.clear();
+                        self.active_saved_playlist = None;
+                    }
+                    if n_sel > 0 {
+                        ui.add_space(4.0);
+                        let del_label = format!("Delete {n_sel} selected");
+                        if ui.small_button(RichText::new(del_label).color(Color32::from_rgb(220, 100, 60))).clicked() {
+                            let current_removed = self.current_index
+                                .map(|ci| self.selected.contains(&ci)).unwrap_or(false);
+                            let mut to_remove: Vec<usize> = self.selected.drain().collect();
+                            to_remove.sort_unstable_by(|a, b| b.cmp(a)); // descending: safe in-place removal
+                            for &idx in &to_remove {
+                                self.playlist.remove(idx);
+                            }
+                            if current_removed {
+                                self.stop();
+                                self.current_index = None;
+                            } else if let Some(ci) = self.current_index {
+                                let removed_before = to_remove.iter().filter(|&&r| r < ci).count();
+                                self.current_index = Some(ci - removed_before);
+                            }
+                            self.last_clicked = None;
+                        }
                     }
                 });
             });
-
             ui.separator();
+
+            // ── Drag / selection tracking ────────────────────────────────
+            let dragging = self.drag_src.is_some();
+            let pointer_released = ctx.input(|i| i.pointer.primary_released());
+            let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+            let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+            let shift_held = ctx.input(|i| i.modifiers.shift);
+
+            let mut play_requested: Option<usize> = None;
+            let mut drag_started_at: Option<usize> = None;
+            let mut click_action: Option<(usize, bool, bool)> = None;
+
+            let n = self.playlist.len();
+            let mut new_drop_row = n;
+            let mut last_row_bottom: Option<(f32, f32, f32)> = None; // (left, right, y)
 
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 if self.playlist.is_empty() {
@@ -1187,11 +1381,19 @@ impl eframe::App for MoosikApp {
                     return;
                 }
 
-                let mut play_requested: Option<usize> = None;
+                let available_w = ui.available_width();
 
-                for (i, track) in self.playlist.iter().enumerate() {
-                    let is_current = self.current_index == Some(i);
-                    let row_color = if is_current {
+                for i in 0..n {
+                    let track_title  = self.playlist[i].display_title().to_string();
+                    let track_artist = self.playlist[i].artist.clone();
+                    let track_dur    = self.playlist[i].duration;
+                    let is_current        = self.current_index == Some(i);
+                    let is_selected       = self.selected.contains(&i);
+                    let is_being_dragged  = self.drag_src == Some(i);
+
+                    let base_color = if is_selected {
+                        Color32::from_rgb(40, 70, 130)
+                    } else if is_current {
                         Color32::from_rgb(30, 60, 100)
                     } else if i % 2 == 0 {
                         Color32::from_gray(28)
@@ -1200,19 +1402,55 @@ impl eframe::App for MoosikApp {
                     };
 
                     let (rect, response) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), 32.0),
-                        egui::Sense::click(),
+                        Vec2::new(available_w, 32.0),
+                        egui::Sense::click_and_drag(),
                     );
 
+                    // Determine drop position: first row whose center is below pointer
+                    if dragging
+                        && let Some(pp) = pointer_pos
+                        && pp.y <= rect.center().y && new_drop_row == n {
+                        new_drop_row = i;
+                    }
+
+                    // Insertion line before this row
+                    if dragging {
+                        let src = self.drag_src;
+                        let no_op = src == Some(i) || src.map(|s| s + 1) == Some(i);
+                        if self.drag_over_row == Some(i) && !no_op {
+                            ui.painter().line_segment(
+                                [egui::Pos2::new(rect.left(), rect.top()),
+                                 egui::Pos2::new(rect.right(), rect.top())],
+                                egui::Stroke::new(2.0, Color32::from_rgb(100, 180, 255)),
+                            );
+                        }
+                    }
+
                     if ui.is_rect_visible(rect) {
-                        ui.painter().rect_filled(rect, 0.0, row_color);
+                        let alpha = if is_being_dragged { 80u8 } else { 255u8 };
+                        let c = base_color;
+                        ui.painter().rect_filled(
+                            rect, 0.0,
+                            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha),
+                        );
 
                         let inner = rect.shrink2(Vec2::new(10.0, 0.0));
+                        let cy = rect.center().y;
+
+                        // Drag handle — 2×3 dot grid, no font dependency
+                        for col in [0.0f32, 4.0] {
+                            for row in [-4.0f32, 0.0, 4.0] {
+                                ui.painter().circle_filled(
+                                    egui::Pos2::new(inner.min.x + 4.0 + col, cy + row),
+                                    1.5,
+                                    Color32::from_gray(75),
+                                );
+                            }
+                        }
 
                         // Track number
-                        let num_rect = egui::Rect::from_min_size(inner.min, Vec2::new(28.0, inner.height()));
                         ui.painter().text(
-                            num_rect.center(),
+                            egui::Pos2::new(inner.min.x + 24.0, cy),
                             egui::Align2::CENTER_CENTER,
                             format!("{}", i + 1),
                             egui::FontId::proportional(12.0),
@@ -1220,60 +1458,122 @@ impl eframe::App for MoosikApp {
                         );
 
                         // Title
-                        let title_start = inner.min + Vec2::new(36.0, 0.0);
-                        let title_rect = egui::Rect::from_min_size(title_start, Vec2::new(inner.width() * 0.45, inner.height()));
+                        let title_x = inner.min.x + 42.0;
+                        let title_w = inner.width() * 0.45;
                         ui.painter().text(
-                            title_rect.left_center(),
+                            egui::Pos2::new(title_x, cy),
                             egui::Align2::LEFT_CENTER,
-                            track.display_title(),
+                            &track_title,
                             egui::FontId::proportional(13.0),
                             if is_current { Color32::WHITE } else { Color32::from_gray(210) },
                         );
 
                         // Artist
-                        let artist_start = title_start + Vec2::new(inner.width() * 0.45 + 8.0, 0.0);
-                        let artist_rect = egui::Rect::from_min_size(artist_start, Vec2::new(inner.width() * 0.30, inner.height()));
                         ui.painter().text(
-                            artist_rect.left_center(),
+                            egui::Pos2::new(title_x + title_w + 8.0, cy),
                             egui::Align2::LEFT_CENTER,
-                            &track.artist,
+                            &track_artist,
                             egui::FontId::proportional(12.0),
                             Color32::from_gray(150),
                         );
 
                         // Duration
-                        if let Some(dur) = track.duration {
-                            let dur_str = Self::format_duration(dur);
-                            let dur_x = inner.max.x - 8.0;
+                        if let Some(dur) = track_dur {
                             ui.painter().text(
-                                egui::Pos2::new(dur_x, rect.center().y),
+                                egui::Pos2::new(inner.max.x - 8.0, cy),
                                 egui::Align2::RIGHT_CENTER,
-                                dur_str,
+                                Self::format_duration(dur),
                                 egui::FontId::monospace(12.0),
                                 Color32::from_gray(120),
                             );
                         }
 
-                        // Hover highlight
-                        if response.hovered() {
-                            ui.painter().rect_filled(rect, 0.0, Color32::from_rgba_premultiplied(255, 255, 255, 8));
+                        if response.hovered() && !is_being_dragged {
+                            ui.painter().rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 8));
                         }
                     }
 
-                    if response.double_clicked() {
-                        play_requested = Some(i);
+                    // Drag start
+                    if response.drag_started() && !dragging {
+                        drag_started_at = Some(i);
                     }
 
-                    if response.clicked() && !response.double_clicked() {
-                        // Single click selects
-                        self.current_index = Some(i);
+                    // Click (only when not starting a drag)
+                    if !dragging && !response.drag_started() {
+                        if response.double_clicked() {
+                            play_requested = Some(i);
+                        } else if response.clicked() {
+                            click_action = Some((i, ctrl_held, shift_held));
+                        }
                     }
+
+                    last_row_bottom = Some((rect.left(), rect.right(), rect.bottom()));
                 }
 
-                if let Some(idx) = play_requested {
-                    self.play_index(idx);
+                // Insertion line at end of list
+                if dragging
+                    && let (Some((rx0, rx1, ry)), Some(drop)) = (last_row_bottom, self.drag_over_row) {
+                    let src = self.drag_src;
+                    let no_op = src.map(|s| s + 1) == Some(n);
+                    if drop == n && !no_op {
+                        ui.painter().line_segment(
+                            [egui::Pos2::new(rx0, ry), egui::Pos2::new(rx1, ry)],
+                            egui::Stroke::new(2.0, Color32::from_rgb(100, 180, 255)),
+                        );
+                    }
                 }
             });
+
+            // ── Apply drag start ─────────────────────────────────────────
+            if let Some(i) = drag_started_at {
+                self.drag_src = Some(i);
+                self.selected.clear();
+            }
+            if dragging {
+                self.drag_over_row = Some(new_drop_row);
+            }
+
+            // ── Finalize drag on release ──────────────────────────────────
+            if dragging && pointer_released {
+                let src = self.drag_src.take().unwrap_or(0);
+                let dst = self.drag_over_row.take().unwrap_or(n);
+                if src != dst && src + 1 != dst && dst <= n {
+                    let track = self.playlist.remove(src);
+                    let insert_at = if dst > src { dst - 1 } else { dst };
+                    self.playlist.insert(insert_at, track);
+                    self.current_index = self.current_index.map(|ci| {
+                        if ci == src              { insert_at }
+                        else if src < ci && ci < dst { ci - 1 }
+                        else if dst <= ci && ci < src { ci + 1 }
+                        else                      { ci }
+                    });
+                }
+            }
+
+            // ── Apply click selection ─────────────────────────────────────
+            if let Some(idx) = play_requested {
+                self.play_index(idx);
+            }
+            if let Some((i, ctrl, shift)) = click_action {
+                if ctrl {
+                    if self.selected.contains(&i) { self.selected.remove(&i); }
+                    else { self.selected.insert(i); }
+                    self.last_clicked = Some(i);
+                } else if shift {
+                    let anchor = self.last_clicked.unwrap_or(i);
+                    let (lo, hi) = if anchor <= i { (anchor, i) } else { (i, anchor) };
+                    for j in lo..=hi { self.selected.insert(j); }
+                    self.last_clicked = Some(i);
+                } else {
+                    self.selected.clear();
+                    self.selected.insert(i);
+                    self.last_clicked = Some(i);
+                }
+            }
         });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        save_last_playlist(&self.playlist);
     }
 }
