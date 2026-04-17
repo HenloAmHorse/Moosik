@@ -995,7 +995,7 @@ impl SpectrumAnalyzer {
             pending_waveform: None,
             pending_analysis: None,
             pre_frames: Vec::new(),
-            pre_frame_rate: 30.0,
+            pre_frame_rate: 60.0,
             pre_receiver: None,
             is_analyzing: Arc::new(AtomicBool::new(false)),
             analysis_progress: Arc::new(AtomicUsize::new(0)),
