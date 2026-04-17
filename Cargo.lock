@@ -2131,7 +2131,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "moosik_player"
+name = "moosik"
 version = "0.1.0"
 dependencies = [
  "eframe",

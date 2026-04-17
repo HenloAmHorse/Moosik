@@ -2505,7 +2505,7 @@ impl SpectrumWindow {
             max_freq: DEFAULT_MAX_FREQ,
             current_path: None,
             status_msg: String::new(),
-            max_fps: 30.0,
+            max_fps: 60.0,
             last_fft_time: None,
             current_fps: 0.0,
             waveform: None,
