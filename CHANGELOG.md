@@ -5,7 +5,7 @@
 Initial public release.
 
 <p align="center">
-  <img src="screenshots/player.png" alt="Player UI" width="700"/>
+  <img src="screenshots/player.png" alt="UI" width="700"/>
 </p>
 
 <p align="center">
