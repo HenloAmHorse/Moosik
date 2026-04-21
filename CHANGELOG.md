@@ -1,11 +1,35 @@
 # Changelog
 
+## [0.2.1] - 2026-04-20
+
+### Album Art
+- **Thumbnails on by default** — playlist thumbnails are now enabled out of the box
+- **Hover preview** — hold the cursor over a playlist thumbnail for 1 second to see a 512px popup of the full art; disappears when the cursor moves away
+
+### Spectrum Analyzer
+- **60 fps default** — corrected the default frame rate back to 60 fps
+- **Window function descriptions** — hovering Hann / Hamming / Blackman / Flat-top now shows a plain-English explanation of each window's trade-offs
+
+### Internal
+- `spectrum.rs` split into `spectrum/eq.rs` and `spectrum/art.rs` — no user-facing changes
+
+## [0.2.0] - 2026-04-18
+
+### Album Art
+
+- **Playlist thumbnails** — each playlist row shows a 28×28 thumbnail of the track's embedded cover art, displayed alongside the track checkbox
+- **Spectrum overlay — Transparent mode** — album art is rendered behind the spectrum at a configurable opacity; fit mode is selectable (Contain, Cover, Stretch)
+- **Spectrum overlay — Mask mode** — spectrum bars act as a cut-out window into the album art; each bar is textured with the region of the art it covers; brightness can be fixed or follow bar magnitude dynamically
+- **Art Settings panel** in the spectrum window — collapses under "Album Art"; supports global settings and per-track overrides (same pattern as EQ presets)
+- **Spectrum placeholder** — optional ♪ glyph shown when a track has no embedded art
+- **Settings persistence** — art display preferences saved to `~/.moosik/art_settings.json`
+
 ## [0.1.0] - 2026-04-04
 
 Initial public release.
 
 <p align="center">
-  <img src="screenshots/player.png" alt="UI" width="700"/>
+  <img src="screenshots/player.png" alt="Player UI" width="700"/>
 </p>
 
 <p align="center">

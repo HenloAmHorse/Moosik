@@ -1792,6 +1792,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2131,11 +2133,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "moosik"
+name = "moosik_player"
 version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "image",
  "lofty",
  "rayon",
  "rfd",

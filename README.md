@@ -1,7 +1,7 @@
 # Moosik
 
 <p align="center">
-  <img src="screenshots/icon.png" width="120" alt="Moosik icon"/>
+  <img src="screenshots/icon.png" width="120" alt="Moosik Player icon"/>
 </p>
 
 A desktop music player with a professional-grade spectrum analyzer and parametric EQ, built in Rust.
@@ -15,7 +15,7 @@ The background is **Eigengrau** (#16161d) — the color the human brain perceive
 The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-temperature blackbody radiator, which emits all frequencies equally. A perfectly flat spectrum. The EQ ideal.
 
 <p align="center">
-  <img src="screenshots/player.png" alt="UI" width="700"/>
+  <img src="screenshots/player.png" alt="Player UI" width="700"/>
 </p>
 
 <p align="center">
@@ -48,6 +48,14 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Pending-switch prompt** — switching presets while modified asks Save & switch / Discard & switch / Cancel
 - **Full preset management** — Save As New, Rename, Duplicate, Delete (with confirmation), Set as Default (★)
 - **Persistent** — stored as JSON in `~/.moosik/eq_presets.json`
+
+### Album Art
+- **Playlist thumbnails** — 28×28 cover art thumbnail in every playlist row; hover for 1 second to see a 512px preview
+- **Transparent overlay** — art rendered behind the spectrum at adjustable opacity; Contain / Cover / Stretch fit modes
+- **Mask mode** — spectrum bars act as a cut-out window into the art, each bar textured with the art region it covers; brightness can track bar magnitude dynamically or be fixed
+- **Art Settings panel** — collapsible section in the spectrum window; global settings with optional per-track overrides
+- **Spectrum placeholder** — configurable ♪ glyph when a track has no embedded art
+- **Persistent** — settings stored in `~/.moosik/art_settings.json`
 
 ### Player
 - Gapless-capable playback via `rodio` + `symphonia`
@@ -82,6 +90,7 @@ All pulled automatically via Cargo:
 | `rustfft` | FFT engine |
 | `rayon` | Parallel analysis |
 | `lofty` | Tag / metadata reading |
+| `image` | Album art decoding |
 | `serde` / `serde_json` | Preset persistence |
 
 ## Platform Support

@@ -6,7 +6,9 @@ use lofty::prelude::*;
 use lofty::probe::Probe;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::{Deserialize, Serialize};
-use spectrum::{SampleBuf, SpectralCeiling, StereoBuf, TrackAnalysis, SpectrumSource, SpectrumWindow, EqSource, EqStateHandle};
+use spectrum::{SampleBuf, SpectralCeiling, StereoBuf, TrackAnalysis, SpectrumSource, SpectrumWindow};
+use spectrum::eq::{EqSource, EqStateHandle};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
@@ -390,6 +392,113 @@ enum PlayState { Stopped, Playing, Paused }
 #[derive(PartialEq, Clone, Copy)]
 enum LoopMode { Sequential, RepeatAll, RepeatOne }
 
+// ---------------------------------------------------------------------------
+// Album art helpers
+// ---------------------------------------------------------------------------
+
+/// Fit `(art_w × art_h)` into `container` while preserving aspect ratio
+/// (letterboxed / pillarboxed, centred).
+fn fit_rect_preserve(container: egui::Rect, art_w: u32, art_h: u32) -> egui::Rect {
+    if art_w == 0 || art_h == 0 { return container; }
+    let art_aspect   = art_w as f32 / art_h as f32;
+    let cont_aspect  = container.width() / container.height().max(1.0);
+    if art_aspect > cont_aspect {
+        let new_h = container.width() / art_aspect;
+        let pad   = (container.height() - new_h) / 2.0;
+        egui::Rect::from_min_max(
+            egui::Pos2::new(container.left(),  container.top()    + pad),
+            egui::Pos2::new(container.right(), container.bottom() - pad),
+        )
+    } else {
+        let new_w = container.height() * art_aspect;
+        let pad   = (container.width() - new_w) / 2.0;
+        egui::Rect::from_min_max(
+            egui::Pos2::new(container.left()  + pad, container.top()),
+            egui::Pos2::new(container.right() - pad, container.bottom()),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Album art loading and caching
+// ---------------------------------------------------------------------------
+
+enum ArtEntry {
+    /// No embedded art found in this file.
+    NoArt,
+    /// Art decoded and uploaded to the GPU.
+    Loaded { texture: egui::TextureHandle, width: u32, height: u32 },
+}
+
+struct ArtCache {
+    entries: HashMap<PathBuf, ArtEntry>,
+}
+
+impl ArtCache {
+    fn new() -> Self { Self { entries: HashMap::new() } }
+
+    /// Returns `(TextureId, orig_width, orig_height)` if art is available,
+    /// loading and caching it on first call.  Returns `None` if the file has
+    /// no embedded art or decoding failed.
+    fn get_or_load(
+        &mut self,
+        path: &Path,
+        ctx: &egui::Context,
+    ) -> Option<(egui::TextureId, u32, u32)> {
+        if !self.entries.contains_key(path) {
+            let entry = match Self::load_from_file(path, ctx) {
+                Some((tex, w, h)) => ArtEntry::Loaded { texture: tex, width: w, height: h },
+                None              => ArtEntry::NoArt,
+            };
+            self.entries.insert(path.to_path_buf(), entry);
+        }
+        match self.entries.get(path)? {
+            ArtEntry::Loaded { texture, width, height } =>
+                Some((texture.id(), *width, *height)),
+            ArtEntry::NoArt => None,
+        }
+    }
+
+    /// True when we already know the answer (loaded or confirmed no-art).
+    #[allow(dead_code)]
+    fn is_known(&self, path: &Path) -> bool { self.entries.contains_key(path) }
+
+    /// True when the file has art that has been successfully loaded.
+    #[allow(dead_code)]
+    fn has_art(&self, path: &Path) -> bool {
+        matches!(self.entries.get(path), Some(ArtEntry::Loaded { .. }))
+    }
+
+    fn load_from_file(path: &Path, ctx: &egui::Context)
+        -> Option<(egui::TextureHandle, u32, u32)>
+    {
+        let bytes = Self::extract_bytes(path)?;
+        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let (w, h) = img.dimensions();
+        let pixels: Vec<egui::Color32> = img.pixels()
+            .map(|p| egui::Color32::from_rgba_unmultiplied(p.0[0], p.0[1], p.0[2], p.0[3]))
+            .collect();
+        let ci = egui::ColorImage { size: [w as usize, h as usize], pixels };
+        let tex = ctx.load_texture(
+            format!("art:{}", path.to_string_lossy()),
+            ci,
+            egui::TextureOptions::LINEAR,
+        );
+        Some((tex, w, h))
+    }
+
+    fn extract_bytes(path: &Path) -> Option<Vec<u8>> {
+        let tagged = Probe::open(path).ok()?.read().ok()?;
+        let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+        let pic = tag.pictures().iter()
+            .find(|p| p.pic_type() == lofty::picture::PictureType::CoverFront)
+            .or_else(|| tag.pictures().first())?;
+        Some(pic.data().to_vec())
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 struct MoosikApp {
     playlist: Vec<Track>,
     current_index: Option<usize>,
@@ -413,6 +522,9 @@ struct MoosikApp {
     active_saved_playlist: Option<usize>,
     show_save_playlist_input: bool,
     playlist_name_buf: String,
+    // album art
+    art_cache: ArtCache,
+    art_hover: Option<(usize, Instant)>, // (track index, time hover started)
 }
 
 impl MoosikApp {
@@ -446,6 +558,8 @@ impl MoosikApp {
             active_saved_playlist: None,
             show_save_playlist_input: false,
             playlist_name_buf: String::new(),
+            art_cache: ArtCache::new(),
+            art_hover: None,
         }
     }
 
@@ -873,6 +987,10 @@ impl eframe::App for MoosikApp {
         let elapsed_secs = self.elapsed().as_secs_f64();
         let is_playing = self.play_state == PlayState::Playing;
         self.spectrum_window.tick(elapsed_secs, is_playing);
+        // Update current art for the spectrum window
+        self.spectrum_window.current_art = self.current_index
+            .and_then(|i| self.playlist.get(i))
+            .and_then(|t| self.art_cache.get_or_load(&t.path, ctx));
         self.spectrum_window.show(ctx);
 
         // --- Info window (separate OS viewport) ---
@@ -1448,9 +1566,85 @@ impl eframe::App for MoosikApp {
                             }
                         }
 
+                        // ── Album art thumbnail ───────────────────────────
+                        let show_art = self.spectrum_window.art_settings.playlist_show;
+                        let art_offset = if show_art { 34.0f32 } else { 0.0 };
+                        if show_art {
+                            let thumb_size = 28.0;
+                            let thumb_x = inner.min.x + 14.0;
+                            let thumb_y = cy - thumb_size / 2.0;
+                            let thumb_rect = egui::Rect::from_min_size(
+                                egui::Pos2::new(thumb_x, thumb_y),
+                                Vec2::splat(thumb_size),
+                            );
+                            let track_path = &self.playlist[i].path;
+                            let art = self.art_cache.get_or_load(track_path, ctx);
+                            if let Some((tex_id, art_w, art_h)) = art {
+                                let art_rect = fit_rect_preserve(thumb_rect, art_w, art_h);
+                                ui.painter().image(
+                                    tex_id, art_rect,
+                                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+
+                                // Hover detection — show full art after 1s
+                                let over = ctx.pointer_hover_pos()
+                                    .map_or(false, |p| thumb_rect.contains(p));
+                                if over {
+                                    match self.art_hover {
+                                        Some((idx, _)) if idx == i => {}
+                                        _ => self.art_hover = Some((i, Instant::now())),
+                                    }
+                                    // Keep repainting so the timer fires without needing mouse movement
+                                    ctx.request_repaint();
+                                } else if self.art_hover.map_or(false, |(idx, _)| idx == i) {
+                                    self.art_hover = None;
+                                }
+
+                                if let Some((hi, since)) = self.art_hover {
+                                    if hi == i && since.elapsed().as_secs_f32() >= 1.0 {
+                                        let max_dim = 512.0f32;
+                                        let aspect = art_w as f32 / art_h.max(1) as f32;
+                                        let (pw, ph) = if aspect >= 1.0 {
+                                            (max_dim, max_dim / aspect)
+                                        } else {
+                                            (max_dim * aspect, max_dim)
+                                        };
+                                        let screen = ctx.screen_rect();
+                                        let px = (thumb_rect.right() + 8.0)
+                                            .min(screen.right() - pw - 4.0);
+                                        let py = (thumb_rect.center().y - ph / 2.0)
+                                            .clamp(screen.top() + 4.0, screen.bottom() - ph - 4.0);
+                                        egui::Area::new(egui::Id::new("art_hover_popup"))
+                                            .fixed_pos(egui::Pos2::new(px, py))
+                                            .order(egui::Order::Tooltip)
+                                            .interactable(false)
+                                            .show(ctx, |ui| {
+                                                let (_, r) = ui.allocate_space(Vec2::new(pw, ph));
+                                                ui.painter().rect_filled(r.expand(2.0), 3.0, Color32::from_black_alpha(100));
+                                                ui.painter().image(
+                                                    tex_id, r,
+                                                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                                                    Color32::WHITE,
+                                                );
+                                            });
+                                    }
+                                }
+                            } else if self.spectrum_window.art_settings.playlist_placeholder {
+                                ui.painter().rect_filled(thumb_rect, 3.0, Color32::from_gray(35));
+                                ui.painter().text(
+                                    thumb_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "♪",
+                                    egui::FontId::proportional(14.0),
+                                    Color32::from_gray(70),
+                                );
+                            }
+                        }
+
                         // Track number
                         ui.painter().text(
-                            egui::Pos2::new(inner.min.x + 24.0, cy),
+                            egui::Pos2::new(inner.min.x + 24.0 + art_offset, cy),
                             egui::Align2::CENTER_CENTER,
                             format!("{}", i + 1),
                             egui::FontId::proportional(12.0),
@@ -1458,8 +1652,8 @@ impl eframe::App for MoosikApp {
                         );
 
                         // Title
-                        let title_x = inner.min.x + 42.0;
-                        let title_w = inner.width() * 0.45;
+                        let title_x = inner.min.x + 42.0 + art_offset;
+                        let title_w = (inner.width() * 0.45 - art_offset).max(0.0);
                         ui.painter().text(
                             egui::Pos2::new(title_x, cy),
                             egui::Align2::LEFT_CENTER,
@@ -1575,5 +1769,6 @@ impl eframe::App for MoosikApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         save_last_playlist(&self.playlist);
+        self.spectrum_window.art_settings.save();
     }
 }
