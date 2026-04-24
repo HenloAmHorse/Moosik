@@ -27,11 +27,12 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 ### Spectrum Analyzer
 - **Pre-processed + real-time hybrid** — full-track analysis runs in the background while real-time FFT feeds the display during playback; seamlessly switches between the two
 - **Multiple visualization styles** — Bars, Line, Filled Area, Waterfall, Spectrogram, Octave Bands, Phasescope
+- **Peak Hold** — configurable marker that tracks the highest level per bar; three decay modes (Linear, Gravity, Fade Out), hold time, fall speed, thickness, and color all adjustable
 - **CQT bar mapping** — Constant-Q Transform mapping gives each bar the same relative frequency resolution regardless of pitch, just like professional analyzers
 - **Configurable FFT** — up to 16× zero-padding, six window functions (Hann, Hamming, Blackman, Flat Top), up to 87.5% overlap
 - **Six interpolation modes** — None, Linear, Catmull-Rom, PCHIP, Akima, Lanczos
 - **Auto FFT size scaling** — adapts to the track's sample rate to maintain a consistent analysis window
-- **Analysis caching** — pre-processed frames are cached to disk; switching settings reloads from cache instantly where available
+- **Analysis caching** — pre-processed frames cached to disk; settings buttons highlight green when a cache exists for that combination; "Clear All" button; reanalysis warning fires on any cache-key change
 - **Loudness** — flat or ISO 226:2003 equal-loudness weighting
 
 ### Parametric EQ

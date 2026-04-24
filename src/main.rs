@@ -956,6 +956,50 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, spectral_ceiling: Option<Spectr
 
 impl eframe::App for MoosikApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- Keyboard shortcuts (only when no text field is focused) ---
+        let no_text_focus = ctx.memory(|m| m.focused().is_none());
+        if no_text_focus {
+            let (space, ctrl_left, ctrl_right, arrow_left, arrow_right, arrow_up, arrow_down) =
+                ctx.input(|i| (
+                    i.key_pressed(egui::Key::Space),
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowLeft),
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowRight),
+                    !i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowLeft),
+                    !i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowRight),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                ));
+
+            if space       { self.toggle_play_pause(); }
+            if ctrl_left   { self.prev_track(); }
+            if ctrl_right  { self.next_track(); }
+            if arrow_left  {
+                let pos = self.elapsed().saturating_sub(Duration::from_secs(5));
+                if let Some(idx) = self.current_index {
+                    let path = self.playlist[idx].path.clone();
+                    if let Some(ref mut engine) = self.engine { engine.seek_to(&path, pos); }
+                    self.spectrum_window.on_seek(pos.as_secs_f64());
+                }
+            }
+            if arrow_right {
+                let pos = self.elapsed() + Duration::from_secs(5);
+                let capped = self.current_duration().map(|d| pos.min(d)).unwrap_or(pos);
+                if let Some(idx) = self.current_index {
+                    let path = self.playlist[idx].path.clone();
+                    if let Some(ref mut engine) = self.engine { engine.seek_to(&path, capped); }
+                    self.spectrum_window.on_seek(capped.as_secs_f64());
+                }
+            }
+            if arrow_up {
+                self.volume = (self.volume + 0.05).min(1.0);
+                if let Some(ref mut engine) = self.engine { engine.set_volume(self.volume); }
+            }
+            if arrow_down {
+                self.volume = (self.volume - 0.05).max(0.0);
+                if let Some(ref mut engine) = self.engine { engine.set_volume(self.volume); }
+            }
+        }
+
         // --- auto-advance when track finishes ---
         if self.play_state == PlayState::Playing {
             let finished = self.engine.as_ref().map(|e| e.is_finished()).unwrap_or(false);

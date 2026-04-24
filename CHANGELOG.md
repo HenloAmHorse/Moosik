@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0] - 2026-04-24
+
+### Spectrum Analyzer — Peak Hold
+- **New feature: Peak Hold** — available in Bars style; a thin marker line sits at the highest level each bar has reached
+- **Three decay modes**
+  - *Linear* — marker falls at a constant rate after the hold window expires
+  - *Gravity* — marker accelerates downward, giving a natural "drop" feel; configurable acceleration
+  - *Fade Out* — marker stays at its position and fades out with exponential alpha decay; smoother and more organic than linear alpha would be
+- **Configurable hold time** — 10–1000ms slider
+- **Configurable fall speed** — logarithmic slider; same value produces equivalent fade duration in Linear and Fade Out modes
+- **Configurable peak thickness** — 1–6 physical pixels; rendered as a mesh rectangle that exactly matches the bar's pixel width, so it displays correctly at any bar gap including 1px-wide bars
+- **Configurable color** — full color picker including alpha
+- **Peak floor clamping** — in Linear and Gravity modes the marker cannot fall below the current bar height; no visual overlap between bar and peak
+- **Fade Out correctness fixes** — per-bar peak resets when alpha fully decays so historical highs don't block future peaks from displaying; FadeOut markers on all bars fade to the same alpha at the same time (draw-time sync)
+
+### Spectrum Analyzer — Analysis Cache
+- **Correct cache key** — FFT size, window function, min Hz, and max Hz are now part of the cache filename; previously changing these would silently reuse a cache computed with different settings
+- **Reanalysis warning wired up** — the ⚠ "no cache for current settings" banner now also triggers when FFT size, window function, or frequency range changes (previously only pad factor, overlap, bar mapping, interpolation, and bar count triggered it)
+- **Clear All button** — single click deletes every `.spectrumcache` file in `~/.moosik/cache/`; shown inline next to the cache stats line
+- **Cache-exists highlight** — FFT size, window, interpolation, zero-padding, overlap, and bar mapping buttons turn green when a cache already exists for that combination with the current other settings; no filesystem calls per frame (backed by a `HashSet` refreshed every 2 s)
+
 ## [0.2.1] - 2026-04-20
 
 ### Album Art

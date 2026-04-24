@@ -66,6 +66,49 @@ pub enum BarMappingMode {
     Cqt,
 }
 
+// ---------------------------------------------------------------------------
+// Peak hold
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum PeakDecayMode {
+    /// Constant fall speed.
+    Linear,
+    /// Accelerates as it falls — feels physical.
+    Gravity,
+    /// Peak fades in place rather than falling.
+    FadeOut,
+}
+
+#[derive(Clone)]
+pub struct PeakHoldConfig {
+    pub enabled:         bool,
+    /// How long the peak marker freezes before decaying (ms).
+    pub hold_ms:         f32,
+    /// Initial decay speed (normalized units/sec).
+    pub fall_speed:      f32,
+    /// Fall acceleration for Gravity mode (normalized units/sec²).
+    pub acceleration:    f32,
+    pub decay_mode:      PeakDecayMode,
+    /// Height of the peak marker in physical pixels.
+    pub peak_thickness:  u8,
+    pub color:           Color32,
+}
+
+impl Default for PeakHoldConfig {
+    fn default() -> Self {
+        Self {
+            enabled:        true,
+            hold_ms:        1500.0,
+            fall_speed:     0.3,
+            acceleration:   4.0,
+            decay_mode:     PeakDecayMode::Gravity,
+            peak_thickness: 2,
+            color:          Color32::WHITE,
+        }
+    }
+}
+
 /// Log-spaced centre frequency for bar index `i` of `n` bars in [min, max].
 fn bar_center_freq(i: usize, n: usize, min_freq: f32, max_freq: f32) -> f32 {
     let t = (i as f32 + 0.5) / n as f32;
@@ -733,7 +776,10 @@ impl SpectrumAnalyzer {
             return;
         }
         let n_bars = self.bar_count;
-        let cache = cache_path_for(&path, n_bars, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
+        let cache = cache_path_for(
+            &path, n_bars, self.fft_size, self.pad_factor, self.overlap,
+            &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode,
+        );
         if let Some(frames) = load_cache(&cache, n_bars) {
             let hop = ((self.fft_size as f32 * (1.0 - self.overlap)).round() as usize).max(1);
             let rate = self.sample_rate as f64 / hop as f64;
@@ -877,23 +923,45 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn cache_path_for(path: &PathBuf, n_bars: usize, pad_factor: usize, overlap: f32, bar_mapping: &BarMappingMode, interp_mode: &InterpolationMode) -> PathBuf {
+fn cache_path_for(
+    path: &PathBuf,
+    n_bars: usize,
+    fft_size: usize,
+    pad_factor: usize,
+    overlap: f32,
+    window_fn: &WindowFn,
+    min_freq: f32,
+    max_freq: f32,
+    bar_mapping: &BarMappingMode,
+    interp_mode: &InterpolationMode,
+) -> PathBuf {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     path.hash(&mut h);
     let hash = h.finish();
-    let overlap_k = (overlap * 1000.0) as u32;
-    let mapping_id: u8 = match bar_mapping { BarMappingMode::FlatOverlap => 0, BarMappingMode::Gaussian => 1, BarMappingMode::Cqt => 2 };
+    let overlap_k  = (overlap * 1000.0) as u32;
+    let window_id: u8 = match window_fn {
+        WindowFn::Hann => 0, WindowFn::Hamming => 1,
+        WindowFn::Blackman => 2, WindowFn::FlatTop => 3,
+    };
+    let mapping_id: u8 = match bar_mapping {
+        BarMappingMode::FlatOverlap => 0, BarMappingMode::Gaussian => 1, BarMappingMode::Cqt => 2,
+    };
     let interp_id: u8 = match interp_mode {
         InterpolationMode::None => 0, InterpolationMode::Linear => 1,
         InterpolationMode::CatmullRom => 2, InterpolationMode::Pchip => 3,
         InterpolationMode::Akima => 4, InterpolationMode::Lanczos => 5,
     };
+    let min_hz = min_freq.round() as u32;
+    let max_hz = max_freq.round() as u32;
     home_dir()
         .join(".moosik")
         .join("cache")
-        .join(format!("{:016x}_b{}_p{}_o{}_m{}_i{}.spectrumcache", hash, n_bars, pad_factor, overlap_k, mapping_id, interp_id))
+        .join(format!(
+            "{:016x}_b{}_f{}_w{}_p{}_o{}_n{}_x{}_m{}_i{}.spectrumcache",
+            hash, n_bars, fft_size, window_id, pad_factor, overlap_k, min_hz, max_hz, mapping_id, interp_id,
+        ))
 }
 
 fn load_cache(cache_path: &PathBuf, n_bars: usize) -> Option<Vec<Vec<f32>>> {
@@ -1821,6 +1889,65 @@ fn draw_bars(painter: &egui::Painter, mags: &[f32], rect: Rect, gap: f32) {
     painter.add(Shape::mesh(mesh));
 }
 
+fn draw_peak_hold(
+    painter:  &egui::Painter,
+    peaks:    &[f32],
+    alphas:   &[f32],
+    rect:     Rect,
+    gap:      f32,
+    cfg:      &PeakHoldConfig,
+) {
+    let n = peaks.len();
+    if n == 0 { return; }
+    let ppp           = painter.ctx().pixels_per_point();
+    let phys_left     = (rect.left()  * ppp).round() as i32;
+    let phys_w        = ((rect.right() * ppp).round() as i32 - phys_left).max(1);
+    let phys_gap      = (gap * ppp).round().max(0.0) as i32;
+    let min_col_w     = (1 + phys_gap).max(1);
+    let draw_n        = ((phys_w / min_col_w) as usize).min(n).max(1);
+    let phys_thick    = (cfg.peak_thickness as i32).max(1);
+    let phys_rect_top = (rect.top()    * ppp).round() as i32;
+
+    let base_color = cfg.color;
+    let mut mesh = egui::Mesh::default();
+    mesh.reserve_triangles(draw_n * 2);
+    mesh.reserve_vertices(draw_n * 4);
+
+    for i in 0..draw_n {
+        let src_lo = (i * n) / draw_n;
+        let src_hi = (((i + 1) * n) / draw_n).min(n);
+        let v     = peaks[src_lo..src_hi].iter().cloned().fold(0.0_f32, f32::max).clamp(0.0, 1.0);
+        let alpha = alphas[src_lo..src_hi].iter().cloned().fold(0.0_f32, f32::max);
+        if v <= 0.0 || alpha <= 0.0 { continue; }
+
+        let px0 = phys_left + (i as i32 * phys_w) / draw_n as i32;
+        let px1 = (phys_left + ((i + 1) as i32 * phys_w) / draw_n as i32 - phys_gap).max(px0 + 1);
+
+        // Bottom edge of marker = top of bar; clamp so marker stays inside plot rect
+        let phys_bar_top = ((rect.bottom() * ppp).round() as i32
+            - (v * rect.height() * ppp).round() as i32)
+            .max(phys_rect_top);
+        let py1 = phys_bar_top;
+        let py0 = (py1 - phys_thick).max(phys_rect_top);
+        if py0 >= py1 { continue; }
+
+        let x0 = px0 as f32 / ppp;
+        let x1 = px1 as f32 / ppp;
+        let y0 = py0 as f32 / ppp;
+        let y1 = py1 as f32 / ppp;
+
+        let a = (alpha * base_color.a() as f32) as u8;
+        let color = Color32::from_rgba_unmultiplied(base_color.r(), base_color.g(), base_color.b(), a);
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(Pos2::new(x0, y0), color);
+        mesh.colored_vertex(Pos2::new(x1, y0), color);
+        mesh.colored_vertex(Pos2::new(x1, y1), color);
+        mesh.colored_vertex(Pos2::new(x0, y1), color);
+        mesh.indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
 fn draw_line(painter: &egui::Painter, mags: &[f32], rect: Rect, color: Color32) {
     let n = mags.len();
     if n < 2 { return; }
@@ -2023,6 +2150,8 @@ pub struct SpectrumWindow {
     /// Cached (count, bytes) of all .spectrumcache files; refreshed lazily.
     cache_stats: (usize, u64),
     cache_stats_at: Option<Instant>,
+    /// Full paths of every .spectrumcache file known to exist (same refresh cadence).
+    cache_file_set: std::collections::HashSet<PathBuf>,
 
     // ── Parametric EQ ──────────────────────────────────────────────────────
     pub eq_state:         EqStateHandle,
@@ -2055,6 +2184,17 @@ pub struct SpectrumWindow {
     /// Texture of the currently-playing track's album art, if any.
     /// Set by MoosikApp before each call to show().
     pub current_art: Option<(egui::TextureId, u32, u32)>,
+
+    // ── Peak hold ──────────────────────────────────────────────────────────
+    pub peak_config:     PeakHoldConfig,
+    /// Current peak level per bar (normalized 0–1).
+    peak_vals:           Vec<f32>,
+    /// Seconds the peak has been held at its current value (Linear/Gravity modes).
+    peak_hold_timers:    Vec<f32>,
+    /// Current fall velocity per bar (for Gravity mode).
+    peak_velocities:     Vec<f32>,
+    /// Current alpha per bar (for FadeOut mode, 0–1).
+    peak_alphas:         Vec<f32>,
 }
 
 impl SpectrumWindow {
@@ -2106,6 +2246,7 @@ impl SpectrumWindow {
             needs_reanalysis: false,
             cache_stats: (0, 0),
             cache_stats_at: None,
+            cache_file_set: std::collections::HashSet::new(),
             eq_state: Arc::new(Mutex::new(EqState::new())),
             show_eq: false,
             eq_overlay: EqOverlayMode::Both,
@@ -2122,6 +2263,11 @@ impl SpectrumWindow {
             eq_save_new_scope: PresetScope::Global,
             art_settings: ArtSettingsStore::load(),
             current_art: None,
+            peak_config: PeakHoldConfig::default(),
+            peak_vals: Vec::new(),
+            peak_hold_timers: Vec::new(),
+            peak_velocities: Vec::new(),
+            peak_alphas: Vec::new(),
         }
     }
 
@@ -2143,12 +2289,8 @@ impl SpectrumWindow {
     fn try_load_or_flag_reanalysis(&mut self) {
         let Some(path) = self.current_path.clone() else { return; };
         let cache = cache_path_for(
-            &path,
-            self.bar_count,
-            self.pad_factor,
-            self.overlap,
-            &self.bar_mapping,
-            &self.interp_mode,
+            &path, self.bar_count, self.fft_size, self.pad_factor, self.overlap,
+            &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode,
         );
         if let Some(frames) = load_cache(&cache, self.bar_count) {
             let hop = ((self.analyzer.fft_size as f32 * (1.0 - self.overlap)).round() as usize).max(1);
@@ -2469,6 +2611,10 @@ impl SpectrumWindow {
                 self.correlation = if denom > 1e-10 { (lr / denom).clamp(-1.0, 1.0) as f32 } else { 1.0 };
             }
         }
+
+        // Advance peak hold state; cap dt to avoid huge jumps after hiccups
+        let peak_dt = elapsed_since_last.min(0.1) as f32;
+        self.update_peaks(peak_dt);
     }
 
     /// Call after the user seeks to a new position. Flushes stale audio state
@@ -2493,6 +2639,74 @@ impl SpectrumWindow {
                 .min(self.analyzer.pre_frames.len().saturating_sub(1));
             self.analyzer.magnitudes = self.analyzer.pre_frames[frame].clone();
             self.analyzer.smoothed = self.analyzer.magnitudes.clone();
+        }
+        // Reset peak hold state so peaks don't hang from the old position
+        self.reset_peaks();
+    }
+
+    /// Reset all peak hold state to zero.
+    fn reset_peaks(&mut self) {
+        let n = self.analyzer.bar_count.max(1);
+        self.peak_vals        = vec![0.0; n];
+        self.peak_hold_timers = vec![0.0; n];
+        self.peak_velocities  = vec![0.0; n];
+        self.peak_alphas      = vec![1.0; n];
+    }
+
+    /// Advance peak hold state by `dt` seconds using the current smoothed magnitudes.
+    fn update_peaks(&mut self, dt: f32) {
+        if !self.peak_config.enabled { return; }
+
+        let mags = &self.analyzer.smoothed;
+        let n    = mags.len();
+
+        if self.peak_vals.len() != n {
+            self.peak_vals        = vec![0.0; n];
+            self.peak_hold_timers = vec![0.0; n];
+            self.peak_velocities  = vec![0.0; n];
+            self.peak_alphas      = vec![1.0; n];
+        }
+
+        let hold_secs = self.peak_config.hold_ms / 1000.0;
+
+        for i in 0..n {
+            let v = mags[i];
+            if v >= self.peak_vals[i] {
+                self.peak_vals[i]        = v;
+                self.peak_hold_timers[i] = 0.0;
+                self.peak_velocities[i]  = 0.0;
+                self.peak_alphas[i]      = 1.0;
+            } else {
+                self.peak_hold_timers[i] += dt;
+                if self.peak_hold_timers[i] > hold_secs {
+                    match self.peak_config.decay_mode {
+                        PeakDecayMode::Linear => {
+                            self.peak_vals[i] = (self.peak_vals[i]
+                                - self.peak_config.fall_speed * dt)
+                                .max(v);
+                        }
+                        PeakDecayMode::Gravity => {
+                            self.peak_velocities[i] +=
+                                self.peak_config.acceleration * dt;
+                            self.peak_vals[i] = (self.peak_vals[i]
+                                - self.peak_velocities[i] * dt)
+                                .max(v);
+                        }
+                        PeakDecayMode::FadeOut => {
+                            // Exponential decay: visually smooth because brightness
+                            // drops quickly at first then eases off naturally.
+                            // Scaled by ln(100)≈4.6 so fall_speed produces the same
+                            // rough fade duration as Linear mode.
+                            let rate = self.peak_config.fall_speed * 4.6;
+                            self.peak_alphas[i] *= (-rate * dt).exp();
+                            if self.peak_alphas[i] < 0.01 {
+                                self.peak_alphas[i] = 0.0;
+                                self.peak_vals[i]   = 0.0;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2616,10 +2830,19 @@ impl SpectrumWindow {
                                 } else {
                                     format!("{sz} ({ms}ms)")
                                 };
-                                let label = if is_auto {
-                                    egui::RichText::new(text).color(Color32::from_rgb(220, 180, 60))
+                                let has_cache = self.current_path.as_ref().map(|p| {
+                                    self.cache_file_set.contains(&cache_path_for(
+                                        p, self.bar_count, sz, self.pad_factor, self.overlap,
+                                        &self.window_fn, self.min_freq, self.max_freq,
+                                        &self.bar_mapping, &self.interp_mode,
+                                    ))
+                                }).unwrap_or(false);
+                                let label = if has_cache {
+                                    egui::RichText::new(&text).color(Color32::from_rgb(100, 210, 100))
+                                } else if is_auto {
+                                    egui::RichText::new(&text).color(Color32::from_rgb(220, 180, 60))
                                 } else {
-                                    egui::RichText::new(text)
+                                    egui::RichText::new(&text)
                                 };
                                 let btn = ui.selectable_label(self.fft_size == sz, label);
                                 let btn = if is_auto {
@@ -2630,53 +2853,118 @@ impl SpectrumWindow {
                                 if btn.clicked() {
                                     self.fft_size = sz;
                                     self.analyzer.fft_size = sz;
-                                    self.auto_fft_size = 0; // user took control
+                                    self.auto_fft_size = 0;
                                     rebuild = true;
+                                    self.try_load_or_flag_reanalysis();
                                 }
                             }
                         });
-                        ui.horizontal(|ui| {
-                            ui.label("Window:");
-                            let prev = self.window_fn.clone();
-                            ui.selectable_value(&mut self.window_fn, WindowFn::Hann, "Hann")
-                                .on_hover_text("Raised cosine. Best general-purpose window — good sidelobe rejection with minimal smearing. Default.");
-                            ui.selectable_value(&mut self.window_fn, WindowFn::Hamming, "Hamming")
-                                .on_hover_text("Optimised for the first sidelobe only. Slightly sharper main lobe than Hann, but higher distant sidelobes.");
-                            ui.selectable_value(&mut self.window_fn, WindowFn::Blackman, "Blackman")
-                                .on_hover_text("Three-term cosine sum. Excellent sidelobe suppression at the cost of a wider main lobe (less frequency resolution).");
-                            ui.selectable_value(&mut self.window_fn, WindowFn::FlatTop, "Flat-top")
-                                .on_hover_text("Near-unity passband — amplitude error < 0.01 dB. Wide main lobe, so poor frequency resolution. Use only for level measurement.");
-                            if self.window_fn != prev {
-                                self.analyzer.window_fn = self.window_fn.clone();
-                                rebuild = true;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Interpolation:");
-                            let prev = self.interp_mode.clone();
-                            ui.selectable_value(&mut self.interp_mode, InterpolationMode::None, "None")
-                                .on_hover_text("Nearest bin — no interpolation. Most honest to the raw FFT.");
-                            ui.selectable_value(&mut self.interp_mode, InterpolationMode::Linear, "Linear")
-                                .on_hover_text("Linear blend between adjacent bins. Fast but angular in the low end.");
-                            ui.selectable_value(&mut self.interp_mode, InterpolationMode::CatmullRom, "Catmull-Rom")
-                                .on_hover_text("Smooth cubic spline. Good balance of quality and speed.");
-                            ui.selectable_value(&mut self.interp_mode, InterpolationMode::Pchip, "PCHIP")
-                                .on_hover_text("Monotone cubic (Fritsch-Carlson) — no overshoot, shape-preserving.");
-                            ui.selectable_value(&mut self.interp_mode, InterpolationMode::Akima, "Akima")
-                                .on_hover_text("Local cubic designed for scientific data. Smooth without oscillation.");
-                            ui.selectable_value(&mut self.interp_mode, InterpolationMode::Lanczos, "Lanczos")
-                                .on_hover_text("Sinc-windowed (a=3). Best accuracy but can ring near sharp peaks.");
-                            if self.interp_mode != prev {
-                                self.analyzer.interp_mode = self.interp_mode.clone();
-                                self.try_load_or_flag_reanalysis();
-                            }
-                        });
+                        {
+                            let wf_green = |wf: WindowFn| -> egui::RichText {
+                                let has = self.current_path.as_ref().map(|p| {
+                                    self.cache_file_set.contains(&cache_path_for(
+                                        p, self.bar_count, self.fft_size, self.pad_factor,
+                                        self.overlap, &wf, self.min_freq, self.max_freq,
+                                        &self.bar_mapping, &self.interp_mode,
+                                    ))
+                                }).unwrap_or(false);
+                                let name = match wf {
+                                    WindowFn::Hann    => "Hann",
+                                    WindowFn::Hamming => "Hamming",
+                                    WindowFn::Blackman => "Blackman",
+                                    WindowFn::FlatTop  => "Flat-top",
+                                };
+                                if has { egui::RichText::new(name).color(Color32::from_rgb(100, 210, 100)) }
+                                else   { egui::RichText::new(name) }
+                            };
+                            let lbl_hann    = wf_green(WindowFn::Hann);
+                            let lbl_hamming = wf_green(WindowFn::Hamming);
+                            let lbl_black   = wf_green(WindowFn::Blackman);
+                            let lbl_flat    = wf_green(WindowFn::FlatTop);
+                            ui.horizontal(|ui| {
+                                ui.label("Window:");
+                                let prev = self.window_fn.clone();
+                                ui.selectable_value(&mut self.window_fn, WindowFn::Hann, lbl_hann)
+                                    .on_hover_text("Raised cosine. Best general-purpose window — good sidelobe rejection with minimal smearing. Default.");
+                                ui.selectable_value(&mut self.window_fn, WindowFn::Hamming, lbl_hamming)
+                                    .on_hover_text("Optimised for the first sidelobe only. Slightly sharper main lobe than Hann, but higher distant sidelobes.");
+                                ui.selectable_value(&mut self.window_fn, WindowFn::Blackman, lbl_black)
+                                    .on_hover_text("Three-term cosine sum. Excellent sidelobe suppression at the cost of a wider main lobe (less frequency resolution).");
+                                ui.selectable_value(&mut self.window_fn, WindowFn::FlatTop, lbl_flat)
+                                    .on_hover_text("Near-unity passband — amplitude error < 0.01 dB. Wide main lobe, so poor frequency resolution. Use only for level measurement.");
+                                if self.window_fn != prev {
+                                    self.analyzer.window_fn = self.window_fn.clone();
+                                    rebuild = true;
+                                    self.try_load_or_flag_reanalysis();
+                                }
+                            });
+                        }
+                        {
+                            let im_green = |im: InterpolationMode| -> egui::RichText {
+                                let has = self.current_path.as_ref().map(|p| {
+                                    self.cache_file_set.contains(&cache_path_for(
+                                        p, self.bar_count, self.fft_size, self.pad_factor,
+                                        self.overlap, &self.window_fn, self.min_freq, self.max_freq,
+                                        &self.bar_mapping, &im,
+                                    ))
+                                }).unwrap_or(false);
+                                let name = match im {
+                                    InterpolationMode::None      => "None",
+                                    InterpolationMode::Linear    => "Linear",
+                                    InterpolationMode::CatmullRom => "Catmull-Rom",
+                                    InterpolationMode::Pchip     => "PCHIP",
+                                    InterpolationMode::Akima     => "Akima",
+                                    InterpolationMode::Lanczos   => "Lanczos",
+                                };
+                                if has { egui::RichText::new(name).color(Color32::from_rgb(100, 210, 100)) }
+                                else   { egui::RichText::new(name) }
+                            };
+                            let lbl_none   = im_green(InterpolationMode::None);
+                            let lbl_linear = im_green(InterpolationMode::Linear);
+                            let lbl_cr     = im_green(InterpolationMode::CatmullRom);
+                            let lbl_pchip  = im_green(InterpolationMode::Pchip);
+                            let lbl_akima  = im_green(InterpolationMode::Akima);
+                            let lbl_lanc   = im_green(InterpolationMode::Lanczos);
+                            ui.horizontal(|ui| {
+                                ui.label("Interpolation:");
+                                let prev = self.interp_mode.clone();
+                                ui.selectable_value(&mut self.interp_mode, InterpolationMode::None, lbl_none)
+                                    .on_hover_text("Nearest bin — no interpolation. Most honest to the raw FFT.");
+                                ui.selectable_value(&mut self.interp_mode, InterpolationMode::Linear, lbl_linear)
+                                    .on_hover_text("Linear blend between adjacent bins. Fast but angular in the low end.");
+                                ui.selectable_value(&mut self.interp_mode, InterpolationMode::CatmullRom, lbl_cr)
+                                    .on_hover_text("Smooth cubic spline. Good balance of quality and speed.");
+                                ui.selectable_value(&mut self.interp_mode, InterpolationMode::Pchip, lbl_pchip)
+                                    .on_hover_text("Monotone cubic (Fritsch-Carlson) — no overshoot, shape-preserving.");
+                                ui.selectable_value(&mut self.interp_mode, InterpolationMode::Akima, lbl_akima)
+                                    .on_hover_text("Local cubic designed for scientific data. Smooth without oscillation.");
+                                ui.selectable_value(&mut self.interp_mode, InterpolationMode::Lanczos, lbl_lanc)
+                                    .on_hover_text("Sinc-windowed (a=3). Best accuracy but can ring near sharp peaks.");
+                                if self.interp_mode != prev {
+                                    self.analyzer.interp_mode = self.interp_mode.clone();
+                                    self.try_load_or_flag_reanalysis();
+                                }
+                            });
+                        }
                         ui.horizontal(|ui| {
                             ui.label("Zero-padding:");
                             let prev_pad = self.pad_factor;
                             for &pf in &[1usize, 2, 4, 8, 16, 32, 64] {
-                                let label = if pf == 1 { "1× (off)".to_string() } else { format!("{}×", pf) };
-                                let btn = ui.selectable_label(self.pad_factor == pf, label);
+                                let label_text = if pf == 1 { "1× (off)".to_string() } else { format!("{}×", pf) };
+                                let has_cache = self.current_path.as_ref().map(|p| {
+                                    let candidate = cache_path_for(
+                                        p, self.bar_count, self.fft_size, pf, self.overlap,
+                                        &self.window_fn, self.min_freq, self.max_freq,
+                                        &self.bar_mapping, &self.interp_mode,
+                                    );
+                                    self.cache_file_set.contains(&candidate)
+                                }).unwrap_or(false);
+                                let rich = if has_cache {
+                                    egui::RichText::new(label_text).color(Color32::from_rgb(100, 210, 100))
+                                } else {
+                                    egui::RichText::new(label_text)
+                                };
+                                let btn = ui.selectable_label(self.pad_factor == pf, rich);
                                 let btn = match pf {
                                     1  => btn.on_hover_text("No padding — rely entirely on interpolation."),
                                     2  => btn.on_hover_text("2× denser bins. Good default."),
@@ -2699,9 +2987,21 @@ impl SpectrumWindow {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Overlap:");
-                            for &(label, val) in &[("50%", 0.5f32), ("75%", 0.75), ("87.5%", 0.875)] {
+                            for &(text, val) in &[("50%", 0.5f32), ("75%", 0.75), ("87.5%", 0.875)] {
+                                let has_cache = self.current_path.as_ref().map(|p| {
+                                    self.cache_file_set.contains(&cache_path_for(
+                                        p, self.bar_count, self.fft_size, self.pad_factor, val,
+                                        &self.window_fn, self.min_freq, self.max_freq,
+                                        &self.bar_mapping, &self.interp_mode,
+                                    ))
+                                }).unwrap_or(false);
+                                let rich = if has_cache {
+                                    egui::RichText::new(text).color(Color32::from_rgb(100, 210, 100))
+                                } else {
+                                    egui::RichText::new(text)
+                                };
                                 let prev = self.overlap;
-                                let btn = ui.selectable_label((self.overlap - val).abs() < 0.01, label);
+                                let btn = ui.selectable_label((self.overlap - val).abs() < 0.01, rich);
                                 let btn = match (val * 1000.0) as u32 {
                                     500 => btn.on_hover_text("50% — standard STFT. Fastest analysis."),
                                     750 => btn.on_hover_text("75% — 2× more frames, smoother temporal detail."),
@@ -2716,20 +3016,41 @@ impl SpectrumWindow {
                                 }
                             }
                         });
-                        ui.horizontal(|ui| {
-                            ui.label("Bar mapping:");
-                            let prev = self.bar_mapping.clone();
-                            ui.selectable_value(&mut self.bar_mapping, BarMappingMode::FlatOverlap, "Flat")
-                                .on_hover_text("Equal weight to all FFT bins within the bar's frequency range.");
-                            ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Gaussian, "Gaussian")
-                                .on_hover_text("Bins near the bar's centre frequency weighted more heavily. More natural.");
-                            ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Cqt, "CQT")
-                                .on_hover_text("Constant-Q Transform — Hann kernel with bandwidth ∝ frequency.\nEach bar has identical relative frequency resolution. Best for music.");
-                            if self.bar_mapping != prev {
-                                self.analyzer.bar_mapping = self.bar_mapping.clone();
-                                self.try_load_or_flag_reanalysis();
-                            }
-                        });
+                        {
+                            let bm_green = |bm: BarMappingMode| -> egui::RichText {
+                                let has = self.current_path.as_ref().map(|p| {
+                                    self.cache_file_set.contains(&cache_path_for(
+                                        p, self.bar_count, self.fft_size, self.pad_factor,
+                                        self.overlap, &self.window_fn, self.min_freq, self.max_freq,
+                                        &bm, &self.interp_mode,
+                                    ))
+                                }).unwrap_or(false);
+                                let name = match bm {
+                                    BarMappingMode::FlatOverlap => "Flat",
+                                    BarMappingMode::Gaussian    => "Gaussian",
+                                    BarMappingMode::Cqt         => "CQT",
+                                };
+                                if has { egui::RichText::new(name).color(Color32::from_rgb(100, 210, 100)) }
+                                else   { egui::RichText::new(name) }
+                            };
+                            let lbl_flat  = bm_green(BarMappingMode::FlatOverlap);
+                            let lbl_gauss = bm_green(BarMappingMode::Gaussian);
+                            let lbl_cqt   = bm_green(BarMappingMode::Cqt);
+                            ui.horizontal(|ui| {
+                                ui.label("Bar mapping:");
+                                let prev = self.bar_mapping.clone();
+                                ui.selectable_value(&mut self.bar_mapping, BarMappingMode::FlatOverlap, lbl_flat)
+                                    .on_hover_text("Equal weight to all FFT bins within the bar's frequency range.");
+                                ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Gaussian, lbl_gauss)
+                                    .on_hover_text("Bins near the bar's centre frequency weighted more heavily. More natural.");
+                                ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Cqt, lbl_cqt)
+                                    .on_hover_text("Constant-Q Transform — Hann kernel with bandwidth ∝ frequency.\nEach bar has identical relative frequency resolution. Best for music.");
+                                if self.bar_mapping != prev {
+                                    self.analyzer.bar_mapping = self.bar_mapping.clone();
+                                    self.try_load_or_flag_reanalysis();
+                                }
+                            });
+                        }
                         ui.horizontal(|ui| {
                             ui.label("Smoothing:");
                             ui.add(egui::Slider::new(&mut self.smoothing, 0.0..=0.97)
@@ -2743,7 +3064,10 @@ impl SpectrumWindow {
                             ui.label("Max Hz:");
                             let r2 = ui.add(egui::DragValue::new(&mut self.max_freq)
                                 .range(1000.0..=24000.0).speed(10.0).suffix(" Hz"));
-                            if r.changed() || r2.changed() { self.sync_params(); }
+                            if r.changed() || r2.changed() {
+                                self.sync_params();
+                                self.try_load_or_flag_reanalysis();
+                            }
                         });
                         ui.horizontal(|ui| {
                             ui.label("Max FPS:");
@@ -2772,7 +3096,7 @@ impl SpectrumWindow {
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🔄 Re-analyze now")).clicked()
                                 && let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
+                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
                                 let _ = std::fs::remove_file(&cache);
                                 self.analyzer.pre_frames.clear();
                                 self.analyzer.start_preprocess(p.clone());
@@ -2787,7 +3111,7 @@ impl SpectrumWindow {
                         if ui.add_enabled(has_path && !analyzing,
                             egui::Button::new("🗑 Clear Cache")).clicked()
                             && let Some(ref p) = self.current_path.clone() {
-                            let cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
+                            let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
                             let existed = cache.exists();
                             let _ = std::fs::remove_file(&cache);
                             self.analyzer.pre_frames.clear();
@@ -2802,7 +3126,7 @@ impl SpectrumWindow {
                         if ui.add_enabled(has_path && !analyzing,
                             egui::Button::new("🔄 Re-analyze")).clicked()
                             && let Some(ref p) = self.current_path.clone() {
-                            let cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
+                            let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
                             let _ = std::fs::remove_file(&cache);
                             self.analyzer.pre_frames.clear();
                             self.analyzer.start_preprocess(p.clone());
@@ -2825,6 +3149,12 @@ impl SpectrumWindow {
                         .unwrap_or(true);
                     if stale {
                         self.cache_stats = cache_dir_stats();
+                        let dir = home_dir().join(".moosik").join("cache");
+                        self.cache_file_set = std::fs::read_dir(&dir)
+                            .into_iter().flatten().filter_map(|e| e.ok())
+                            .filter(|e| e.path().extension().map(|x| x == "spectrumcache").unwrap_or(false))
+                            .map(|e| e.path())
+                            .collect();
                         self.cache_stats_at = Some(Instant::now());
                     }
                     let (count, bytes) = self.cache_stats;
@@ -2835,9 +3165,29 @@ impl SpectrumWindow {
                     } else {
                         format!("{:.0} KB", bytes as f64 / 1e3)
                     };
-                    ui.label(egui::RichText::new(
-                        format!("Cache: {} file{} — {}", count, if count == 1 { "" } else { "s" }, size_str))
-                        .size(10.0).color(Color32::from_gray(110)));
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(
+                            format!("Cache: {} file{} — {}", count, if count == 1 { "" } else { "s" }, size_str))
+                            .size(10.0).color(Color32::from_gray(110)));
+                        let analyzing = self.analyzer.is_analyzing.load(Ordering::Relaxed);
+                        if ui.add_enabled(count > 0 && !analyzing,
+                            egui::Button::new("🗑 Clear All").small()).clicked() {
+                            let dir = home_dir().join(".moosik").join("cache");
+                            if let Ok(entries) = std::fs::read_dir(&dir) {
+                                for e in entries.filter_map(|e| e.ok()) {
+                                    let p = e.path();
+                                    if p.extension().map(|x| x == "spectrumcache").unwrap_or(false) {
+                                        let _ = std::fs::remove_file(p);
+                                    }
+                                }
+                            }
+                            self.analyzer.pre_frames.clear();
+                            self.needs_reanalysis = self.mode == SpectrumMode::PreProcess
+                                && self.current_path.is_some();
+                            self.cache_stats_at = None;
+                            self.status_msg = "All caches cleared.".into();
+                        }
+                    });
                 }
 
                 // Bar gap slider (only meaningful for Bars style)
@@ -2851,6 +3201,71 @@ impl SpectrumWindow {
                                  0 = no gap (solid fill). Higher values give a more separated look."
                             );
                     });
+                }
+
+                // ── Peak Hold settings (Bars only) ────────────────────────
+                if self.style == VizStyle::Bars {
+                    egui::CollapsingHeader::new("📌 Peak Hold")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.checkbox(&mut self.peak_config.enabled, "Enabled");
+                            ui.add_enabled_ui(self.peak_config.enabled, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Hold time:");
+                                    ui.add(egui::Slider::new(&mut self.peak_config.hold_ms, 10.0..=1000.0)
+                                        .suffix(" ms"))
+                                        .on_hover_text("How long the peak line freezes before it starts to decay.");
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Decay mode:");
+                                    ui.selectable_value(&mut self.peak_config.decay_mode, PeakDecayMode::Linear,  "Linear")
+                                        .on_hover_text("Peak falls at a constant speed.");
+                                    ui.selectable_value(&mut self.peak_config.decay_mode, PeakDecayMode::Gravity, "Gravity")
+                                        .on_hover_text("Peak accelerates as it falls — feels physical.");
+                                    ui.selectable_value(&mut self.peak_config.decay_mode, PeakDecayMode::FadeOut, "Fade Out")
+                                        .on_hover_text("Peak stays in place but fades to transparent.");
+                                });
+                                let speed_label = match self.peak_config.decay_mode {
+                                    PeakDecayMode::FadeOut => "Fade speed:",
+                                    _                      => "Fall speed:",
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(speed_label);
+                                    ui.add(egui::Slider::new(&mut self.peak_config.fall_speed, 0.05..=5.0)
+                                        .logarithmic(true))
+                                        .on_hover_text("Initial decay rate (normalized units/sec). For Fade Out this controls how fast the line disappears.");
+                                });
+                                if self.peak_config.decay_mode == PeakDecayMode::Gravity {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Acceleration:");
+                                        ui.add(egui::Slider::new(&mut self.peak_config.acceleration, 0.5..=20.0)
+                                            .logarithmic(true))
+                                            .on_hover_text("How quickly the fall accelerates. Higher values make it feel heavier.");
+                                    });
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label("Thickness:");
+                                    let mut t = self.peak_config.peak_thickness as i32;
+                                    if ui.add(egui::Slider::new(&mut t, 1..=6).suffix(" px"))
+                                        .on_hover_text("Height of the peak marker in physical pixels.")
+                                        .changed()
+                                    {
+                                        self.peak_config.peak_thickness = t as u8;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Color:");
+                                    let mut rgb = [
+                                        self.peak_config.color.r(),
+                                        self.peak_config.color.g(),
+                                        self.peak_config.color.b(),
+                                    ];
+                                    if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                        self.peak_config.color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                                    }
+                                });
+                            });
+                        });
                 }
 
                 // ── Album Art settings ────────────────────────────────────
@@ -3011,7 +3426,7 @@ impl SpectrumWindow {
                                     let eq = self.eq_state.lock().unwrap();
                                     let fp = eq.fingerprint();
                                     drop(eq);
-                                    let mut cache = cache_path_for(p, self.bar_count, self.pad_factor, self.overlap, &self.bar_mapping, &self.interp_mode);
+                                    let mut cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
                                     // Append EQ fingerprint to filename stem
                                     let stem = cache.file_stem().unwrap_or_default().to_string_lossy().to_string();
                                     cache.set_file_name(format!("{}_eq{:016x}.spectrumcache", stem, fp));
@@ -3465,6 +3880,12 @@ impl SpectrumWindow {
                                 }
                             } else {
                                 draw_bars(&painter, mags, plot_rect, self.bar_gap);
+                            }
+                            if self.peak_config.enabled && !self.peak_vals.is_empty() {
+                                draw_peak_hold(
+                                    &painter, &self.peak_vals, &self.peak_alphas,
+                                    plot_rect, self.bar_gap, &self.peak_config,
+                                );
                             }
                         }
                         VizStyle::Line       => draw_line(&painter, mags, plot_rect,
