@@ -98,7 +98,7 @@ pub struct PeakHoldConfig {
 impl Default for PeakHoldConfig {
     fn default() -> Self {
         Self {
-            enabled:        false,
+            enabled:        true,
             hold_ms:        500.0,
             fall_speed:     3.0,
             acceleration:   4.0,
