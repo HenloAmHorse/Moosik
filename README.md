@@ -1,7 +1,7 @@
 # Moosik
 
 <p align="center">
-  <img src="screenshots/icon.png" width="120" alt="Moosik Player icon"/>
+  <img src="assets/icon.png" width="120" alt="Moosik icon"/>
 </p>
 
 A desktop music player with a professional-grade spectrum analyzer and parametric EQ, built in Rust.
