@@ -4,7 +4,7 @@
   <img src="assets/icon.png" width="120" alt="Moosik icon"/>
 </p>
 
-A desktop music player with a professional-grade spectrum analyzer and parametric EQ, built in Rust.
+A desktop music player with bit-perfect output, a professional-grade spectrum analyzer, and a parametric EQ, built in Rust.
 
 ### The icon
 
@@ -15,7 +15,7 @@ The background is **Eigengrau** (#16161d) — the color the human brain perceive
 The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-temperature blackbody radiator, which emits all frequencies equally. A perfectly flat spectrum. The EQ ideal.
 
 <p align="center">
-  <img src="screenshots/player.png" alt="Player UI" width="700"/>
+  <img src="screenshots/player.png" alt="UI" width="700"/>
 </p>
 
 <p align="center">
@@ -23,6 +23,13 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 </p>
 
 ## Features
+
+### Bit-Perfect Output
+- **Native-rate, bit-transparent playback** — toggle the 💎 button and audio is sent to the device at the file's exact sample rate, decoded at full precision (24-bit safe) and converted to the device's native format with exact power-of-two scaling, so integer sources reach the DAC unchanged
+- **Windows: WASAPI exclusive mode** — opens the device exclusively, like foobar2000's WASAPI output, bypassing the Windows mixer; a DAC pinned to e.g. 384 kHz in the control panel still plays 44.1/48/96/192 kHz tracks at their native rate
+- **Linux / macOS** — direct cpal output at the exact rate; choosing an ALSA `hw:` device skips the PipeWire/Pulse resampling shims
+- **Device picker** — the 🔈▾ menu lists every output device with its real capabilities (supported rates, sample formats, channels), probed in the background; pick one or stay on the system default. Your choice is remembered
+- **Honest fallbacks** — if a device can't play a track's format, playback drops to normal mode with a message listing what the device *does* support; EQ is bypassed in this mode (and the EQ panel says so), and the 💎 tooltip warns when volume is below 100%, since attenuation breaks bit-perfectness
 
 ### Spectrum Analyzer
 - **Pre-processed + real-time hybrid** — full-track analysis runs in the background while real-time FFT feeds the display during playback; seamlessly switches between the two
@@ -72,6 +79,14 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 
 Requires Rust (stable, edition 2024).
 
+On Linux, the audio backend (cpal/ALSA) needs the ALSA development headers:
+
+```sh
+sudo apt install libasound2-dev   # Debian/Ubuntu
+```
+
+Then:
+
 ```sh
 git clone https://github.com/HenloAmHorse/Moosik
 cd Moosik
@@ -86,21 +101,24 @@ All pulled automatically via Cargo:
 | Crate | Purpose |
 |---|---|
 | `eframe` / `egui` | Immediate-mode GUI |
-| `rodio` | Audio playback |
+| `rodio` | Audio playback (normal mode) |
+| `cpal` | Direct device output (bit-perfect mode, Linux/macOS) |
+| `wasapi` | WASAPI exclusive-mode output (bit-perfect mode, Windows) |
 | `symphonia` | Audio decoding (MP3, FLAC, OGG, WAV, AAC, …) |
+| `rtrb` | Lock-free ring buffer (decode → output) |
 | `rustfft` | FFT engine |
 | `rayon` | Parallel analysis |
 | `lofty` | Tag / metadata reading |
 | `image` | Album art decoding |
-| `serde` / `serde_json` | Preset persistence |
+| `serde` / `serde_json` | Preset / settings persistence |
 
 ## Platform Support
 
-| Platform | Status |
-|---|---|
-| Linux | Tested |
-| Windows | Should work (fonts loaded from standard paths) |
-| macOS | Should work |
+| Platform | Status | Bit-perfect backend |
+|---|---|---|
+| Linux | Tested | cpal — direct ALSA `hw:` device for true bit-perfect |
+| Windows | Tested | WASAPI exclusive mode |
+| macOS | Should work | cpal — direct CoreAudio output |
 
 ## License
 

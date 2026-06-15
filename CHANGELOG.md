@@ -1,5 +1,31 @@
 # Changelog
 
+## [1.0.0] - 2026-06-15
+
+First stable release. Adds true bit-perfect output (with WASAPI exclusive mode
+on Windows and a device picker), and resolves the long-standing high-CPU draw
+of the spectrum window. Everything below lands in 1.0.
+
+### Bit-Perfect Output (new)
+- **Native-rate, bit-transparent playback** — a dedicated symphonia decode thread (full sample precision, 24-bit safe) feeds a lock-free ring buffer; the output callback only copies samples and converts to the device's native format with exact power-of-two scaling, so integer sources round-trip unchanged
+- **Windows: WASAPI exclusive mode** — shared-mode WASAPI only accepts the mixer's configured format (e.g. a DAC pinned to 384 kHz rejects 44.1 kHz tracks), so the bit-perfect path opens the device in exclusive mode like foobar2000's WASAPI output; device capabilities are probed in exclusive mode too, format candidates (16/24/24-in-32/32-bit int, 32-bit float) are chosen to match the source bit depth, and polling mode is used to avoid the USB-audio stutter of event-driven exclusive streams
+- **Linux/macOS** — direct cpal output at the exact rate; selecting an ALSA `hw:` device bypasses the PipeWire/Pulse resampling shims
+- **Device detection & selection** — output devices are scanned in the background with their capabilities (supported rates, sample formats, max channels); pick one from the 🔈▾ menu next to the 💎 button, or stay on the system default; selection is persisted to `~/.moosik/bitperfect.json`
+- **Fast seeking** — container-level symphonia seek instead of decode-and-discard
+- **Sample-accurate position** — elapsed time is derived from frames actually delivered to the device, not wall-clock time
+- **Graceful fallback** — if the device rejects a track's format the player drops back to normal mode (or rolls back a device switch) with a clear status message listing what the device supports
+- **Volume warning** — the 💎 tooltip warns when volume is below 100%, since rescaling breaks bit-perfectness
+- EQ is intentionally bypassed in bit-perfect mode; the EQ panel shows a notice and the spectrum stops simulating EQ gain
+
+### Performance — Spectrum window CPU
+- **Frame limiter** — with the spectrum window open, the app was repainting at ~900 fps (an immediate child viewport requests a repaint every frame, which overrode `request_repaint_after`), burning ~30% CPU regardless of the Max FPS setting. The render loop is now hard-capped to the target frame rate by parking the UI thread to the frame deadline (the thread sleeps, it does not spin), so CPU scales with Max FPS as expected
+- **Windows timer resolution** — raised to 1 ms at startup (`timeBeginPeriod`) so the limiter's sleep is accurate on high-refresh displays; without it Windows' ~15.6 ms default would clamp the cap to ~64 fps
+- **Max FPS up to 240** — raised from 120 for high-refresh monitors
+- **Honest F3 instrumentation** — the overlay now shows the real repaint rate and per-frame draw cost (the old "FPS" line tracked only the FFT throttle and couldn't reveal the true repaint rate)
+
+### Spectrum Analyzer
+- **FFT auto-size** targets a ≥100 ms analysis window (8192 @ 44.1/48 kHz, 16384 @ 96 kHz, 32768 @ 192 kHz); 32768 is selectable manually
+
 ## [0.3.0] - 2026-04-24
 
 ### Spectrum Analyzer — Peak Hold
@@ -50,7 +76,7 @@
 Initial public release.
 
 <p align="center">
-  <img src="screenshots/player.png" alt="Player UI" width="700"/>
+  <img src="screenshots/player.png" alt="UI" width="700"/>
 </p>
 
 <p align="center">

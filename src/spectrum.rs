@@ -604,7 +604,7 @@ impl SpectrumAnalyzer {
             pending_waveform: None,
             pending_analysis: None,
             pre_frames: Vec::new(),
-            pre_frame_rate: 30.0,
+            pre_frame_rate: 60.0,
             pre_receiver: None,
             is_analyzing: Arc::new(AtomicBool::new(false)),
             analysis_progress: Arc::new(AtomicUsize::new(0)),
@@ -757,7 +757,7 @@ impl SpectrumAnalyzer {
         if !self.pre_frames.is_empty() {
             let frame = ((elapsed * self.pre_frame_rate) as usize)
                 .min(self.pre_frames.len().saturating_sub(1));
-            let mags = self.pre_frames[frame].clone();
+            let mags = &self.pre_frames[frame];
             // Guard: if bar_count changed mid-stream, resize smooth buffer
             if self.smoothed.len() != mags.len() {
                 self.smoothed = vec![0.0; mags.len()];
@@ -765,8 +765,14 @@ impl SpectrumAnalyzer {
             for (s, m) in self.smoothed.iter_mut().zip(mags.iter()) {
                 *s = *s * 0.5 + m * 0.5;
             }
-            self.magnitudes = self.smoothed.clone();
-            self.push_waterfall(self.magnitudes.clone());
+            if self.magnitudes.len() != self.smoothed.len() {
+                self.magnitudes = vec![0.0; self.smoothed.len()];
+            }
+            self.magnitudes.copy_from_slice(&self.smoothed);
+            // push_waterfall no-ops unless the waterfall view is active.
+            if self.waterfall_enabled {
+                self.push_waterfall(self.magnitudes.clone());
+            }
         }
     }
 
@@ -2122,9 +2128,20 @@ pub struct SpectrumWindow {
     pub max_fps: f32,
     last_fft_time: Option<Instant>,
     current_fps: f32,
+    /// Instrumentation: wall-clock time of the previous show() call, the
+    /// resulting real repaint rate (NOT the FFT throttle rate), and the
+    /// measured cost of the last full draw. Surfaced in the F3 overlay so we
+    /// can tell "too many frames" from "each frame too expensive".
+    last_show_time: Option<Instant>,
+    real_repaint_fps: f32,
+    draw_ms: f32,
     pub waveform: Option<Vec<f32>>,
     waveform_rx: Option<std::sync::mpsc::Receiver<(Vec<f32>, TrackAnalysis)>>,
     pub spectral_ceiling: Option<SpectralCeiling>,
+    /// True once compute_spectral_ceiling has run for the current pre_frames.
+    /// Without this, a track whose ceiling comes back None (e.g. near-silent)
+    /// would rescan every frame of the whole track on every UI tick.
+    spectral_ceiling_attempted: bool,
     pub stereo_buf: StereoBuf,
     pub track_analysis: Option<TrackAnalysis>,
     pub momentary_lufs: f32,
@@ -2139,7 +2156,11 @@ pub struct SpectrumWindow {
     chroma_ema: [f32; 12],        // exponential moving average for live chord smoothing
     auto_fft_size: usize,         // last FFT size chosen automatically; 0 = user overrode it
     phasescope_frames: Vec<[f32; 2]>, // snapshot captured in tick() — no lock/clone in show()
-    lufs_tick: u8, // simple counter for throttling LUFS computation
+    /// Last momentary-LUFS computation — throttled by wall clock (~15 Hz) so
+    /// the cost doesn't scale with the repaint rate.
+    last_lufs_time: Option<Instant>,
+    /// Reused buffer for the LUFS window snapshot (avoids a ~75 KB alloc per run).
+    lufs_scratch: Vec<f32>,
     pub interp_mode: InterpolationMode,
     pub pad_factor: usize,
     pub overlap: f32,
@@ -2178,6 +2199,10 @@ pub struct SpectrumWindow {
     eq_save_new_open:     bool,
     /// Scope selector for the "Save As New" row (Global vs Local).
     eq_save_new_scope:    PresetScope,
+
+    // ── Bit-perfect mode ───────────────────────────────────────────────────
+    /// When true, EQ is not applied to audio — reflect that in the spectrum display.
+    pub bit_perfect: bool,
 
     // ── Album art ──────────────────────────────────────────────────────────
     pub art_settings: ArtSettingsStore,
@@ -2220,9 +2245,13 @@ impl SpectrumWindow {
             max_fps: 60.0,
             last_fft_time: None,
             current_fps: 0.0,
+            last_show_time: None,
+            real_repaint_fps: 0.0,
+            draw_ms: 0.0,
             waveform: None,
             waveform_rx: None,
             spectral_ceiling: None,
+            spectral_ceiling_attempted: false,
             spectrogram: Spectrogram::new(),
             spectrogram_texture: None,
             waterfall_texture: None,
@@ -2237,7 +2266,8 @@ impl SpectrumWindow {
             chroma_ema: [0.0; 12],
             auto_fft_size: 0,
             phasescope_frames: Vec::new(),
-            lufs_tick: 0,
+            last_lufs_time: None,
+            lufs_scratch: Vec::new(),
             interp_mode: InterpolationMode::None,
             pad_factor: 16,
             overlap: 0.875,
@@ -2261,6 +2291,7 @@ impl SpectrumWindow {
             eq_confirm_delete: None,
             eq_save_new_open: false,
             eq_save_new_scope: PresetScope::Global,
+            bit_perfect: false,
             art_settings: ArtSettingsStore::load(),
             current_art: None,
             peak_config: PeakHoldConfig::default(),
@@ -2298,6 +2329,7 @@ impl SpectrumWindow {
             self.analyzer.pre_frames = frames;
             self.analyzer.pre_frame_rate = rate;
             self.spectral_ceiling = None; // recompute on next tick
+            self.spectral_ceiling_attempted = false;
             self.needs_reanalysis = false;
         } else {
             self.analyzer.pre_frames.clear();
@@ -2413,14 +2445,16 @@ impl SpectrumWindow {
         // Save the active preset for the track we're leaving.
         self.persist_last_used();
 
-        // Auto-scale FFT size to maintain the same ~85ms analysis window as
-        // 8192 samples @ 96 kHz.  Picks the nearest supported power-of-two.
-        let ideal = (8192.0_f32 * sample_rate as f32 / 96_000.0).round() as usize;
-        let auto_fft = [1024usize, 2048, 4096, 8192, 16384]
+        // Auto-scale FFT size so the analysis window is 100–200 ms at the
+        // track's sample rate.  Pick the smallest power-of-two that covers
+        // at least 100 ms worth of samples (e.g. 8192 @ 44.1/48 kHz ≈ 170–185 ms,
+        // 16384 @ 96 kHz ≈ 170 ms, 32768 @ 192 kHz ≈ 170 ms).
+        let min_samples = (sample_rate / 10) as usize; // 100 ms minimum
+        let auto_fft = [1024usize, 2048, 4096, 8192, 16384, 32768]
             .iter()
-            .min_by_key(|&&sz| (sz as i64 - ideal as i64).unsigned_abs())
             .copied()
-            .unwrap_or(8192);
+            .find(|&sz| sz >= min_samples)
+            .unwrap_or(32768);
         self.fft_size = auto_fft;
         self.analyzer.fft_size = auto_fft;
         self.analyzer.rebuild_fft();
@@ -2434,6 +2468,7 @@ impl SpectrumWindow {
         self.analyzer.bar_count = self.bar_count;
         self.sync_params();
         self.spectral_ceiling = None;
+        self.spectral_ceiling_attempted = false;
         self.waveform = None;
         self.waveform_rx = None;
         self.spectrogram.clear();
@@ -2477,11 +2512,12 @@ impl SpectrumWindow {
         if let Some(analysis) = self.analyzer.pending_analysis.take() {
             self.track_analysis = Some(analysis);
         }
-        if self.spectral_ceiling.is_none() && !self.analyzer.pre_frames.is_empty() {
+        if !self.spectral_ceiling_attempted && !self.analyzer.pre_frames.is_empty() {
             self.spectral_ceiling = compute_spectral_ceiling(
                 &self.analyzer.pre_frames, self.bar_count,
                 self.min_freq, self.max_freq.min(self.analyzer.sample_rate as f32 / 2.0),
             );
+            self.spectral_ceiling_attempted = true;
         }
 
         // Current chord — only computed when the overlay is actually visible.
@@ -2563,26 +2599,28 @@ impl SpectrumWindow {
         }
 
         // Momentary LUFS (400 ms window from live sample buffer).
-        // Throttled: run at most every other tick so at 30 fps it updates at ~15 fps —
-        // plenty for a meter display. LUFS is also used by the main-window readout
-        // so we keep it running even when the spectrum panel is not in phasescope mode.
-        self.lufs_tick = self.lufs_tick.wrapping_add(1);
-        if self.lufs_tick.is_multiple_of(2) {
+        // Throttled by wall clock to ~15 Hz — plenty for a meter display, and
+        // independent of the repaint rate (was every other tick, which at high
+        // max-fps settings ran the K-weight filter over 19k samples 100+ times
+        // a second). LUFS is also used by the main-window readout so we keep
+        // it running even when the spectrum panel is not in phasescope mode.
+        let lufs_due = self.last_lufs_time.map(|t| t.elapsed().as_millis() >= 66).unwrap_or(true);
+        if lufs_due {
+            self.last_lufs_time = Some(Instant::now());
             let window = (self.analyzer.sample_rate as f64 * 0.4) as usize;
-            let lufs_slice: Vec<f32> = {
+            self.lufs_scratch.clear();
+            {
                 let guard = self.sample_buf.lock().unwrap_or_else(|p| p.into_inner());
                 if guard.len() >= window {
                     let start = guard.len() - window;
-                    guard[start..].to_vec()
-                } else {
-                    Vec::new()
+                    self.lufs_scratch.extend_from_slice(&guard[start..]);
                 }
-            }; // lock released here
-            if !lufs_slice.is_empty() {
+            } // lock released here
+            if !self.lufs_scratch.is_empty() {
                 let mut kw = KWeightFilter::new(self.analyzer.sample_rate);
-                let mean_sq: f64 = lufs_slice.iter()
+                let mean_sq: f64 = self.lufs_scratch.iter()
                     .map(|&s| { let y = kw.process(s) as f64; y * y })
-                    .sum::<f64>() / lufs_slice.len() as f64;
+                    .sum::<f64>() / self.lufs_scratch.len() as f64;
                 self.momentary_lufs = if mean_sq > 1e-10 {
                     (-0.691 + 10.0 * mean_sq.log10()) as f32
                 } else {
@@ -2714,6 +2752,19 @@ impl SpectrumWindow {
     pub fn show(&mut self, ctx: &egui::Context) {
         if !self.open { return; }
 
+        // Instrumentation: measure the REAL repaint interval (how often this
+        // window is actually being redrawn) and the wall-clock cost of the
+        // draw. Unlike `current_fps`, which only tracks the FFT throttle,
+        // these expose the true CPU driver.
+        let show_start = Instant::now();
+        if let Some(prev) = self.last_show_time {
+            let dt = (show_start - prev).as_secs_f32();
+            if dt > 0.0 && dt < 1.0 {
+                self.real_repaint_fps = self.real_repaint_fps * 0.9 + (1.0 / dt) * 0.1;
+            }
+        }
+        self.last_show_time = Some(show_start);
+
         let vp_id = egui::ViewportId::from_hash_of("moosik_spectrum");
         let vp_builder = egui::ViewportBuilder::default()
             .with_title("Spectrum Analyzer")
@@ -2821,7 +2872,7 @@ impl SpectrumWindow {
                         let mut rebuild = false;
                         ui.horizontal(|ui| {
                             ui.label("FFT size:");
-                            for &sz in &[1024usize, 2048, 4096, 8192, 16384] {
+                            for &sz in &[1024usize, 2048, 4096, 8192, 16384, 32768] {
                                 let is_auto = sz == self.auto_fft_size;
                                 let sr = self.analyzer.sample_rate.max(1);
                                 let ms = sz * 1000 / sr as usize;
@@ -3071,7 +3122,7 @@ impl SpectrumWindow {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Max FPS:");
-                            ui.add(egui::Slider::new(&mut self.max_fps, 1.0..=120.0)
+                            ui.add(egui::Slider::new(&mut self.max_fps, 1.0..=240.0)
                                 .step_by(1.0).suffix(" fps"));
                         });
                         if rebuild {
@@ -3394,6 +3445,18 @@ impl SpectrumWindow {
                     egui::CollapsingHeader::new("🎛 Parametric EQ")
                         .default_open(true)
                         .show(ui, |ui| {
+                            // Bit-perfect mode notice — EQ is bypassed in audio path
+                            if self.bit_perfect {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("💎 Bit-perfect mode active — EQ bypassed in audio path")
+                                            .size(12.0)
+                                            .color(Color32::from_rgb(100, 255, 200)),
+                                    );
+                                });
+                                ui.separator();
+                            }
+
                             // Global controls row
                             ui.horizontal(|ui| {
                                 let eq_on = { self.eq_state.lock().unwrap().enabled };
@@ -3812,7 +3875,9 @@ impl SpectrumWindow {
                     );
 
                     // ── EQ bar modification (apply EQ gain to displayed bars) ──
-                    let eq_snap = if self.show_eq {
+                    // Skipped in bit-perfect mode: EQ is not in the audio path, so
+                    // the spectrum correctly shows what you hear without modification.
+                    let eq_snap = if self.show_eq && !self.bit_perfect {
                         let eq = self.eq_state.lock().unwrap();
                         if eq.is_active() { Some((eq.bands.clone(), eq.sample_rate, eq.enabled)) } else { None }
                     } else { None };
@@ -4082,7 +4147,9 @@ impl SpectrumWindow {
                             format!("Analyzing:   {}  progress: {}%", analyzing, pct),
                             format!("Frames:      {}  frame_rate: {:.2} fps", self.analyzer.pre_frames.len(), self.analyzer.pre_frame_rate),
                             format!("── Runtime ─────────────────────────"),
-                            format!("FPS:         {:.1}", self.current_fps),
+                            format!("FFT rate:    {:.1} fps (max {:.0})", self.current_fps, self.max_fps),
+                            format!("REPAINT:     {:.1} fps (real)", self.real_repaint_fps),
+                            format!("DRAW cost:   {:.2} ms/frame", self.draw_ms),
                             format!("LUFS:        {:.2}", self.momentary_lufs),
                             format!("Correlation: {:.3}", self.correlation),
                             format!("FFT norms:   {} bins", self.analyzer.last_fft_norms.len()),
@@ -4131,5 +4198,9 @@ impl SpectrumWindow {
                 }
             });
         });
+
+        // Record the wall-clock cost of this full draw (EMA-smoothed).
+        let ms = show_start.elapsed().as_secs_f32() * 1000.0;
+        self.draw_ms = self.draw_ms * 0.9 + ms * 0.1;
     }
 }

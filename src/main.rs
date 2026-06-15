@@ -1,3 +1,4 @@
+mod bitperfect;
 mod spectrum;
 
 use eframe::egui;
@@ -72,7 +73,19 @@ fn setup_fonts(ctx: &egui::Context) {
     }
 }
 
+/// Raise the Windows system timer resolution to 1 ms. The default (~15.6 ms)
+/// would clamp the frame limiter's `thread::sleep` to ~64 fps; 1 ms keeps it
+/// accurate up to high-refresh rates. Windows restores the default on process
+/// exit, so no matching `timeEndPeriod` is needed.
+#[cfg(windows)]
+fn raise_timer_resolution() {
+    unsafe { windows_sys::Win32::Media::timeBeginPeriod(1); }
+}
+#[cfg(not(windows))]
+fn raise_timer_resolution() {}
+
 fn main() -> eframe::Result {
+    raise_timer_resolution();
     let icon = eframe::icon_data::from_png_bytes(
         include_bytes!("../assets/icon.png")
     ).expect("invalid icon PNG");
@@ -223,9 +236,18 @@ fn fmt_size(bytes: u64) -> String {
 // ---------------------------------------------------------------------------
 
 struct Engine {
+    // ── rodio path (normal mode) ───────────────────────────────────────────
     _stream: OutputStream,
     stream_handle: OutputStreamHandle,
     sink: Option<Sink>,
+    // ── bit-perfect path (direct cpal stream fed by a symphonia thread) ────
+    bp: Option<bitperfect::BpStream>,
+    pub bit_perfect: bool,
+    /// Selected bit-perfect output device name; None = system default.
+    pub bp_device: Option<String>,
+    /// Position of the start of the current bit-perfect session.
+    bp_base: Duration,
+    // ── shared ─────────────────────────────────────────────────────────────
     // We track position manually because rodio Sink doesn't expose elapsed time
     started_at: Option<Instant>,
     paused_elapsed: Duration,
@@ -244,6 +266,10 @@ impl Engine {
             _stream: stream,
             stream_handle,
             sink: None,
+            bp: None,
+            bit_perfect: false,
+            bp_device: None,
+            bp_base: Duration::ZERO,
             started_at: None,
             paused_elapsed: Duration::ZERO,
             current_duration: None,
@@ -257,28 +283,80 @@ impl Engine {
 
     fn play_file(&mut self, path: &PathBuf, duration: Option<Duration>) -> Result<(), String> {
         self.stop();
-        let file = File::open(path).map_err(|e| format!("Open failed: {e}"))?;
-        let decoder = Decoder::new(BufReader::new(file))
-            .map_err(|e| format!("Decode failed: {e}"))?;
-        let sink = Sink::try_new(&self.stream_handle)
-            .map_err(|e| format!("Sink failed: {e}"))?;
-        sink.set_volume(self.volume);
-        self.last_sample_rate = decoder.sample_rate();
-        let tapped = SpectrumSource::new(decoder, self.sample_buf.clone(), self.stereo_buf.clone());
-        if let Some(ref eq) = self.eq {
-            sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+        if self.bit_perfect {
+            self.start_bp(path, Duration::ZERO)?;
         } else {
-            sink.append(tapped);
+            let file = File::open(path).map_err(|e| format!("Open failed: {e}"))?;
+            let decoder = Decoder::new(BufReader::new(file))
+                .map_err(|e| format!("Decode failed: {e}"))?;
+            let sink = Sink::try_new(&self.stream_handle)
+                .map_err(|e| format!("Sink failed: {e}"))?;
+            sink.set_volume(self.volume);
+            self.last_sample_rate = decoder.sample_rate();
+            let tapped = SpectrumSource::new(decoder, self.sample_buf.clone(), self.stereo_buf.clone());
+            if let Some(ref eq) = self.eq {
+                sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+            } else {
+                sink.append(tapped);
+            }
+            self.sink = Some(sink);
         }
-        self.sink = Some(sink);
         self.started_at = Some(Instant::now());
         self.paused_elapsed = Duration::ZERO;
         self.current_duration = duration;
         Ok(())
     }
 
+    /// Decode `path` from `start` and play it on the bit-perfect stream,
+    /// (re)opening the cpal stream if the device or stream format changed.
+    fn start_bp(&mut self, path: &Path, start: Duration) -> Result<(), String> {
+        let prep = bitperfect::prepare(path, start)
+            .map_err(|e| format!("Bit-perfect: {e}"))?;
+        self.last_sample_rate = prep.sample_rate;
+
+        let reuse = self.bp.as_ref().is_some_and(|s| {
+            s.sample_rate == prep.sample_rate
+                && s.channels == prep.channels
+                && s.requested_device == self.bp_device
+        });
+        if !reuse {
+            self.bp = None; // release the old stream/device first
+            self.bp = Some(bitperfect::BpStream::open(
+                self.bp_device.as_deref(),
+                prep.sample_rate,
+                prep.channels,
+                prep.bits_per_sample,
+                self.sample_buf.clone(),
+                self.stereo_buf.clone(),
+            ).map_err(|e| format!("Bit-perfect: {e}"))?);
+        }
+        let bp = self.bp.as_ref().unwrap();
+        bp.resume();
+        bp.start(prep, self.volume);
+        self.bp_base = start;
+        Ok(())
+    }
+
+    /// One-line description of the active bit-perfect stream for the UI.
+    fn bp_describe(&self) -> Option<String> {
+        self.bp.as_ref().map(|s| format!("{} → {}", s.describe(), s.device_name))
+    }
+
+    /// Drop the bit-perfect stream entirely (releases the audio device).
+    fn close_bp(&mut self) {
+        self.bp = None;
+    }
+
     fn pause(&mut self) {
-        if let Some(ref sink) = self.sink
+        if self.bit_perfect {
+            if let Some(ref bp) = self.bp
+                && !bp.is_paused() {
+                bp.pause();
+                if let Some(started) = self.started_at.take() {
+                    self.paused_elapsed += started.elapsed();
+                }
+            }
+        } else if let Some(ref sink) = self.sink
             && !sink.is_paused() {
             sink.pause();
             if let Some(started) = self.started_at.take() {
@@ -288,7 +366,13 @@ impl Engine {
     }
 
     fn resume(&mut self) {
-        if let Some(ref sink) = self.sink
+        if self.bit_perfect {
+            if let Some(ref bp) = self.bp
+                && bp.is_paused() {
+                bp.resume();
+                self.started_at = Some(Instant::now());
+            }
+        } else if let Some(ref sink) = self.sink
             && sink.is_paused() {
             sink.play();
             self.started_at = Some(Instant::now());
@@ -299,16 +383,26 @@ impl Engine {
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
+        if let Some(ref bp) = self.bp { bp.stop_session(); }
+        self.bp_base = Duration::ZERO;
         self.started_at = None;
         self.paused_elapsed = Duration::ZERO;
         self.current_duration = None;
     }
 
     fn is_finished(&self) -> bool {
-        self.sink.as_ref().is_some_and(|s| s.empty())
+        if self.bit_perfect {
+            self.bp.as_ref().is_some_and(|bp| bp.is_finished())
+        } else {
+            self.sink.as_ref().is_some_and(|s| s.empty())
+        }
     }
 
     fn elapsed(&self) -> Duration {
+        if self.bit_perfect && let Some(ref bp) = self.bp {
+            // Sample-accurate: frames actually delivered to the device.
+            return self.bp_base + bp.played();
+        }
         let running = self.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
         self.paused_elapsed + running
     }
@@ -318,17 +412,37 @@ impl Engine {
         if let Some(ref sink) = self.sink {
             sink.set_volume(vol);
         }
+        if let Some(ref bp) = self.bp { bp.set_volume(vol); }
     }
 
     /// Seek to `target`.
     ///
-    /// Preferred path: `Sink::try_seek` — works for WAV and any format whose symphonia
-    /// reader can seek without the byte-length hint (e.g. MP3).
+    /// Bit-perfect path: symphonia container-level seek on a fresh decode
+    /// session — no decode-and-discard, fast even at 192 kHz.
     ///
-    /// Fallback path: stop sink, reopen file, consume N samples to reach `target`,
-    /// start a fresh sink.  Handles FLAC, where symphonia 0.5.5 returns
-    /// `Unseekable` because rodio's `ReadSeekSource::byte_len()` always returns `None`.
+    /// Normal mode, preferred path: `Sink::try_seek` — works for WAV and any
+    /// format whose symphonia reader can seek without the byte-length hint (e.g. MP3).
+    ///
+    /// Normal mode, fallback path: stop sink, reopen file, consume N samples to
+    /// reach `target`.  Handles FLAC, where symphonia 0.5.5 returns `Unseekable`
+    /// because rodio's `ReadSeekSource::byte_len()` always returns `None`.
     fn seek_to(&mut self, path: &PathBuf, target: Duration) {
+        if self.bit_perfect {
+            let was_paused = self.bp.as_ref().map(|bp| bp.is_paused()).unwrap_or(false);
+            if let Err(e) = self.start_bp(path, target) {
+                eprintln!("seek: {e}");
+                return;
+            }
+            if was_paused {
+                if let Some(ref bp) = self.bp { bp.pause(); }
+                self.started_at = None;
+            } else {
+                self.started_at = Some(Instant::now());
+            }
+            self.paused_elapsed = target;
+            return;
+        }
+
         let was_paused = self.sink.as_ref().map(|s| s.is_paused()).unwrap_or(false);
 
         // --- Fast path: in-place seek via Sink::try_seek ---
@@ -525,12 +639,19 @@ struct MoosikApp {
     // album art
     art_cache: ArtCache,
     art_hover: Option<(usize, Instant)>, // (track index, time hover started)
+    // bit-perfect mode
+    bit_perfect: bool,
+    bp_device: Option<String>,
+    bp_devices: Option<Vec<bitperfect::DeviceCaps>>,
+    bp_scan_rx: Option<std::sync::mpsc::Receiver<Vec<bitperfect::DeviceCaps>>>,
+    // Frame limiter: wall-clock time the previous update() frame began.
+    last_frame: Option<Instant>,
 }
 
 impl MoosikApp {
     fn new(cc: &eframe::CreationContext) -> Self {
         setup_fonts(&cc.egui_ctx);
-        let spectrum_window = SpectrumWindow::new();
+        let mut spectrum_window = SpectrumWindow::new();
         let mut engine = Engine::new(spectrum_window.sample_buf.clone(), spectrum_window.stereo_buf.clone());
         if let Some(ref mut e) = engine {
             e.eq = Some(spectrum_window.eq_state.clone());
@@ -538,6 +659,12 @@ impl MoosikApp {
         let saved_paths = load_last_playlist();
         let playlist: Vec<Track> = saved_paths.into_iter().map(Track::load).collect();
         let playlist_store = load_playlist_store();
+        let bp_settings = bitperfect::load_settings(&moosik_dir());
+        if let Some(ref mut e) = engine {
+            e.bit_perfect = bp_settings.enabled;
+            e.bp_device = bp_settings.device.clone();
+        }
+        spectrum_window.bit_perfect = bp_settings.enabled;
         MoosikApp {
             playlist,
             current_index: None,
@@ -560,6 +687,12 @@ impl MoosikApp {
             playlist_name_buf: String::new(),
             art_cache: ArtCache::new(),
             art_hover: None,
+            bit_perfect: bp_settings.enabled,
+            bp_device: bp_settings.device,
+            bp_devices: None,
+            // Kick off the device scan at startup so the picker is ready.
+            bp_scan_rx: Some(bitperfect::spawn_device_scan()),
+            last_frame: None,
         }
     }
 
@@ -610,6 +743,30 @@ impl MoosikApp {
             Ok(()) => {
                 self.play_state = PlayState::Playing;
                 self.status_msg = format!("Playing: {}", self.playlist[idx].title);
+                if self.bit_perfect
+                    && let Some(desc) = self.engine.as_ref().and_then(|e| e.bp_describe()) {
+                    self.status_msg = format!("💎 {desc} — {}", self.playlist[idx].title);
+                }
+            }
+            Err(e) if self.bit_perfect => {
+                // Device rejected the format (or vanished) — drop to normal
+                // mode so playback keeps working, and tell the user why.
+                // Runtime-only: the saved preference is left untouched.
+                self.apply_bit_perfect_runtime(false);
+                let retried = self.engine.as_mut()
+                    .map(|eng| eng.play_file(&path, duration))
+                    .unwrap_or(Err("No audio engine".to_string()));
+                match retried {
+                    Ok(()) => {
+                        self.play_state = PlayState::Playing;
+                        self.status_msg = format!("💎 disabled ({e}) — playing in normal mode");
+                    }
+                    Err(e2) => {
+                        self.play_state = PlayState::Stopped;
+                        self.status_msg = format!("Error: {e2}");
+                        return;
+                    }
+                }
             }
             Err(e) => {
                 self.play_state = PlayState::Stopped;
@@ -621,6 +778,105 @@ impl MoosikApp {
         self.seeking = false;
         let sr = self.engine.as_ref().map(|e| e.last_sample_rate).unwrap_or(44_100);
         self.spectrum_window.on_play(&self.playlist[idx].path, sr);
+    }
+
+    // ── Bit-perfect helpers ─────────────────────────────────────────────────
+
+    fn save_bp_settings(&self) {
+        bitperfect::save_settings(&moosik_dir(), &bitperfect::BpSettings {
+            enabled: self.bit_perfect,
+            device: self.bp_device.clone(),
+        });
+    }
+
+    /// Propagate the bit-perfect flag to every component without persisting —
+    /// used by the automatic fallback so a transient device failure doesn't
+    /// overwrite the user's saved preference. Does not restart playback.
+    fn apply_bit_perfect_runtime(&mut self, on: bool) {
+        self.bit_perfect = on;
+        self.spectrum_window.bit_perfect = on;
+        if let Some(ref mut engine) = self.engine {
+            engine.bit_perfect = on;
+            if !on { engine.close_bp(); } // release the device
+        }
+    }
+
+    /// Propagate the bit-perfect flag and persist it (explicit user action).
+    fn apply_bit_perfect(&mut self, on: bool) {
+        self.apply_bit_perfect_runtime(on);
+        self.save_bp_settings();
+    }
+
+    /// Restart the current track in the engine's current mode, preserving
+    /// position and pause state. Used when toggling bit-perfect or switching
+    /// output device mid-track.
+    fn restart_current_track(&mut self) -> Result<(), String> {
+        let Some(idx) = self.current_index else { return Ok(()) };
+        if self.play_state == PlayState::Stopped { return Ok(()) }
+        let pos        = self.elapsed();
+        let was_paused = self.play_state == PlayState::Paused;
+        let path       = self.playlist[idx].path.clone();
+        let dur        = self.playlist[idx].duration;
+        let engine = self.engine.as_mut().ok_or("No audio engine")?;
+        engine.play_file(&path, dur)?;
+        if pos > Duration::ZERO {
+            engine.seek_to(&path, pos);
+            self.spectrum_window.on_seek(pos.as_secs_f64());
+        }
+        if was_paused {
+            engine.pause();
+            self.play_state = PlayState::Paused;
+        }
+        Ok(())
+    }
+
+    /// Toggle bit-perfect mode, restarting the current track in the new mode.
+    /// Reverts the toggle (with a status message) if the device refuses.
+    fn toggle_bit_perfect(&mut self) {
+        let new_bp = !self.bit_perfect;
+        self.apply_bit_perfect(new_bp);
+        match self.restart_current_track() {
+            Ok(()) => {
+                if new_bp {
+                    self.status_msg = match self.engine.as_ref().and_then(|e| e.bp_describe()) {
+                        Some(desc) => format!("💎 Bit-perfect: {desc}"),
+                        None => "💎 Bit-perfect enabled".to_string(),
+                    };
+                } else {
+                    self.status_msg = "Bit-perfect off".to_string();
+                }
+            }
+            Err(e) => {
+                self.apply_bit_perfect(!new_bp);
+                let _ = self.restart_current_track();
+                self.status_msg = format!("Bit-perfect unavailable: {e}");
+            }
+        }
+    }
+
+    /// Select the bit-perfect output device (None = system default) and, if
+    /// playing in bit-perfect mode, move playback onto it.
+    fn select_bp_device(&mut self, device: Option<String>) {
+        let old = self.bp_device.clone();
+        self.bp_device = device.clone();
+        if let Some(ref mut engine) = self.engine {
+            engine.bp_device = device.clone();
+        }
+        self.save_bp_settings();
+        if self.bit_perfect
+            && let Err(e) = self.restart_current_track() {
+            // New device refused the current track — roll back.
+            self.bp_device = old.clone();
+            if let Some(ref mut engine) = self.engine { engine.bp_device = old; }
+            self.save_bp_settings();
+            let _ = self.restart_current_track();
+            self.status_msg = format!("Device unavailable: {e}");
+            return;
+        }
+        self.status_msg = match (&self.bp_device, self.bit_perfect) {
+            (Some(n), _) => format!("Output device: {n}"),
+            (None, _)    => "Output device: system default".to_string(),
+        };
     }
 
     fn toggle_play_pause(&mut self) {
@@ -956,6 +1212,45 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, spectral_ceiling: Option<Spectr
 
 impl eframe::App for MoosikApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- Frame limiter ---------------------------------------------------
+        // eframe + an immediate child viewport (the spectrum window) free-run
+        // the repaint loop: the child requests a repaint every frame, which
+        // overrides request_repaint_after, so the window was redrawing at
+        // ~900 fps and burning ~30% CPU. request_repaint_after is only an
+        // upper bound on the wait, so it cannot cap this on its own. Park the
+        // UI thread to the target frame interval instead — this yields the CPU
+        // (the thread sleeps, it does not spin) and hard-caps the real rate.
+        //
+        // Target = spectrum's max_fps while that window is open (it drives the
+        // animation), else 60 fps for the main window's seek bar.
+        let spectrum_open = self.spectrum_window.open;
+        let animating = self.play_state == PlayState::Playing
+            || self.spectrum_window.analyzer.is_analyzing.load(std::sync::atomic::Ordering::Relaxed);
+        // Drive frames while anything is animating, or just to cap the spin of
+        // an open (but idle) spectrum viewport.
+        let want_frames = animating || spectrum_open;
+        if want_frames {
+            let target_fps = match (spectrum_open, animating) {
+                (true, true)  => self.spectrum_window.max_fps.max(1.0), // live spectrum
+                (true, false) => 30.0,  // open but static — just cap the spin
+                (false, _)    => 60.0,  // main-window seek bar / progress
+            };
+            let frame_time = Duration::from_secs_f32(1.0 / target_fps);
+            if let Some(last) = self.last_frame {
+                let dt = last.elapsed();
+                if dt < frame_time {
+                    std::thread::sleep(frame_time - dt);
+                }
+            }
+            self.last_frame = Some(Instant::now());
+            // Keep the loop running at our paced rate. We've already slept, so
+            // this just schedules the next frame; when idle we skip it and fall
+            // back to eframe's reactive (event-driven) mode → ~0% CPU.
+            ctx.request_repaint();
+        } else {
+            self.last_frame = None;
+        }
+
         // --- Keyboard shortcuts (only when no text field is focused) ---
         let no_text_focus = ctx.memory(|m| m.focused().is_none());
         if no_text_focus {
@@ -1000,6 +1295,13 @@ impl eframe::App for MoosikApp {
             }
         }
 
+        // --- collect finished bit-perfect device scan ---
+        if let Some(ref rx) = self.bp_scan_rx
+            && let Ok(devices) = rx.try_recv() {
+            self.bp_devices = Some(devices);
+            self.bp_scan_rx = None;
+        }
+
         // --- auto-advance when track finishes ---
         if self.play_state == PlayState::Playing {
             let finished = self.engine.as_ref().map(|e| e.is_finished()).unwrap_or(false);
@@ -1014,18 +1316,7 @@ impl eframe::App for MoosikApp {
             engine.set_volume(self.volume);
         }
 
-        // Request repaint while playing or while background analysis is running.
-        // The analysis check ensures the waveform seekbar appears as soon as
-        // analysis finishes even if playback is paused.
-        let is_analyzing = self.spectrum_window.analyzer.is_analyzing.load(std::sync::atomic::Ordering::Relaxed);
-        if self.play_state == PlayState::Playing || is_analyzing {
-            let interval_ms = if self.spectrum_window.open {
-                (1000.0 / self.spectrum_window.max_fps.max(1.0)) as u64
-            } else {
-                50 // ~20 fps is plenty for the seek bar counter alone
-            };
-            ctx.request_repaint_after(Duration::from_millis(interval_ms));
-        }
+        // Repaint pacing is handled by the frame limiter at the top of update().
 
         // Advance spectrum analyzer and render window
         let elapsed_secs = self.elapsed().as_secs_f64();
@@ -1363,6 +1654,75 @@ impl eframe::App for MoosikApp {
                     if ui.add_enabled(info_enabled, egui::Button::new(info_label)).clicked() {
                         self.info_open = !self.info_open;
                     }
+                    ui.add_space(8.0);
+
+                    // ── Bit-perfect: device picker (▾) + toggle ─────────────
+                    // right_to_left layout: the toggle is added first so it
+                    // sits to the right of the picker.
+                    let bp_label = if self.bit_perfect {
+                        RichText::new("💎 Bit-Perfect").size(13.0).color(Color32::from_rgb(100, 255, 200))
+                    } else {
+                        RichText::new("💎 Bit-Perfect").size(13.0)
+                    };
+                    let mut hover = String::from(
+                        "Direct device output at the file's native sample rate.\n\
+                         Decoded at full precision (24-bit safe), EQ bypassed.");
+                    if self.volume < 0.999 {
+                        hover.push_str("\n⚠ Volume below 100% rescales samples — set volume to max for true bit-perfect.");
+                    }
+                    if ui.button(bp_label).on_hover_text(hover).clicked() {
+                        self.toggle_bit_perfect();
+                    }
+
+                    ui.menu_button(RichText::new("🔈▾").size(13.0), |ui| {
+                        ui.set_min_width(320.0);
+                        ui.label(RichText::new("Bit-perfect output device").strong().size(12.0));
+                        ui.separator();
+
+                        let track_sr = self.current_index
+                            .and_then(|i| self.playlist.get(i))
+                            .and_then(|t| t.sample_rate);
+
+                        let mut pick: Option<Option<String>> = None;
+                        if ui.selectable_label(self.bp_device.is_none(), "System default").clicked() {
+                            pick = Some(None);
+                            ui.close_menu();
+                        }
+                        match self.bp_devices {
+                            None => { ui.add_space(2.0); ui.spinner(); ui.label(RichText::new("Scanning devices…").size(11.0)); }
+                            Some(ref devs) if devs.is_empty() => {
+                                ui.label(RichText::new("No output devices found").size(11.0).color(Color32::from_gray(140)));
+                            }
+                            Some(ref devs) => {
+                                for d in devs {
+                                    let selected = self.bp_device.as_deref() == Some(d.name.as_str());
+                                    let mut name = d.name.clone();
+                                    if d.is_default { name.push_str("  (default)"); }
+                                    // Flag devices that can't do the current track's rate.
+                                    let caps = match track_sr {
+                                        Some(sr) if !d.supports_rate(sr) =>
+                                            format!("{}   ⚠ no {}", d.summary(), fmt_hz(sr)),
+                                        _ => d.summary(),
+                                    };
+                                    let resp = ui.selectable_label(selected, name)
+                                        .on_hover_text(&caps);
+                                    ui.label(RichText::new(caps).size(10.0).color(Color32::from_gray(130)));
+                                    if resp.clicked() {
+                                        pick = Some(Some(d.name.clone()));
+                                        ui.close_menu();
+                                    }
+                                }
+                            }
+                        }
+                        ui.separator();
+                        if ui.button(RichText::new("⟳ Rescan").size(12.0)).clicked() {
+                            self.bp_devices = None;
+                            self.bp_scan_rx = Some(bitperfect::spawn_device_scan());
+                        }
+                        if let Some(dev) = pick {
+                            self.select_bp_device(dev);
+                        }
+                    }).response.on_hover_text("Choose the output device for bit-perfect playback");
                 });
             });
 
@@ -1529,10 +1889,11 @@ impl eframe::App for MoosikApp {
             let mut click_action: Option<(usize, bool, bool)> = None;
 
             let n = self.playlist.len();
+            const ROW_H: f32 = 32.0;
             let mut new_drop_row = n;
             let mut last_row_bottom: Option<(f32, f32, f32)> = None; // (left, right, y)
 
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, n, |ui, rows| {
                 if self.playlist.is_empty() {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
@@ -1545,7 +1906,17 @@ impl eframe::App for MoosikApp {
 
                 let available_w = ui.available_width();
 
-                for i in 0..n {
+                // A drag can only target rows that are on screen (there is no
+                // auto-scroll), so scanning the visible range is sufficient.
+                // If the pointer is above the first visible row, drop there.
+                if dragging
+                    && let Some(pp) = pointer_pos
+                    && pp.y < ui.max_rect().top() {
+                    new_drop_row = rows.start;
+                }
+                let rows_end = rows.end;
+
+                for i in rows {
                     let track_title  = self.playlist[i].display_title().to_string();
                     let track_artist = self.playlist[i].artist.clone();
                     let track_dur    = self.playlist[i].duration;
@@ -1564,7 +1935,7 @@ impl eframe::App for MoosikApp {
                     };
 
                     let (rect, response) = ui.allocate_exact_size(
-                        Vec2::new(available_w, 32.0),
+                        Vec2::new(available_w, ROW_H),
                         egui::Sense::click_and_drag(),
                     );
 
@@ -1746,6 +2117,13 @@ impl eframe::App for MoosikApp {
                     }
 
                     last_row_bottom = Some((rect.left(), rect.right(), rect.bottom()));
+                }
+
+                // Pointer below every visible row's center → the drop target is
+                // the first row just past the visible range (matches the old
+                // full-scan behavior; equals n when scrolled to the bottom).
+                if dragging && pointer_pos.is_some() && new_drop_row == n && rows_end < n {
+                    new_drop_row = rows_end;
                 }
 
                 // Insertion line at end of list
