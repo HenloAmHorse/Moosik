@@ -188,6 +188,15 @@ struct Shared {
     /// Frames handed to the device since the last `start()` — drives the
     /// sample-accurate position readout.
     frames_played: AtomicU64,
+    /// Gapless: the next track's decode pipeline, queued by the UI thread and
+    /// picked up by the decode thread the instant the current file ends (only
+    /// ever holds a track with the same rate/channels as the open stream).
+    next: Mutex<Option<Prepared>>,
+    /// Cumulative frame counts (since `start()`) at which one track ends and
+    /// the next begins — pushed by the decode thread at each gapless hand-off,
+    /// consumed by the UI thread once the device has played past them to roll
+    /// the displayed track over.
+    boundaries: Mutex<std::collections::VecDeque<u64>>,
 }
 
 impl Shared {
@@ -198,6 +207,8 @@ impl Shared {
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
             finished: AtomicBool::new(false),
             frames_played: AtomicU64::new(0),
+            next: Mutex::new(None),
+            boundaries: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 }
@@ -319,12 +330,17 @@ impl BpStream {
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
 
+        // A fresh session supersedes any gapless queue/boundaries from the last.
+        if let Ok(mut g) = self.shared.next.lock() { *g = None; }
+        if let Ok(mut b) = self.shared.boundaries.lock() { b.clear(); }
+
         {
             let stop = Arc::clone(&stop);
             let done = Arc::clone(&done);
+            let shared = Arc::clone(&self.shared);
             std::thread::Builder::new()
                 .name("bp-decode".into())
-                .spawn(move || decode_loop(prep, prod, done, stop))
+                .spawn(move || decode_loop(prep, prod, done, stop, shared))
                 .ok();
         }
 
@@ -333,6 +349,35 @@ impl BpStream {
         self.shared.frames_played.store(0, Ordering::Relaxed);
         if let Ok(mut g) = self.shared.session.lock() {
             *g = Some(Session { cons, decode_done: done, stop }); // old Session drop signals its thread
+        }
+    }
+
+    /// Queue the next track for gapless continuation. The caller guarantees the
+    /// rate and channel count match the open stream (a mismatch would force a
+    /// device re-open, so it isn't gapless). The decode thread swaps to it the
+    /// instant the current file ends, without a gap or a `finished` signal.
+    pub fn queue_next(&self, prep: Prepared) {
+        if let Ok(mut g) = self.shared.next.lock() { *g = Some(prep); }
+    }
+
+    /// Drop a queued-but-not-yet-started gapless track (e.g. the user changed
+    /// what plays next). No effect once the decode thread has already begun it.
+    pub fn clear_next(&self) {
+        if let Ok(mut g) = self.shared.next.lock() { *g = None; }
+    }
+
+    /// If the device has finished playing a gapless track, pop that boundary and
+    /// return the cumulative played time at it (so the UI can roll over). The
+    /// value is frame-exact — no reliance on possibly-wrong metadata duration.
+    pub fn take_reached_boundary(&self) -> Option<Duration> {
+        let played = self.shared.frames_played.load(Ordering::Relaxed);
+        let mut b = self.shared.boundaries.lock().ok()?;
+        match b.front().copied() {
+            Some(front) if played >= front => {
+                b.pop_front();
+                Some(Duration::from_secs_f64(front as f64 / self.sample_rate.max(1) as f64))
+            }
+            _ => None,
         }
     }
 
@@ -430,45 +475,67 @@ fn decode_loop(
     mut prod: rtrb::Producer<f32>,
     done: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,
 ) {
     let mut buf: Option<SampleBuffer<f32>> = None;
+    // Frames pushed into the ring since `start()`, across every gapless track.
+    // A push is FIFO into the ring and then FIFO to the device, so this running
+    // total is exactly the play-time boundary between one track and the next.
+    let mut frames_pushed: u64 = 0;
 
-    loop {
-        if stop.load(Ordering::Relaxed) { return; }
+    'track: loop {
+        // Decode the current file until it ends (or the session is superseded).
+        loop {
+            if stop.load(Ordering::Relaxed) { return; }
 
-        let packet = match prep.format.next_packet() {
-            Ok(p) => p,
-            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(SymError::ResetRequired) => break,
-            Err(e) => { eprintln!("[bit-perfect] read error: {e}"); break; }
-        };
-        if packet.track_id() != prep.track_id { continue; }
+            let packet = match prep.format.next_packet() {
+                Ok(p) => p,
+                Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(SymError::ResetRequired) => break,
+                Err(e) => { eprintln!("[bit-perfect] read error: {e}"); break; }
+            };
+            if packet.track_id() != prep.track_id { continue; }
 
-        let decoded = match prep.decoder.decode(&packet) {
-            Ok(d) => d,
-            Err(SymError::DecodeError(e)) => { eprintln!("[bit-perfect] skipping bad packet: {e}"); continue; }
-            Err(e) => { eprintln!("[bit-perfect] decode error: {e}"); break; }
-        };
+            let decoded = match prep.decoder.decode(&packet) {
+                Ok(d) => d,
+                Err(SymError::DecodeError(e)) => { eprintln!("[bit-perfect] skipping bad packet: {e}"); continue; }
+                Err(e) => { eprintln!("[bit-perfect] decode error: {e}"); break; }
+            };
 
-        let spec = *decoded.spec();
-        let needed = decoded.capacity() as u64;
-        if buf.as_ref().map(|b| (b.capacity() as u64) < needed * spec.channels.count() as u64)
-              .unwrap_or(true) {
-            buf = Some(SampleBuffer::<f32>::new(needed, spec));
-        }
-        let buf = buf.as_mut().unwrap();
-        buf.copy_interleaved_ref(decoded);
+            let spec = *decoded.spec();
+            let ch = spec.channels.count().max(1) as u64;
+            let needed = decoded.capacity() as u64;
+            if buf.as_ref().map(|b| (b.capacity() as u64) < needed * spec.channels.count() as u64)
+                  .unwrap_or(true) {
+                buf = Some(SampleBuffer::<f32>::new(needed, spec));
+            }
+            let buf = buf.as_mut().unwrap();
+            buf.copy_interleaved_ref(decoded);
 
-        // Push with backpressure — the ring holds ~1 s, so this thread spends
-        // most of its life asleep here.
-        for &s in buf.samples() {
-            loop {
-                if stop.load(Ordering::Relaxed) { return; }
-                match prod.push(s) {
-                    Ok(()) => break,
-                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            // Push with backpressure — the ring holds ~1 s, so this thread spends
+            // most of its life asleep here.
+            for &s in buf.samples() {
+                loop {
+                    if stop.load(Ordering::Relaxed) { return; }
+                    match prod.push(s) {
+                        Ok(()) => break,
+                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    }
                 }
             }
+            frames_pushed += buf.samples().len() as u64 / ch;
+        }
+
+        // The current file is exhausted. Continue straight into a queued next
+        // track (gapless), else signal completion.
+        let next = shared.next.lock().ok().and_then(|mut g| g.take());
+        match next {
+            Some(next_prep) => {
+                if let Ok(mut b) = shared.boundaries.lock() { b.push_back(frames_pushed); }
+                prep = next_prep;
+                continue 'track;
+            }
+            None => break,
         }
     }
 
@@ -530,7 +597,8 @@ mod tests {
     fn drain(prep: Prepared) -> Vec<f32> {
         let (prod, mut cons) = rtrb::RingBuffer::new(4 << 20);
         let done = Arc::new(AtomicBool::new(false));
-        decode_loop(prep, prod, Arc::clone(&done), Arc::new(AtomicBool::new(false)));
+        let shared = Arc::new(Shared::new());
+        decode_loop(prep, prod, Arc::clone(&done), Arc::new(AtomicBool::new(false)), shared);
         assert!(done.load(Ordering::Acquire), "decode loop must signal completion");
         let mut out = Vec::new();
         while let Ok(s) = cons.pop() { out.push(s); }

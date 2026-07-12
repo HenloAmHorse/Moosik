@@ -17,6 +17,11 @@ of the spectrum window. Everything below lands in 1.0.
 - **Volume warning** — the 💎 tooltip warns when volume is below 100%, since rescaling breaks bit-perfectness
 - EQ is intentionally bypassed in bit-perfect mode; the EQ panel shows a notice and the spectrum stops simulating EQ gain
 
+### Player
+- **Gapless playback** — consecutive tracks now play back-to-back with no silence, on both paths. Normal mode appends the next track onto the same output before the current one ends (rodio plays queued sources seamlessly); bit-perfect chains the next file's decode into the same device stream, and rolls the display over on frame-exact track boundaries (no drift across a long album). Bit-perfect stays gapless as long as the next track shares the current sample rate and channel count — a format change still re-opens the device, as it must. The next track is prebuffered a few seconds ahead; changing what plays next (seek, loop mode, new selection) discards the prebuffer cleanly.
+- **OS media integration** — hardware media keys (play/pause/next/previous/stop) and the system now-playing panel now work: MPRIS on Linux, System Media Transport Controls on Windows, the Now Playing center on macOS. Title/artist/album/duration and live playback position/state are published to the OS; transport buttons (and the lock-screen scrubber) drive playback. Uses the pure-Rust D-Bus backend on Linux, so no `libdbus` system library is needed to build.
+- **ReplayGain loudness normalization** — new 🔊 RG menu with Off / Track / Album modes and a clip-prevention toggle. Reads ReplayGain tags when present; for untagged files it falls back to Moosik's own measured integrated LUFS (normalising to the −18 LUFS reference), so it works even on libraries that were never scanned. Applied live (updates as the loudness scan completes mid-track) and **bypassed in bit-perfect mode**, since a gain change would break bit-perfectness — the menu says so. Setting persists in `~/.moosik/replaygain.json`.
+
 ### Performance — Spectrum window CPU
 - **Frame limiter** — with the spectrum window open, the app was repainting at ~900 fps (an immediate child viewport requests a repaint every frame, which overrode `request_repaint_after`), burning ~30% CPU regardless of the Max FPS setting. The render loop is now hard-capped to the target frame rate by parking the UI thread to the frame deadline (the thread sleeps, it does not spin), so CPU scales with Max FPS as expected
 - **Windows timer resolution** — raised to 1 ms at startup (`timeBeginPeriod`) so the limiter's sleep is accurate on high-refresh displays; without it Windows' ~15.6 ms default would clamp the cap to ~64 fps
@@ -25,6 +30,15 @@ of the spectrum window. Everything below lands in 1.0.
 
 ### Spectrum Analyzer
 - **FFT auto-size** targets a ≥100 ms analysis window (8192 @ 44.1/48 kHz, 16384 @ 96 kHz, 32768 @ 192 kHz); 32768 is selectable manually
+
+### Fixed
+- **UI freeze on FLAC seeks** — the rodio seek fallback (used for FLAC, which symphonia can't seek in-place through rodio) decoded-and-discarded every sample up to the target *on the UI thread*. Deep into a hi-res file that meant tens of millions of samples and a multi-second "not responding" freeze — most visibly when toggling bit-perfect **off** mid-track (which restarts the track and seeks back to position). The decode-and-discard now runs on a background thread and the seeked stream is installed when ready, so the UI stays responsive; pause/stop/track-change during the seek are handled.
+- **Toggling bit-perfect off mid-track no longer hitches** — the toggle-off restart used to play the track from 0 and *then* seek back to the current position, which briefly emitted audio from the start and did decode work on the UI thread. It now opens and positions the stream entirely on a background thread (no play-from-0 blip, no UI-thread decode).
+- **Silent rodio output after using bit-perfect** — on Windows, opening the device in WASAPI exclusive mode suspends the long-lived shared-mode (rodio) output stream, and cpal never recovered it, so normal-mode playback was mute for the rest of the session once bit-perfect had run. The output stream is now recreated before the next normal-mode track whenever a bit-perfect stream has held the device.
+- **Crash log** — panics on any thread are now recorded to `~/.moosik/crash.log` (the release build aborts on panic, so a background-thread panic would otherwise vanish with no trace).
+
+### Removed
+- **Chord detection overlay** — the triad-template matcher was unreliable on anything beyond simple major/minor material (no 7th/sus/extended chords, weak major-vs-minor discrimination, no harmonic suppression), so it's been dropped. Key detection (Krumhansl-Schmuckler), which shares the chromagram front-end, stays.
 
 ## [0.3.0] - 2026-04-24
 

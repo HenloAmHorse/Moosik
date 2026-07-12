@@ -21,6 +21,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 rtrb = "0.3.4"
 symphonia = { version = "0.5", features = ["flac", "mp3", "vorbis", "isomp4", "aac"] }
 cpal = "0.15"
+# OS media-key / now-playing integration (MPRIS, SMTC, macOS MediaPlayer).
+# use_zbus = pure-Rust D-Bus on Linux, so no system libdbus-1-dev needed.
+souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
@@ -29,7 +32,11 @@ winres = "0.1"
 wasapi = "0.23.0"
 # timeBeginPeriod — raise the system timer resolution so the frame limiter's
 # thread::sleep is accurate enough for high-refresh displays.
-windows-sys = { version = "0.59", features = ["Win32_Media"] }
+# Win32_Graphics_Gdi — EnumDisplaySettingsW, to default Max FPS to the monitor's
+# refresh rate.
+windows-sys = { version = "0.59", features = ["Win32_Media", "Win32_Graphics_Gdi"] }
+# Extract the HWND from eframe for SMTC media controls (souvlaki needs it).
+raw-window-handle = "0.6"
 
 [profile.release]
 opt-level = 3

@@ -66,14 +66,15 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Persistent** — settings stored in `~/.moosik/art_settings.json`
 
 ### Player
-- Gapless-capable playback via `rodio` + `symphonia`
+- **Gapless playback** — consecutive tracks play with no silence between them, in both normal and bit-perfect mode (bit-perfect stays gapless across same-rate tracks; a sample-rate change re-opens the device)
 - Waveform seek bar with click-to-seek
 - Volume control
 - Metadata display (title, artist, album, cover art) via `lofty`
 - CJK font fallback (Japanese, Chinese, Korean tags display correctly)
+- **OS media integration** — hardware media keys and the system now-playing panel (MPRIS on Linux, SMTC on Windows, Now Playing on macOS): play/pause/next/previous/stop, live title/artist/album and playback position
+- **ReplayGain** — loudness normalization (Track / Album), reading ReplayGain tags when present and falling back to Moosik's own measured LUFS for untagged files; clip-prevention toggle; bypassed in bit-perfect mode
 - Momentary LUFS display
 - Stereo correlation meter
-- Chord detection overlay
 
 ## Building
 
@@ -109,6 +110,7 @@ All pulled automatically via Cargo:
 | `rustfft` | FFT engine |
 | `rayon` | Parallel analysis |
 | `lofty` | Tag / metadata reading |
+| `souvlaki` | OS media-key / now-playing integration (MPRIS / SMTC / macOS) |
 | `image` | Album art decoding |
 | `serde` / `serde_json` | Preset / settings persistence |
 

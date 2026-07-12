@@ -2,6 +2,7 @@ pub mod eq;
 pub mod art;
 
 use egui::{Color32, Pos2, Rect, Shape, Stroke};
+use serde::{Deserialize, Serialize};
 use rustfft::{FftPlanner, num_complex::Complex};
 use rodio::Source;
 use std::f32::consts::PI;
@@ -215,7 +216,7 @@ pub fn compute_eq_weights(n_bars: usize, min_freq: f32, max_freq: f32) -> Vec<f3
 }
 
 // ---------------------------------------------------------------------------
-// Chromagram, key detection, chord detection, BPM
+// Chromagram, key detection, BPM
 // ---------------------------------------------------------------------------
 
 const NOTE_NAMES: &[&str] = &["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
@@ -224,20 +225,16 @@ const NOTE_NAMES: &[&str] = &["C","C#","D","D#","E","F","F#","G","G#","A","A#","
 const KS_MAJOR: [f32; 12] = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88];
 const KS_MINOR: [f32; 12] = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
 
-/// Soft triad templates (root = index 0).
-/// Weights reflect perceptual salience: root > 5th > 3rd (harmonics taper off).
-const CHORD_MAJ_T: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.0];
-const CHORD_MIN_T: [f32; 12] = [1.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.0];
-
 /// Convert FFT half-spectrum → 12-bin chromagram (pitch-class energy sums).
+/// Feeds key detection (`detect_key`).
 ///
 /// Key improvements over the naive approach:
-/// - Frequency range 110 Hz–4186 Hz (A2–C8): covers chord fundamentals and
+/// - Frequency range 110 Hz–4186 Hz (A2–C8): covers note fundamentals and
 ///   their first few harmonics without being swamped by sub-bass or high noise.
 /// - Log-magnitude compression: `log2(1 + v*scale)` equalises the energy
 ///   contribution across octaves; without this, bass bins dominate.
 /// - Returns unnormalised values so callers can accumulate across multiple
-///   frames (energy-weighted) before normalising at match time.
+///   frames (energy-weighted) before normalising.
 fn compute_chroma(norms: &[f32], sr: u32, fft_size: usize) -> [f32; 12] {
     let mut chroma = [0.0f32; 12];
     let scale = fft_size as f32;
@@ -273,39 +270,6 @@ fn detect_key(chroma: &[f32; 12]) -> String {
         if mn > best_score { best_score = mn; best_name = format!("{} minor", NOTE_NAMES[root]); }
     }
     best_name
-}
-
-/// Match a chroma frame to the best major/minor triad.
-/// Returns 0–11 = C..B major, 12–23 = Cm..Bm, 255 = too quiet.
-/// L1-normalises on the stack — zero heap allocation.
-fn match_chord(chroma: &[f32; 12]) -> u8 {
-    let sum: f32 = chroma.iter().sum();
-    if sum < 1e-6 { return 255; }
-    let cn: [f32; 12] = std::array::from_fn(|i| chroma[i] / sum);
-    let mut best_score = -2.0f32;
-    let mut best = 255u8;
-    for root in 0..12usize {
-        let maj: [f32; 12] = std::array::from_fn(|i| CHORD_MAJ_T[(i + 12 - root) % 12]);
-        let min: [f32; 12] = std::array::from_fn(|i| CHORD_MIN_T[(i + 12 - root) % 12]);
-        let ms = cosine_sim(&cn, &maj);
-        let mn = cosine_sim(&cn, &min);
-        if ms > best_score { best_score = ms; best = root as u8; }
-        if mn > best_score { best_score = mn; best = (root + 12) as u8; }
-    }
-    best
-}
-
-/// Human-readable chord name. 255 = silence/unknown.
-pub fn chord_name(idx: u8) -> &'static str {
-    match idx {
-        0  => "C",    1  => "C#",   2  => "D",    3  => "D#",
-        4  => "E",    5  => "F",    6  => "F#",   7  => "G",
-        8  => "G#",   9  => "A",   10  => "A#",  11  => "B",
-        12 => "Cm",  13 => "C#m",  14 => "Dm",   15 => "D#m",
-        16 => "Em",  17 => "Fm",   18 => "F#m",  19 => "Gm",
-        20 => "G#m", 21 => "Am",   22 => "A#m",  23 => "Bm",
-        _  => "—",
-    }
 }
 
 /// Estimate BPM from a spectral-flux series (at `flux_rate` Hz) via autocorrelation.
@@ -396,8 +360,6 @@ pub struct TrackAnalysis {
     pub clip_positions: Vec<f32>,  // normalised 0..1 positions (capped at 500)
     pub bpm: f32,                  // estimated tempo (0 = undetermined)
     pub key_name: String,          // e.g. "A minor", "C# major"
-    pub chord_timeline: Vec<u8>,   // chord index per step (see chord_name()); 255 = silent
-    pub chord_step_secs: f32,      // seconds per chord step
     pub loudness_history: Vec<f32>,// per-second integrated LUFS
 }
 
@@ -1114,12 +1076,6 @@ fn preprocess_file(
     let chroma_win = make_window(CHROMA_FFT, &WindowFn::Hann);
     let mut fft_ring: Vec<f32> = Vec::with_capacity(CHROMA_FFT + CHROMA_HOP);
     let mut chroma_total = [0.0f32; 12];
-    let chord_hop_frames = ((1.5 * sample_rate as f32) / CHROMA_HOP as f32).ceil() as usize;
-    let chord_hop_frames = chord_hop_frames.max(1);
-    let chord_step_secs  = chord_hop_frames as f32 * CHROMA_HOP as f32 / sample_rate as f32;
-    let mut chord_acc    = [0.0f32; 12];
-    let mut chord_frame_count = 0usize;
-    let mut chord_timeline: Vec<u8> = Vec::new();
     let mut prev_fft_norms = vec![0.0f32; chroma_half];
     let mut flux_series: Vec<f32> = Vec::new();
     let flux_rate = sample_rate as f32 / CHROMA_HOP as f32;
@@ -1199,13 +1155,6 @@ fn preprocess_file(
             prev_fft_norms.copy_from_slice(&norms);
             let fc = compute_chroma(&norms, sample_rate, CHROMA_FFT);
             for (a, &b) in chroma_total.iter_mut().zip(&fc) { *a += b; }
-            for (a, &b) in chord_acc.iter_mut().zip(&fc) { *a += b; }
-            chord_frame_count += 1;
-            if chord_frame_count >= chord_hop_frames {
-                chord_timeline.push(match_chord(&chord_acc));
-                chord_acc = [0.0; 12];
-                chord_frame_count = 0;
-            }
             fft_ring.drain(..CHROMA_HOP);
         }
     }
@@ -1219,7 +1168,6 @@ fn preprocess_file(
         } else { -70.0 };
         loudness_history.push(lufs_s);
     }
-    if chord_frame_count > 0 { chord_timeline.push(match_chord(&chord_acc)); }
 
     let waveform: Vec<f32> = if chunks.is_empty() {
         vec![0.0; waveform_n_cols]
@@ -1256,7 +1204,7 @@ fn preprocess_file(
     let analysis = TrackAnalysis {
         integrated_lufs, dr_score, peak_dbfs: peak_db,
         clip_count, clip_positions, bpm, key_name,
-        chord_timeline, chord_step_secs, loudness_history,
+        loudness_history,
     };
 
     // ── Phase 2: process frames in parallel with rayon (50–99 %) ─────────────
@@ -1462,7 +1410,7 @@ impl Spectrogram {
     }
 
     /// Add one time-column from raw half-spectrum norms.
-    fn push_frame(&mut self, norms: &[f32], sr: u32, fft_size: usize, min_freq: f32, max_freq: f32) {
+    fn push_frame(&mut self, norms: &[f32], sr: u32, fft_size: usize, min_freq: f32, max_freq: f32, pal: &Palette) {
         let half  = norms.len();
         let scale = fft_size as f32;
         let log_min = min_freq.log10();
@@ -1474,7 +1422,7 @@ impl Spectrogram {
             let bin  = ((freq * fft_size as f32 / sr as f32) as usize).clamp(1, half - 1);
             let db   = 20.0 * (norms[bin] / scale).log10().max(-80.0);
             let v    = ((db + 80.0) / 80.0).clamp(0.0, 1.0);
-            self.pixels[row * SPEC_W + self.col_head] = heat_color(v);
+            self.pixels[row * SPEC_W + self.col_head] = pal.heat(v);
         }
         self.col_head = (self.col_head + 1) % SPEC_W;
         self.dirty = true;
@@ -1533,7 +1481,7 @@ fn octave_band_magnitudes(norms: &[f32], sr: u32, fft_size: usize) -> Vec<(f32, 
 
 fn draw_octave_bands(
     painter: &egui::Painter, bands: &[(f32, f32)],
-    plot_rect: Rect, sr: u32, min_freq: f32, max_freq: f32,
+    plot_rect: Rect, sr: u32, min_freq: f32, max_freq: f32, pal: &Palette,
 ) {
     if bands.is_empty() { return; }
     let nyquist  = sr as f32 / 2.0;
@@ -1558,7 +1506,7 @@ fn draw_octave_bands(
                 Pos2::new(x_lo + 1.0, plot_rect.bottom() - bar_h),
                 Pos2::new((x_hi - 1.0).max(x_lo + 2.0), plot_rect.bottom()),
             ),
-            0.0, bar_color(mag),
+            0.0, pal.bar(mag),
         );
 
         // Frequency label below the plot area
@@ -1717,46 +1665,133 @@ fn interp_sub_bin(norms: &[f32], center: f32, mode: &InterpolationMode) -> f32 {
     }
 }
 
-fn bar_color(t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.2 {
-        // silence → dark blue
-        let s = t / 0.2;
-        Color32::from_rgb(0, 0, (s * 140.0) as u8)
-    } else if t < 0.4 {
-        // dark blue → cyan
-        let s = (t - 0.2) / 0.2;
-        Color32::from_rgb(0, (s * 220.0) as u8, (140.0 + s * 115.0) as u8)
-    } else if t < 0.6 {
-        // cyan → yellow
-        let s = (t - 0.4) / 0.2;
-        Color32::from_rgb((s * 255.0) as u8, 220, (255.0 * (1.0 - s)) as u8)
-    } else if t < 0.8 {
-        // yellow → orange-red
-        let s = (t - 0.6) / 0.2;
-        Color32::from_rgb(255, (220.0 - s * 150.0) as u8, 0)
-    } else {
-        // orange-red → white-hot
-        let s = (t - 0.8) / 0.2;
-        Color32::from_rgb(255, (70.0 + s * 185.0) as u8, (s * 220.0) as u8)
+/// Colour ramp for the spectrum visualisers. `Classic` is the original rainbow
+/// heat map; the others are cohesive alternatives, and `Accent` follows the
+/// current track's album-art accent so the graph matches the surrounding chrome.
+/// Selectable (and persisted) from the app's Appearance menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum SpectrumPalette {
+    Classic,
+    Kugelblitz,
+    Ice,
+    Magma,
+    Aurora,
+    Mono,
+    Accent,
+}
+
+impl Default for SpectrumPalette {
+    fn default() -> Self { SpectrumPalette::Classic }
+}
+
+impl SpectrumPalette {
+    /// All variants, in menu order.
+    pub const ALL: [SpectrumPalette; 7] = [
+        SpectrumPalette::Classic,
+        SpectrumPalette::Kugelblitz,
+        SpectrumPalette::Ice,
+        SpectrumPalette::Magma,
+        SpectrumPalette::Aurora,
+        SpectrumPalette::Mono,
+        SpectrumPalette::Accent,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SpectrumPalette::Classic    => "Classic",
+            SpectrumPalette::Kugelblitz => "Kugelblitz",
+            SpectrumPalette::Ice        => "Ice",
+            SpectrumPalette::Magma      => "Magma",
+            SpectrumPalette::Aurora     => "Aurora",
+            SpectrumPalette::Mono       => "Mono",
+            SpectrumPalette::Accent     => "Album accent",
+        }
     }
 }
 
-fn heat_color(t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.25 {
-        let s = t / 0.25;
-        Color32::from_rgb(0, 0, (s * 180.0) as u8)
-    } else if t < 0.5 {
-        let s = (t - 0.25) / 0.25;
-        Color32::from_rgb(0, (s * 200.0) as u8, 180)
-    } else if t < 0.75 {
-        let s = (t - 0.5) / 0.25;
-        Color32::from_rgb((s * 255.0) as u8, 200, (180.0 * (1.0 - s)) as u8)
-    } else {
-        let s = (t - 0.75) / 0.25;
-        Color32::from_rgb(255, (200.0 + s * 55.0) as u8, (s * 80.0) as u8)
+/// A resolved palette: the chosen ramp plus the accent it may need (used only
+/// by `SpectrumPalette::Accent`). Small and `Copy`, so passed by value/ref freely.
+#[derive(Clone, Copy)]
+pub struct Palette {
+    pub kind:   SpectrumPalette,
+    pub accent: Color32,
+}
+
+impl Palette {
+    pub fn new(kind: SpectrumPalette, accent: Color32) -> Self { Self { kind, accent } }
+
+    /// Colour for a normalised bar / point magnitude (0–1).
+    pub fn bar(&self, t: f32) -> Color32 { self.sample(t) }
+    /// Colour for a spectrogram / waterfall cell (0–1).
+    pub fn heat(&self, t: f32) -> Color32 { self.sample(t) }
+    /// A representative "hot" colour, for line / filled outline styles.
+    pub fn line(&self) -> Color32 { self.sample(0.82) }
+
+    fn sample(&self, t: f32) -> Color32 {
+        let t = t.clamp(0.0, 1.0);
+        match self.kind {
+            SpectrumPalette::Classic => sample_stops(&[
+                (0.0, (0, 0, 0)), (0.2, (0, 0, 140)), (0.4, (0, 220, 255)),
+                (0.6, (255, 220, 0)), (0.8, (255, 70, 0)), (1.0, (255, 255, 220)),
+            ], t),
+            SpectrumPalette::Kugelblitz => sample_stops(&[
+                (0.0, (10, 12, 24)), (0.45, (60, 90, 200)),
+                (0.78, (148, 177, 255)), (1.0, (232, 240, 255)),
+            ], t),
+            SpectrumPalette::Ice => sample_stops(&[
+                (0.0, (2, 6, 20)), (0.35, (0, 70, 150)),
+                (0.7, (0, 190, 220)), (1.0, (224, 255, 255)),
+            ], t),
+            SpectrumPalette::Magma => sample_stops(&[
+                (0.0, (2, 0, 6)), (0.25, (70, 16, 96)), (0.5, (160, 44, 96)),
+                (0.75, (240, 110, 60)), (1.0, (255, 246, 200)),
+            ], t),
+            SpectrumPalette::Aurora => sample_stops(&[
+                (0.0, (2, 12, 10)), (0.35, (0, 96, 76)),
+                (0.66, (44, 200, 126)), (1.0, (204, 255, 190)),
+            ], t),
+            SpectrumPalette::Mono => sample_stops(&[
+                (0.0, (8, 8, 10)), (1.0, (240, 242, 248)),
+            ], t),
+            SpectrumPalette::Accent => {
+                let a = self.accent;
+                // A low tint of the accent (keeps a little hue out of the floor),
+                // the accent itself in the body, pushed toward white at the peak.
+                let lo = (a.r() / 6, a.g() / 6, (a.b() / 5).max(14));
+                let mid = (a.r(), a.g(), a.b());
+                let hi = (
+                    (a.r() as u16 + 170).min(255) as u8,
+                    (a.g() as u16 + 170).min(255) as u8,
+                    (a.b() as u16 + 170).min(255) as u8,
+                );
+                sample_stops(&[(0.0, (6, 7, 12)), (0.28, lo), (0.7, mid), (1.0, hi)], t)
+            }
+        }
     }
+}
+
+/// Linearly interpolate a colour from an ascending list of `(pos, rgb)` stops.
+fn sample_stops(stops: &[(f32, (u8, u8, u8))], t: f32) -> Color32 {
+    let rgb = |c: (u8, u8, u8)| Color32::from_rgb(c.0, c.1, c.2);
+    match stops.first() {
+        None => return Color32::BLACK,
+        Some(&(p0, c0)) if t <= p0 => return rgb(c0),
+        _ => {}
+    }
+    let &(pl, cl) = stops.last().unwrap();
+    if t >= pl { return rgb(cl); }
+    for w in stops.windows(2) {
+        let (p0, c0) = w[0];
+        let (p1, c1) = w[1];
+        if t >= p0 && t <= p1 {
+            let s = if (p1 - p0).abs() < 1e-6 { 0.0 } else { (t - p0) / (p1 - p0) };
+            let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * s).round() as u8;
+            return Color32::from_rgb(
+                lerp(c0.0, c1.0), lerp(c0.1, c1.1), lerp(c0.2, c1.2),
+            );
+        }
+    }
+    rgb(cl)
 }
 
 // ---------------------------------------------------------------------------
@@ -1851,7 +1886,7 @@ fn draw_eq_overlay(
     }
 }
 
-fn draw_bars(painter: &egui::Painter, mags: &[f32], rect: Rect, gap: f32) {
+fn draw_bars(painter: &egui::Painter, mags: &[f32], rect: Rect, gap: f32, pal: &Palette) {
     let n = mags.len();
     if n == 0 { return; }
     let ppp       = painter.ctx().pixels_per_point();
@@ -1884,7 +1919,7 @@ fn draw_bars(painter: &egui::Painter, mags: &[f32], rect: Rect, gap: f32) {
         let x1 = px1 as f32 / ppp;
         let y0 = rect.bottom() - h;
         let y1 = rect.bottom();
-        let c  = bar_color(v);
+        let c  = pal.bar(v);
         let base = mesh.vertices.len() as u32;
         mesh.colored_vertex(Pos2::new(x0, y0), c);  // top-left
         mesh.colored_vertex(Pos2::new(x1, y0), c);  // top-right
@@ -1965,11 +2000,12 @@ fn draw_line(painter: &egui::Painter, mags: &[f32], rect: Rect, color: Color32) 
     painter.add(Shape::line(points, Stroke::new(1.5, color)));
 }
 
-fn draw_filled(painter: &egui::Painter, mags: &[f32], rect: Rect) {
+fn draw_filled(painter: &egui::Painter, mags: &[f32], rect: Rect, pal: &Palette) {
     let n = mags.len();
     if n < 2 { return; }
-    let line_color = Color32::from_rgb(80, 210, 140);
-    let fill_color = Color32::from_rgba_unmultiplied(40, 160, 100, 110);
+    let line_color = pal.line();
+    let mid        = pal.bar(0.5);
+    let fill_color = Color32::from_rgba_unmultiplied(mid.r(), mid.g(), mid.b(), 110);
 
     // Build a quad mesh (two triangles per adjacent pair of spectrum points).
     // This correctly fills non-convex shapes; PathShape tessellation does not.
@@ -1990,7 +2026,7 @@ fn draw_filled(painter: &egui::Painter, mags: &[f32], rect: Rect) {
     draw_line(painter, mags, rect, line_color);
 }
 
-fn waterfall_to_color_image(waterfall: &[Vec<f32>]) -> Option<egui::ColorImage> {
+fn waterfall_to_color_image(waterfall: &[Vec<f32>], pal: &Palette) -> Option<egui::ColorImage> {
     let n = waterfall.first().map(|r| r.len()).unwrap_or(0);
     if n == 0 { return None; }
     let h = WATERFALL_ROWS;
@@ -2001,7 +2037,7 @@ fn waterfall_to_color_image(waterfall: &[Vec<f32>]) -> Option<egui::ColorImage> 
         let tex_row = h.saturating_sub(1 + row_idx);
         let cols = row.len().min(n);
         for col in 0..cols {
-            pixels[tex_row * n + col] = heat_color(row[col]);
+            pixels[tex_row * n + col] = pal.heat(row[col]);
         }
     }
     Some(egui::ColorImage { size: [n, h], pixels })
@@ -2151,9 +2187,6 @@ pub struct SpectrumWindow {
     waterfall_texture: Option<egui::TextureHandle>,
     octave_bands: Vec<(f32, f32)>,
     octave_smoothed: Vec<f32>,
-    pub show_chord: bool,
-    pub current_chord: String,
-    chroma_ema: [f32; 12],        // exponential moving average for live chord smoothing
     auto_fft_size: usize,         // last FFT size chosen automatically; 0 = user overrode it
     phasescope_frames: Vec<[f32; 2]>, // snapshot captured in tick() — no lock/clone in show()
     /// Last momentary-LUFS computation — throttled by wall clock (~15 Hz) so
@@ -2203,6 +2236,14 @@ pub struct SpectrumWindow {
     // ── Bit-perfect mode ───────────────────────────────────────────────────
     /// When true, EQ is not applied to audio — reflect that in the spectrum display.
     pub bit_perfect: bool,
+
+    // ── Appearance ─────────────────────────────────────────────────────────
+    /// Colour ramp for the visualisers. Set by the app each frame from the
+    /// persisted Appearance settings.
+    pub palette_kind:   SpectrumPalette,
+    /// Accent used by the `Accent` palette — the current track's album-art
+    /// tint. Set by the app each frame.
+    pub palette_accent: Color32,
 
     // ── Album art ──────────────────────────────────────────────────────────
     pub art_settings: ArtSettingsStore,
@@ -2261,9 +2302,6 @@ impl SpectrumWindow {
             track_analysis: None,
             momentary_lufs: f32::NEG_INFINITY,
             correlation: 1.0,
-            show_chord: false,
-            current_chord: String::new(),
-            chroma_ema: [0.0; 12],
             auto_fft_size: 0,
             phasescope_frames: Vec::new(),
             last_lufs_time: None,
@@ -2292,6 +2330,8 @@ impl SpectrumWindow {
             eq_save_new_open: false,
             eq_save_new_scope: PresetScope::Global,
             bit_perfect: false,
+            palette_kind: SpectrumPalette::Classic,
+            palette_accent: Color32::from_rgb(0x94, 0xb1, 0xff),
             art_settings: ArtSettingsStore::load(),
             current_art: None,
             peak_config: PeakHoldConfig::default(),
@@ -2477,8 +2517,6 @@ impl SpectrumWindow {
         self.track_analysis = None;
         self.momentary_lufs = f32::NEG_INFINITY;
         self.correlation = 1.0;
-        self.current_chord = String::new();
-        self.chroma_ema = [0.0; 12];
         self.needs_reanalysis = false;
         if let Ok(mut v) = self.stereo_buf.lock() { v.clear(); }
         // Always preprocess — needed for spectral ceiling even in real-time mode
@@ -2520,29 +2558,6 @@ impl SpectrumWindow {
             self.spectral_ceiling_attempted = true;
         }
 
-        // Current chord — only computed when the overlay is actually visible.
-        if self.show_chord {
-            if let Some(ref analysis) = self.track_analysis {
-                if !analysis.chord_timeline.is_empty() && analysis.chord_step_secs > 0.0 {
-                    let step = (elapsed_secs / analysis.chord_step_secs as f64) as usize;
-                    let step = step.min(analysis.chord_timeline.len().saturating_sub(1));
-                    self.current_chord = chord_name(analysis.chord_timeline[step]).to_string();
-                }
-            } else if self.mode == SpectrumMode::RealTime && !self.analyzer.last_fft_norms.is_empty() {
-                // Live path: EMA-smooth the chroma before matching to reduce jitter.
-                let fc = compute_chroma(
-                    &self.analyzer.last_fft_norms,
-                    self.analyzer.sample_rate,
-                    self.analyzer.fft_size * self.analyzer.pad_factor,
-                );
-                const ALPHA: f32 = 0.8;
-                for (e, &c) in self.chroma_ema.iter_mut().zip(&fc) {
-                    *e = *e * ALPHA + c * (1.0 - ALPHA);
-                }
-                self.current_chord = chord_name(match_chord(&self.chroma_ema)).to_string();
-            }
-        }
-
         if !is_playing { return; }
 
         // Throttle FFT runs to max_fps
@@ -2573,11 +2588,13 @@ impl SpectrumWindow {
                 // Real-time uses 2× padding (not pad_factor) — match here.
                 if !self.analyzer.last_fft_norms.is_empty() {
                     let eff_fft = self.analyzer.fft_size * 2;
+                    let pal = Palette::new(self.palette_kind, self.palette_accent);
                     self.spectrogram.push_frame(
                         &self.analyzer.last_fft_norms,
                         self.analyzer.sample_rate,
                         eff_fft,
                         self.min_freq, self.max_freq,
+                        &pal,
                     );
                     let raw = octave_band_magnitudes(
                         &self.analyzer.last_fft_norms,
@@ -2815,16 +2832,6 @@ impl SpectrumWindow {
                     ui.selectable_value(&mut self.loudness_mode, LoudnessMode::EqualLoudness, "ISO 226");
                     if self.loudness_mode != prev_loudness {
                         self.sync_params();
-                    }
-                    ui.separator();
-                    ui.label("Chord:");
-                    let chord_label = if self.show_chord {
-                        egui::RichText::new("On").color(Color32::from_rgb(120, 220, 160))
-                    } else {
-                        egui::RichText::new("Off").color(Color32::from_gray(120))
-                    };
-                    if ui.selectable_label(self.show_chord, chord_label).clicked() {
-                        self.show_chord = !self.show_chord;
                     }
                     ui.separator();
                     let eq_label = egui::RichText::new("🎛 EQ")
@@ -3931,6 +3938,7 @@ impl SpectrumWindow {
                         );
                     }
 
+                    let pal = Palette::new(self.palette_kind, self.palette_accent);
                     match self.style {
                         VizStyle::Bars => {
                             if has_art && matches!(art_cfg.spectrum_mode, ArtSpectrumMode::Mask) {
@@ -3941,10 +3949,10 @@ impl SpectrumWindow {
                                         &art_cfg.mask_mode, art_cfg.mask_brightness,
                                     );
                                 } else {
-                                    draw_bars(&painter, mags, plot_rect, self.bar_gap);
+                                    draw_bars(&painter, mags, plot_rect, self.bar_gap, &pal);
                                 }
                             } else {
-                                draw_bars(&painter, mags, plot_rect, self.bar_gap);
+                                draw_bars(&painter, mags, plot_rect, self.bar_gap, &pal);
                             }
                             if self.peak_config.enabled && !self.peak_vals.is_empty() {
                                 draw_peak_hold(
@@ -3953,12 +3961,11 @@ impl SpectrumWindow {
                                 );
                             }
                         }
-                        VizStyle::Line       => draw_line(&painter, mags, plot_rect,
-                                                 Color32::from_rgb(80, 200, 255)),
-                        VizStyle::FilledArea => draw_filled(&painter, mags, plot_rect),
+                        VizStyle::Line       => draw_line(&painter, mags, plot_rect, pal.line()),
+                        VizStyle::FilledArea => draw_filled(&painter, mags, plot_rect, &pal),
                         VizStyle::Waterfall  => {
                             if self.analyzer.waterfall_dirty {
-                                if let Some(img) = waterfall_to_color_image(&self.analyzer.waterfall) {
+                                if let Some(img) = waterfall_to_color_image(&self.analyzer.waterfall, &pal) {
                                     if let Some(ref mut th) = self.waterfall_texture {
                                         th.set(img, egui::TextureOptions::NEAREST);
                                     } else {
@@ -4010,7 +4017,7 @@ impl SpectrumWindow {
                         VizStyle::OctaveBands => {
                             draw_octave_bands(
                                 &painter, &self.octave_bands, plot_rect,
-                                self.analyzer.sample_rate, self.min_freq, self.max_freq,
+                                self.analyzer.sample_rate, self.min_freq, self.max_freq, &pal,
                             );
                         }
                         VizStyle::Phasescope => {
@@ -4153,7 +4160,6 @@ impl SpectrumWindow {
                             format!("LUFS:        {:.2}", self.momentary_lufs),
                             format!("Correlation: {:.3}", self.correlation),
                             format!("FFT norms:   {} bins", self.analyzer.last_fft_norms.len()),
-                            format!("Chord:       {} (show={})", self.current_chord, self.show_chord),
                         ];
                         let x = rect.left() + 8.0;
                         let mut y = rect.top() + 20.0;
@@ -4175,26 +4181,6 @@ impl SpectrumWindow {
                         }
                     }
 
-                    // Chord overlay
-                    if self.show_chord && !self.current_chord.is_empty() {
-                        let cx = rect.center().x;
-                        let cy = rect.bottom() - 20.0;
-                        // Shadow
-                        painter.text(
-                            Pos2::new(cx + 1.0, cy + 1.0),
-                            egui::Align2::CENTER_CENTER,
-                            &self.current_chord,
-                            egui::FontId::proportional(38.0),
-                            Color32::from_rgba_unmultiplied(0, 0, 0, 180),
-                        );
-                        painter.text(
-                            Pos2::new(cx, cy),
-                            egui::Align2::CENTER_CENTER,
-                            &self.current_chord,
-                            egui::FontId::proportional(38.0),
-                            Color32::from_rgba_unmultiplied(255, 240, 120, 230),
-                        );
-                    }
                 }
             });
         });

@@ -1,4 +1,5 @@
 mod bitperfect;
+mod media_controls;
 mod spectrum;
 
 use eframe::egui;
@@ -15,6 +16,34 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// The single source of colour truth, all derived from the app's identity:
+/// the icon's Eigengrau base (#16161d) and Kugelblitz accent (#94b1ff). Every
+/// widget-level surface comes from `apply_theme`; these are the handful of
+/// custom-painted spots (seek bar, playlist rows, status text) that paint
+/// outside egui's widget system and so need explicit colours.
+mod pal {
+    use egui::Color32;
+
+    /// Kugelblitz — the brand accent (a perfectly flat spectrum's blue).
+    pub const ACCENT: Color32 = Color32::from_rgb(0x94, 0xb1, 0xff);
+
+    // Playlist rows — blue-tinted neutrals that sit in the panel ramp, plus
+    // accent-tinted states so the current/selected track reads as "lit".
+    pub const ROW_EVEN: Color32 = Color32::from_rgb(0x1b, 0x1c, 0x25);
+    pub const ROW_ODD: Color32 = Color32::from_rgb(0x16, 0x17, 0x1f);
+    pub const ROW_CURRENT: Color32 = Color32::from_rgb(0x27, 0x31, 0x4e);
+    pub const ROW_SELECTED: Color32 = Color32::from_rgb(0x30, 0x40, 0x66);
+
+    // Seek bar.
+    pub const TRACK_BG: Color32 = Color32::from_rgb(0x2a, 0x2d, 0x3a);
+    pub const WAVE_UNPLAYED: Color32 = Color32::from_rgb(0x39, 0x3d, 0x4d);
+
+    // Semantic (kept distinct from the accent on purpose).
+    pub const WARN: Color32 = Color32::from_rgb(0xe0, 0x6c, 0x5c);
+    pub const AMBER: Color32 = Color32::from_rgb(0xd9, 0xa8, 0x5c);
+    pub const MUTED: Color32 = Color32::from_gray(0x78);
+}
 
 fn setup_fonts(ctx: &egui::Context) {
     // Each entry: (font key, candidate paths in priority order).
@@ -73,6 +102,72 @@ fn setup_fonts(ctx: &egui::Context) {
     }
 }
 
+/// A cohesive dark theme built from the app's own identity colors: the icon's
+/// **Eigengrau** (#16161d) background and **Kugelblitz** (#94b1ff) accent. Softer
+/// brand-tinted surfaces, gently rounded corners, and accent-coloured selection
+/// and hover — a calmer look than egui's flat default grey.
+fn apply_theme(ctx: &egui::Context) {
+    use egui::{Color32, CornerRadius, Stroke};
+
+    let accent = pal::ACCENT; // Kugelblitz
+
+    // A short ramp of blue-tinted neutrals from the Eigengrau base upward.
+    let bg0 = Color32::from_rgb(0x14, 0x15, 0x1c); // deepest (text fields, wells)
+    let bg1 = Color32::from_rgb(0x18, 0x19, 0x21); // panels
+    let bg2 = Color32::from_rgb(0x1e, 0x20, 0x2a); // windows / surfaces
+    let bg3 = Color32::from_rgb(0x25, 0x27, 0x33); // resting widgets
+    let bg4 = Color32::from_rgb(0x30, 0x33, 0x43); // hovered widgets
+    let bg5 = Color32::from_rgb(0x3a, 0x3e, 0x52); // pressed widgets
+    let line = Color32::from_rgb(0x2a, 0x2c, 0x39); // hairline separators
+
+    let mut style = (*ctx.style()).clone();
+    let v = &mut style.visuals;
+    v.dark_mode = true;
+
+    v.panel_fill = bg1;
+    v.window_fill = bg2;
+    v.extreme_bg_color = bg0;
+    v.faint_bg_color = Color32::from_rgb(0x1c, 0x1d, 0x26);
+    v.window_stroke = Stroke::new(1.0, line);
+    v.window_corner_radius = CornerRadius::same(9);
+    v.menu_corner_radius = CornerRadius::same(7);
+
+    // Selection + hyperlinks carry the accent.
+    v.selection.bg_fill = accent.gamma_multiply(0.30);
+    v.selection.stroke = Stroke::new(1.0, accent);
+    v.hyperlink_color = accent;
+
+    let r = CornerRadius::same(6);
+    let w = &mut v.widgets;
+    w.noninteractive.corner_radius = r;
+    w.noninteractive.bg_fill = bg2;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, line);
+
+    w.inactive.corner_radius = r;
+    w.inactive.bg_fill = bg3;
+    w.inactive.weak_bg_fill = bg3;
+    w.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x2f, 0x31, 0x3f));
+
+    w.hovered.corner_radius = r;
+    w.hovered.bg_fill = bg4;
+    w.hovered.weak_bg_fill = bg4;
+    w.hovered.bg_stroke = Stroke::new(1.0, accent.gamma_multiply(0.55));
+
+    w.active.corner_radius = r;
+    w.active.bg_fill = bg5;
+    w.active.weak_bg_fill = bg5;
+    w.active.bg_stroke = Stroke::new(1.0, accent);
+
+    w.open.corner_radius = r;
+    w.open.bg_fill = bg3;
+
+    // A touch more breathing room, without disturbing the compact layout.
+    style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+    style.spacing.button_padding = egui::vec2(7.0, 3.0);
+
+    ctx.set_style(style);
+}
+
 /// Raise the Windows system timer resolution to 1 ms. The default (~15.6 ms)
 /// would clamp the frame limiter's `thread::sleep` to ~64 fps; 1 ms keeps it
 /// accurate up to high-refresh rates. Windows restores the default on process
@@ -84,8 +179,64 @@ fn raise_timer_resolution() {
 #[cfg(not(windows))]
 fn raise_timer_resolution() {}
 
+/// The primary monitor's current refresh rate in Hz, if it can be determined.
+/// Used to default the spectrum window's Max FPS so the animation runs as
+/// smoothly as the display allows without the user having to bump it manually.
+#[cfg(windows)]
+fn monitor_refresh_hz() -> Option<f32> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
+    };
+    unsafe {
+        let mut dm: DEVMODEW = std::mem::zeroed();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm) != 0 {
+            let hz = dm.dmDisplayFrequency;
+            // 0 or 1 mean "hardware default / unspecified" per the Win32 docs.
+            if hz > 1 {
+                return Some(hz as f32);
+            }
+        }
+    }
+    None
+}
+#[cfg(not(windows))]
+fn monitor_refresh_hz() -> Option<f32> { None }
+
+/// Record panics to `~/.moosik/crash.log` (and still print to stderr). The
+/// release profile uses `panic = "abort"`, so a panic on *any* thread (decode,
+/// output, seek worker) takes the whole process down with no visible stack —
+/// this leaves a durable breadcrumb of the message, location, and thread so a
+/// "crash" can be diagnosed from evidence instead of guessed at.
+fn install_crash_logger() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "?".into());
+        let msg = info.payload().downcast_ref::<&str>().map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".into());
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let dir = moosik_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true).open(dir.join("crash.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "[{secs}] panic on '{thread}' at {loc}: {msg}");
+        }
+        default(info); // keep the normal stderr output
+    }));
+}
+
 fn main() -> eframe::Result {
     raise_timer_resolution();
+    install_crash_logger();
     let icon = eframe::icon_data::from_png_bytes(
         include_bytes!("../assets/icon.png")
     ).expect("invalid icon PNG");
@@ -125,6 +276,11 @@ struct Track {
     bit_depth: Option<u8>,
     bitrate: Option<u32>,   // avg kbps
     file_size: u64,
+    // ReplayGain tags (dB gain, linear peak), if present in the file.
+    rg_track_gain: Option<f32>,
+    rg_album_gain: Option<f32>,
+    rg_track_peak: Option<f32>,
+    rg_album_peak: Option<f32>,
 }
 
 impl Track {
@@ -138,6 +294,8 @@ impl Track {
             sample_rate: m.sample_rate, channels: m.channels,
             bit_depth: m.bit_depth, bitrate: m.bitrate,
             file_size: m.file_size,
+            rg_track_gain: m.rg_track_gain, rg_album_gain: m.rg_album_gain,
+            rg_track_peak: m.rg_track_peak, rg_album_peak: m.rg_album_peak,
         }
     }
 
@@ -151,6 +309,18 @@ struct TrackMeta {
     sample_rate: Option<u32>, channels: Option<u8>,
     bit_depth: Option<u8>, bitrate: Option<u32>,
     file_size: u64,
+    rg_track_gain: Option<f32>, rg_album_gain: Option<f32>,
+    rg_track_peak: Option<f32>, rg_album_peak: Option<f32>,
+}
+
+/// Parse a ReplayGain gain string ("-7.30 dB", "+2.4", …) to dB.
+fn parse_rg_gain(s: &str) -> Option<f32> {
+    s.trim().trim_end_matches("dB").trim_end_matches("DB").trim().parse::<f32>().ok()
+}
+
+/// Parse a ReplayGain peak string (linear sample peak, e.g. "0.988553").
+fn parse_rg_peak(s: &str) -> Option<f32> {
+    s.trim().parse::<f32>().ok().filter(|p| *p > 0.0)
 }
 
 fn read_metadata(path: &PathBuf) -> TrackMeta {
@@ -189,8 +359,25 @@ fn read_metadata(path: &PathBuf) -> TrackMeta {
         (None, None, None, None, None)
     };
 
+    // ReplayGain tags (Vorbis comment / ID3 TXXX / iTunes atoms — lofty
+    // normalises them all to these ItemKeys).
+    let (rg_track_gain, rg_album_gain, rg_track_peak, rg_album_peak) = tagged
+        .as_ref()
+        .and_then(|t| t.primary_tag().or_else(|| t.first_tag()))
+        .map(|tag| {
+            use lofty::tag::ItemKey;
+            (
+                tag.get_string(&ItemKey::ReplayGainTrackGain).and_then(parse_rg_gain),
+                tag.get_string(&ItemKey::ReplayGainAlbumGain).and_then(parse_rg_gain),
+                tag.get_string(&ItemKey::ReplayGainTrackPeak).and_then(parse_rg_peak),
+                tag.get_string(&ItemKey::ReplayGainAlbumPeak).and_then(parse_rg_peak),
+            )
+        })
+        .unwrap_or((None, None, None, None));
+
     TrackMeta { title, artist, album, year, genre, track_number,
-                duration, sample_rate, channels, bit_depth, bitrate, file_size }
+                duration, sample_rate, channels, bit_depth, bitrate, file_size,
+                rg_track_gain, rg_album_gain, rg_track_peak, rg_album_peak }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +422,14 @@ fn fmt_size(bytes: u64) -> String {
 // Playback engine (wraps rodio Sink)
 // ---------------------------------------------------------------------------
 
+/// A rodio slow-path seek (FLAC decode-and-discard) running on a background
+/// thread, so the UI never blocks while millions of samples are skipped.
+struct PendingSeek {
+    rx: std::sync::mpsc::Receiver<Option<Decoder<BufReader<File>>>>,
+    target: Duration,
+    was_paused: bool,
+}
+
 struct Engine {
     // ── rodio path (normal mode) ───────────────────────────────────────────
     _stream: OutputStream,
@@ -245,8 +440,14 @@ struct Engine {
     pub bit_perfect: bool,
     /// Selected bit-perfect output device name; None = system default.
     pub bp_device: Option<String>,
-    /// Position of the start of the current bit-perfect session.
+    /// Position within the current track corresponding to `bp_played_at_track_start`
+    /// frames played — i.e. the seek offset the current track started at (0 after
+    /// a gapless roll-over, or the seek target on the first track of a session).
     bp_base: Duration,
+    /// Value of `bp.played()` at which the current track began, so per-track
+    /// position can be derived from the session-cumulative frame counter across
+    /// gapless hand-offs.
+    bp_played_at_track_start: Duration,
     // ── shared ─────────────────────────────────────────────────────────────
     // We track position manually because rodio Sink doesn't expose elapsed time
     started_at: Option<Instant>,
@@ -257,6 +458,17 @@ struct Engine {
     stereo_buf: StereoBuf,
     pub last_sample_rate: u32,
     eq: Option<EqStateHandle>,
+    /// ReplayGain factor (linear) applied on the rodio path only; 1.0 = off.
+    /// Never applied on the bit-perfect path (a gain multiply breaks bit-perfect).
+    replay_gain: f32,
+    /// In-flight background seek (rodio slow path); None when idle.
+    pending_seek: Option<PendingSeek>,
+    /// Set once a bit-perfect stream has grabbed the output device. On Windows,
+    /// WASAPI exclusive mode suspends the long-lived rodio (shared-mode)
+    /// OutputStream and cpal doesn't recover it when exclusive mode is released
+    /// — so the stream is recreated before the next normal-mode sink, else the
+    /// rodio path is silent forever after bit-perfect has run once.
+    rodio_stream_dirty: bool,
 }
 
 impl Engine {
@@ -270,6 +482,7 @@ impl Engine {
             bit_perfect: false,
             bp_device: None,
             bp_base: Duration::ZERO,
+            bp_played_at_track_start: Duration::ZERO,
             started_at: None,
             paused_elapsed: Duration::ZERO,
             current_duration: None,
@@ -278,20 +491,39 @@ impl Engine {
             stereo_buf,
             last_sample_rate: 44_100,
             eq: None,
+            replay_gain: 1.0,
+            pending_seek: None,
+            rodio_stream_dirty: false,
         })
     }
+
+    /// Recreate the rodio output stream if a bit-perfect (exclusive) stream may
+    /// have invalidated it. No-op unless flagged, so normal playback pays
+    /// nothing. Must be called before building any normal-mode sink.
+    fn ensure_rodio_stream(&mut self) {
+        if !self.rodio_stream_dirty { return; }
+        if let Ok((stream, handle)) = OutputStream::try_default() {
+            self._stream = stream;
+            self.stream_handle = handle;
+        }
+        self.rodio_stream_dirty = false;
+    }
+
+    /// Effective rodio sink volume: user volume × ReplayGain.
+    fn rodio_volume(&self) -> f32 { self.volume * self.replay_gain }
 
     fn play_file(&mut self, path: &PathBuf, duration: Option<Duration>) -> Result<(), String> {
         self.stop();
         if self.bit_perfect {
             self.start_bp(path, Duration::ZERO)?;
         } else {
+            self.ensure_rodio_stream();
             let file = File::open(path).map_err(|e| format!("Open failed: {e}"))?;
             let decoder = Decoder::new(BufReader::new(file))
                 .map_err(|e| format!("Decode failed: {e}"))?;
             let sink = Sink::try_new(&self.stream_handle)
                 .map_err(|e| format!("Sink failed: {e}"))?;
-            sink.set_volume(self.volume);
+            sink.set_volume(self.rodio_volume());
             self.last_sample_rate = decoder.sample_rate();
             let tapped = SpectrumSource::new(decoder, self.sample_buf.clone(), self.stereo_buf.clone());
             if let Some(ref eq) = self.eq {
@@ -334,7 +566,37 @@ impl Engine {
         bp.resume();
         bp.start(prep, self.volume);
         self.bp_base = start;
+        self.bp_played_at_track_start = Duration::ZERO; // fresh session: frames_played reset to 0
+        self.rodio_stream_dirty = true; // exclusive mode may kill the rodio stream
         Ok(())
+    }
+
+    /// Queue `path` for gapless continuation on the open bit-perfect stream.
+    /// Returns false (no gapless) if there is no stream, the file can't be
+    /// prepared, or its rate/channels differ from the stream (a format change
+    /// forces a device re-open, so the track boundary can't be gapless).
+    fn bp_queue_next(&self, path: &Path) -> bool {
+        let Some(bp) = self.bp.as_ref() else { return false };
+        let Ok(prep) = bitperfect::prepare(path, Duration::ZERO) else { return false };
+        if prep.sample_rate != bp.sample_rate || prep.channels != bp.channels { return false; }
+        bp.queue_next(prep);
+        true
+    }
+
+    /// Drop a queued gapless track that hasn't started yet.
+    fn bp_clear_next(&self) {
+        if let Some(bp) = self.bp.as_ref() { bp.clear_next(); }
+    }
+
+    /// If the bit-perfect device has crossed a gapless track boundary, advance
+    /// the per-track position base and report it (true). Call in a loop.
+    fn bp_poll_boundary(&mut self) -> bool {
+        let Some(boundary) = self.bp.as_ref().and_then(|bp| bp.take_reached_boundary()) else {
+            return false;
+        };
+        self.bp_played_at_track_start = boundary;
+        self.bp_base = Duration::ZERO; // the new track starts from its beginning
+        true
     }
 
     /// One-line description of the active bit-perfect stream for the UI.
@@ -348,6 +610,9 @@ impl Engine {
     }
 
     fn pause(&mut self) {
+        // A seek may still be decoding on the worker; remember the intent so it
+        // resumes paused.
+        if let Some(ps) = self.pending_seek.as_mut() { ps.was_paused = true; }
         if self.bit_perfect {
             if let Some(ref bp) = self.bp
                 && !bp.is_paused() {
@@ -366,6 +631,7 @@ impl Engine {
     }
 
     fn resume(&mut self) {
+        if let Some(ps) = self.pending_seek.as_mut() { ps.was_paused = false; }
         if self.bit_perfect {
             if let Some(ref bp) = self.bp
                 && bp.is_paused() {
@@ -380,6 +646,7 @@ impl Engine {
     }
 
     fn stop(&mut self) {
+        self.pending_seek = None; // abandon any in-flight background seek
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
@@ -400,8 +667,9 @@ impl Engine {
 
     fn elapsed(&self) -> Duration {
         if self.bit_perfect && let Some(ref bp) = self.bp {
-            // Sample-accurate: frames actually delivered to the device.
-            return self.bp_base + bp.played();
+            // Sample-accurate: frames delivered to the device, less the frames
+            // that belonged to earlier gapless tracks in this session.
+            return self.bp_base + bp.played().saturating_sub(self.bp_played_at_track_start);
         }
         let running = self.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
         self.paused_elapsed + running
@@ -410,9 +678,44 @@ impl Engine {
     fn set_volume(&mut self, vol: f32) {
         self.volume = vol;
         if let Some(ref sink) = self.sink {
-            sink.set_volume(vol);
+            sink.set_volume(self.rodio_volume());
         }
+        // Bit-perfect path gets the raw user volume — never ReplayGain.
         if let Some(ref bp) = self.bp { bp.set_volume(vol); }
+    }
+
+    /// Set the ReplayGain factor (linear) and apply it live to the rodio sink.
+    fn set_replay_gain(&mut self, gain: f32) {
+        self.replay_gain = gain;
+        if let Some(ref sink) = self.sink {
+            sink.set_volume(self.rodio_volume());
+        }
+    }
+
+    /// Append `path` to the current rodio sink for gapless continuation — rodio
+    /// plays queued sources back-to-back with no gap. Decoding is lazy, but the
+    /// decoder is opened here so the hand-off never underruns.
+    fn append_next(&self, path: &Path) -> Result<(), String> {
+        let sink = self.sink.as_ref().ok_or("no sink")?;
+        let file = File::open(path).map_err(|e| format!("Open failed: {e}"))?;
+        let decoder = Decoder::new(BufReader::new(file))
+            .map_err(|e| format!("Decode failed: {e}"))?;
+        let tapped = SpectrumSource::new(decoder, self.sample_buf.clone(), self.stereo_buf.clone());
+        if let Some(ref eq) = self.eq {
+            sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+        } else {
+            sink.append(tapped);
+        }
+        Ok(())
+    }
+
+    /// Roll the normal-mode (wall-clock) position onto the next gapless track:
+    /// carry any overflow past the old duration into the new track's elapsed.
+    fn roll_normal_position(&mut self, next_duration: Option<Duration>) {
+        let over = self.elapsed().saturating_sub(self.current_duration.unwrap_or(Duration::ZERO));
+        self.paused_elapsed = over;
+        self.started_at = Some(Instant::now());
+        self.current_duration = next_duration;
     }
 
     /// Seek to `target`.
@@ -426,7 +729,7 @@ impl Engine {
     /// Normal mode, fallback path: stop sink, reopen file, consume N samples to
     /// reach `target`.  Handles FLAC, where symphonia 0.5.5 returns `Unseekable`
     /// because rodio's `ReadSeekSource::byte_len()` always returns `None`.
-    fn seek_to(&mut self, path: &PathBuf, target: Duration) {
+    fn seek_to(&mut self, path: &Path, target: Duration) {
         if self.bit_perfect {
             let was_paused = self.bp.as_ref().map(|bp| bp.is_paused()).unwrap_or(false);
             if let Err(e) = self.start_bp(path, target) {
@@ -459,40 +762,103 @@ impl Engine {
             return;
         }
 
-        // --- Slow path: reopen + skip samples ---
+        // --- Slow path: reopen + skip samples, ON A BACKGROUND THREAD ---
+        // FLAC seeks decode-and-discard every sample up to `target`; deep into a
+        // hi-res file that is tens of millions of samples. Doing it here would
+        // freeze the UI for seconds ("not responding"), so we hand it to a
+        // worker and install the resulting decoder when it's ready (poll_pending_seek).
         if let Some(sink) = self.sink.take() { sink.stop(); }
+        let rx = Self::spawn_seek_worker(path, target); // drops any prior receiver
 
-        let file = match File::open(path) { Ok(f) => f, Err(e) => { eprintln!("seek reopen: {e}"); return; } };
-        let decoder = match Decoder::new(BufReader::new(file)) { Ok(d) => d, Err(e) => { eprintln!("seek decode: {e}"); return; } };
-
-        let sr = decoder.sample_rate();
-        let ch = decoder.channels() as u64;
-        let samples_to_skip = (target.as_secs_f64() * sr as f64 * ch as f64) as u64;
-
-        // Consume samples up to the target. Each `next()` call decodes one sample;
-        // FLAC decodes frames lazily so this runs well above real-time even in debug.
-        let mut decoder = decoder;
-        let mut consumed = 0u64;
-        while consumed < samples_to_skip {
-            if decoder.next().is_none() { break; }
-            consumed += 1;
-        }
-
-        let sink = match Sink::try_new(&self.stream_handle) { Ok(s) => s, Err(_) => return };
-        sink.set_volume(self.volume);
-        let tapped = SpectrumSource::new(decoder, self.sample_buf.clone(), self.stereo_buf.clone());
-        if let Some(ref eq) = self.eq {
-            sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
-        } else {
-            sink.append(tapped);
-        }
-
-        if was_paused { sink.pause(); self.started_at = None; }
-        else { self.started_at = Some(Instant::now()); }
+        // Reflect the target position immediately; time is frozen until the
+        // seek lands (started_at = None), and is_finished() returns false while
+        // a seek is pending, so no spurious auto-advance.
+        self.pending_seek = Some(PendingSeek { rx, target, was_paused });
         self.paused_elapsed = target;
-        self.sink = Some(sink);
-        // Grace period: suppress is_finished() for 500 ms so the audio thread has
-        // time to pick up the source before we auto-advance.
+        self.started_at = None;
+    }
+
+    /// Spawn the background decode-and-skip worker for a normal-mode seek to
+    /// `target`: open the file, build a rodio decoder, discard samples up to
+    /// `target`, and hand the positioned decoder back over the channel. Every
+    /// bit of decode cost lives on this thread, never the UI thread.
+    fn spawn_seek_worker(
+        path: &Path,
+        target: Duration,
+    ) -> std::sync::mpsc::Receiver<Option<Decoder<BufReader<File>>>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path_c = path.to_path_buf();
+        std::thread::Builder::new()
+            .name("rodio-seek".into())
+            .spawn(move || {
+                let seeked = (|| -> Option<Decoder<BufReader<File>>> {
+                    let file = File::open(&path_c).ok()?;
+                    let mut decoder = Decoder::new(BufReader::new(file)).ok()?;
+                    let sr = decoder.sample_rate() as f64;
+                    let ch = decoder.channels() as f64;
+                    let skip = (target.as_secs_f64() * sr * ch) as u64;
+                    let mut n = 0u64;
+                    while n < skip {
+                        if decoder.next().is_none() { break; }
+                        n += 1;
+                    }
+                    Some(decoder)
+                })();
+                let _ = tx.send(seeked);
+            })
+            .ok();
+        rx
+    }
+
+    /// Begin normal-mode playback of `path` positioned at `target`, doing the
+    /// open + decode-skip entirely on the worker thread (poll_pending_seek
+    /// installs the sink when it lands). No audio is emitted from position 0 and
+    /// the UI never blocks — used by the bit-perfect toggle-off restart, where
+    /// `target` can be deep into a hi-res file.
+    fn play_seeked_async(
+        &mut self,
+        path: &Path,
+        target: Duration,
+        duration: Option<Duration>,
+        was_paused: bool,
+    ) {
+        self.stop(); // release any bp stream/session and supersede a pending seek
+        self.current_duration = duration;
+        let rx = Self::spawn_seek_worker(path, target);
+        self.pending_seek = Some(PendingSeek { rx, target, was_paused });
+        self.paused_elapsed = target;
+        self.started_at = None;
+    }
+
+    /// True while a background seek is decoding — the UI must keep ticking so
+    /// poll_pending_seek() runs and installs the result.
+    fn is_seeking(&self) -> bool { self.pending_seek.is_some() }
+
+    /// Poll the background rodio seek; when the seeked decoder arrives, wire it
+    /// into a fresh sink. Cheap — call every frame.
+    fn poll_pending_seek(&mut self) {
+        let Some(ps) = self.pending_seek.as_ref() else { return };
+        match ps.rx.try_recv() {
+            Ok(Some(decoder)) => {
+                let PendingSeek { target, was_paused, .. } = self.pending_seek.take().unwrap();
+                self.ensure_rodio_stream();
+                let Ok(sink) = Sink::try_new(&self.stream_handle) else { return };
+                sink.set_volume(self.rodio_volume());
+                let tapped = SpectrumSource::new(decoder, self.sample_buf.clone(), self.stereo_buf.clone());
+                if let Some(ref eq) = self.eq {
+                    sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+                } else {
+                    sink.append(tapped);
+                }
+                if was_paused { sink.pause(); self.started_at = None; }
+                else { self.started_at = Some(Instant::now()); }
+                self.paused_elapsed = target;
+                self.sink = Some(sink);
+            }
+            Ok(None) => self.pending_seek = None,                         // seek failed
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}               // still working
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending_seek = None,
+        }
     }
 }
 
@@ -505,6 +871,105 @@ enum PlayState { Stopped, Playing, Paused }
 
 #[derive(PartialEq, Clone, Copy)]
 enum LoopMode { Sequential, RepeatAll, RepeatOne }
+
+// ---------------------------------------------------------------------------
+// ReplayGain (loudness normalization) — rodio path only; bypassed in
+// bit-perfect mode, since any gain multiply breaks bit-perfectness.
+// ---------------------------------------------------------------------------
+
+/// ReplayGain 2.0 reference loudness. Used as the target when normalising
+/// from Moosik's own measured LUFS (for files without ReplayGain tags).
+const RG_TARGET_LUFS: f32 = -18.0;
+
+#[derive(PartialEq, Clone, Copy, Serialize, Deserialize, Default)]
+enum RgMode {
+    #[default]
+    Off,
+    Track,
+    Album,
+}
+
+impl RgMode {
+    fn label(self) -> &'static str {
+        match self { RgMode::Off => "Off", RgMode::Track => "Track", RgMode::Album => "Album" }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct RgSettings {
+    mode: RgMode,
+    /// Cap gain by the track's peak so a boost can't clip.
+    prevent_clip: bool,
+}
+
+impl Default for RgSettings {
+    fn default() -> Self { Self { mode: RgMode::Off, prevent_clip: true } }
+}
+
+fn load_rg_settings(dir: &Path) -> RgSettings {
+    std::fs::read_to_string(dir.join("replaygain.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_rg_settings(dir: &Path, s: &RgSettings) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(json) = serde_json::to_string(s) {
+        let _ = std::fs::write(dir.join("replaygain.json"), json);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Appearance — optional, persisted visual preferences
+// ---------------------------------------------------------------------------
+
+fn default_ui_scale() -> f32 { 1.0 }
+fn default_true() -> bool { true }
+
+/// User-configurable look-and-feel. Every field is optional to change and has a
+/// default matching the app's original appearance, so an absent or partial
+/// settings file (or a fresh install) reproduces the shipped defaults exactly.
+#[derive(Serialize, Deserialize, Clone)]
+struct Appearance {
+    /// Colour ramp for the spectrum visualisers.
+    #[serde(default)] spectrum_palette: spectrum::SpectrumPalette,
+    /// Global UI / text scale (egui zoom factor). 1.0 = 100%.
+    #[serde(default = "default_ui_scale")] ui_scale: f32,
+    /// Tint the chrome (now-playing, seek fill, current row) with the accent
+    /// pulled from the current track's cover art. When off, the fixed brand
+    /// accent is used everywhere.
+    #[serde(default = "default_true")] art_accent: bool,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            spectrum_palette: spectrum::SpectrumPalette::default(),
+            ui_scale: 1.0,
+            art_accent: true,
+        }
+    }
+}
+
+/// UI-scale bounds — matches egui's own zoom range and keeps text legible.
+const UI_SCALE_MIN: f32 = 0.7;
+const UI_SCALE_MAX: f32 = 1.6;
+
+fn load_appearance(dir: &Path) -> Appearance {
+    std::fs::read_to_string(dir.join("appearance.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Appearance>(&s).ok())
+        .map(|mut a| { a.ui_scale = a.ui_scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX); a })
+        .unwrap_or_default()
+}
+
+fn save_appearance(dir: &Path, a: &Appearance) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(json) = serde_json::to_string_pretty(a) {
+        let _ = std::fs::write(dir.join("appearance.json"), json);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Album art helpers
@@ -540,8 +1005,9 @@ fn fit_rect_preserve(container: egui::Rect, art_w: u32, art_h: u32) -> egui::Rec
 enum ArtEntry {
     /// No embedded art found in this file.
     NoArt,
-    /// Art decoded and uploaded to the GPU.
-    Loaded { texture: egui::TextureHandle, width: u32, height: u32 },
+    /// Art decoded and uploaded to the GPU, plus a per-track UI accent derived
+    /// from the cover (already blended toward the brand accent).
+    Loaded { texture: egui::TextureHandle, width: u32, height: u32, accent: Color32 },
 }
 
 struct ArtCache {
@@ -561,14 +1027,23 @@ impl ArtCache {
     ) -> Option<(egui::TextureId, u32, u32)> {
         if !self.entries.contains_key(path) {
             let entry = match Self::load_from_file(path, ctx) {
-                Some((tex, w, h)) => ArtEntry::Loaded { texture: tex, width: w, height: h },
-                None              => ArtEntry::NoArt,
+                Some((tex, w, h, accent)) => ArtEntry::Loaded { texture: tex, width: w, height: h, accent },
+                None                      => ArtEntry::NoArt,
             };
             self.entries.insert(path.to_path_buf(), entry);
         }
         match self.entries.get(path)? {
-            ArtEntry::Loaded { texture, width, height } =>
+            ArtEntry::Loaded { texture, width, height, .. } =>
                 Some((texture.id(), *width, *height)),
+            ArtEntry::NoArt => None,
+        }
+    }
+
+    /// The per-track UI accent derived from the cover art (a tint of the brand
+    /// accent), or `None` if the track has no art or isn't loaded yet.
+    fn accent(&self, path: &Path) -> Option<Color32> {
+        match self.entries.get(path)? {
+            ArtEntry::Loaded { accent, .. } => Some(*accent),
             ArtEntry::NoArt => None,
         }
     }
@@ -584,11 +1059,12 @@ impl ArtCache {
     }
 
     fn load_from_file(path: &Path, ctx: &egui::Context)
-        -> Option<(egui::TextureHandle, u32, u32)>
+        -> Option<(egui::TextureHandle, u32, u32, Color32)>
     {
         let bytes = Self::extract_bytes(path)?;
         let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
         let (w, h) = img.dimensions();
+        let accent = Self::vibrant_accent(&img);
         let pixels: Vec<egui::Color32> = img.pixels()
             .map(|p| egui::Color32::from_rgba_unmultiplied(p.0[0], p.0[1], p.0[2], p.0[3]))
             .collect();
@@ -598,7 +1074,46 @@ impl ArtCache {
             ci,
             egui::TextureOptions::LINEAR,
         );
-        Some((tex, w, h))
+        Some((tex, w, h, accent))
+    }
+
+    /// Derive a UI accent from cover art: sample the image, weight each pixel by
+    /// saturation × brightness so vivid colours win over muddy/dark ones,
+    /// average, lift if too dark for a dark UI, then blend 55% toward the art
+    /// colour and 45% toward Kugelblitz — so the result is always a *tint of the
+    /// brand accent*, never an arbitrary clashing colour. Falls back to the pure
+    /// brand accent for grayscale / low-colour art.
+    fn vibrant_accent(img: &image::RgbaImage) -> Color32 {
+        let (w, h) = img.dimensions();
+        let step = ((w.max(h) / 64).max(1)) as usize; // cap at ~64 samples/axis
+        let (mut r, mut g, mut b, mut wsum) = (0f32, 0f32, 0f32, 0f32);
+        for y in (0..h as usize).step_by(step) {
+            for x in (0..w as usize).step_by(step) {
+                let p = img.get_pixel(x as u32, y as u32).0;
+                if p[3] < 128 { continue; } // skip transparent
+                let (rf, gf, bf) = (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0);
+                let max = rf.max(gf).max(bf);
+                let min = rf.min(gf).min(bf);
+                let sat = if max <= 0.0 { 0.0 } else { (max - min) / max };
+                let weight = sat * max; // vivid AND not too dark
+                r += rf * weight; g += gf * weight; b += bf * weight; wsum += weight;
+            }
+        }
+        if wsum < 1e-3 {
+            return pal::ACCENT; // grayscale / no vivid colour
+        }
+        let (mut rr, mut gg, mut bb) = (r / wsum, g / wsum, b / wsum);
+        // Keep the accent bright enough to read on the dark chrome.
+        let lum = 0.299 * rr + 0.587 * gg + 0.114 * bb;
+        if lum < 0.35 {
+            let boost = 0.35 / lum.max(1e-3);
+            rr = (rr * boost).min(1.0); gg = (gg * boost).min(1.0); bb = (bb * boost).min(1.0);
+        }
+        let k = pal::ACCENT;
+        let mix = |art: f32, brand: u8| -> u8 {
+            ((art * 0.55 + (brand as f32 / 255.0) * 0.45).clamp(0.0, 1.0) * 255.0) as u8
+        };
+        Color32::from_rgb(mix(rr, k.r()), mix(gg, k.g()), mix(bb, k.b()))
     }
 
     fn extract_bytes(path: &Path) -> Option<Vec<u8>> {
@@ -646,11 +1161,40 @@ struct MoosikApp {
     bp_scan_rx: Option<std::sync::mpsc::Receiver<Vec<bitperfect::DeviceCaps>>>,
     // Frame limiter: wall-clock time the previous update() frame began.
     last_frame: Option<Instant>,
+    // OS media controls (media keys + now-playing) and change-tracking so we
+    // only push updates to the OS when something actually changes.
+    media: media_controls::MediaOs,
+    media_last_index: Option<usize>,
+    media_last_state: Option<media_controls::PlaybackState>,
+    media_last_push: Option<Instant>,
+    // Appearance (palette, UI scale, accent source) — optional/persisted.
+    appearance: Appearance,
+    /// Pending text-size value edited by the slider; applied to
+    /// `appearance.ui_scale` only when the user clicks Apply, so dragging the
+    /// slider doesn't live-resize the UI (which fights the cursor).
+    ui_scale_draft: f32,
+    // ReplayGain
+    rg: RgSettings,
+    /// Last linear gain pushed to the engine — so update_replay_gain() is a
+    /// cheap no-op until something actually changes.
+    rg_last_applied: f32,
+    /// Per-track UI accent (a tint of the brand accent pulled from the current
+    /// cover art), refreshed each frame. Drives the now-playing bar, current-row
+    /// marker, and seek fill so the chrome picks up the mood of what's playing.
+    track_accent: Color32,
+    // Gapless playback
+    /// Playlist index appended/queued ahead for a seamless hand-off, once the
+    /// current track nears its end. None when nothing is queued.
+    gapless_next: Option<usize>,
+    /// The `current_index` we've already made a prebuffer decision for, so the
+    /// decision runs once per track rather than every frame.
+    gapless_tried: Option<usize>,
 }
 
 impl MoosikApp {
     fn new(cc: &eframe::CreationContext) -> Self {
         setup_fonts(&cc.egui_ctx);
+        apply_theme(&cc.egui_ctx);
         let mut spectrum_window = SpectrumWindow::new();
         let mut engine = Engine::new(spectrum_window.sample_buf.clone(), spectrum_window.stereo_buf.clone());
         if let Some(ref mut e) = engine {
@@ -665,6 +1209,13 @@ impl MoosikApp {
             e.bp_device = bp_settings.device.clone();
         }
         spectrum_window.bit_perfect = bp_settings.enabled;
+        // Default the spectrum animation cap to the monitor's refresh rate
+        // (clamped to the slider's range), falling back to 60 if unknown.
+        if let Some(hz) = monitor_refresh_hz() {
+            spectrum_window.max_fps = hz.clamp(1.0, 240.0);
+        }
+        let appearance = load_appearance(&moosik_dir());
+        let ui_scale_draft = appearance.ui_scale;
         MoosikApp {
             playlist,
             current_index: None,
@@ -693,7 +1244,38 @@ impl MoosikApp {
             // Kick off the device scan at startup so the picker is ready.
             bp_scan_rx: Some(bitperfect::spawn_device_scan()),
             last_frame: None,
+            media: media_controls::MediaOs::new(cc),
+            media_last_index: None,
+            media_last_state: None,
+            media_last_push: None,
+            appearance,
+            ui_scale_draft,
+            rg: load_rg_settings(&moosik_dir()),
+            rg_last_applied: 1.0,
+            track_accent: pal::ACCENT,
+            gapless_next: None,
+            gapless_tried: None,
         }
+    }
+
+    /// The accent for the current track: its cover-derived tint, or the brand
+    /// accent when the track has no art (or it hasn't decoded yet).
+    fn current_accent(&self) -> Color32 {
+        if !self.appearance.art_accent {
+            return pal::ACCENT;
+        }
+        self.current_index
+            .and_then(|i| self.playlist.get(i))
+            .and_then(|t| self.art_cache.accent(&t.path))
+            .unwrap_or(pal::ACCENT)
+    }
+
+    /// A brightened form of the per-track accent, for playheads / hovered
+    /// handles that need to pop against the accent-filled progress.
+    fn track_accent_bright(&self) -> Color32 {
+        let a = self.track_accent;
+        let m = |c: u8| (c as f32 * 0.55 + 255.0 * 0.45) as u8;
+        Color32::from_rgb(m(a.r()), m(a.g()), m(a.b()))
     }
 
     fn add_files(&mut self) {
@@ -730,6 +1312,9 @@ impl MoosikApp {
         if idx >= self.playlist.len() {
             return;
         }
+        // Explicit track change rebuilds the stream — drop any gapless queue.
+        self.gapless_next = None;
+        self.gapless_tried = None;
         self.current_index = Some(idx);
         let track = &self.playlist[idx];
         let path = track.path.clone();
@@ -818,6 +1403,17 @@ impl MoosikApp {
         let path       = self.playlist[idx].path.clone();
         let dur        = self.playlist[idx].duration;
         let engine = self.engine.as_mut().ok_or("No audio engine")?;
+
+        // Normal mode with a real position (e.g. toggling bit-perfect OFF
+        // mid-track): open + seek entirely off the UI thread. Skips the
+        // play-from-0 blip and keeps every decode off the UI thread — a deep
+        // hi-res FLAC seek on the UI thread here is what froze the app.
+        if !engine.bit_perfect && pos > Duration::ZERO {
+            engine.play_seeked_async(&path, pos, dur, was_paused);
+            self.spectrum_window.on_seek(pos.as_secs_f64());
+            return Ok(());
+        }
+
         engine.play_file(&path, dur)?;
         if pos > Duration::ZERO {
             engine.seek_to(&path, pos);
@@ -904,6 +1500,8 @@ impl MoosikApp {
     }
 
     fn stop(&mut self) {
+        self.gapless_next = None;
+        self.gapless_tried = None;
         if let Some(ref mut engine) = self.engine {
             engine.stop();
         }
@@ -911,6 +1509,102 @@ impl MoosikApp {
         self.seek_pos = 0.0;
         self.status_msg = String::new();
         self.spectrum_window.on_stop();
+    }
+
+    // ── Gapless playback ────────────────────────────────────────────────────
+
+    /// The index that will play after the current one, per the loop mode — the
+    /// track to prebuffer for a seamless hand-off. None = nothing follows.
+    fn upcoming_index(&self) -> Option<usize> {
+        let cur = self.current_index?;
+        if self.playlist.is_empty() { return None; }
+        match self.loop_mode {
+            LoopMode::RepeatOne => Some(cur),
+            LoopMode::RepeatAll => Some((cur + 1) % self.playlist.len()),
+            LoopMode::Sequential => (cur + 1 < self.playlist.len()).then_some(cur + 1),
+        }
+    }
+
+    /// Once per track, when it nears its end, prebuffer the next one onto the
+    /// same stream so playback continues with no gap. Requires a known duration
+    /// (for the lead timing); bit-perfect additionally requires the next track
+    /// to share the current rate/channels, else it's left to end normally.
+    fn try_arm_gapless(&mut self) {
+        let Some(cur) = self.current_index else { return };
+        if self.gapless_tried == Some(cur) { return; }
+        let Some(dur) = self.playlist.get(cur).and_then(|t| t.duration) else { return };
+        let bp = self.engine.as_ref().map(|e| e.bit_perfect).unwrap_or(false);
+        let lead = Duration::from_secs(if bp { 5 } else { 2 });
+        if dur.saturating_sub(self.elapsed()) > lead { return; }
+
+        // Decide exactly once for this track, whatever the outcome.
+        self.gapless_tried = Some(cur);
+        let Some(next) = self.upcoming_index() else { return };
+        let path = self.playlist[next].path.clone();
+        let armed = self.engine.as_ref().map(|e| {
+            if bp { e.bp_queue_next(&path) } else { e.append_next(&path).is_ok() }
+        }).unwrap_or(false);
+        if armed { self.gapless_next = Some(next); }
+    }
+
+    /// Roll the UI/metadata over to the gapless-queued track once the device has
+    /// crossed the boundary. The audio is already flowing seamlessly; this only
+    /// updates the displayed track, spectrum, ReplayGain source, and position.
+    fn gapless_rollover(&mut self) {
+        let Some(next) = self.gapless_next.take() else { return };
+        if next >= self.playlist.len() {
+            // Playlist shrank under a queued hand-off — advance cleanly instead.
+            self.gapless_tried = None;
+            self.next_track();
+            return;
+        }
+        let next_dur = self.playlist[next].duration;
+        let bp = self.engine.as_ref().map(|e| e.bit_perfect).unwrap_or(false);
+        if let Some(e) = self.engine.as_mut() {
+            if bp {
+                e.current_duration = next_dur; // position base advanced in bp_poll_boundary
+            } else {
+                e.roll_normal_position(next_dur);
+            }
+        }
+        self.current_index = Some(next);
+        self.gapless_tried = None; // let the new current arm its own successor
+        self.seek_pos = 0.0;
+        let sr = self.playlist[next].sample_rate
+            .or_else(|| self.engine.as_ref().map(|e| e.last_sample_rate))
+            .unwrap_or(44_100);
+        let path = self.playlist[next].path.clone();
+        let title = self.playlist[next].title.clone();
+        self.spectrum_window.on_play(&path, sr);
+        self.status_msg = if bp {
+            self.engine.as_ref().and_then(|e| e.bp_describe())
+                .map(|d| format!("💎 {d} — {title}"))
+                .unwrap_or_else(|| format!("Playing: {title}"))
+        } else {
+            format!("Playing: {title}")
+        };
+    }
+
+    /// Discard a queued gapless hand-off (the user changed what plays next).
+    /// Bit-perfect just drops the queued decode; normal mode must rebuild the
+    /// current track without its appended successor (a brief gap, but only on an
+    /// explicit action near a track boundary).
+    fn flush_gapless(&mut self) {
+        if self.gapless_next.take().is_none() { return; }
+        self.gapless_tried = None;
+        let bp = self.engine.as_ref().map(|e| e.bit_perfect).unwrap_or(false);
+        if bp {
+            if let Some(e) = self.engine.as_ref() { e.bp_clear_next(); }
+        } else if self.play_state != PlayState::Stopped
+            && let Some(idx) = self.current_index {
+            let path = self.playlist[idx].path.clone();
+            let dur = self.playlist[idx].duration;
+            let pos = self.elapsed();
+            let was_paused = self.play_state == PlayState::Paused;
+            if let Some(e) = self.engine.as_mut() {
+                e.play_seeked_async(&path, pos, dur, was_paused);
+            }
+        }
     }
 
     fn next_track(&mut self) {
@@ -941,6 +1635,135 @@ impl MoosikApp {
             _ => self.playlist.len() - 1,
         };
         self.play_index(idx);
+    }
+
+    /// Seek the current track to `target` (clamped to its duration), keeping
+    /// the spectrum and seek-bar position in sync. Shared by the seek bar and
+    /// OS media-key seeking.
+    fn seek_to(&mut self, target: Duration) {
+        let Some(idx) = self.current_index else { return };
+        // A seek reshapes the current stream — discard any gapless queue so the
+        // engine and our roll-over bookkeeping can't diverge.
+        self.flush_gapless();
+        let dur = self.playlist[idx].duration;
+        let target = dur.map_or(target, |d| target.min(d));
+        let path = self.playlist[idx].path.clone();
+        if let Some(ref mut engine) = self.engine {
+            engine.seek_to(&path, target);
+        }
+        self.spectrum_window.on_seek(target.as_secs_f64());
+        self.seek_pos = dur
+            .map(|d| (target.as_secs_f32() / d.as_secs_f32().max(0.001)).clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+    }
+
+    /// Handle media-key / OS transport events drained from `self.media`.
+    fn handle_media_events(&mut self) {
+        use media_controls::{MediaControlEvent as E, SeekDirection};
+        let events: Vec<E> = self.media.events().collect();
+        for ev in events {
+            match ev {
+                E::Play => if self.play_state != PlayState::Playing { self.toggle_play_pause(); },
+                E::Pause => if self.play_state == PlayState::Playing { self.toggle_play_pause(); },
+                E::Toggle => self.toggle_play_pause(),
+                E::Next => self.next_track(),
+                E::Previous => self.prev_track(),
+                E::Stop => self.stop(),
+                E::Seek(dir) | E::SeekBy(dir, _) => {
+                    let step = match ev {
+                        E::SeekBy(_, d) => d,
+                        _ => Duration::from_secs(5),
+                    };
+                    let cur = self.elapsed();
+                    let target = match dir {
+                        SeekDirection::Forward => cur + step,
+                        SeekDirection::Backward => cur.saturating_sub(step),
+                    };
+                    self.seek_to(target);
+                }
+                E::SetPosition(pos) => self.seek_to(pos.0),
+                _ => {} // SetVolume / OpenUri / Raise / Quit — not handled
+            }
+        }
+    }
+
+    /// Push now-playing metadata (on track change) and playback state /
+    /// progress (on state change or ~once a second) to the OS controls.
+    fn sync_media_os(&mut self) {
+        use media_controls::PlaybackState;
+        let state = match self.play_state {
+            PlayState::Playing => PlaybackState::Playing,
+            PlayState::Paused => PlaybackState::Paused,
+            PlayState::Stopped => PlaybackState::Stopped,
+        };
+
+        if self.current_index != self.media_last_index {
+            self.media_last_index = self.current_index;
+            if let Some(t) = self.current_index.and_then(|i| self.playlist.get(i)) {
+                let (title, artist, album, dur) =
+                    (t.display_title().to_string(), t.artist.clone(), t.album.clone(), t.duration);
+                self.media.set_metadata(&title, &artist, &album, dur);
+            }
+            self.media_last_state = None; // force a playback push to follow
+        }
+
+        let due = self.media_last_push.map(|t| t.elapsed().as_millis() >= 1000).unwrap_or(true);
+        if self.media_last_state != Some(state) || due {
+            self.media_last_state = Some(state);
+            self.media_last_push = Some(Instant::now());
+            let progress = (state != PlaybackState::Stopped).then(|| self.elapsed());
+            self.media.set_playback(state, progress);
+        }
+    }
+
+    // ── ReplayGain ───────────────────────────────────────────────────────────
+
+    /// Linear ReplayGain factor for the current track under the current mode.
+    /// 1.0 (no change) when Off, in bit-perfect mode, or when no gain source
+    /// is available yet (untagged track whose loudness scan hasn't finished).
+    fn compute_replay_gain(&self) -> f32 {
+        if self.rg.mode == RgMode::Off || self.bit_perfect {
+            return 1.0;
+        }
+        let Some(t) = self.current_index.and_then(|i| self.playlist.get(i)) else { return 1.0 };
+
+        // Prefer the requested tag (other as fallback); else Moosik's measured LUFS.
+        let (tag_gain, tag_peak) = match self.rg.mode {
+            RgMode::Album => (t.rg_album_gain.or(t.rg_track_gain), t.rg_album_peak.or(t.rg_track_peak)),
+            _ => (t.rg_track_gain.or(t.rg_album_gain), t.rg_track_peak.or(t.rg_album_peak)),
+        };
+
+        let analysis = self.spectrum_window.track_analysis.as_ref();
+        let (mut gain_db, peak_db) = if let Some(g) = tag_gain {
+            (g, tag_peak.map(|p| 20.0 * p.log10()))
+        } else if let Some(a) = analysis.filter(|a| a.integrated_lufs.is_finite()) {
+            (RG_TARGET_LUFS - a.integrated_lufs, Some(a.peak_dbfs))
+        } else {
+            return 1.0; // measurement not ready yet — unity until it lands
+        };
+
+        if self.rg.prevent_clip
+            && let Some(pk) = peak_db {
+            gain_db = gain_db.min(-pk); // keep peak ≤ 0 dBFS
+        }
+        gain_db = gain_db.clamp(-24.0, 12.0);
+        10f32.powf(gain_db / 20.0)
+    }
+
+    /// Recompute and, if changed, apply the ReplayGain factor. Cheap enough to
+    /// call every frame — catches track change, mode change, bit-perfect
+    /// toggle, and the measured LUFS arriving mid-track.
+    fn update_replay_gain(&mut self) {
+        let g = self.compute_replay_gain();
+        if (g - self.rg_last_applied).abs() > 1e-4 {
+            self.rg_last_applied = g;
+            if let Some(ref mut e) = self.engine { e.set_replay_gain(g); }
+        }
+    }
+
+    /// Currently-applied gain in dB (for the UI). 0.0 = unity.
+    fn rg_applied_db(&self) -> f32 {
+        20.0 * self.rg_last_applied.max(1e-6).log10()
     }
 
     fn elapsed(&self) -> Duration {
@@ -1016,7 +1839,7 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
 
 fn section(ui: &mut egui::Ui, heading: &str) {
     ui.separator();
-    ui.label(egui::RichText::new(heading).strong().size(13.0).color(Color32::from_rgb(120, 180, 255)));
+    ui.label(egui::RichText::new(heading).strong().size(13.0).color(pal::ACCENT));
     ui.end_row();
 }
 
@@ -1156,7 +1979,7 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, spectral_ceiling: Option<Spectr
         && !a.loudness_history.is_empty() {
         ui.add_space(8.0);
             ui.label(egui::RichText::new("Loudness History (per second)")
-                .size(12.0).color(Color32::from_rgb(120, 180, 255)));
+                .size(12.0).color(pal::ACCENT));
             ui.add_space(4.0);
 
             let plot_h = 60.0_f32;
@@ -1224,10 +2047,12 @@ impl eframe::App for MoosikApp {
         // Target = spectrum's max_fps while that window is open (it drives the
         // animation), else 60 fps for the main window's seek bar.
         let spectrum_open = self.spectrum_window.open;
+        let seeking = self.engine.as_ref().is_some_and(|e| e.is_seeking());
         let animating = self.play_state == PlayState::Playing
+            || seeking
             || self.spectrum_window.analyzer.is_analyzing.load(std::sync::atomic::Ordering::Relaxed);
-        // Drive frames while anything is animating, or just to cap the spin of
-        // an open (but idle) spectrum viewport.
+        // Drive frames while anything is animating (incl. a pending background
+        // seek), or just to cap the spin of an open (but idle) spectrum viewport.
         let want_frames = animating || spectrum_open;
         if want_frames {
             let target_fps = match (spectrum_open, animating) {
@@ -1251,6 +2076,19 @@ impl eframe::App for MoosikApp {
             self.last_frame = None;
         }
 
+        // --- Typography / UI scale ---
+        // Apply the configured zoom factor (egui scales point sizes too, so all
+        // fixed `.size()` text scales proportionally). set_zoom_factor only
+        // triggers a relayout when the value actually changes, so calling it
+        // every frame is cheap.
+        let scale = self.appearance.ui_scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+        if (ctx.zoom_factor() - scale).abs() > f32::EPSILON {
+            ctx.set_zoom_factor(scale);
+        }
+
+        // --- OS media-key / transport events ---
+        self.handle_media_events();
+
         // --- Keyboard shortcuts (only when no text field is focused) ---
         let no_text_focus = ctx.memory(|m| m.focused().is_none());
         if no_text_focus {
@@ -1270,19 +2108,15 @@ impl eframe::App for MoosikApp {
             if ctrl_right  { self.next_track(); }
             if arrow_left  {
                 let pos = self.elapsed().saturating_sub(Duration::from_secs(5));
-                if let Some(idx) = self.current_index {
-                    let path = self.playlist[idx].path.clone();
-                    if let Some(ref mut engine) = self.engine { engine.seek_to(&path, pos); }
-                    self.spectrum_window.on_seek(pos.as_secs_f64());
+                if self.current_index.is_some() {
+                    self.seek_to(pos);
                 }
             }
             if arrow_right {
                 let pos = self.elapsed() + Duration::from_secs(5);
                 let capped = self.current_duration().map(|d| pos.min(d)).unwrap_or(pos);
-                if let Some(idx) = self.current_index {
-                    let path = self.playlist[idx].path.clone();
-                    if let Some(ref mut engine) = self.engine { engine.seek_to(&path, capped); }
-                    self.spectrum_window.on_seek(capped.as_secs_f64());
+                if self.current_index.is_some() {
+                    self.seek_to(capped);
                 }
             }
             if arrow_up {
@@ -1302,12 +2136,36 @@ impl eframe::App for MoosikApp {
             self.bp_scan_rx = None;
         }
 
-        // --- auto-advance when track finishes ---
+        // --- install a completed background seek, if any ---
+        if let Some(ref mut engine) = self.engine {
+            engine.poll_pending_seek();
+        }
+
+        // --- gapless roll-over + auto-advance when a track finishes ---
         if self.play_state == PlayState::Playing {
+            // Bit-perfect: the device reports exact frame boundaries as it plays
+            // through gaplessly-chained tracks (possibly several per frame).
+            while self.engine.as_mut().map(|e| e.bp_poll_boundary()).unwrap_or(false) {
+                self.gapless_rollover();
+            }
+            // Normal mode: no per-source callback, so detect the boundary by time.
+            let normal_crossed = self.gapless_next.is_some()
+                && self.engine.as_ref().map(|e| !e.bit_perfect).unwrap_or(false)
+                && self.current_index
+                    .and_then(|i| self.playlist.get(i)).and_then(|t| t.duration)
+                    .map(|d| self.elapsed() >= d).unwrap_or(false);
+            if normal_crossed {
+                self.gapless_rollover();
+            }
+
+            // A truly finished stream (nothing was queued) advances the old way.
             let finished = self.engine.as_ref().map(|e| e.is_finished()).unwrap_or(false);
             if finished {
                 self.next_track();
             }
+
+            // Prebuffer the next track once we're near the end of this one.
+            self.try_arm_gapless();
         }
 
         // sync volume to engine on startup
@@ -1321,11 +2179,18 @@ impl eframe::App for MoosikApp {
         // Advance spectrum analyzer and render window
         let elapsed_secs = self.elapsed().as_secs_f64();
         let is_playing = self.play_state == PlayState::Playing;
+        // Push the current appearance into the spectrum window so its visualisers
+        // (incl. the spectrogram fed inside tick()) use the selected palette.
+        self.spectrum_window.palette_kind = self.appearance.spectrum_palette;
+        self.spectrum_window.palette_accent = self.track_accent;
         self.spectrum_window.tick(elapsed_secs, is_playing);
-        // Update current art for the spectrum window
+        // Update current art for the spectrum window (loads it if needed), then
+        // refresh the per-track accent now that the art is available.
         self.spectrum_window.current_art = self.current_index
             .and_then(|i| self.playlist.get(i))
             .and_then(|t| self.art_cache.get_or_load(&t.path, ctx));
+        self.track_accent = self.current_accent();
+        self.spectrum_window.palette_accent = self.track_accent;
         self.spectrum_window.show(ctx);
 
         // --- Info window (separate OS viewport) ---
@@ -1371,12 +2236,12 @@ impl eframe::App for MoosikApp {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(12.0);
-                        let state_icon = match self.play_state {
-                            PlayState::Playing => "▶ Playing",
-                            PlayState::Paused => "⏸ Paused",
-                            PlayState::Stopped => "⏹ Stopped",
+                        let (state_icon, state_col) = match self.play_state {
+                            PlayState::Playing => ("▶ Playing", self.track_accent),
+                            PlayState::Paused  => ("⏸ Paused",  pal::AMBER),
+                            PlayState::Stopped => ("⏹ Stopped", pal::MUTED),
                         };
-                        ui.label(RichText::new(state_icon).size(13.0).color(Color32::from_rgb(120, 180, 255)));
+                        ui.label(RichText::new(state_icon).size(13.0).color(state_col));
                     });
                 });
             } else {
@@ -1453,9 +2318,9 @@ impl eframe::App for MoosikApp {
                     let half_h = (rms * max_half_h).max(1.0);
                     let col_frac = (i as f32 + 0.5) / n as f32;
                     let color = if col_frac <= self.seek_pos {
-                        Color32::from_rgb(60, 130, 220)
+                        self.track_accent
                     } else {
-                        Color32::from_gray(50)
+                        pal::WAVE_UNPLAYED
                     };
                     painter.rect_filled(
                         egui::Rect::from_min_max(
@@ -1473,7 +2338,7 @@ impl eframe::App for MoosikApp {
                         painter.line_segment(
                             [egui::Pos2::new(x, row_rect.top() + 1.0),
                              egui::Pos2::new(x, row_rect.bottom() - 1.0)],
-                            egui::Stroke::new(1.5, Color32::from_rgb(220, 60, 60)),
+                            egui::Stroke::new(1.5, pal::WARN),
                         );
                     }
                 }
@@ -1481,7 +2346,7 @@ impl eframe::App for MoosikApp {
                 painter.line_segment(
                     [egui::Pos2::new(fill_x, row_rect.top() + 2.0),
                      egui::Pos2::new(fill_x, row_rect.bottom() - 2.0)],
-                    egui::Stroke::new(2.0, Color32::WHITE),
+                    egui::Stroke::new(2.0, self.track_accent_bright()),
                 );
             } else {
                 // Fallback: thin bar
@@ -1491,7 +2356,7 @@ impl eframe::App for MoosikApp {
                         egui::Pos2::new(track_x1, track_y + 2.0),
                     ),
                     2.0,
-                    Color32::from_gray(65),
+                    pal::TRACK_BG,
                 );
                 if fill_x > track_x0 {
                     painter.rect_filled(
@@ -1500,11 +2365,13 @@ impl eframe::App for MoosikApp {
                             egui::Pos2::new(fill_x,   track_y + 2.0),
                         ),
                         2.0,
-                        Color32::from_rgb(80, 160, 255),
+                        self.track_accent,
                     );
                 }
-                let handle_r = if seek_resp.hovered() || seek_resp.dragged() { 8.0_f32 } else { 6.0_f32 };
-                painter.circle_filled(egui::Pos2::new(fill_x, track_y), handle_r, Color32::WHITE);
+                let hot = seek_resp.hovered() || seek_resp.dragged();
+                let handle_r = if hot { 8.0_f32 } else { 6.0_f32 };
+                painter.circle_filled(egui::Pos2::new(fill_x, track_y), handle_r,
+                    if hot { self.track_accent_bright() } else { Color32::WHITE });
             }
             // Time labels
             painter.text(
@@ -1524,14 +2391,9 @@ impl eframe::App for MoosikApp {
 
             // 4. Commit seek on drag-release or click.
             if seek_resp.drag_stopped() || seek_resp.clicked() {
-                if let (Some(dur), Some(idx)) = (total, self.current_index) {
+                if let (Some(dur), Some(_idx)) = (total, self.current_index) {
                     let target_secs = self.seek_pos * dur.as_secs_f32();
-                    let target = Duration::from_secs_f32(target_secs);
-                    let path = self.playlist[idx].path.clone();
-                    if let Some(ref mut engine) = self.engine {
-                        engine.seek_to(&path, target);
-                    }
-                    self.spectrum_window.on_seek(target_secs as f64);
+                    self.seek_to(Duration::from_secs_f32(target_secs));
                 }
                 self.seeking = false;
             }
@@ -1578,6 +2440,8 @@ impl eframe::App for MoosikApp {
                         LoopMode::RepeatAll  => LoopMode::RepeatOne,
                         LoopMode::RepeatOne  => LoopMode::Sequential,
                     };
+                    // The queued gapless track may no longer be the right next.
+                    self.flush_gapless();
                 }
 
                 ui.add_space(20.0);
@@ -1637,7 +2501,7 @@ impl eframe::App for MoosikApp {
                     }
                     ui.add_space(8.0);
                     let spectrum_label = if self.spectrum_window.open {
-                        RichText::new("📊 Spectrum").size(13.0).color(Color32::from_rgb(100, 200, 255))
+                        RichText::new("📊 Spectrum").size(13.0).color(pal::ACCENT)
                     } else {
                         RichText::new("📊 Spectrum").size(13.0)
                     };
@@ -1647,7 +2511,7 @@ impl eframe::App for MoosikApp {
                     ui.add_space(8.0);
                     let info_enabled = self.current_index.is_some();
                     let info_label = if self.info_open {
-                        RichText::new("ℹ Info").size(13.0).color(Color32::from_rgb(100, 200, 255))
+                        RichText::new("ℹ Info").size(13.0).color(pal::ACCENT)
                     } else {
                         RichText::new("ℹ Info").size(13.0)
                     };
@@ -1723,6 +2587,126 @@ impl eframe::App for MoosikApp {
                             self.select_bp_device(dev);
                         }
                     }).response.on_hover_text("Choose the output device for bit-perfect playback");
+
+                    ui.add_space(8.0);
+
+                    // ── ReplayGain (loudness normalization) ─────────────────
+                    let rg_active = self.rg.mode != RgMode::Off;
+                    let rg_label = if rg_active {
+                        RichText::new(format!("🔊 RG {}", self.rg.mode.label()))
+                            .size(13.0).color(Color32::from_rgb(160, 210, 120))
+                    } else {
+                        RichText::new("🔊 RG").size(13.0)
+                    };
+                    let rg_hover = if self.bit_perfect && rg_active {
+                        "ReplayGain is bypassed in bit-perfect mode — a gain change breaks bit-perfectness.".to_string()
+                    } else if rg_active {
+                        format!("Loudness normalization: {} · currently {:+.1} dB", self.rg.mode.label(), self.rg_applied_db())
+                    } else {
+                        "Loudness normalization (off) — plays original levels".to_string()
+                    };
+                    ui.menu_button(rg_label, |ui| {
+                        ui.set_min_width(250.0);
+                        ui.label(RichText::new("ReplayGain — loudness normalization").strong().size(12.0));
+                        if self.bit_perfect {
+                            ui.label(RichText::new("💎 Bypassed in bit-perfect mode")
+                                .size(11.0).color(Color32::from_rgb(100, 255, 200)));
+                        }
+                        ui.separator();
+                        let mut changed = false;
+                        for mode in [RgMode::Off, RgMode::Track, RgMode::Album] {
+                            if ui.selectable_label(self.rg.mode == mode, mode.label()).clicked() {
+                                self.rg.mode = mode;
+                                changed = true;
+                            }
+                        }
+                        ui.separator();
+                        if ui.checkbox(&mut self.rg.prevent_clip, "Prevent clipping (cap gain by peak)").changed() {
+                            changed = true;
+                        }
+                        ui.separator();
+                        if self.rg.mode == RgMode::Off {
+                            ui.label(RichText::new("Off — original file levels")
+                                .size(11.0).color(Color32::from_gray(140)));
+                        } else {
+                            let src = self.current_index.and_then(|i| self.playlist.get(i)).map(|t| {
+                                let tagged = match self.rg.mode {
+                                    RgMode::Album => t.rg_album_gain.or(t.rg_track_gain),
+                                    _ => t.rg_track_gain.or(t.rg_album_gain),
+                                }.is_some();
+                                if tagged { "from ReplayGain tag" } else { "from measured loudness" }
+                            }).unwrap_or("—");
+                            ui.label(RichText::new(format!("Applied: {:+.1} dB  ({src})", self.rg_applied_db()))
+                                .size(11.0).color(Color32::from_gray(150)));
+                            ui.label(RichText::new(format!("Untagged target: {:.0} LUFS", RG_TARGET_LUFS))
+                                .size(10.0).color(Color32::from_gray(120)));
+                        }
+                        if changed {
+                            save_rg_settings(&moosik_dir(), &self.rg);
+                        }
+                    }).response.on_hover_text(rg_hover);
+
+                    ui.add_space(8.0);
+
+                    // ── Appearance (palette · text size · accent) ───────────
+                    ui.menu_button(RichText::new("🎨 Look").size(13.0), |ui| {
+                        ui.set_min_width(230.0);
+                        ui.label(RichText::new("Appearance").strong().size(12.0));
+                        ui.separator();
+                        let mut changed = false;
+
+                        ui.label(RichText::new("Spectrum palette")
+                            .size(11.0).color(Color32::from_gray(150)));
+                        for p in spectrum::SpectrumPalette::ALL {
+                            if ui.selectable_value(
+                                &mut self.appearance.spectrum_palette, p, p.label(),
+                            ).clicked() {
+                                changed = true;
+                            }
+                        }
+
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.label(RichText::new("Text size")
+                            .size(11.0).color(Color32::from_gray(150)));
+                        // Edit a draft, then commit on Apply — a live zoom change
+                        // mid-drag resizes the menu under the cursor.
+                        ui.add(
+                            Slider::new(&mut self.ui_scale_draft, UI_SCALE_MIN..=UI_SCALE_MAX)
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                .custom_parser(|s| {
+                                    s.trim().trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)
+                                }),
+                        );
+                        ui.horizontal(|ui| {
+                            let pending = (self.ui_scale_draft - self.appearance.ui_scale).abs() > 1e-3;
+                            if ui.add_enabled(pending, egui::Button::new("Apply")).clicked() {
+                                self.appearance.ui_scale =
+                                    self.ui_scale_draft.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+                                save_appearance(&moosik_dir(), &self.appearance);
+                            }
+                            if ui.small_button("Reset").clicked() {
+                                self.ui_scale_draft = 1.0;
+                                self.appearance.ui_scale = 1.0;
+                                save_appearance(&moosik_dir(), &self.appearance);
+                            }
+                            ui.label(RichText::new(format!("now {:.0}%", self.appearance.ui_scale * 100.0))
+                                .size(10.0).color(Color32::from_gray(120)));
+                        });
+
+                        ui.add_space(6.0);
+                        ui.separator();
+                        if ui.checkbox(&mut self.appearance.art_accent,
+                            "Tint UI with album-art accent").changed() {
+                            changed = true;
+                        }
+                        ui.label(RichText::new("Off → fixed brand accent")
+                            .size(10.0).color(Color32::from_gray(120)));
+
+                        if changed {
+                            save_appearance(&moosik_dir(), &self.appearance);
+                        }
+                    }).response.on_hover_text("Palette, text size, and accent — all optional");
                 });
             });
 
@@ -1925,13 +2909,13 @@ impl eframe::App for MoosikApp {
                     let is_being_dragged  = self.drag_src == Some(i);
 
                     let base_color = if is_selected {
-                        Color32::from_rgb(40, 70, 130)
+                        pal::ROW_SELECTED
                     } else if is_current {
-                        Color32::from_rgb(30, 60, 100)
+                        pal::ROW_CURRENT
                     } else if i % 2 == 0 {
-                        Color32::from_gray(28)
+                        pal::ROW_EVEN
                     } else {
-                        Color32::from_gray(22)
+                        pal::ROW_ODD
                     };
 
                     let (rect, response) = ui.allocate_exact_size(
@@ -1954,7 +2938,7 @@ impl eframe::App for MoosikApp {
                             ui.painter().line_segment(
                                 [egui::Pos2::new(rect.left(), rect.top()),
                                  egui::Pos2::new(rect.right(), rect.top())],
-                                egui::Stroke::new(2.0, Color32::from_rgb(100, 180, 255)),
+                                egui::Stroke::new(2.0, pal::ACCENT),
                             );
                         }
                     }
@@ -1966,6 +2950,14 @@ impl eframe::App for MoosikApp {
                             rect, 0.0,
                             Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha),
                         );
+                        // A slim accent bar marks the track that's playing.
+                        if is_current {
+                            let bar = egui::Rect::from_min_max(
+                                rect.left_top(),
+                                egui::Pos2::new(rect.left() + 3.0, rect.bottom()),
+                            );
+                            ui.painter().rect_filled(bar, 0.0, self.track_accent);
+                        }
 
                         let inner = rect.shrink2(Vec2::new(10.0, 0.0));
                         let cy = rect.center().y;
@@ -2063,7 +3055,7 @@ impl eframe::App for MoosikApp {
                             egui::Align2::CENTER_CENTER,
                             format!("{}", i + 1),
                             egui::FontId::proportional(12.0),
-                            if is_current { Color32::from_rgb(120, 180, 255) } else { Color32::from_gray(100) },
+                            if is_current { self.track_accent } else { Color32::from_gray(100) },
                         );
 
                         // Title
@@ -2134,7 +3126,7 @@ impl eframe::App for MoosikApp {
                     if drop == n && !no_op {
                         ui.painter().line_segment(
                             [egui::Pos2::new(rx0, ry), egui::Pos2::new(rx1, ry)],
-                            egui::Stroke::new(2.0, Color32::from_rgb(100, 180, 255)),
+                            egui::Stroke::new(2.0, pal::ACCENT),
                         );
                     }
                 }
@@ -2187,6 +3179,12 @@ impl eframe::App for MoosikApp {
                 }
             }
         });
+
+        // Reflect final playback state of this frame to the OS controls.
+        self.sync_media_os();
+        // Apply ReplayGain (idempotent; catches track change, mode change,
+        // bit-perfect toggle, and the measured LUFS landing mid-track).
+        self.update_replay_gain();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
