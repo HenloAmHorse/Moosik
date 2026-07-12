@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.1.0] - 2026-07-12
+
+A visual release: a cohesive dark theme drawn from the app's own identity
+colors, per-track accents pulled from cover art, and a set of optional,
+persisted appearance controls. Everything here defaults to the shipped look, so
+nothing changes until you opt in.
+
+### Theme
+- **Cohesive dark theme** — built from the icon's own palette (the **Eigengrau** #16161d base and **Kugelblitz** #94b1ff accent): a short blue-tinted neutral ramp for panels/surfaces/widgets, gently rounded corners, and accent-coloured selection and hover. Replaces egui's flat default grey with a calmer, on-brand look.
+- **One palette everywhere** — the theme now also drives the custom-painted surfaces that sit outside egui's widget system (seek bar, playlist rows, status text), so the whole window reads as one design instead of themed widgets over grey chrome.
+- **Per-track UI accent** — the now-playing bar, current-row marker, and seek fill pick up an accent sampled from the current track's cover art (weighted toward vivid, saturated colours and blended toward the brand blue so it never clashes). Art-less or grayscale covers fall back to the pure brand accent.
+
+### Appearance (new — optional & persisted)
+A new **🎨 Look** menu in the top bar, saved to `~/.moosik/appearance.json`. Defaults reproduce the original appearance exactly.
+- **Spectrum palette** — the visualiser's colour ramp is now selectable: **Classic** (the original rainbow), **Kugelblitz**, **Ice**, **Magma**, **Aurora**, **Mono**, and **Album accent** (a ramp built from the current cover art). Applied consistently across bars, octave bands, line, filled, spectrogram, and waterfall.
+- **Text size** — a UI-scale slider (70–160%) that scales all text and chrome via egui's zoom factor. Committed on an explicit **Apply** (with **Reset** to 100%), so dragging the slider doesn't live-resize the menu under the cursor.
+- **Accent source** — toggle between the album-art accent and the fixed brand accent for the chrome.
+
+### Spectrum
+- **Max FPS defaults to the monitor's refresh rate** — read from the primary display at startup (Windows), clamped to the 1–240 range, falling back to 60 when it can't be determined. Previously a fixed 60 that had to be raised by hand every launch on a high-refresh display.
+
 ## [1.0.0] - 2026-06-15
 
 First stable release. Adds true bit-perfect output (with WASAPI exclusive mode

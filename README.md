@@ -39,6 +39,7 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Configurable FFT** — up to 16× zero-padding, six window functions (Hann, Hamming, Blackman, Flat Top), up to 87.5% overlap
 - **Six interpolation modes** — None, Linear, Catmull-Rom, PCHIP, Akima, Lanczos
 - **Auto FFT size scaling** — adapts to the track's sample rate to maintain a consistent analysis window
+- **Refresh-rate-aware frame cap** — Max FPS defaults to the monitor's refresh rate (up to 240) so the animation is as smooth as the display allows, adjustable in the settings
 - **Analysis caching** — pre-processed frames cached to disk; settings buttons highlight green when a cache exists for that combination; "Clear All" button; reanalysis warning fires on any cache-key change
 - **Loudness** — flat or ISO 226:2003 equal-loudness weighting
 
@@ -64,6 +65,14 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Art Settings panel** — collapsible section in the spectrum window; global settings with optional per-track overrides
 - **Spectrum placeholder** — configurable ♪ glyph when a track has no embedded art
 - **Persistent** — settings stored in `~/.moosik/art_settings.json`
+
+### Theme & Appearance
+- **Cohesive dark theme** — built from the app's own identity colors (the **Eigengrau** #16161d base and **Kugelblitz** #94b1ff accent): a blue-tinted surface ramp, rounded corners, and accent-coloured selection and hover, applied across both the egui widgets and the custom-painted surfaces (seek bar, playlist rows, status text)
+- **Per-track accent** — the now-playing bar, current-row marker, and seek fill take on an accent sampled from the current track's cover art (blended toward the brand blue so it never clashes); art-less or grayscale covers fall back to the brand accent
+- **🎨 Look menu** — optional, persisted appearance controls (`~/.moosik/appearance.json`), all defaulting to the shipped look:
+  - **Spectrum palette** — seven selectable colour ramps (Classic, Kugelblitz, Ice, Magma, Aurora, Mono, and Album-accent) applied across bars, octave bands, line, filled, spectrogram, and waterfall
+  - **Text size** — a 70–160% UI-scale slider (applied on click), scaling all text and chrome
+  - **Accent source** — album-art accent or the fixed brand accent
 
 ### Player
 - **Gapless playback** — consecutive tracks play with no silence between them, in both normal and bit-perfect mode (bit-perfect stays gapless across same-rate tracks; a sample-rate change re-opens the device)

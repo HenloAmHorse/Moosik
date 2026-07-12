@@ -932,42 +932,44 @@ fn cache_path_for(
         ))
 }
 
+// Cache format v2: [magic(4), num_frames(4), num_bars(4), lz4_compressed(u16 LE × n_frames × n_bars)]
+// u16 gives 65 536 levels (>30× a 4K screen height). LZ4 adds ~2–4× compression on top.
+// Old f32 caches (no magic header) are auto-rejected: their first 4 bytes decode as a frame
+// count that won't match CACHE_MAGIC, so they recompute silently.
+const CACHE_MAGIC: u32 = 0x4D535032; // "MSP2"
+
 fn load_cache(cache_path: &PathBuf, n_bars: usize) -> Option<Vec<Vec<f32>>> {
     use std::io::Read;
     let mut file = std::fs::File::open(cache_path).ok()?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).ok()?;
-    if data.len() < 8 {
-        return None;
-    }
-    let num_frames = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
-    let num_bars  = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw).ok()?;
+    if raw.len() < 12 { return None; }
 
-    // Sanity caps: reject obviously bogus / crafted headers before arithmetic.
-    if num_bars != n_bars || num_bars > MAX_BAR_COUNT || num_frames > 500_000 {
-        return None;
-    }
+    let magic      = u32::from_le_bytes(raw[0..4].try_into().ok()?);
+    let num_frames = u32::from_le_bytes(raw[4..8].try_into().ok()?) as usize;
+    let num_bars   = u32::from_le_bytes(raw[8..12].try_into().ok()?) as usize;
 
-    // Use saturating arithmetic so a huge header can't overflow `expected`.
-    let payload = num_frames.saturating_mul(num_bars).saturating_mul(4);
-    let expected = 8usize.saturating_add(payload);
-    if data.len() < expected {
+    if magic != CACHE_MAGIC || num_bars != n_bars || num_bars > MAX_BAR_COUNT || num_frames > 500_000 {
         return None;
     }
 
-    // Decode frames — propagate any conversion failure as None instead of panicking.
-    let frames: Option<Vec<Vec<f32>>> = (0..num_frames)
+    let decompressed = lz4_flex::decompress_size_prepended(&raw[12..]).ok()?;
+
+    // Each value is a u16 LE → 2 bytes per bar per frame.
+    let expected_bytes = num_frames.saturating_mul(num_bars).saturating_mul(2);
+    if decompressed.len() < expected_bytes { return None; }
+
+    let frames: Vec<Vec<f32>> = (0..num_frames)
         .map(|f| {
-            (0..num_bars)
-                .map(|b| {
-                    let off = 8 + (f * num_bars + b) * 4;
-                    let bytes: [u8; 4] = data[off..off + 4].try_into().ok()?;
-                    Some(f32::from_le_bytes(bytes))
-                })
-                .collect::<Option<Vec<f32>>>()
+            let base = f * num_bars * 2;
+            (0..num_bars).map(|b| {
+                let off = base + b * 2;
+                let v = u16::from_le_bytes([decompressed[off], decompressed[off + 1]]);
+                v as f32 / 65535.0
+            }).collect()
         })
         .collect();
-    frames
+    Some(frames)
 }
 
 fn save_cache(cache_path: &PathBuf, frames: &[Vec<f32>]) {
@@ -975,16 +977,25 @@ fn save_cache(cache_path: &PathBuf, frames: &[Vec<f32>]) {
     if let Some(parent) = cache_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let mut data: Vec<u8> = Vec::new();
     let n_bars = frames.first().map(|f| f.len()).unwrap_or(0);
-    data.extend_from_slice(&(frames.len() as u32).to_le_bytes());
-    data.extend_from_slice(&(n_bars as u32).to_le_bytes());
+
+    // Flatten to u16 LE bytes, then LZ4-compress.
+    let mut payload: Vec<u8> = Vec::with_capacity(frames.len() * n_bars * 2);
     for frame in frames {
         for &v in frame {
-            data.extend_from_slice(&v.to_le_bytes());
+            let q = (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
+            payload.extend_from_slice(&q.to_le_bytes());
         }
     }
-    if let Ok(mut f) = std::fs::File::create(cache_path) && f.write_all(&data).is_err() {
+    let compressed = lz4_flex::compress_prepend_size(&payload);
+
+    let mut header = Vec::with_capacity(12 + compressed.len());
+    header.extend_from_slice(&CACHE_MAGIC.to_le_bytes());
+    header.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+    header.extend_from_slice(&(n_bars as u32).to_le_bytes());
+    header.extend_from_slice(&compressed);
+
+    if let Ok(mut f) = std::fs::File::create(cache_path) && f.write_all(&header).is_err() {
         let _ = std::fs::remove_file(cache_path);
     }
 }
