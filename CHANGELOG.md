@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.1.2] - 2026-07-14
+
+Daily-use conveniences and per-track history.
+
+### Player
+- **Sleep timer** (💤) — stop playback after 15 / 30 / 45 / 60 / 90 minutes or
+  at the end of the current track; the button lights up and its tooltip shows
+  the time remaining.
+- **A-B repeat** — cycle A → B → off to loop a section of the current track,
+  with A/B markers drawn on the seek bar. Gapless prebuffering and auto-advance
+  are suppressed while a loop is active.
+- **Bookmarks** (🔖) — save the current position per track and jump back to it
+  later; persisted to `~/.moosik/bookmarks.json`.
+- **Play statistics** — per-track play count and last-played time, persisted to
+  `~/.moosik/stats.json`. Shown in the Info window, as an optional **▶N column**
+  in the playlist (toggle in the 🎨 Look menu), and as two new sort columns —
+  **Plays** (most-played first) and **Recent** (most-recently-played first).
+
 ## [1.1.1] - 2026-07-13
 
 Follow-up polish to the 1.1.0 appearance work: a tidier spectrum window, a lot

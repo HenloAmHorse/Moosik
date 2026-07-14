@@ -960,17 +960,26 @@ enum PlayState { Stopped, Playing, Paused }
 #[derive(PartialEq, Clone, Copy, Serialize, Deserialize)]
 enum LoopMode { Sequential, RepeatAll, RepeatOne }
 
-/// Column the playlist can be sorted by.
+/// Column the playlist can be sorted by. `Plays` / `Recent` sort by the
+/// persisted play statistics (most-played / most-recently-played first).
 #[derive(PartialEq, Clone, Copy)]
-enum SortKey { Title, Artist, Album, Duration }
+enum SortKey { Title, Artist, Album, Duration, Plays, Recent }
 
 impl SortKey {
-    const ALL: [SortKey; 4] = [SortKey::Title, SortKey::Artist, SortKey::Album, SortKey::Duration];
+    const ALL: [SortKey; 6] = [
+        SortKey::Title, SortKey::Artist, SortKey::Album,
+        SortKey::Duration, SortKey::Plays, SortKey::Recent,
+    ];
     fn label(self) -> &'static str {
         match self {
             SortKey::Title => "Title", SortKey::Artist => "Artist",
             SortKey::Album => "Album", SortKey::Duration => "Time",
+            SortKey::Plays => "Plays", SortKey::Recent => "Recent",
         }
+    }
+    /// These default to descending (highest / most-recent first).
+    fn default_desc(self) -> bool {
+        matches!(self, SortKey::Plays | SortKey::Recent)
     }
 }
 
@@ -1003,6 +1012,102 @@ fn save_player_prefs(dir: &Path, p: &PlayerPrefs) {
     let _ = std::fs::create_dir_all(dir);
     if let Ok(json) = serde_json::to_string_pretty(p) {
         let _ = std::fs::write(dir.join("player.json"), json);
+    }
+}
+
+/// Seconds since the Unix epoch (0 if the clock is before it, which never
+/// happens in practice).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A coarse "… ago" string for a Unix timestamp (no calendar library needed).
+fn fmt_ago(unix: u64) -> String {
+    let now = now_unix();
+    if unix == 0 || unix > now { return "just now".to_string(); }
+    let s = now - unix;
+    match s {
+        0..=59            => "just now".to_string(),
+        60..=3599         => format!("{} min ago", s / 60),
+        3600..=86_399     => format!("{} h ago", s / 3600),
+        86_400..=2_591_999 => format!("{} days ago", s / 86_400),
+        _                 => format!("{} months ago", s / 2_592_000),
+    }
+}
+
+// ── Play statistics (~/.moosik/stats.json) ─────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct PlayStat {
+    #[serde(default)] count: u32,
+    /// Unix seconds of the most recent play.
+    #[serde(default)] last: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct PlayStats {
+    /// Key: absolute track path as a string.
+    #[serde(default)] plays: HashMap<String, PlayStat>,
+}
+
+impl PlayStats {
+    fn load(dir: &Path) -> Self {
+        std::fs::read_to_string(dir.join("stats.json"))
+            .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    }
+    fn save(&self, dir: &Path) {
+        let _ = std::fs::create_dir_all(dir);
+        if let Ok(json) = serde_json::to_string(self) {
+            let _ = std::fs::write(dir.join("stats.json"), json);
+        }
+    }
+    fn record(&mut self, path: &Path) {
+        let e = self.plays.entry(path.to_string_lossy().into_owned()).or_default();
+        e.count += 1;
+        e.last = now_unix();
+    }
+    fn get(&self, path: &Path) -> Option<&PlayStat> {
+        self.plays.get(&*path.to_string_lossy())
+    }
+}
+
+// ── Bookmarks (~/.moosik/bookmarks.json) ───────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct Bookmarks {
+    /// Key: absolute track path → sorted list of positions (seconds).
+    #[serde(default)] marks: HashMap<String, Vec<f32>>,
+}
+
+impl Bookmarks {
+    fn load(dir: &Path) -> Self {
+        std::fs::read_to_string(dir.join("bookmarks.json"))
+            .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    }
+    fn save(&self, dir: &Path) {
+        let _ = std::fs::create_dir_all(dir);
+        if let Ok(json) = serde_json::to_string(self) {
+            let _ = std::fs::write(dir.join("bookmarks.json"), json);
+        }
+    }
+    fn for_track(&self, path: &Path) -> Option<&Vec<f32>> {
+        self.marks.get(&*path.to_string_lossy())
+    }
+    fn add(&mut self, path: &Path, secs: f32) {
+        let v = self.marks.entry(path.to_string_lossy().into_owned()).or_default();
+        // Ignore a near-duplicate within 1 s.
+        if v.iter().any(|&x| (x - secs).abs() < 1.0) { return; }
+        v.push(secs);
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    fn remove(&mut self, path: &Path, secs: f32) {
+        if let Some(v) = self.marks.get_mut(&*path.to_string_lossy()) {
+            v.retain(|&x| (x - secs).abs() >= 0.01);
+            if v.is_empty() { self.marks.remove(&*path.to_string_lossy()); }
+        }
     }
 }
 
@@ -1091,6 +1196,8 @@ struct Appearance {
     #[serde(default = "default_true")] art_accent: bool,
     /// Light or dark theme.
     #[serde(default)] theme: ThemeMode,
+    /// Show each track's play count in the playlist rows.
+    #[serde(default)] show_play_count: bool,
 }
 
 impl Default for Appearance {
@@ -1100,6 +1207,7 @@ impl Default for Appearance {
             ui_scale: 1.0,
             art_accent: true,
             theme: ThemeMode::Dark,
+            show_play_count: false,
         }
     }
 }
@@ -1295,6 +1403,16 @@ struct MoosikApp {
     /// Last (volume, loop_mode) written to player.json, for change detection.
     saved_player: PlayerPrefs,
     player_save_at: Option<Instant>,
+    /// Sleep timer: stop playback at this instant, or at the end of the current
+    /// track (when `sleep_end_of_track`).
+    sleep_deadline: Option<Instant>,
+    sleep_end_of_track: bool,
+    /// A-B repeat within the current track (loops between two positions).
+    ab_a: Option<Duration>,
+    ab_b: Option<Duration>,
+    /// Persisted play counts and per-track bookmarks.
+    stats: PlayStats,
+    bookmarks: Bookmarks,
     // multi-select
     selected: HashSet<usize>,
     last_clicked: Option<usize>,
@@ -1392,6 +1510,12 @@ impl MoosikApp {
             loop_mode: player_prefs.loop_mode,
             saved_player: player_prefs,
             player_save_at: None,
+            sleep_deadline: None,
+            sleep_end_of_track: false,
+            ab_a: None,
+            ab_b: None,
+            stats: PlayStats::load(&moosik_dir()),
+            bookmarks: Bookmarks::load(&moosik_dir()),
             selected: HashSet::new(),
             last_clicked: None,
             filter_query: String::new(),
@@ -1444,16 +1568,22 @@ impl MoosikApp {
     /// direction. The currently-playing track is followed to its new position;
     /// selection and any queued gapless track are cleared since indices change.
     fn sort_playlist(&mut self, key: SortKey) {
-        let asc = if self.sort_key == Some(key) { !self.sort_asc } else { true };
+        let asc = if self.sort_key == Some(key) { !self.sort_asc } else { !key.default_desc() };
         let cur_path = self.current_index
             .and_then(|i| self.playlist.get(i))
             .map(|t| t.path.clone());
+        // Snapshot the stats so the comparator doesn't borrow self while the
+        // playlist is being sorted in place.
+        let stats = self.stats.clone();
+        let stat = |p: &Path| stats.get(p).cloned().unwrap_or_default();
         self.playlist.sort_by(|a, b| {
             let o = match key {
                 SortKey::Title    => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
                 SortKey::Artist   => a.artist.to_lowercase().cmp(&b.artist.to_lowercase()),
                 SortKey::Album    => a.album.to_lowercase().cmp(&b.album.to_lowercase()),
                 SortKey::Duration => a.duration.cmp(&b.duration),
+                SortKey::Plays    => stat(&a.path).count.cmp(&stat(&b.path).count),
+                SortKey::Recent   => stat(&a.path).last.cmp(&stat(&b.path).last),
             };
             if asc { o } else { o.reverse() }
         });
@@ -1549,6 +1679,7 @@ impl MoosikApp {
                     && let Some(desc) = self.engine.as_ref().and_then(|e| e.bp_describe()) {
                     self.status_msg = format!("💎 {desc} — {}", self.playlist[idx].title);
                 }
+                self.on_track_started(&path);
             }
             Err(e) if self.bit_perfect => {
                 // Device rejected the format (or vanished) — drop to normal
@@ -1787,6 +1918,7 @@ impl MoosikApp {
         self.current_index = Some(next);
         self.gapless_tried = None; // let the new current arm its own successor
         self.seek_pos = 0.0;
+        self.on_track_started(&self.playlist[next].path.clone());
         let sr = self.playlist[next].sample_rate
             .or_else(|| self.engine.as_ref().map(|e| e.last_sample_rate))
             .unwrap_or(44_100);
@@ -1821,6 +1953,32 @@ impl MoosikApp {
             if let Some(e) = self.engine.as_mut() {
                 e.play_seeked_async(&path, pos, dur, was_paused);
             }
+        }
+    }
+
+    /// Called whenever a track begins playing (explicit, auto-advance, or
+    /// gapless roll-over): bump its play count and reset the per-track A-B loop.
+    fn on_track_started(&mut self, path: &Path) {
+        self.stats.record(path);
+        self.stats.save(&moosik_dir());
+        self.ab_a = None;
+        self.ab_b = None;
+    }
+
+    /// Cycle the A-B repeat state: unset → set A (now) → set B (now) → clear.
+    fn cycle_ab_repeat(&mut self) {
+        let pos = self.elapsed();
+        match (self.ab_a, self.ab_b) {
+            (None, _) => { self.ab_a = Some(pos); self.ab_b = None; }
+            (Some(a), None) => {
+                if pos > a {
+                    self.ab_b = Some(pos);
+                    self.flush_gapless(); // stay on this track while looping
+                } else {
+                    self.ab_a = Some(pos); // B must be after A — move A instead
+                }
+            }
+            (Some(_), Some(_)) => { self.ab_a = None; self.ab_b = None; }
         }
     }
 
@@ -2060,7 +2218,7 @@ fn section(ui: &mut egui::Ui, heading: &str) {
     ui.end_row();
 }
 
-fn show_track_info(ui: &mut egui::Ui, t: &Track, spectral_ceiling: Option<SpectralCeiling>, analysis: Option<&TrackAnalysis>) {
+fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectral_ceiling: Option<SpectralCeiling>, analysis: Option<&TrackAnalysis>) {
     use egui::Grid;
 
     let codec  = codec_name(&t.path);
@@ -2074,6 +2232,12 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, spectral_ceiling: Option<Spectr
         row(ui, "Size",     &fmt_size(t.file_size));
         row(ui, "Format",   codec);
         row(ui, "Lossless", if lossy { "No (lossy)" } else { "Yes" });
+
+        // ── History ─────────────────────────────────────────────────────
+        section(ui, "History");
+        let s = stat.unwrap_or_default();
+        row(ui, "Play count", &s.count.to_string());
+        row(ui, "Last played", &if s.count == 0 { "Never".to_string() } else { fmt_ago(s.last) });
 
         // ── Stream ──────────────────────────────────────────────────────
         section(ui, "Stream");
@@ -2381,29 +2545,55 @@ impl eframe::App for MoosikApp {
 
         // --- gapless roll-over + auto-advance when a track finishes ---
         if self.play_state == PlayState::Playing {
-            // Bit-perfect: the device reports exact frame boundaries as it plays
-            // through gaplessly-chained tracks (possibly several per frame).
-            while self.engine.as_mut().map(|e| e.bp_poll_boundary()).unwrap_or(false) {
-                self.gapless_rollover();
-            }
-            // Normal mode: no per-source callback, so detect the boundary by time.
-            let normal_crossed = self.gapless_next.is_some()
-                && self.engine.as_ref().map(|e| !e.bit_perfect).unwrap_or(false)
-                && self.current_index
-                    .and_then(|i| self.playlist.get(i)).and_then(|t| t.duration)
-                    .map(|d| self.elapsed() >= d).unwrap_or(false);
-            if normal_crossed {
-                self.gapless_rollover();
-            }
+            // A-B repeat keeps playback inside the current track: loop back to A
+            // at B, and skip all advance / gapless logic while it's active.
+            if let (Some(a), Some(b)) = (self.ab_a, self.ab_b) {
+                if self.elapsed() >= b {
+                    self.seek_to(a);
+                }
+            } else {
+                // Bit-perfect: the device reports exact frame boundaries as it plays
+                // through gaplessly-chained tracks (possibly several per frame).
+                while self.engine.as_mut().map(|e| e.bp_poll_boundary()).unwrap_or(false) {
+                    self.gapless_rollover();
+                }
+                // Normal mode: no per-source callback, so detect the boundary by time.
+                let normal_crossed = self.gapless_next.is_some()
+                    && self.engine.as_ref().map(|e| !e.bit_perfect).unwrap_or(false)
+                    && self.current_index
+                        .and_then(|i| self.playlist.get(i)).and_then(|t| t.duration)
+                        .map(|d| self.elapsed() >= d).unwrap_or(false);
+                if normal_crossed {
+                    self.gapless_rollover();
+                }
 
-            // A truly finished stream (nothing was queued) advances the old way.
-            let finished = self.engine.as_ref().map(|e| e.is_finished()).unwrap_or(false);
-            if finished {
-                self.next_track();
-            }
+                // A truly finished stream (nothing was queued) advances — unless
+                // the sleep timer is set to stop at the end of this track.
+                let finished = self.engine.as_ref().map(|e| e.is_finished()).unwrap_or(false);
+                if finished {
+                    if self.sleep_end_of_track {
+                        self.sleep_end_of_track = false;
+                        self.stop();
+                    } else {
+                        self.next_track();
+                    }
+                }
 
-            // Prebuffer the next track once we're near the end of this one.
-            self.try_arm_gapless();
+                // Prebuffer the next track once we're near the end of this one.
+                // Suppressed when we'll stop at the end anyway.
+                if !self.sleep_end_of_track {
+                    self.try_arm_gapless();
+                }
+            }
+        }
+
+        // --- Sleep timer (fixed deadline) ---
+        if let Some(dl) = self.sleep_deadline
+            && Instant::now() >= dl {
+            self.sleep_deadline = None;
+            if self.play_state == PlayState::Playing {
+                self.toggle_play_pause(); // pause
+            }
         }
 
         // sync volume to engine on startup
@@ -2454,7 +2644,7 @@ impl eframe::App for MoosikApp {
                 }
                 egui::CentralPanel::default().show(vp_ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        show_track_info(ui, &track, self.spectrum_window.spectral_ceiling.clone(), self.spectrum_window.track_analysis.as_ref());
+                        show_track_info(ui, &track, self.stats.get(&track.path).cloned(), self.spectrum_window.spectral_ceiling.clone(), self.spectrum_window.track_analysis.as_ref());
                     });
                 });
             });
@@ -2636,6 +2826,25 @@ impl eframe::App for MoosikApp {
                 pal::text(dark),
             );
 
+            // A-B repeat markers on the track.
+            if let Some(dur) = total {
+                let ds = dur.as_secs_f32().max(0.001);
+                let mark = |pos: Duration, label: &str, col: Color32| {
+                    let t = (pos.as_secs_f32() / ds).clamp(0.0, 1.0);
+                    let x = track_x0 + t * (track_x1 - track_x0);
+                    painter.line_segment(
+                        [egui::Pos2::new(x, row_rect.top() + 3.0),
+                         egui::Pos2::new(x, row_rect.bottom() - 3.0)],
+                        egui::Stroke::new(2.0, col),
+                    );
+                    painter.text(egui::Pos2::new(x, row_rect.top() + 1.0),
+                        egui::Align2::CENTER_TOP, label, egui::FontId::monospace(9.0), col);
+                };
+                let ab_col = pal::amber(dark);
+                if let Some(a) = self.ab_a { mark(a, "A", ab_col); }
+                if let Some(b) = self.ab_b { mark(b, "B", ab_col); }
+            }
+
             // 4. Commit seek on drag-release or click.
             if seek_resp.drag_stopped() || seek_resp.clicked() {
                 if let (Some(dur), Some(_idx)) = (total, self.current_index) {
@@ -2690,6 +2899,113 @@ impl eframe::App for MoosikApp {
                     // The queued gapless track may no longer be the right next.
                     self.flush_gapless();
                 }
+
+                ui.add_space(8.0);
+
+                // ── A-B repeat ───────────────────────────────────────────
+                let (ab_label, ab_on) = match (self.ab_a, self.ab_b) {
+                    (None, _)          => ("A–B", false),
+                    (Some(_), None)    => ("A‥",  true),
+                    (Some(_), Some(_)) => ("A↔B", true),
+                };
+                let ab_txt = if ab_on {
+                    RichText::new(ab_label).size(15.0).color(pal::accent(ui.visuals().dark_mode))
+                } else {
+                    RichText::new(ab_label).size(15.0)
+                };
+                let ab_tip = match (self.ab_a, self.ab_b) {
+                    (None, _) => "A-B repeat — click to set point A".to_string(),
+                    (Some(a), None) => format!("A = {} — click to set B (or clear)",
+                        Self::format_duration(a)),
+                    (Some(a), Some(b)) => format!("Looping {}–{} — click to clear",
+                        Self::format_duration(a), Self::format_duration(b)),
+                };
+                if ui.add_enabled(self.current_index.is_some(),
+                    egui::Button::new(ab_txt).min_size(Vec2::new(46.0, 36.0)))
+                    .on_hover_text(ab_tip).clicked() {
+                    self.cycle_ab_repeat();
+                }
+
+                // ── Bookmarks ────────────────────────────────────────────
+                ui.menu_button(RichText::new("🔖").size(16.0), |ui| {
+                    ui.set_min_width(200.0);
+                    let cur = self.current_index.map(|i| self.playlist[i].path.clone());
+                    if ui.add_enabled(cur.is_some(),
+                        egui::Button::new("＋ Bookmark current position")).clicked() {
+                        if let Some(ref p) = cur {
+                            self.bookmarks.add(p, self.elapsed().as_secs_f32());
+                            self.bookmarks.save(&moosik_dir());
+                        }
+                        ui.close_menu();
+                    }
+                    if let Some(ref p) = cur
+                        && let Some(marks) = self.bookmarks.for_track(p).cloned()
+                        && !marks.is_empty() {
+                        ui.separator();
+                        let mut jump: Option<f32> = None;
+                        let mut remove: Option<f32> = None;
+                        for m in marks {
+                            ui.horizontal(|ui| {
+                                if ui.button(format!("↪ {}",
+                                    Self::format_duration(Duration::from_secs_f32(m)))).clicked() {
+                                    jump = Some(m);
+                                }
+                                if ui.small_button("✕").on_hover_text("Remove").clicked() {
+                                    remove = Some(m);
+                                }
+                            });
+                        }
+                        if let Some(m) = jump {
+                            self.seek_to(Duration::from_secs_f32(m));
+                            ui.close_menu();
+                        }
+                        if let Some(m) = remove {
+                            self.bookmarks.remove(p, m);
+                            self.bookmarks.save(&moosik_dir());
+                        }
+                    }
+                }).response.on_hover_text("Bookmarks for the current track");
+
+                // ── Sleep timer ──────────────────────────────────────────
+                let sleep_on = self.sleep_deadline.is_some() || self.sleep_end_of_track;
+                let sleep_txt = if sleep_on {
+                    RichText::new("💤").size(16.0).color(pal::accent(ui.visuals().dark_mode))
+                } else {
+                    RichText::new("💤").size(16.0)
+                };
+                let sleep_tip = if let Some(dl) = self.sleep_deadline {
+                    format!("Sleep in {}", Self::format_duration(dl.saturating_duration_since(Instant::now())))
+                } else if self.sleep_end_of_track {
+                    "Sleep at end of track".to_string()
+                } else {
+                    "Sleep timer".to_string()
+                };
+                ui.menu_button(sleep_txt, |ui| {
+                    ui.set_min_width(150.0);
+                    if ui.selectable_label(!sleep_on, "Off").clicked() {
+                        self.sleep_deadline = None;
+                        self.sleep_end_of_track = false;
+                        ui.close_menu();
+                    }
+                    for mins in [15u64, 30, 45, 60, 90] {
+                        if ui.selectable_label(false, format!("{mins} minutes")).clicked() {
+                            self.sleep_deadline = Some(Instant::now() + Duration::from_secs(mins * 60));
+                            self.sleep_end_of_track = false;
+                            ui.close_menu();
+                        }
+                    }
+                    if ui.selectable_label(self.sleep_end_of_track, "End of track").clicked() {
+                        self.sleep_end_of_track = true;
+                        self.sleep_deadline = None;
+                        ui.close_menu();
+                    }
+                    if let Some(dl) = self.sleep_deadline {
+                        ui.separator();
+                        ui.label(RichText::new(format!("⏳ {} left",
+                            Self::format_duration(dl.saturating_duration_since(Instant::now()))))
+                            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+                    }
+                }).response.on_hover_text(sleep_tip);
 
                 ui.add_space(20.0);
 
@@ -2956,6 +3272,13 @@ impl eframe::App for MoosikApp {
                         ui.label(RichText::new("Off → fixed brand accent")
                             .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
 
+                        ui.add_space(6.0);
+                        ui.separator();
+                        if ui.checkbox(&mut self.appearance.show_play_count,
+                            "Show play counts in playlist").changed() {
+                            changed = true;
+                        }
+
                         if changed {
                             save_appearance(&moosik_dir(), &self.appearance);
                         }
@@ -3219,6 +3542,8 @@ impl eframe::App for MoosikApp {
                     let track_title  = self.playlist[i].display_title().to_string();
                     let track_artist = self.playlist[i].artist.clone();
                     let track_dur    = self.playlist[i].duration;
+                    let play_count   = self.stats.get(&self.playlist[i].path).map(|s| s.count).unwrap_or(0);
+                    let show_count   = self.appearance.show_play_count;
                     let is_current        = self.current_index == Some(i);
                     let is_selected       = self.selected.contains(&i);
                     let is_being_dragged  = self.drag_src == Some(i);
@@ -3394,10 +3719,22 @@ impl eframe::App for MoosikApp {
                             pal::text_dim(dark),
                         );
 
+                        // Play count (optional) — sits left of the duration.
+                        let dur_right = if show_count { inner.max.x - 52.0 } else { inner.max.x - 8.0 };
+                        if show_count {
+                            ui.painter().text(
+                                egui::Pos2::new(inner.max.x - 8.0, cy),
+                                egui::Align2::RIGHT_CENTER,
+                                if play_count > 0 { format!("▶{play_count}") } else { "–".to_string() },
+                                egui::FontId::proportional(11.0),
+                                if play_count > 0 { pal::text_dim(dark) } else { pal::text_faint(dark) },
+                            );
+                        }
+
                         // Duration
                         if let Some(dur) = track_dur {
                             ui.painter().text(
-                                egui::Pos2::new(inner.max.x - 8.0, cy),
+                                egui::Pos2::new(dur_right, cy),
                                 egui::Align2::RIGHT_CENTER,
                                 Self::format_duration(dur),
                                 egui::FontId::monospace(12.0),

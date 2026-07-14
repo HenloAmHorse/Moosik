@@ -79,7 +79,11 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 ### Player
 - **Gapless playback** — consecutive tracks play with no silence between them, in both normal and bit-perfect mode (bit-perfect stays gapless across same-rate tracks; a sample-rate change re-opens the device)
 - **Playlist search** — a 🔍 box filters the playlist by title, artist, or album as you type (`Ctrl+F` to focus, `Esc` to clear)
-- **Column sorting** — sort by Title / Artist / Album / Time; click a column to sort, click again to reverse
+- **Column sorting** — sort by Title / Artist / Album / Time, plus **Plays** and **Recent** from play history; click a column to sort, click again to reverse
+- **Sleep timer** — stop after 15–90 minutes or at the end of the current track
+- **A-B repeat** — loop a section of the current track, with markers on the seek bar
+- **Bookmarks** — save and jump back to positions per track
+- **Play statistics** — per-track play count and last-played, shown in the Info window and (optionally) as a column in the playlist
 - Waveform seek bar with click-to-seek
 - Volume control (volume and loop mode persist across launches)
 - Metadata display (title, artist, album, cover art) via `lofty`
