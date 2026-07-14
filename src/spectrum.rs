@@ -28,7 +28,7 @@ const WATERFALL_ROWS: usize = 120;
 // ---------------------------------------------------------------------------
 // New public enums: loudness mode, window function
 // ---------------------------------------------------------------------------
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum LoudnessMode {
     /// Raw dB magnitude — no psychoacoustic correction.
     Flat,
@@ -36,11 +36,11 @@ pub enum LoudnessMode {
     EqualLoudness,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum WindowFn { Hann, Hamming, Blackman, FlatTop }
 
 /// Sub-bin interpolation method used when mapping FFT bins to spectrum bars.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum InterpolationMode {
     /// No interpolation — nearest bin value. Fastest, most "honest".
     None,
@@ -56,7 +56,7 @@ pub enum InterpolationMode {
     Lanczos,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum BarMappingMode {
     /// Flat overlap average — equal weight to all bins in range.
     FlatOverlap,
@@ -71,7 +71,7 @@ pub enum BarMappingMode {
 // Peak hold
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum PeakDecayMode {
     /// Constant fall speed.
     Linear,
@@ -79,6 +79,10 @@ pub enum PeakDecayMode {
     Gravity,
     /// Peak fades in place rather than falling.
     FadeOut,
+}
+
+impl Default for PeakDecayMode {
+    fn default() -> Self { PeakDecayMode::Gravity }
 }
 
 #[derive(Clone)]
@@ -320,13 +324,13 @@ impl SampleToF32 for u16 {
 // Public types
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum SpectrumMode {
     RealTime,
     PreProcess,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum VizStyle {
     Bars,
     Line,
@@ -1805,6 +1809,43 @@ fn sample_stops(stops: &[(f32, (u8, u8, u8))], t: f32) -> Color32 {
     rgb(cl)
 }
 
+/// Paint a small left→right gradient preview of a palette (its low-to-high
+/// magnitude ramp), used as a swatch in the palette picker.
+fn paint_palette_swatch(ui: &mut egui::Ui, pal: &Palette, size: egui::Vec2) {
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if !ui.is_rect_visible(rect) { return; }
+    let painter = ui.painter();
+    let n = 22usize;
+    for i in 0..n {
+        let t  = i as f32 / (n - 1) as f32;
+        let x0 = rect.left() + rect.width() * (i as f32) / (n as f32);
+        let x1 = rect.left() + rect.width() * ((i + 1) as f32) / (n as f32);
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(x0, rect.top()), Pos2::new(x1, rect.bottom())),
+            0.0, pal.bar(t),
+        );
+    }
+}
+
+// Theme-aware text colours for the spectrum window's chrome labels (the window
+// itself follows the app's light/dark theme). Plot-painted text keeps its own
+// fixed colours since the plot area stays dark in both themes.
+fn txt_dim(dark: bool) -> Color32 {
+    if dark { Color32::from_gray(150) } else { Color32::from_rgb(0x55, 0x58, 0x63) }
+}
+fn txt_faint(dark: bool) -> Color32 {
+    if dark { Color32::from_gray(120) } else { Color32::from_rgb(0x74, 0x77, 0x82) }
+}
+fn txt_ok(dark: bool) -> Color32 {
+    if dark { Color32::from_rgb(100, 210, 100) } else { Color32::from_rgb(0x1c, 0x77, 0x30) }
+}
+fn txt_warn(dark: bool) -> Color32 {
+    if dark { Color32::from_rgb(255, 200, 60) } else { Color32::from_rgb(0x93, 0x63, 0x00) }
+}
+fn txt_accent(dark: bool) -> Color32 {
+    if dark { Color32::from_rgb(140, 190, 255) } else { Color32::from_rgb(0x2f, 0x50, 0xc0) }
+}
+
 // ---------------------------------------------------------------------------
 // EQ overlay — response curve and draggable band nodes
 // ---------------------------------------------------------------------------
@@ -2153,6 +2194,79 @@ fn snap_pow2(n: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Persisted spectrum view settings (~/.moosik/spectrum.json)
+// ---------------------------------------------------------------------------
+
+/// The subset of spectrum-window state worth remembering across launches — the
+/// analysis/display knobs the user tweaks. Deliberately excludes `fft_size`
+/// (auto-scaled per track in `on_play`) and anything runtime (textures, paths,
+/// per-frame state). Every field has a `serde(default)` so an older or partial
+/// file still loads.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Default)]
+struct SpectrumSettings {
+    #[serde(default)] mode:          SpectrumMode,
+    #[serde(default)] style:         VizStyle,
+    #[serde(default)] loudness_mode: LoudnessMode,
+    #[serde(default)] bar_count:     usize,
+    #[serde(default)] bar_gap:       f32,
+    #[serde(default)] window_fn:     WindowFn,
+    #[serde(default)] smoothing:     f32,
+    #[serde(default)] min_freq:      f32,
+    #[serde(default)] max_freq:      f32,
+    #[serde(default)] interp_mode:   InterpolationMode,
+    #[serde(default)] pad_factor:    usize,
+    #[serde(default)] overlap:       f32,
+    #[serde(default)] bar_mapping:   BarMappingMode,
+    #[serde(default)] show_fft:      bool,
+    #[serde(default)] show_peak:     bool,
+    #[serde(default)] show_art:      bool,
+    #[serde(default)] show_cache:    bool,
+    // Peak-hold config (colour stored as RGB so no egui serde feature is needed).
+    // Defaults mirror PeakHoldConfig::default() so a settings file written
+    // before these fields existed still restores sensible peak-hold values.
+    #[serde(default = "def_true")]       peak_enabled:      bool,
+    #[serde(default = "def_peak_hold")]  peak_hold_ms:      f32,
+    #[serde(default = "def_peak_fall")]  peak_fall_speed:   f32,
+    #[serde(default = "def_peak_accel")] peak_acceleration: f32,
+    #[serde(default)]                    peak_decay_mode:   PeakDecayMode,
+    #[serde(default = "def_peak_thick")] peak_thickness:    u8,
+    #[serde(default = "def_peak_color")] peak_color:        [u8; 3],
+}
+
+fn def_true() -> bool { true }
+fn def_peak_hold() -> f32 { 500.0 }
+fn def_peak_fall() -> f32 { 3.0 }
+fn def_peak_accel() -> f32 { 4.0 }
+fn def_peak_thick() -> u8 { 2 }
+fn def_peak_color() -> [u8; 3] { [255, 255, 255] }
+
+// serde(default) needs Default impls for the enums used above.
+impl Default for SpectrumMode      { fn default() -> Self { SpectrumMode::PreProcess } }
+impl Default for VizStyle          { fn default() -> Self { VizStyle::Bars } }
+impl Default for LoudnessMode      { fn default() -> Self { LoudnessMode::Flat } }
+impl Default for WindowFn          { fn default() -> Self { WindowFn::Hann } }
+impl Default for InterpolationMode { fn default() -> Self { InterpolationMode::None } }
+impl Default for BarMappingMode    { fn default() -> Self { BarMappingMode::Cqt } }
+
+fn spectrum_settings_path() -> PathBuf {
+    home_dir().join(".moosik").join("spectrum.json")
+}
+
+fn load_spectrum_settings() -> Option<SpectrumSettings> {
+    std::fs::read_to_string(spectrum_settings_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn save_spectrum_settings(s: &SpectrumSettings) {
+    let path = spectrum_settings_path();
+    if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
+    if let Ok(json) = serde_json::to_string_pretty(s) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SpectrumWindow — the main public interface consumed by MoosikApp
 // ---------------------------------------------------------------------------
 
@@ -2255,6 +2369,18 @@ pub struct SpectrumWindow {
     /// Accent used by the `Accent` palette — the current track's album-art
     /// tint. Set by the app each frame.
     pub palette_accent: Color32,
+    /// Open/closed state for the settings sections. They live in a single
+    /// wrap-around toggle row (instead of stacked collapsibles) so the plot
+    /// keeps as much height as possible; each section's body renders full-width
+    /// below the row only when open.
+    show_fft_settings:  bool,
+    show_peak_settings: bool,
+    show_art_settings:  bool,
+    show_cache_settings: bool,
+    /// Last snapshot written to spectrum.json, for change detection, plus a
+    /// timestamp so a slider drag doesn't rewrite the file every frame.
+    saved_settings:   SpectrumSettings,
+    settings_save_at: Option<Instant>,
 
     // ── Album art ──────────────────────────────────────────────────────────
     pub art_settings: ArtSettingsStore,
@@ -2278,7 +2404,7 @@ impl SpectrumWindow {
     pub fn new() -> Self {
         let buf = new_sample_buf();
         let analyzer = SpectrumAnalyzer::new(Arc::clone(&buf));
-        Self {
+        let mut w = Self {
             open: false,
             mode: SpectrumMode::PreProcess,
             style: VizStyle::Bars,
@@ -2343,6 +2469,12 @@ impl SpectrumWindow {
             bit_perfect: false,
             palette_kind: SpectrumPalette::Classic,
             palette_accent: Color32::from_rgb(0x94, 0xb1, 0xff),
+            show_fft_settings: false,
+            show_peak_settings: false,
+            show_art_settings: false,
+            show_cache_settings: false,
+            saved_settings: SpectrumSettings::default(),
+            settings_save_at: None,
             art_settings: ArtSettingsStore::load(),
             current_art: None,
             peak_config: PeakHoldConfig::default(),
@@ -2350,6 +2482,103 @@ impl SpectrumWindow {
             peak_hold_timers: Vec::new(),
             peak_velocities: Vec::new(),
             peak_alphas: Vec::new(),
+        };
+        // Restore persisted view settings, then record the snapshot so we only
+        // rewrite the file when something actually changes.
+        if let Some(s) = load_spectrum_settings() {
+            w.apply_settings(&s);
+        }
+        w.saved_settings = w.snapshot();
+        w
+    }
+
+    /// Current persistable view settings.
+    fn snapshot(&self) -> SpectrumSettings {
+        SpectrumSettings {
+            mode:          self.mode.clone(),
+            style:         self.style.clone(),
+            loudness_mode: self.loudness_mode.clone(),
+            bar_count:     self.bar_count,
+            bar_gap:       self.bar_gap,
+            window_fn:     self.window_fn.clone(),
+            smoothing:     self.smoothing,
+            min_freq:      self.min_freq,
+            max_freq:      self.max_freq,
+            interp_mode:   self.interp_mode.clone(),
+            pad_factor:    self.pad_factor,
+            overlap:       self.overlap,
+            bar_mapping:   self.bar_mapping.clone(),
+            show_fft:      self.show_fft_settings,
+            show_peak:     self.show_peak_settings,
+            show_art:      self.show_art_settings,
+            show_cache:    self.show_cache_settings,
+            peak_enabled:      self.peak_config.enabled,
+            peak_hold_ms:      self.peak_config.hold_ms,
+            peak_fall_speed:   self.peak_config.fall_speed,
+            peak_acceleration: self.peak_config.acceleration,
+            peak_decay_mode:   self.peak_config.decay_mode.clone(),
+            peak_thickness:    self.peak_config.peak_thickness,
+            peak_color: [
+                self.peak_config.color.r(),
+                self.peak_config.color.g(),
+                self.peak_config.color.b(),
+            ],
+        }
+    }
+
+    /// Apply persisted view settings, mirroring the analyzer fields exactly as
+    /// the UI handlers do, then rebuild so analysis reflects them.
+    fn apply_settings(&mut self, s: &SpectrumSettings) {
+        self.mode          = s.mode.clone();
+        self.style         = s.style.clone();
+        self.loudness_mode = s.loudness_mode.clone();
+        self.bar_gap       = s.bar_gap.clamp(0.0, 12.0);
+        self.window_fn     = s.window_fn.clone();
+        self.smoothing     = s.smoothing.clamp(0.0, 0.99);
+        self.min_freq      = s.min_freq;
+        self.max_freq      = s.max_freq;
+        self.interp_mode   = s.interp_mode.clone();
+        self.pad_factor    = s.pad_factor.clamp(1, 64);
+        self.overlap       = s.overlap;
+        self.bar_mapping   = s.bar_mapping.clone();
+        self.show_fft_settings   = s.show_fft;
+        self.show_peak_settings  = s.show_peak;
+        self.show_art_settings   = s.show_art;
+        self.show_cache_settings = s.show_cache;
+
+        self.peak_config.enabled        = s.peak_enabled;
+        self.peak_config.hold_ms        = s.peak_hold_ms.clamp(10.0, 1000.0);
+        self.peak_config.fall_speed     = s.peak_fall_speed.clamp(0.05, 5.0);
+        self.peak_config.acceleration   = s.peak_acceleration.clamp(0.5, 20.0);
+        self.peak_config.decay_mode     = s.peak_decay_mode.clone();
+        self.peak_config.peak_thickness = s.peak_thickness.clamp(1, 6);
+        self.peak_config.color = Color32::from_rgb(s.peak_color[0], s.peak_color[1], s.peak_color[2]);
+
+        // Mirror into the analyzer (fft_size is left alone — on_play auto-scales it).
+        self.analyzer.window_fn   = self.window_fn.clone();
+        self.analyzer.interp_mode = self.interp_mode.clone();
+        self.analyzer.pad_factor  = self.pad_factor;
+        self.analyzer.overlap     = self.overlap;
+        self.analyzer.bar_mapping = self.bar_mapping.clone();
+        let bc = s.bar_count.clamp(MIN_BAR_COUNT, MAX_BAR_COUNT);
+        self.bar_count = bc;
+        self.analyzer.set_bar_count(bc);
+        self.sync_params();
+        self.analyzer.rebuild_fft();
+    }
+
+    /// Save view settings when they change, throttled so a slider drag doesn't
+    /// hammer the disk. Call once per frame at the end of `show`.
+    fn persist_settings_if_changed(&mut self) {
+        let cur = self.snapshot();
+        if cur == self.saved_settings { return; }
+        let ready = self.settings_save_at
+            .map(|t| t.elapsed().as_secs_f32() > 0.6)
+            .unwrap_or(true);
+        if ready {
+            save_spectrum_settings(&cur);
+            self.saved_settings = cur;
+            self.settings_save_at = Some(Instant::now());
         }
     }
 
@@ -2845,8 +3074,26 @@ impl SpectrumWindow {
                         self.sync_params();
                     }
                     ui.separator();
+                    ui.label("Palette:");
+                    egui::ComboBox::from_id_salt("spectrum_palette")
+                        .selected_text(self.palette_kind.label())
+                        .show_ui(ui, |ui| {
+                            for p in SpectrumPalette::ALL {
+                                let selected = self.palette_kind == p;
+                                let clicked = ui.horizontal(|ui| {
+                                    paint_palette_swatch(
+                                        ui, &Palette::new(p, self.palette_accent),
+                                        egui::vec2(34.0, 13.0),
+                                    );
+                                    ui.selectable_label(selected, p.label()).clicked()
+                                }).inner;
+                                if clicked { self.palette_kind = p; }
+                            }
+                        });
+                    ui.separator();
+                    let dark = ui.visuals().dark_mode;
                     let eq_label = egui::RichText::new("🎛 EQ")
-                        .color(if self.show_eq { Color32::from_rgb(100, 200, 255) } else { Color32::from_gray(120) });
+                        .color(if self.show_eq { txt_accent(dark) } else { txt_faint(dark) });
                     if ui.selectable_label(self.show_eq, eq_label)
                         .on_hover_text("Toggle parametric EQ panel.\nClick on spectrum to add bands.\nDrag nodes to adjust.\nRight-click node to remove.")
                         .clicked()
@@ -2855,7 +3102,7 @@ impl SpectrumWindow {
                     }
                     ui.separator();
                     let dbg_label = egui::RichText::new("🐛 Debug")
-                        .color(if self.show_debug { Color32::from_rgb(255, 180, 60) } else { Color32::from_gray(120) });
+                        .color(if self.show_debug { txt_warn(dark) } else { txt_faint(dark) });
                     if ui.selectable_label(self.show_debug, dbg_label)
                         .on_hover_text("Toggle debug overlay (F3)")
                         .clicked()
@@ -2864,8 +3111,8 @@ impl SpectrumWindow {
                     }
                 });
 
-                // ── Row 2: bar count ──────────────────────────────────────
-                ui.horizontal(|ui| {
+                // ── Row 2: bar count (+ bar gap for Bars) ─────────────────
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Bars:");
                     let r = ui.add(egui::Slider::new(&mut self.bar_count,
                             MIN_BAR_COUNT..=MAX_BAR_COUNT)
@@ -2881,12 +3128,47 @@ impl SpectrumWindow {
                         "  ({} Hz/bin)",
                         self.analyzer.sample_rate / self.fft_size as u32
                     ));
+                    // Bar gap lives here (only meaningful for Bars), so it no
+                    // longer needs a row of its own.
+                    if self.style == VizStyle::Bars {
+                        ui.separator();
+                        ui.label("Gap:");
+                        ui.add(egui::Slider::new(&mut self.bar_gap, 0.0..=12.0)
+                            .step_by(1.0).suffix(" px"))
+                            .on_hover_text(
+                                "Physical-pixel gap between bars.\n\
+                                 0 = no gap (solid fill). Higher values give a more separated look."
+                            );
+                    }
                 });
 
-                // ── Row 3: FFT params (collapsible) ───────────────────────
-                egui::CollapsingHeader::new("⚙ FFT Settings")
-                    .default_open(false)
-                    .show(ui, |ui| {
+                // ── Settings sections ─────────────────────────────────────
+                // One wrap-around row of toggles instead of three stacked
+                // collapsibles, so the plot keeps its height. Each section's
+                // body renders full-width below when its toggle is on; the row
+                // wraps to more lines only when the window is too narrow.
+                ui.horizontal_wrapped(|ui| {
+                    let dark = ui.visuals().dark_mode;
+                    let mut chip = |open: &mut bool, text: &str| {
+                        let col = if *open { txt_accent(dark) } else { txt_dim(dark) };
+                        if ui.selectable_label(*open, egui::RichText::new(text).color(col))
+                            .clicked()
+                        {
+                            *open = !*open;
+                        }
+                    };
+                    chip(&mut self.show_fft_settings, "⚙ FFT Settings");
+                    if self.style == VizStyle::Bars {
+                        chip(&mut self.show_peak_settings, "📌 Peak Hold");
+                    }
+                    chip(&mut self.show_art_settings, "🖼 Album Art");
+                    if self.mode == SpectrumMode::PreProcess {
+                        chip(&mut self.show_cache_settings, "🗄 Cache");
+                    }
+                });
+
+                // ── FFT params ────────────────────────────────────────────
+                if self.show_fft_settings { ui.group(|ui| {
                         let mut rebuild = false;
                         ui.horizontal(|ui| {
                             ui.label("FFT size:");
@@ -2907,9 +3189,9 @@ impl SpectrumWindow {
                                     ))
                                 }).unwrap_or(false);
                                 let label = if has_cache {
-                                    egui::RichText::new(&text).color(Color32::from_rgb(100, 210, 100))
+                                    egui::RichText::new(&text).color(txt_ok(ui.visuals().dark_mode))
                                 } else if is_auto {
-                                    egui::RichText::new(&text).color(Color32::from_rgb(220, 180, 60))
+                                    egui::RichText::new(&text).color(txt_warn(ui.visuals().dark_mode))
                                 } else {
                                     egui::RichText::new(&text)
                                 };
@@ -2943,7 +3225,7 @@ impl SpectrumWindow {
                                     WindowFn::Blackman => "Blackman",
                                     WindowFn::FlatTop  => "Flat-top",
                                 };
-                                if has { egui::RichText::new(name).color(Color32::from_rgb(100, 210, 100)) }
+                                if has { egui::RichText::new(name).color(txt_ok(ui.visuals().dark_mode)) }
                                 else   { egui::RichText::new(name) }
                             };
                             let lbl_hann    = wf_green(WindowFn::Hann);
@@ -2985,7 +3267,7 @@ impl SpectrumWindow {
                                     InterpolationMode::Akima     => "Akima",
                                     InterpolationMode::Lanczos   => "Lanczos",
                                 };
-                                if has { egui::RichText::new(name).color(Color32::from_rgb(100, 210, 100)) }
+                                if has { egui::RichText::new(name).color(txt_ok(ui.visuals().dark_mode)) }
                                 else   { egui::RichText::new(name) }
                             };
                             let lbl_none   = im_green(InterpolationMode::None);
@@ -3029,7 +3311,7 @@ impl SpectrumWindow {
                                     self.cache_file_set.contains(&candidate)
                                 }).unwrap_or(false);
                                 let rich = if has_cache {
-                                    egui::RichText::new(label_text).color(Color32::from_rgb(100, 210, 100))
+                                    egui::RichText::new(label_text).color(txt_ok(ui.visuals().dark_mode))
                                 } else {
                                     egui::RichText::new(label_text)
                                 };
@@ -3065,7 +3347,7 @@ impl SpectrumWindow {
                                     ))
                                 }).unwrap_or(false);
                                 let rich = if has_cache {
-                                    egui::RichText::new(text).color(Color32::from_rgb(100, 210, 100))
+                                    egui::RichText::new(text).color(txt_ok(ui.visuals().dark_mode))
                                 } else {
                                     egui::RichText::new(text)
                                 };
@@ -3099,7 +3381,7 @@ impl SpectrumWindow {
                                     BarMappingMode::Gaussian    => "Gaussian",
                                     BarMappingMode::Cqt         => "CQT",
                                 };
-                                if has { egui::RichText::new(name).color(Color32::from_rgb(100, 210, 100)) }
+                                if has { egui::RichText::new(name).color(txt_ok(ui.visuals().dark_mode)) }
                                 else   { egui::RichText::new(name) }
                             };
                             let lbl_flat  = bm_green(BarMappingMode::FlatOverlap);
@@ -3146,9 +3428,12 @@ impl SpectrumWindow {
                         if rebuild {
                             self.analyzer.rebuild_fft();
                         }
-                    });
+                    }); }
 
-                // ── Row 4: pre-process cache controls ────────────────────
+                // ── Pre-process cache ─────────────────────────────────────
+                // Warning banner and the stats refresh stay live; the actual
+                // management controls tuck into the 🗄 Cache chip so they don't
+                // eat plot height when unused.
                 if self.mode == SpectrumMode::PreProcess {
                     // Banner when settings changed and no matching cache exists
                     if self.needs_reanalysis && self.current_path.is_some() {
@@ -3160,7 +3445,7 @@ impl SpectrumWindow {
                                 "⚠ No cache for current settings."
                             };
                             ui.label(egui::RichText::new(label)
-                                .size(11.0).color(Color32::from_rgb(255, 200, 60)));
+                                .size(11.0).color(txt_warn(ui.visuals().dark_mode)));
                             let has_path = self.current_path.is_some();
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🔄 Re-analyze now")).clicked()
@@ -3174,45 +3459,11 @@ impl SpectrumWindow {
                             }
                         });
                     }
-                    ui.horizontal(|ui| {
-                        let analyzing = self.analyzer.is_analyzing.load(Ordering::Relaxed);
-                        let has_path  = self.current_path.is_some();
-                        if ui.add_enabled(has_path && !analyzing,
-                            egui::Button::new("🗑 Clear Cache")).clicked()
-                            && let Some(ref p) = self.current_path.clone() {
-                            let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
-                            let existed = cache.exists();
-                            let _ = std::fs::remove_file(&cache);
-                            self.analyzer.pre_frames.clear();
-                            self.needs_reanalysis = false;
-                            self.cache_stats_at = None;
-                            self.status_msg = if existed {
-                                "Cache cleared.".into()
-                            } else {
-                                "No cache file found.".into()
-                            };
-                        }
-                        if ui.add_enabled(has_path && !analyzing,
-                            egui::Button::new("🔄 Re-analyze")).clicked()
-                            && let Some(ref p) = self.current_path.clone() {
-                            let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
-                            let _ = std::fs::remove_file(&cache);
-                            self.analyzer.pre_frames.clear();
-                            self.analyzer.start_preprocess(p.clone());
-                            self.needs_reanalysis = false;
-                            self.status_msg = String::new();
-                        }
-                        if analyzing {
-                            let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
-                            ui.spinner();
-                            ui.label(egui::RichText::new(format!("Analyzing… {}%", pct))
-                                .size(11.0).color(Color32::from_gray(160)));
-                        } else if !self.status_msg.is_empty() {
-                            ui.label(egui::RichText::new(&self.status_msg)
-                                .size(11.0).color(Color32::from_gray(160)));
-                        }
-                    });
-                    // Cache size — refreshed at most once per 2 s
+
+                    // Refresh cache stats + file set (no UI). Must run even when
+                    // the Cache chip is closed — the FFT-size / window / padding
+                    // buttons colour green from cache_file_set to show which
+                    // combinations are already analysed.
                     let stale = self.cache_stats_at
                         .map(|t| t.elapsed().as_secs_f32() > 2.0)
                         .unwrap_or(true);
@@ -3226,57 +3477,83 @@ impl SpectrumWindow {
                             .collect();
                         self.cache_stats_at = Some(Instant::now());
                     }
-                    let (count, bytes) = self.cache_stats;
-                    let size_str = if bytes >= 1_000_000_000 {
-                        format!("{:.1} GB", bytes as f64 / 1e9)
-                    } else if bytes >= 1_000_000 {
-                        format!("{:.1} MB", bytes as f64 / 1e6)
-                    } else {
-                        format!("{:.0} KB", bytes as f64 / 1e3)
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(
-                            format!("Cache: {} file{} — {}", count, if count == 1 { "" } else { "s" }, size_str))
-                            .size(10.0).color(Color32::from_gray(110)));
-                        let analyzing = self.analyzer.is_analyzing.load(Ordering::Relaxed);
-                        if ui.add_enabled(count > 0 && !analyzing,
-                            egui::Button::new("🗑 Clear All").small()).clicked() {
-                            let dir = home_dir().join(".moosik").join("cache");
-                            if let Ok(entries) = std::fs::read_dir(&dir) {
-                                for e in entries.filter_map(|e| e.ok()) {
-                                    let p = e.path();
-                                    if p.extension().map(|x| x == "spectrumcache").unwrap_or(false) {
-                                        let _ = std::fs::remove_file(p);
+
+                    if self.show_cache_settings { ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            let analyzing = self.analyzer.is_analyzing.load(Ordering::Relaxed);
+                            let has_path  = self.current_path.is_some();
+                            if ui.add_enabled(has_path && !analyzing,
+                                egui::Button::new("🗑 Clear Cache")).clicked()
+                                && let Some(ref p) = self.current_path.clone() {
+                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
+                                let existed = cache.exists();
+                                let _ = std::fs::remove_file(&cache);
+                                self.analyzer.pre_frames.clear();
+                                self.needs_reanalysis = false;
+                                self.cache_stats_at = None;
+                                self.status_msg = if existed {
+                                    "Cache cleared.".into()
+                                } else {
+                                    "No cache file found.".into()
+                                };
+                            }
+                            if ui.add_enabled(has_path && !analyzing,
+                                egui::Button::new("🔄 Re-analyze")).clicked()
+                                && let Some(ref p) = self.current_path.clone() {
+                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
+                                let _ = std::fs::remove_file(&cache);
+                                self.analyzer.pre_frames.clear();
+                                self.analyzer.start_preprocess(p.clone());
+                                self.needs_reanalysis = false;
+                                self.status_msg = String::new();
+                            }
+                            if analyzing {
+                                let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
+                                ui.spinner();
+                                ui.label(egui::RichText::new(format!("Analyzing… {}%", pct))
+                                    .size(11.0).color(txt_dim(ui.visuals().dark_mode)));
+                            } else if !self.status_msg.is_empty() {
+                                ui.label(egui::RichText::new(&self.status_msg)
+                                    .size(11.0).color(txt_dim(ui.visuals().dark_mode)));
+                            }
+                        });
+                        let (count, bytes) = self.cache_stats;
+                        let size_str = if bytes >= 1_000_000_000 {
+                            format!("{:.1} GB", bytes as f64 / 1e9)
+                        } else if bytes >= 1_000_000 {
+                            format!("{:.1} MB", bytes as f64 / 1e6)
+                        } else {
+                            format!("{:.0} KB", bytes as f64 / 1e3)
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(
+                                format!("Cache: {} file{} — {}", count, if count == 1 { "" } else { "s" }, size_str))
+                                .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            let analyzing = self.analyzer.is_analyzing.load(Ordering::Relaxed);
+                            if ui.add_enabled(count > 0 && !analyzing,
+                                egui::Button::new("🗑 Clear All").small()).clicked() {
+                                let dir = home_dir().join(".moosik").join("cache");
+                                if let Ok(entries) = std::fs::read_dir(&dir) {
+                                    for e in entries.filter_map(|e| e.ok()) {
+                                        let p = e.path();
+                                        if p.extension().map(|x| x == "spectrumcache").unwrap_or(false) {
+                                            let _ = std::fs::remove_file(p);
+                                        }
                                     }
                                 }
+                                self.analyzer.pre_frames.clear();
+                                self.needs_reanalysis = self.mode == SpectrumMode::PreProcess
+                                    && self.current_path.is_some();
+                                self.cache_stats_at = None;
+                                self.status_msg = "All caches cleared.".into();
                             }
-                            self.analyzer.pre_frames.clear();
-                            self.needs_reanalysis = self.mode == SpectrumMode::PreProcess
-                                && self.current_path.is_some();
-                            self.cache_stats_at = None;
-                            self.status_msg = "All caches cleared.".into();
-                        }
-                    });
-                }
-
-                // Bar gap slider (only meaningful for Bars style)
-                if self.style == VizStyle::Bars {
-                    ui.horizontal(|ui| {
-                        ui.label("Bar gap:");
-                        ui.add(egui::Slider::new(&mut self.bar_gap, 0.0..=12.0)
-                            .step_by(1.0).suffix(" px"))
-                            .on_hover_text(
-                                "Physical-pixel gap between bars.\n\
-                                 0 = no gap (solid fill). Higher values give a more separated look."
-                            );
-                    });
+                        });
+                    }); }
                 }
 
                 // ── Peak Hold settings (Bars only) ────────────────────────
-                if self.style == VizStyle::Bars {
-                    egui::CollapsingHeader::new("📌 Peak Hold")
-                        .default_open(false)
-                        .show(ui, |ui| {
+                if self.style == VizStyle::Bars && self.show_peak_settings {
+                    ui.group(|ui| {
                             ui.checkbox(&mut self.peak_config.enabled, "Enabled");
                             ui.add_enabled_ui(self.peak_config.enabled, |ui| {
                                 ui.horizontal(|ui| {
@@ -3338,9 +3615,7 @@ impl SpectrumWindow {
                 }
 
                 // ── Album Art settings ────────────────────────────────────
-                egui::CollapsingHeader::new("🖼 Album Art")
-                    .default_open(false)
-                    .show(ui, |ui| {
+                if self.show_art_settings { ui.group(|ui| {
                         let has_art   = self.current_art.is_some();
                         let has_track = self.current_path.is_some();
                         // Disable spectrum art controls when a track is loaded with no art
@@ -3373,7 +3648,7 @@ impl SpectrumWindow {
                         // ── Spectrum scope: global vs per-track ──────────
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Spectrum:").size(11.0)
-                                .color(Color32::from_gray(160)));
+                                .color(txt_dim(ui.visuals().dark_mode)));
                             if !track_key.is_empty() {
                                 let has_override = self.art_settings.has_override(&track_key);
                                 let btn = if has_override { "This track ★" } else { "Global" };
@@ -3454,9 +3729,9 @@ impl SpectrumWindow {
 
                         if has_track && !has_art {
                             ui.label(egui::RichText::new("ℹ No embedded art in this track.")
-                                .size(10.0).color(Color32::from_gray(100)));
+                                .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
                         }
-                    });
+                    }); }
 
                 // ── EQ panel ──────────────────────────────────────────────
                 if self.show_eq {
@@ -3469,7 +3744,7 @@ impl SpectrumWindow {
                                     ui.label(
                                         egui::RichText::new("💎 Bit-perfect mode active — EQ bypassed in audio path")
                                             .size(12.0)
-                                            .color(Color32::from_rgb(100, 255, 200)),
+                                            .color(txt_ok(ui.visuals().dark_mode)),
                                     );
                                 });
                                 ui.separator();
@@ -3479,7 +3754,7 @@ impl SpectrumWindow {
                             ui.horizontal(|ui| {
                                 let eq_on = { self.eq_state.lock().unwrap().enabled };
                                 let on_label = egui::RichText::new(if eq_on { "ON" } else { "OFF" })
-                                    .color(if eq_on { Color32::from_rgb(100, 220, 120) } else { Color32::from_gray(120) });
+                                    .color(if eq_on { txt_ok(ui.visuals().dark_mode) } else { txt_faint(ui.visuals().dark_mode) });
                                 if ui.selectable_label(eq_on, on_label)
                                     .on_hover_text("Bypass all EQ bands").clicked()
                                 {
@@ -3538,7 +3813,7 @@ impl SpectrumWindow {
                                 // ── Pending-switch prompt (Save / Discard / Cancel) ──
                                 if let Some(pending) = self.pending_preset_switch.clone() {
                                     ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new("⚠ Unsaved changes — ").color(Color32::from_rgb(255, 200, 80)));
+                                        ui.label(egui::RichText::new("⚠ Unsaved changes — ").color(txt_warn(ui.visuals().dark_mode)));
                                         if ui.button("Save & switch").clicked() {
                                             self.overwrite_active_preset();
                                             let p = pending.clone();
@@ -3572,7 +3847,7 @@ impl SpectrumWindow {
                                 };
 
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("Preset:").size(11.0).color(Color32::from_gray(160)));
+                                    ui.label(egui::RichText::new("Preset:").size(11.0).color(txt_dim(ui.visuals().dark_mode)));
 
                                     // ── Global preset dropdown ──
                                     let global_label = {
@@ -3788,13 +4063,13 @@ impl SpectrumWindow {
                                 .striped(true)
                                 .spacing([4.0, 2.0])
                                 .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("#").size(10.0).color(Color32::from_gray(130)));
-                                    ui.label(egui::RichText::new("Type").size(10.0).color(Color32::from_gray(130)));
-                                    ui.label(egui::RichText::new("Freq (Hz)").size(10.0).color(Color32::from_gray(130)));
-                                    ui.label(egui::RichText::new("Gain (dB)").size(10.0).color(Color32::from_gray(130)));
-                                    ui.label(egui::RichText::new("Q").size(10.0).color(Color32::from_gray(130)));
-                                    ui.label(egui::RichText::new("On").size(10.0).color(Color32::from_gray(130)));
-                                    ui.label(egui::RichText::new("Del").size(10.0).color(Color32::from_gray(130)));
+                                    ui.label(egui::RichText::new("#").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                                    ui.label(egui::RichText::new("Type").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                                    ui.label(egui::RichText::new("Freq (Hz)").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                                    ui.label(egui::RichText::new("Gain (dB)").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                                    ui.label(egui::RichText::new("Q").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                                    ui.label(egui::RichText::new("On").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                                    ui.label(egui::RichText::new("Del").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
                                     ui.end_row();
 
                                     let mut remove_idx: Option<usize> = None;
@@ -3871,7 +4146,7 @@ impl SpectrumWindow {
                                     eq.bump();
                                 }
                                 ui.label(egui::RichText::new(format!("{}/16 bands", band_count))
-                                    .size(10.0).color(Color32::from_gray(110)));
+                                    .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
                             });
 
                             let _ = sr; // used in overlay, suppress warning
@@ -4195,6 +4470,9 @@ impl SpectrumWindow {
                 }
             });
         });
+
+        // Persist any view-setting changes made this frame (throttled).
+        self.persist_settings_if_changed();
 
         // Record the wall-clock cost of this full draw (EMA-smoothed).
         let ms = show_start.elapsed().as_secs_f32() * 1000.0;

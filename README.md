@@ -34,6 +34,8 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 ### Spectrum Analyzer
 - **Pre-processed + real-time hybrid** — full-track analysis runs in the background while real-time FFT feeds the display during playback; seamlessly switches between the two
 - **Multiple visualization styles** — Bars, Line, Filled Area, Waterfall, Spectrogram, Octave Bands, Phasescope
+- **Selectable palette** — seven colour ramps (Classic, Kugelblitz, Ice, Magma, Aurora, Mono, and an Album-accent ramp that follows the cover art), picked from the control row with a gradient swatch preview and applied across bars, octave bands, line, filled, spectrogram, and waterfall
+- **Settings persist** — the view settings (style, bars, window, interpolation, padding, overlap, bar mapping, frequency range, …) restore across launches (`~/.moosik/spectrum.json`)
 - **Peak Hold** — configurable marker that tracks the highest level per bar; three decay modes (Linear, Gravity, Fade Out), hold time, fall speed, thickness, and color all adjustable
 - **CQT bar mapping** — Constant-Q Transform mapping gives each bar the same relative frequency resolution regardless of pitch, just like professional analyzers
 - **Configurable FFT** — up to 16× zero-padding, six window functions (Hann, Hamming, Blackman, Flat Top), up to 87.5% overlap
@@ -67,17 +69,19 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Persistent** — settings stored in `~/.moosik/art_settings.json`
 
 ### Theme & Appearance
-- **Cohesive dark theme** — built from the app's own identity colors (the **Eigengrau** #16161d base and **Kugelblitz** #94b1ff accent): a blue-tinted surface ramp, rounded corners, and accent-coloured selection and hover, applied across both the egui widgets and the custom-painted surfaces (seek bar, playlist rows, status text)
+- **Cohesive theme, light or dark** — built from the app's own identity colors (the **Eigengrau** #16161d base and **Kugelblitz** #94b1ff accent): a tinted surface ramp, rounded corners, and accent-coloured selection and hover, applied across both the egui widgets and the custom-painted surfaces (seek bar, playlist rows, status text). A light variant is a click away
 - **Per-track accent** — the now-playing bar, current-row marker, and seek fill take on an accent sampled from the current track's cover art (blended toward the brand blue so it never clashes); art-less or grayscale covers fall back to the brand accent
 - **🎨 Look menu** — optional, persisted appearance controls (`~/.moosik/appearance.json`), all defaulting to the shipped look:
-  - **Spectrum palette** — seven selectable colour ramps (Classic, Kugelblitz, Ice, Magma, Aurora, Mono, and Album-accent) applied across bars, octave bands, line, filled, spectrogram, and waterfall
+  - **Theme** — dark (default) or light
   - **Text size** — a 70–160% UI-scale slider (applied on click), scaling all text and chrome
   - **Accent source** — album-art accent or the fixed brand accent
 
 ### Player
 - **Gapless playback** — consecutive tracks play with no silence between them, in both normal and bit-perfect mode (bit-perfect stays gapless across same-rate tracks; a sample-rate change re-opens the device)
+- **Playlist search** — a 🔍 box filters the playlist by title, artist, or album as you type (`Ctrl+F` to focus, `Esc` to clear)
+- **Column sorting** — sort by Title / Artist / Album / Time; click a column to sort, click again to reverse
 - Waveform seek bar with click-to-seek
-- Volume control
+- Volume control (volume and loop mode persist across launches)
 - Metadata display (title, artist, album, cover art) via `lofty`
 - CJK font fallback (Japanese, Chinese, Korean tags display correctly)
 - **OS media integration** — hardware media keys and the system now-playing panel (MPRIS on Linux, SMTC on Windows, Now Playing on macOS): play/pause/next/previous/stop, live title/artist/album and playback position

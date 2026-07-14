@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.1.1] - 2026-07-13
+
+Follow-up polish to the 1.1.0 appearance work: a tidier spectrum window, a lot
+more persistence, a light theme, and playlist search + sorting.
+
+### Spectrum window
+- **Palette moved into the window** — the palette picker now lives on the
+  spectrum window's own control row (next to Mode / View / Loudness) instead of
+  the main Look menu, and each option shows a gradient **swatch** previewing its
+  low→high ramp (the Album-accent palette previews the current cover tint).
+- **Tidier controls, bigger plot** — the FFT Settings, Peak Hold, and Album Art
+  sections collapsed from three stacked headers into a single wrap-around row of
+  toggle chips; each body renders full-width only when open, and the row wraps to
+  more lines only when the window is too narrow. Bar gap folded onto the bars
+  row, and the pre-process cache controls (Clear Cache / Re-analyze / Cache size
+  / Clear All) moved into a new 🗄 Cache chip. The "no cache" warning and the
+  cache-hit highlighting stay live.
+- **View settings persist** — mode, style, loudness, bar count/gap, window,
+  smoothing, frequency range, interpolation, padding, overlap, bar mapping, the
+  section chip states, and the full **Peak Hold** config now restore across
+  launches (`~/.moosik/spectrum.json`). FFT size is intentionally excluded — it
+  auto-scales per track.
+
+### Appearance
+- **Light theme** — a Dark / Light toggle in the 🎨 Look menu (persisted). The
+  whole UI resolves per theme, including the hand-painted chrome (playlist rows,
+  seek bar, waveform, now-playing, status text) and every custom-coloured label
+  (section chips, cache / album-art text, the bit-perfect / ReplayGain / EQ
+  status colours) — so text is dark-on-light and light-on-dark instead of the
+  old low-contrast greys and pale mint on white. The accent deepens on light and
+  the cover-derived per-track accent is dimmed to read against the pale chrome.
+
+### Player
+- **Playlist search / filter** — a 🔍 box filters the playlist by title, artist,
+  or album as you type (**Ctrl+F** to focus, **Esc** to clear); play / select /
+  current-track stay correct, and drag-reorder is disabled while a filter is
+  active.
+- **Column sorting** — sort the playlist by Title / Artist / Album / Time; click
+  a column to sort, click again to reverse (▲/▼). The playing track is followed
+  to its new position; manual drag-reorder still builds a custom order.
+- **Volume & loop mode persist** — both now restore on launch
+  (`~/.moosik/player.json`) instead of resetting to 80% / Repeat All.
+
 ## [1.1.0] - 2026-07-12
 
 A visual release: a cohesive dark theme drawn from the app's own identity

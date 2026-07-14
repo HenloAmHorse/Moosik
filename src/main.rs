@@ -25,24 +25,83 @@ use std::time::{Duration, Instant};
 mod pal {
     use egui::Color32;
 
-    /// Kugelblitz — the brand accent (a perfectly flat spectrum's blue).
+    /// Kugelblitz — the brand accent (a perfectly flat spectrum's blue). This is
+    /// the fixed identity colour used as the album-art blend target and the
+    /// dark-theme accent; use `accent(dark)` for on-screen text/strokes so the
+    /// light theme gets a deeper, higher-contrast blue.
     pub const ACCENT: Color32 = Color32::from_rgb(0x94, 0xb1, 0xff);
 
-    // Playlist rows — blue-tinted neutrals that sit in the panel ramp, plus
+    /// Accent for UI text / strokes / selection, tuned per theme for contrast.
+    pub fn accent(dark: bool) -> Color32 {
+        if dark { ACCENT } else { Color32::from_rgb(0x3a, 0x55, 0xc2) }
+    }
+
+    // Text tiers for custom-painted labels (playlist rows, now-playing, seek
+    // times). egui's own widgets pick up the right colour from the theme, but
+    // these are painted by hand and so must resolve per theme — otherwise the
+    // dark-theme light greys / white are near-invisible on the light background.
+    /// Strongest text (titles, now-playing) — white on dark, near-black on light.
+    pub fn text_strong(dark: bool) -> Color32 {
+        if dark { Color32::WHITE } else { Color32::from_rgb(0x12, 0x13, 0x18) }
+    }
+    /// Primary body text.
+    pub fn text(dark: bool) -> Color32 {
+        if dark { Color32::from_gray(210) } else { Color32::from_rgb(0x25, 0x27, 0x30) }
+    }
+    /// Secondary / dimmer text (artist, subtitle).
+    pub fn text_dim(dark: bool) -> Color32 {
+        if dark { Color32::from_gray(150) } else { Color32::from_rgb(0x55, 0x58, 0x63) }
+    }
+    /// Faint text (track number, duration, hints).
+    pub fn text_faint(dark: bool) -> Color32 {
+        if dark { Color32::from_gray(120) } else { Color32::from_rgb(0x74, 0x77, 0x82) }
+    }
+    /// Positive / active green text (bit-perfect, ReplayGain on, LUFS) — deepened
+    /// on light so it isn't a pale mint on white.
+    pub fn ok(dark: bool) -> Color32 {
+        if dark { Color32::from_rgb(120, 230, 170) } else { Color32::from_rgb(0x12, 0x7a, 0x4c) }
+    }
+
+    // Playlist rows — tinted neutrals in each theme's panel ramp, plus
     // accent-tinted states so the current/selected track reads as "lit".
-    pub const ROW_EVEN: Color32 = Color32::from_rgb(0x1b, 0x1c, 0x25);
-    pub const ROW_ODD: Color32 = Color32::from_rgb(0x16, 0x17, 0x1f);
-    pub const ROW_CURRENT: Color32 = Color32::from_rgb(0x27, 0x31, 0x4e);
-    pub const ROW_SELECTED: Color32 = Color32::from_rgb(0x30, 0x40, 0x66);
+    pub fn row_even(dark: bool) -> Color32 {
+        if dark { Color32::from_rgb(0x1b, 0x1c, 0x25) } else { Color32::from_rgb(0xf2, 0xf3, 0xf8) }
+    }
+    pub fn row_odd(dark: bool) -> Color32 {
+        if dark { Color32::from_rgb(0x16, 0x17, 0x1f) } else { Color32::from_rgb(0xe8, 0xea, 0xf1) }
+    }
+    pub fn row_current(dark: bool) -> Color32 {
+        if dark { Color32::from_rgb(0x27, 0x31, 0x4e) } else { Color32::from_rgb(0xcd, 0xd9, 0xf5) }
+    }
+    pub fn row_selected(dark: bool) -> Color32 {
+        if dark { Color32::from_rgb(0x30, 0x40, 0x66) } else { Color32::from_rgb(0xb6, 0xc7, 0xef) }
+    }
 
     // Seek bar.
-    pub const TRACK_BG: Color32 = Color32::from_rgb(0x2a, 0x2d, 0x3a);
-    pub const WAVE_UNPLAYED: Color32 = Color32::from_rgb(0x39, 0x3d, 0x4d);
+    pub fn track_bg(dark: bool) -> Color32 {
+        if dark { Color32::from_rgb(0x2a, 0x2d, 0x3a) } else { Color32::from_rgb(0xd4, 0xd7, 0xe2) }
+    }
+    pub fn wave_unplayed(dark: bool) -> Color32 {
+        if dark { Color32::from_rgb(0x39, 0x3d, 0x4d) } else { Color32::from_rgb(0xbc, 0xc0, 0xce) }
+    }
 
     // Semantic (kept distinct from the accent on purpose).
-    pub const WARN: Color32 = Color32::from_rgb(0xe0, 0x6c, 0x5c);
-    pub const AMBER: Color32 = Color32::from_rgb(0xd9, 0xa8, 0x5c);
-    pub const MUTED: Color32 = Color32::from_gray(0x78);
+    pub fn warn(dark: bool) -> Color32 {
+        if dark { Color32::from_rgb(0xe0, 0x6c, 0x5c) } else { Color32::from_rgb(0xbf, 0x39, 0x2b) }
+    }
+    pub fn amber(dark: bool) -> Color32 {
+        if dark { Color32::from_rgb(0xd9, 0xa8, 0x5c) } else { Color32::from_rgb(0x9c, 0x6f, 0x1e) }
+    }
+    pub fn muted(dark: bool) -> Color32 {
+        if dark { Color32::from_gray(0x78) } else { Color32::from_gray(0x80) }
+    }
+}
+
+/// Darken a (typically bright, cover-derived) accent so it reads against the
+/// light theme's pale chrome, preserving hue.
+fn dim_for_light(c: egui::Color32) -> egui::Color32 {
+    let m = |x: u8| (x as f32 * 0.60) as u8;
+    egui::Color32::from_rgb(m(c.r()), m(c.g()), m(c.b()))
 }
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -102,38 +161,63 @@ fn setup_fonts(ctx: &egui::Context) {
     }
 }
 
-/// A cohesive dark theme built from the app's own identity colors: the icon's
+/// A cohesive theme built from the app's own identity colors: the icon's
 /// **Eigengrau** (#16161d) background and **Kugelblitz** (#94b1ff) accent. Softer
 /// brand-tinted surfaces, gently rounded corners, and accent-coloured selection
-/// and hover — a calmer look than egui's flat default grey.
-fn apply_theme(ctx: &egui::Context) {
+/// and hover — a calmer look than egui's flat default grey. `dark` selects the
+/// dark (default) or light variant; both share the accent and layout.
+fn apply_theme(ctx: &egui::Context, dark: bool) {
     use egui::{Color32, CornerRadius, Stroke};
 
-    let accent = pal::ACCENT; // Kugelblitz
+    let accent = pal::accent(dark);
 
-    // A short ramp of blue-tinted neutrals from the Eigengrau base upward.
-    let bg0 = Color32::from_rgb(0x14, 0x15, 0x1c); // deepest (text fields, wells)
-    let bg1 = Color32::from_rgb(0x18, 0x19, 0x21); // panels
-    let bg2 = Color32::from_rgb(0x1e, 0x20, 0x2a); // windows / surfaces
-    let bg3 = Color32::from_rgb(0x25, 0x27, 0x33); // resting widgets
-    let bg4 = Color32::from_rgb(0x30, 0x33, 0x43); // hovered widgets
-    let bg5 = Color32::from_rgb(0x3a, 0x3e, 0x52); // pressed widgets
-    let line = Color32::from_rgb(0x2a, 0x2c, 0x39); // hairline separators
+    // A short ramp of tinted neutrals: dark climbs from the Eigengrau base,
+    // light descends from near-white.
+    let (bg0, bg1, bg2, bg3, bg4, bg5, line, faint) = if dark {
+        (
+            Color32::from_rgb(0x14, 0x15, 0x1c), // deepest (text fields, wells)
+            Color32::from_rgb(0x18, 0x19, 0x21), // panels
+            Color32::from_rgb(0x1e, 0x20, 0x2a), // windows / surfaces
+            Color32::from_rgb(0x25, 0x27, 0x33), // resting widgets
+            Color32::from_rgb(0x30, 0x33, 0x43), // hovered widgets
+            Color32::from_rgb(0x3a, 0x3e, 0x52), // pressed widgets
+            Color32::from_rgb(0x2a, 0x2c, 0x39), // hairline separators
+            Color32::from_rgb(0x1c, 0x1d, 0x26), // faint
+        )
+    } else {
+        (
+            Color32::from_rgb(0xfb, 0xfb, 0xfd),
+            Color32::from_rgb(0xec, 0xed, 0xf2),
+            Color32::from_rgb(0xf4, 0xf5, 0xf9),
+            Color32::from_rgb(0xe1, 0xe3, 0xea),
+            Color32::from_rgb(0xd3, 0xd6, 0xe1),
+            Color32::from_rgb(0xc2, 0xc6, 0xd5),
+            Color32::from_rgb(0xd0, 0xd3, 0xdd),
+            Color32::from_rgb(0xe7, 0xe8, 0xef),
+        )
+    };
 
     let mut style = (*ctx.style()).clone();
+    // Start from egui's matching base so text colours / fg strokes are sensible,
+    // then override the surfaces and accent.
+    style.visuals = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     let v = &mut style.visuals;
-    v.dark_mode = true;
+    v.dark_mode = dark;
 
     v.panel_fill = bg1;
     v.window_fill = bg2;
     v.extreme_bg_color = bg0;
-    v.faint_bg_color = Color32::from_rgb(0x1c, 0x1d, 0x26);
+    v.faint_bg_color = faint;
     v.window_stroke = Stroke::new(1.0, line);
     v.window_corner_radius = CornerRadius::same(9);
     v.menu_corner_radius = CornerRadius::same(7);
 
     // Selection + hyperlinks carry the accent.
-    v.selection.bg_fill = accent.gamma_multiply(0.30);
+    v.selection.bg_fill = if dark {
+        accent.gamma_multiply(0.30)
+    } else {
+        Color32::from_rgb(0xc4, 0xd3, 0xf3)
+    };
     v.selection.stroke = Stroke::new(1.0, accent);
     v.hyperlink_color = accent;
 
@@ -146,7 +230,11 @@ fn apply_theme(ctx: &egui::Context) {
     w.inactive.corner_radius = r;
     w.inactive.bg_fill = bg3;
     w.inactive.weak_bg_fill = bg3;
-    w.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x2f, 0x31, 0x3f));
+    w.inactive.bg_stroke = Stroke::new(1.0, if dark {
+        Color32::from_rgb(0x2f, 0x31, 0x3f)
+    } else {
+        Color32::from_rgb(0xcb, 0xce, 0xd8)
+    });
 
     w.hovered.corner_radius = r;
     w.hovered.bg_fill = bg4;
@@ -869,8 +957,54 @@ impl Engine {
 #[derive(PartialEq)]
 enum PlayState { Stopped, Playing, Paused }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Serialize, Deserialize)]
 enum LoopMode { Sequential, RepeatAll, RepeatOne }
+
+/// Column the playlist can be sorted by.
+#[derive(PartialEq, Clone, Copy)]
+enum SortKey { Title, Artist, Album, Duration }
+
+impl SortKey {
+    const ALL: [SortKey; 4] = [SortKey::Title, SortKey::Artist, SortKey::Album, SortKey::Duration];
+    fn label(self) -> &'static str {
+        match self {
+            SortKey::Title => "Title", SortKey::Artist => "Artist",
+            SortKey::Album => "Album", SortKey::Duration => "Time",
+        }
+    }
+}
+
+impl Default for LoopMode {
+    fn default() -> Self { LoopMode::RepeatAll }
+}
+
+/// Persisted player preferences (`~/.moosik/player.json`).
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct PlayerPrefs {
+    #[serde(default = "default_volume")] volume: f32,
+    #[serde(default)] loop_mode: LoopMode,
+}
+
+fn default_volume() -> f32 { 0.8 }
+
+impl Default for PlayerPrefs {
+    fn default() -> Self { Self { volume: 0.8, loop_mode: LoopMode::RepeatAll } }
+}
+
+fn load_player_prefs(dir: &Path) -> PlayerPrefs {
+    std::fs::read_to_string(dir.join("player.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<PlayerPrefs>(&s).ok())
+        .map(|mut p| { p.volume = p.volume.clamp(0.0, 1.0); p })
+        .unwrap_or_default()
+}
+
+fn save_player_prefs(dir: &Path, p: &PlayerPrefs) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(json) = serde_json::to_string_pretty(p) {
+        let _ = std::fs::write(dir.join("player.json"), json);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ReplayGain (loudness normalization) — rodio path only; bypassed in
@@ -927,6 +1061,21 @@ fn save_rg_settings(dir: &Path, s: &RgSettings) {
 fn default_ui_scale() -> f32 { 1.0 }
 fn default_true() -> bool { true }
 
+/// Light / dark theme choice.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
+enum ThemeMode {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    fn is_dark(self) -> bool { self == ThemeMode::Dark }
+    fn label(self) -> &'static str {
+        match self { ThemeMode::Dark => "Dark", ThemeMode::Light => "Light" }
+    }
+}
+
 /// User-configurable look-and-feel. Every field is optional to change and has a
 /// default matching the app's original appearance, so an absent or partial
 /// settings file (or a fresh install) reproduces the shipped defaults exactly.
@@ -940,6 +1089,8 @@ struct Appearance {
     /// pulled from the current track's cover art. When off, the fixed brand
     /// accent is used everywhere.
     #[serde(default = "default_true")] art_accent: bool,
+    /// Light or dark theme.
+    #[serde(default)] theme: ThemeMode,
 }
 
 impl Default for Appearance {
@@ -948,6 +1099,7 @@ impl Default for Appearance {
             spectrum_palette: spectrum::SpectrumPalette::default(),
             ui_scale: 1.0,
             art_accent: true,
+            theme: ThemeMode::Dark,
         }
     }
 }
@@ -1140,9 +1292,17 @@ struct MoosikApp {
     spectrum_window: SpectrumWindow,
     info_open: bool,
     loop_mode: LoopMode,
+    /// Last (volume, loop_mode) written to player.json, for change detection.
+    saved_player: PlayerPrefs,
+    player_save_at: Option<Instant>,
     // multi-select
     selected: HashSet<usize>,
     last_clicked: Option<usize>,
+    /// Playlist filter query (title / artist / album substring). Empty = no filter.
+    filter_query: String,
+    /// Active playlist sort column + direction (None = manual / file order).
+    sort_key: Option<SortKey>,
+    sort_asc: bool,
     // drag-to-reorder
     drag_src: Option<usize>,
     drag_over_row: Option<usize>,
@@ -1194,7 +1354,8 @@ struct MoosikApp {
 impl MoosikApp {
     fn new(cc: &eframe::CreationContext) -> Self {
         setup_fonts(&cc.egui_ctx);
-        apply_theme(&cc.egui_ctx);
+        let appearance = load_appearance(&moosik_dir());
+        apply_theme(&cc.egui_ctx, appearance.theme.is_dark());
         let mut spectrum_window = SpectrumWindow::new();
         let mut engine = Engine::new(spectrum_window.sample_buf.clone(), spectrum_window.stereo_buf.clone());
         if let Some(ref mut e) = engine {
@@ -1214,22 +1375,28 @@ impl MoosikApp {
         if let Some(hz) = monitor_refresh_hz() {
             spectrum_window.max_fps = hz.clamp(1.0, 240.0);
         }
-        let appearance = load_appearance(&moosik_dir());
         let ui_scale_draft = appearance.ui_scale;
+        let player_prefs = load_player_prefs(&moosik_dir());
+        if let Some(ref mut e) = engine { e.set_volume(player_prefs.volume); }
         MoosikApp {
             playlist,
             current_index: None,
             play_state: PlayState::Stopped,
             engine,
-            volume: 0.8,
+            volume: player_prefs.volume,
             seek_pos: 0.0,
             seeking: false,
             status_msg: String::new(),
             spectrum_window,
             info_open: false,
-            loop_mode: LoopMode::RepeatAll,
+            loop_mode: player_prefs.loop_mode,
+            saved_player: player_prefs,
+            player_save_at: None,
             selected: HashSet::new(),
             last_clicked: None,
+            filter_query: String::new(),
+            sort_key: None,
+            sort_asc: true,
             drag_src: None,
             drag_over_row: None,
             playlist_store,
@@ -1259,23 +1426,73 @@ impl MoosikApp {
     }
 
     /// The accent for the current track: its cover-derived tint, or the brand
-    /// accent when the track has no art (or it hasn't decoded yet).
+    /// accent when the track has no art (or it hasn't decoded yet). On the light
+    /// theme the cover tint is darkened so it reads against light chrome.
     fn current_accent(&self) -> Color32 {
+        let dark = self.appearance.theme.is_dark();
         if !self.appearance.art_accent {
-            return pal::ACCENT;
+            return pal::accent(dark);
         }
-        self.current_index
+        let base = self.current_index
             .and_then(|i| self.playlist.get(i))
             .and_then(|t| self.art_cache.accent(&t.path))
-            .unwrap_or(pal::ACCENT)
+            .unwrap_or(pal::accent(dark));
+        if dark { base } else { dim_for_light(base) }
     }
 
-    /// A brightened form of the per-track accent, for playheads / hovered
-    /// handles that need to pop against the accent-filled progress.
+    /// Sort the playlist by a column. Re-selecting the same column flips
+    /// direction. The currently-playing track is followed to its new position;
+    /// selection and any queued gapless track are cleared since indices change.
+    fn sort_playlist(&mut self, key: SortKey) {
+        let asc = if self.sort_key == Some(key) { !self.sort_asc } else { true };
+        let cur_path = self.current_index
+            .and_then(|i| self.playlist.get(i))
+            .map(|t| t.path.clone());
+        self.playlist.sort_by(|a, b| {
+            let o = match key {
+                SortKey::Title    => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+                SortKey::Artist   => a.artist.to_lowercase().cmp(&b.artist.to_lowercase()),
+                SortKey::Album    => a.album.to_lowercase().cmp(&b.album.to_lowercase()),
+                SortKey::Duration => a.duration.cmp(&b.duration),
+            };
+            if asc { o } else { o.reverse() }
+        });
+        self.current_index = cur_path
+            .and_then(|p| self.playlist.iter().position(|t| t.path == p));
+        self.selected.clear();
+        self.last_clicked = None;
+        self.flush_gapless();
+        self.sort_key = Some(key);
+        self.sort_asc = asc;
+    }
+
+    /// Save volume + loop mode when they change, throttled so a volume-slider
+    /// drag doesn't hammer the disk.
+    fn persist_player_prefs_if_changed(&mut self) {
+        let cur = PlayerPrefs { volume: self.volume, loop_mode: self.loop_mode };
+        if cur == self.saved_player { return; }
+        let ready = self.player_save_at
+            .map(|t| t.elapsed().as_secs_f32() > 0.6)
+            .unwrap_or(true);
+        if ready {
+            save_player_prefs(&moosik_dir(), &cur);
+            self.saved_player = cur;
+            self.player_save_at = Some(Instant::now());
+        }
+    }
+
+    /// A form of the per-track accent for playheads / hovered handles that need
+    /// to pop against the accent-filled progress — brightened on dark, deepened
+    /// on light.
     fn track_accent_bright(&self) -> Color32 {
         let a = self.track_accent;
-        let m = |c: u8| (c as f32 * 0.55 + 255.0 * 0.45) as u8;
-        Color32::from_rgb(m(a.r()), m(a.g()), m(a.b()))
+        if self.appearance.theme.is_dark() {
+            let m = |c: u8| (c as f32 * 0.55 + 255.0 * 0.45) as u8;
+            Color32::from_rgb(m(a.r()), m(a.g()), m(a.b()))
+        } else {
+            let m = |c: u8| (c as f32 * 0.72) as u8;
+            Color32::from_rgb(m(a.r()), m(a.g()), m(a.b()))
+        }
     }
 
     fn add_files(&mut self) {
@@ -1832,14 +2049,14 @@ fn load_playlist_store() -> Vec<SavedPlaylist> {
 }
 
 fn row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(egui::RichText::new(label).color(Color32::from_gray(150)).size(12.0));
+    ui.label(egui::RichText::new(label).color(pal::text_dim(ui.visuals().dark_mode)).size(12.0));
     ui.label(egui::RichText::new(value).size(12.0));
     ui.end_row();
 }
 
 fn section(ui: &mut egui::Ui, heading: &str) {
     ui.separator();
-    ui.label(egui::RichText::new(heading).strong().size(13.0).color(pal::ACCENT));
+    ui.label(egui::RichText::new(heading).strong().size(13.0).color(pal::accent(ui.visuals().dark_mode)));
     ui.end_row();
 }
 
@@ -1979,7 +2196,7 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, spectral_ceiling: Option<Spectr
         && !a.loudness_history.is_empty() {
         ui.add_space(8.0);
             ui.label(egui::RichText::new("Loudness History (per second)")
-                .size(12.0).color(pal::ACCENT));
+                .size(12.0).color(pal::accent(ui.visuals().dark_mode)));
             ui.add_space(4.0);
 
             let plot_h = 60.0_f32;
@@ -2089,6 +2306,27 @@ impl eframe::App for MoosikApp {
         // --- OS media-key / transport events ---
         self.handle_media_events();
 
+        // --- Search shortcuts (work regardless of focus) ---
+        // Ctrl+F focuses the playlist filter; Esc clears it (and drops focus).
+        let filter_id = egui::Id::new("playlist_filter");
+        let (ctrl_f, esc) = ctx.input(|i| (
+            i.modifiers.ctrl && i.key_pressed(egui::Key::F),
+            i.key_pressed(egui::Key::Escape),
+        ));
+        if ctrl_f {
+            ctx.memory_mut(|m| m.request_focus(filter_id));
+        }
+        if esc {
+            let (filter_focused, nothing_focused) =
+                ctx.memory(|m| (m.has_focus(filter_id), m.focused().is_none()));
+            // Clear when the filter box itself has focus, or when nothing else is
+            // focused (so Esc while typing in another field is left alone).
+            if filter_focused || (nothing_focused && !self.filter_query.is_empty()) {
+                self.filter_query.clear();
+                ctx.memory_mut(|m| m.surrender_focus(filter_id));
+            }
+        }
+
         // --- Keyboard shortcuts (only when no text field is focused) ---
         let no_text_focus = ctx.memory(|m| m.focused().is_none());
         if no_text_focus {
@@ -2192,6 +2430,12 @@ impl eframe::App for MoosikApp {
         self.track_accent = self.current_accent();
         self.spectrum_window.palette_accent = self.track_accent;
         self.spectrum_window.show(ctx);
+        // The palette selector lives in the spectrum window; persist any change
+        // it made back into the Appearance settings.
+        if self.spectrum_window.palette_kind != self.appearance.spectrum_palette {
+            self.appearance.spectrum_palette = self.spectrum_window.palette_kind;
+            save_appearance(&moosik_dir(), &self.appearance);
+        }
 
         // --- Info window (separate OS viewport) ---
         if self.info_open
@@ -2226,20 +2470,22 @@ impl eframe::App for MoosikApp {
                 let track = &self.playlist[idx];
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
+                    let dark = ui.visuals().dark_mode;
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(&track.title).size(18.0).strong().color(Color32::WHITE));
+                        ui.label(RichText::new(&track.title).size(18.0).strong().color(pal::text_strong(dark)));
                         ui.label(
                             RichText::new(format!("{} — {}", track.artist, track.album))
                                 .size(13.0)
-                                .color(Color32::from_gray(180)),
+                                .color(pal::text_dim(dark)),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(12.0);
+                        let dark = ui.visuals().dark_mode;
                         let (state_icon, state_col) = match self.play_state {
                             PlayState::Playing => ("▶ Playing", self.track_accent),
-                            PlayState::Paused  => ("⏸ Paused",  pal::AMBER),
-                            PlayState::Stopped => ("⏹ Stopped", pal::MUTED),
+                            PlayState::Paused  => ("⏸ Paused",  pal::amber(dark)),
+                            PlayState::Stopped => ("⏹ Stopped", pal::muted(dark)),
                         };
                         ui.label(RichText::new(state_icon).size(13.0).color(state_col));
                     });
@@ -2248,7 +2494,7 @@ impl eframe::App for MoosikApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
-                    ui.label(RichText::new("No track loaded").size(16.0).color(Color32::from_gray(120)));
+                    ui.label(RichText::new("No track loaded").size(16.0).color(pal::text_faint(ui.visuals().dark_mode)));
                 });
             }
             ui.add_space(8.0);
@@ -2303,6 +2549,7 @@ impl eframe::App for MoosikApp {
 
             // 3. Draw the track.
             let painter = ui.painter_at(row_rect);
+            let dark = ui.visuals().dark_mode;
             let fill_x = (track_x0 + self.seek_pos * (track_x1 - track_x0))
                 .clamp(track_x0, track_x1);
 
@@ -2320,7 +2567,7 @@ impl eframe::App for MoosikApp {
                     let color = if col_frac <= self.seek_pos {
                         self.track_accent
                     } else {
-                        pal::WAVE_UNPLAYED
+                        pal::wave_unplayed(dark)
                     };
                     painter.rect_filled(
                         egui::Rect::from_min_max(
@@ -2338,7 +2585,7 @@ impl eframe::App for MoosikApp {
                         painter.line_segment(
                             [egui::Pos2::new(x, row_rect.top() + 1.0),
                              egui::Pos2::new(x, row_rect.bottom() - 1.0)],
-                            egui::Stroke::new(1.5, pal::WARN),
+                            egui::Stroke::new(1.5, pal::warn(dark)),
                         );
                     }
                 }
@@ -2356,7 +2603,7 @@ impl eframe::App for MoosikApp {
                         egui::Pos2::new(track_x1, track_y + 2.0),
                     ),
                     2.0,
-                    pal::TRACK_BG,
+                    pal::track_bg(dark),
                 );
                 if fill_x > track_x0 {
                     painter.rect_filled(
@@ -2371,7 +2618,7 @@ impl eframe::App for MoosikApp {
                 let hot = seek_resp.hovered() || seek_resp.dragged();
                 let handle_r = if hot { 8.0_f32 } else { 6.0_f32 };
                 painter.circle_filled(egui::Pos2::new(fill_x, track_y), handle_r,
-                    if hot { self.track_accent_bright() } else { Color32::WHITE });
+                    if hot { self.track_accent_bright() } else { pal::text_strong(dark) });
             }
             // Time labels
             painter.text(
@@ -2379,14 +2626,14 @@ impl eframe::App for MoosikApp {
                 egui::Align2::LEFT_CENTER,
                 &elapsed_str,
                 egui::FontId::monospace(11.0),
-                Color32::from_gray(190),
+                pal::text(dark),
             );
             painter.text(
                 egui::Pos2::new(row_rect.right() - h_pad, track_y),
                 egui::Align2::RIGHT_CENTER,
                 &total_str,
                 egui::FontId::monospace(11.0),
-                Color32::from_gray(190),
+                pal::text(dark),
             );
 
             // 4. Commit seek on drag-release or click.
@@ -2460,7 +2707,7 @@ impl eframe::App for MoosikApp {
                 ui.label(
                     RichText::new(format!("{}%", (self.volume * 100.0) as u32))
                         .size(12.0)
-                        .color(Color32::from_gray(180)),
+                        .color(pal::text_dim(ui.visuals().dark_mode)),
                 );
 
                 // Sample rate + PCM bitrate indicator
@@ -2476,7 +2723,7 @@ impl eframe::App for MoosikApp {
                             None       => fmt_hz(sr),
                         };
                         ui.add_space(8.0);
-                        ui.label(RichText::new(label).size(11.0).color(Color32::from_gray(140)));
+                        ui.label(RichText::new(label).size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
                     }
                 }
 
@@ -2485,7 +2732,7 @@ impl eframe::App for MoosikApp {
                     if lufs.is_finite() {
                         ui.add_space(6.0);
                         ui.label(RichText::new(format!("{:.1} LUFS", lufs))
-                            .size(11.0).color(Color32::from_rgb(120, 210, 140)));
+                            .size(11.0).color(pal::ok(ui.visuals().dark_mode)));
                     }
                 }
 
@@ -2501,7 +2748,7 @@ impl eframe::App for MoosikApp {
                     }
                     ui.add_space(8.0);
                     let spectrum_label = if self.spectrum_window.open {
-                        RichText::new("📊 Spectrum").size(13.0).color(pal::ACCENT)
+                        RichText::new("📊 Spectrum").size(13.0).color(pal::accent(ui.visuals().dark_mode))
                     } else {
                         RichText::new("📊 Spectrum").size(13.0)
                     };
@@ -2511,7 +2758,7 @@ impl eframe::App for MoosikApp {
                     ui.add_space(8.0);
                     let info_enabled = self.current_index.is_some();
                     let info_label = if self.info_open {
-                        RichText::new("ℹ Info").size(13.0).color(pal::ACCENT)
+                        RichText::new("ℹ Info").size(13.0).color(pal::accent(ui.visuals().dark_mode))
                     } else {
                         RichText::new("ℹ Info").size(13.0)
                     };
@@ -2524,7 +2771,7 @@ impl eframe::App for MoosikApp {
                     // right_to_left layout: the toggle is added first so it
                     // sits to the right of the picker.
                     let bp_label = if self.bit_perfect {
-                        RichText::new("💎 Bit-Perfect").size(13.0).color(Color32::from_rgb(100, 255, 200))
+                        RichText::new("💎 Bit-Perfect").size(13.0).color(pal::ok(ui.visuals().dark_mode))
                     } else {
                         RichText::new("💎 Bit-Perfect").size(13.0)
                     };
@@ -2555,7 +2802,7 @@ impl eframe::App for MoosikApp {
                         match self.bp_devices {
                             None => { ui.add_space(2.0); ui.spinner(); ui.label(RichText::new("Scanning devices…").size(11.0)); }
                             Some(ref devs) if devs.is_empty() => {
-                                ui.label(RichText::new("No output devices found").size(11.0).color(Color32::from_gray(140)));
+                                ui.label(RichText::new("No output devices found").size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
                             }
                             Some(ref devs) => {
                                 for d in devs {
@@ -2570,7 +2817,7 @@ impl eframe::App for MoosikApp {
                                     };
                                     let resp = ui.selectable_label(selected, name)
                                         .on_hover_text(&caps);
-                                    ui.label(RichText::new(caps).size(10.0).color(Color32::from_gray(130)));
+                                    ui.label(RichText::new(caps).size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
                                     if resp.clicked() {
                                         pick = Some(Some(d.name.clone()));
                                         ui.close_menu();
@@ -2594,7 +2841,7 @@ impl eframe::App for MoosikApp {
                     let rg_active = self.rg.mode != RgMode::Off;
                     let rg_label = if rg_active {
                         RichText::new(format!("🔊 RG {}", self.rg.mode.label()))
-                            .size(13.0).color(Color32::from_rgb(160, 210, 120))
+                            .size(13.0).color(pal::ok(ui.visuals().dark_mode))
                     } else {
                         RichText::new("🔊 RG").size(13.0)
                     };
@@ -2610,7 +2857,7 @@ impl eframe::App for MoosikApp {
                         ui.label(RichText::new("ReplayGain — loudness normalization").strong().size(12.0));
                         if self.bit_perfect {
                             ui.label(RichText::new("💎 Bypassed in bit-perfect mode")
-                                .size(11.0).color(Color32::from_rgb(100, 255, 200)));
+                                .size(11.0).color(pal::ok(ui.visuals().dark_mode)));
                         }
                         ui.separator();
                         let mut changed = false;
@@ -2627,7 +2874,7 @@ impl eframe::App for MoosikApp {
                         ui.separator();
                         if self.rg.mode == RgMode::Off {
                             ui.label(RichText::new("Off — original file levels")
-                                .size(11.0).color(Color32::from_gray(140)));
+                                .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
                         } else {
                             let src = self.current_index.and_then(|i| self.playlist.get(i)).map(|t| {
                                 let tagged = match self.rg.mode {
@@ -2637,9 +2884,9 @@ impl eframe::App for MoosikApp {
                                 if tagged { "from ReplayGain tag" } else { "from measured loudness" }
                             }).unwrap_or("—");
                             ui.label(RichText::new(format!("Applied: {:+.1} dB  ({src})", self.rg_applied_db()))
-                                .size(11.0).color(Color32::from_gray(150)));
+                                .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
                             ui.label(RichText::new(format!("Untagged target: {:.0} LUFS", RG_TARGET_LUFS))
-                                .size(10.0).color(Color32::from_gray(120)));
+                                .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
                         }
                         if changed {
                             save_rg_settings(&moosik_dir(), &self.rg);
@@ -2648,27 +2895,33 @@ impl eframe::App for MoosikApp {
 
                     ui.add_space(8.0);
 
-                    // ── Appearance (palette · text size · accent) ───────────
+                    // ── Appearance (text size · accent) ─────────────────────
+                    // The spectrum palette lives in the spectrum window itself
+                    // (next to the View controls), since it only affects that view.
                     ui.menu_button(RichText::new("🎨 Look").size(13.0), |ui| {
                         ui.set_min_width(230.0);
                         ui.label(RichText::new("Appearance").strong().size(12.0));
                         ui.separator();
                         let mut changed = false;
 
-                        ui.label(RichText::new("Spectrum palette")
-                            .size(11.0).color(Color32::from_gray(150)));
-                        for p in spectrum::SpectrumPalette::ALL {
-                            if ui.selectable_value(
-                                &mut self.appearance.spectrum_palette, p, p.label(),
-                            ).clicked() {
-                                changed = true;
+                        ui.label(RichText::new("Theme")
+                            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+                        ui.horizontal(|ui| {
+                            for tm in [ThemeMode::Dark, ThemeMode::Light] {
+                                if ui.selectable_label(self.appearance.theme == tm, tm.label()).clicked()
+                                    && self.appearance.theme != tm
+                                {
+                                    self.appearance.theme = tm;
+                                    apply_theme(ctx, tm.is_dark());
+                                    changed = true;
+                                }
                             }
-                        }
+                        });
 
                         ui.add_space(6.0);
                         ui.separator();
                         ui.label(RichText::new("Text size")
-                            .size(11.0).color(Color32::from_gray(150)));
+                            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
                         // Edit a draft, then commit on Apply — a live zoom change
                         // mid-drag resizes the menu under the cursor.
                         ui.add(
@@ -2691,7 +2944,7 @@ impl eframe::App for MoosikApp {
                                 save_appearance(&moosik_dir(), &self.appearance);
                             }
                             ui.label(RichText::new(format!("now {:.0}%", self.appearance.ui_scale * 100.0))
-                                .size(10.0).color(Color32::from_gray(120)));
+                                .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
                         });
 
                         ui.add_space(6.0);
@@ -2701,7 +2954,7 @@ impl eframe::App for MoosikApp {
                             changed = true;
                         }
                         ui.label(RichText::new("Off → fixed brand accent")
-                            .size(10.0).color(Color32::from_gray(120)));
+                            .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
 
                         if changed {
                             save_appearance(&moosik_dir(), &self.appearance);
@@ -2714,7 +2967,7 @@ impl eframe::App for MoosikApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
-                    ui.label(RichText::new(&self.status_msg).size(11.0).color(Color32::from_gray(140)));
+                    ui.label(RichText::new(&self.status_msg).size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
                 });
             }
 
@@ -2824,7 +3077,7 @@ impl eframe::App for MoosikApp {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.label(RichText::new(format!("Playlist  ({} tracks)", self.playlist.len()))
-                    .size(13.0).color(Color32::from_gray(160)));
+                    .size(13.0).color(pal::text_dim(ui.visuals().dark_mode)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
                     if !self.playlist.is_empty()
@@ -2877,13 +3130,74 @@ impl eframe::App for MoosikApp {
             let mut new_drop_row = n;
             let mut last_row_bottom: Option<(f32, f32, f32)> = None; // (left, right, y)
 
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, n, |ui, rows| {
+            // ── Search / filter ─────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.label("🔍");
+                ui.add(egui::TextEdit::singleline(&mut self.filter_query)
+                    .id(egui::Id::new("playlist_filter"))
+                    .hint_text(RichText::new("Filter by title, artist, or album…  (Ctrl+F)")
+                        .color(pal::text_faint(ui.visuals().dark_mode)))
+                    .desired_width(240.0));
+                if !self.filter_query.is_empty()
+                    && ui.small_button("✕").on_hover_text("Clear filter (Esc)").clicked() {
+                    self.filter_query.clear();
+                }
+
+                // ── Sort columns (pushed to the right) ───────────────────
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut sort_click: Option<SortKey> = None;
+                    // right_to_left: add in reverse so they read Title→Time.
+                    for key in SortKey::ALL.iter().rev() {
+                        let active = self.sort_key == Some(*key);
+                        let arrow = if active { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
+                        if ui.selectable_label(active,
+                            RichText::new(format!("{}{}", key.label(), arrow)).size(12.0))
+                            .on_hover_text("Sort by this column (click again to reverse)")
+                            .clicked()
+                        {
+                            sort_click = Some(*key);
+                        }
+                    }
+                    ui.label(RichText::new("Sort:").size(11.0)
+                        .color(pal::text_faint(ui.visuals().dark_mode)));
+                    if let Some(k) = sort_click { self.sort_playlist(k); }
+                });
+            });
+            ui.add_space(2.0);
+
+            // Real playlist indices to display: all rows, or only those matching
+            // the filter. Filtering disables drag-reorder (an ambiguous op on a
+            // subset), so with no filter this is the identity 0..n and every
+            // path below behaves exactly as before.
+            let q = self.filter_query.trim().to_lowercase();
+            let filtering = !q.is_empty();
+            let visible: Vec<usize> = if filtering {
+                (0..n).filter(|&i| {
+                    let t = &self.playlist[i];
+                    t.title.to_lowercase().contains(&q)
+                        || t.artist.to_lowercase().contains(&q)
+                        || t.album.to_lowercase().contains(&q)
+                }).collect()
+            } else {
+                (0..n).collect()
+            };
+            let vn = visible.len();
+
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, vn, |ui, rows| {
                 if self.playlist.is_empty() {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("No tracks loaded").size(15.0).color(Color32::from_gray(100)));
+                        ui.label(RichText::new("No tracks loaded").size(15.0).color(pal::text_faint(ui.visuals().dark_mode)));
                         ui.add_space(8.0);
-                        ui.label(RichText::new("Click \"+ Add Files\" to get started").size(12.0).color(Color32::from_gray(80)));
+                        ui.label(RichText::new("Click \"+ Add Files\" to get started").size(12.0).color(pal::text_faint(ui.visuals().dark_mode)));
+                    });
+                    return;
+                }
+                if visible.is_empty() {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new(format!("No tracks match “{}”", self.filter_query.trim()))
+                            .size(14.0).color(pal::text_faint(ui.visuals().dark_mode)));
                     });
                     return;
                 }
@@ -2900,22 +3214,24 @@ impl eframe::App for MoosikApp {
                 }
                 let rows_end = rows.end;
 
-                for i in rows {
+                for row in rows {
+                    let i = visible[row];
                     let track_title  = self.playlist[i].display_title().to_string();
                     let track_artist = self.playlist[i].artist.clone();
                     let track_dur    = self.playlist[i].duration;
                     let is_current        = self.current_index == Some(i);
                     let is_selected       = self.selected.contains(&i);
                     let is_being_dragged  = self.drag_src == Some(i);
+                    let dark = ui.visuals().dark_mode;
 
                     let base_color = if is_selected {
-                        pal::ROW_SELECTED
+                        pal::row_selected(dark)
                     } else if is_current {
-                        pal::ROW_CURRENT
+                        pal::row_current(dark)
                     } else if i % 2 == 0 {
-                        pal::ROW_EVEN
+                        pal::row_even(dark)
                     } else {
-                        pal::ROW_ODD
+                        pal::row_odd(dark)
                     };
 
                     let (rect, response) = ui.allocate_exact_size(
@@ -2938,7 +3254,7 @@ impl eframe::App for MoosikApp {
                             ui.painter().line_segment(
                                 [egui::Pos2::new(rect.left(), rect.top()),
                                  egui::Pos2::new(rect.right(), rect.top())],
-                                egui::Stroke::new(2.0, pal::ACCENT),
+                                egui::Stroke::new(2.0, pal::accent(dark)),
                             );
                         }
                     }
@@ -3055,7 +3371,7 @@ impl eframe::App for MoosikApp {
                             egui::Align2::CENTER_CENTER,
                             format!("{}", i + 1),
                             egui::FontId::proportional(12.0),
-                            if is_current { self.track_accent } else { Color32::from_gray(100) },
+                            if is_current { self.track_accent } else { pal::text_faint(dark) },
                         );
 
                         // Title
@@ -3066,7 +3382,7 @@ impl eframe::App for MoosikApp {
                             egui::Align2::LEFT_CENTER,
                             &track_title,
                             egui::FontId::proportional(13.0),
-                            if is_current { Color32::WHITE } else { Color32::from_gray(210) },
+                            if is_current { pal::text_strong(dark) } else { pal::text(dark) },
                         );
 
                         // Artist
@@ -3075,7 +3391,7 @@ impl eframe::App for MoosikApp {
                             egui::Align2::LEFT_CENTER,
                             &track_artist,
                             egui::FontId::proportional(12.0),
-                            Color32::from_gray(150),
+                            pal::text_dim(dark),
                         );
 
                         // Duration
@@ -3085,17 +3401,23 @@ impl eframe::App for MoosikApp {
                                 egui::Align2::RIGHT_CENTER,
                                 Self::format_duration(dur),
                                 egui::FontId::monospace(12.0),
-                                Color32::from_gray(120),
+                                pal::text_faint(dark),
                             );
                         }
 
                         if response.hovered() && !is_being_dragged {
-                            ui.painter().rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 8));
+                            let hl = if dark {
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 8)
+                            } else {
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 12)
+                            };
+                            ui.painter().rect_filled(rect, 0.0, hl);
                         }
                     }
 
-                    // Drag start
-                    if response.drag_started() && !dragging {
+                    // Drag start (reorder is disabled while filtering — a subset
+                    // has no unambiguous drop position in the full list).
+                    if response.drag_started() && !dragging && !filtering {
                         drag_started_at = Some(i);
                     }
 
@@ -3126,7 +3448,7 @@ impl eframe::App for MoosikApp {
                     if drop == n && !no_op {
                         ui.painter().line_segment(
                             [egui::Pos2::new(rx0, ry), egui::Pos2::new(rx1, ry)],
-                            egui::Stroke::new(2.0, pal::ACCENT),
+                            egui::Stroke::new(2.0, pal::accent(ui.visuals().dark_mode)),
                         );
                     }
                 }
@@ -3185,10 +3507,17 @@ impl eframe::App for MoosikApp {
         // Apply ReplayGain (idempotent; catches track change, mode change,
         // bit-perfect toggle, and the measured LUFS landing mid-track).
         self.update_replay_gain();
+        // Persist volume / loop mode if they changed this frame (throttled).
+        self.persist_player_prefs_if_changed();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         save_last_playlist(&self.playlist);
         self.spectrum_window.art_settings.save();
+        // Final flush of volume / loop mode (a change inside the throttle window
+        // may not have been written yet).
+        save_player_prefs(&moosik_dir(), &PlayerPrefs {
+            volume: self.volume, loop_mode: self.loop_mode,
+        });
     }
 }
