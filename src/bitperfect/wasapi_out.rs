@@ -54,11 +54,19 @@ const CANDIDATES: [(usize, usize, SampleType, DevFmt, &str); 5] = [
 /// container that holds the source exactly (a 16-bit file on a 16-bit pipe
 /// is bit-perfect; padding up to 24/32 is too, but narrower is the classic
 /// choice and what drivers support most reliably).
-fn candidate_order(src_bits: Option<u32>) -> [usize; 5] {
+///
+/// `dop` forces an integer-only, ≥24-bit container (indices 1-3: I24,
+/// 24-in-32, 32i) — the ring carries pre-packed 24-bit DoP words, and a
+/// DoP-aware DAC must see that literal integer bit pattern; F32 would send an
+/// IEEE-754 encoding instead, and I16 (index 0) is too narrow to hold one.
+fn candidate_order(src_bits: Option<u32>, dop: bool) -> Vec<usize> {
+    if dop {
+        return vec![1, 2, 3];
+    }
     match src_bits {
-        Some(b) if b <= 16 => [0, 1, 2, 3, 4],
-        Some(b) if b > 24 => [3, 4, 1, 2, 0],
-        _ => [1, 2, 3, 4, 0], // 24-bit or unknown
+        Some(b) if b <= 16 => vec![0, 1, 2, 3, 4],
+        Some(b) if b > 24 => vec![3, 4, 1, 2, 0],
+        _ => vec![1, 2, 3, 4, 0], // 24-bit or unknown
     }
 }
 
@@ -141,6 +149,7 @@ pub fn open(
     sample_rate: u32,
     channels: u16,
     src_bits: Option<u32>,
+    dop: bool,
     shared: Arc<Shared>,
     tap: SpectrumTap,
 ) -> Result<(Handle, String, String), String> {
@@ -151,7 +160,7 @@ pub fn open(
 
     let join = std::thread::Builder::new()
         .name("bp-wasapi-render".into())
-        .spawn(move || render_thread(dev_name, sample_rate, channels, src_bits, shared, tap, stop_t, tx))
+        .spawn(move || render_thread(dev_name, sample_rate, channels, src_bits, dop, shared, tap, stop_t, tx))
         .map_err(|e| format!("thread spawn failed: {e}"))?;
 
     match rx.recv() {
@@ -167,6 +176,7 @@ fn render_thread(
     sample_rate: u32,
     channels: u16,
     src_bits: Option<u32>,
+    dop: bool,
     shared: Arc<Shared>,
     mut tap: SpectrumTap,
     stop: Arc<AtomicBool>,
@@ -174,7 +184,7 @@ fn render_thread(
 ) {
     let _ = initialize_mta();
 
-    let setup = setup_stream(device_name.as_deref(), sample_rate, channels, src_bits);
+    let setup = setup_stream(device_name.as_deref(), sample_rate, channels, src_bits, dop);
     let (client, render, fmt, dev_fmt, label, dev_label) = match setup {
         Ok(s) => s,
         Err(e) => { let _ = tx.send(Err(e)); return; }
@@ -234,6 +244,7 @@ fn setup_stream(
     sample_rate: u32,
     channels: u16,
     src_bits: Option<u32>,
+    dop: bool,
 ) -> Result<StreamSetup, String> {
     let enumerator = DeviceEnumerator::new()
         .map_err(|e| format!("device enumeration failed: {e}"))?;
@@ -265,7 +276,7 @@ fn setup_stream(
 
     // Negotiate the device format in exclusive mode.
     let mut chosen: Option<(WaveFormat, DevFmt, &str)> = None;
-    for idx in candidate_order(src_bits) {
+    for idx in candidate_order(src_bits, dop) {
         let c = &CANDIDATES[idx];
         if let Ok(accepted) =
             client.is_supported_exclusive_with_quirks(&wave_format(c, sample_rate, channels))
@@ -282,8 +293,9 @@ fn setup_stream(
             }))
             .map(fmt_khz)
             .collect();
+        let dop_note = if dop { " (DoP requires a ≥24-bit integer format)" } else { "" };
         format!(
-            "\"{dev_label}\" rejected {} / {channels}ch in exclusive mode (accepts: {})",
+            "\"{dev_label}\" rejected {} / {channels}ch{dop_note} in exclusive mode (accepts: {})",
             fmt_khz(sample_rate),
             if rates.is_empty() { "no standard rates — is another app holding the device?".into() }
             else { rates.join(", ") },

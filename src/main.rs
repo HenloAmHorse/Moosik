@@ -1,4 +1,5 @@
 mod bitperfect;
+mod dsd;
 mod media_controls;
 mod spectrum;
 
@@ -411,12 +412,30 @@ fn parse_rg_peak(s: &str) -> Option<f32> {
     s.trim().parse::<f32>().ok().filter(|p| *p > 0.0)
 }
 
+/// Read a file's tags with lofty. DSD containers aren't a lofty file type,
+/// but both carry a standard ID3v2 blob (DSF via a header pointer, DFF via an
+/// `ID3 ` chunk) — extract it and hand it to lofty's ID3v2-capable MPEG
+/// reader with properties disabled, so titles, ReplayGain TXXX frames and
+/// cover art all flow through the exact same pipeline as every other format.
+fn probe_tagged(path: &Path) -> Option<lofty::file::TaggedFile> {
+    if dsd::is_dsd_path(path) {
+        let info = dsd::parse_file(path).ok()?;
+        let blob = dsd::read_id3_blob(path, &info)?;
+        Probe::with_file_type(std::io::Cursor::new(blob), lofty::file::FileType::Mpeg)
+            .options(lofty::config::ParseOptions::new().read_properties(false))
+            .read().ok()
+    } else {
+        Probe::open(path).ok()?.read().ok()
+    }
+}
+
 fn read_metadata(path: &PathBuf) -> TrackMeta {
     let fallback_title = path.file_stem()
         .and_then(|s| s.to_str()).unwrap_or("Unknown").to_string();
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-    let tagged = Probe::open(path).ok().and_then(|p| p.read().ok());
+    let dsd_info = dsd::is_dsd_path(path).then(|| dsd::parse_file(path).ok()).flatten();
+    let tagged = probe_tagged(path);
 
     let (title, artist, album, year, genre, track_number) = if let Some(ref t) = tagged {
         let tag = t.primary_tag().or_else(|| t.first_tag());
@@ -436,7 +455,16 @@ fn read_metadata(path: &PathBuf) -> TrackMeta {
         (fallback_title, "Unknown Artist".to_string(), "Unknown Album".to_string(), None, None, None)
     };
 
-    let (duration, sample_rate, channels, bit_depth, bitrate) = if let Some(ref t) = tagged {
+    let (duration, sample_rate, channels, bit_depth, bitrate) = if let Some(ref i) = dsd_info {
+        // Stream properties come from the DSD header, not lofty.
+        (
+            Some(i.duration()),
+            Some(i.sample_rate),
+            Some(i.channels as u8),
+            Some(1),
+            Some(i.sample_rate / 1000 * i.channels), // 1 bit × rate × channels
+        )
+    } else if let Some(ref t) = tagged {
         let p = t.properties();
         let secs = p.duration().as_secs();
         (
@@ -478,12 +506,15 @@ fn codec_name(path: &Path) -> &'static str {
         Some("mp3")  => "MP3",
         Some("ogg")  => "Ogg Vorbis",
         Some("wav")  => "WAV / PCM",
+        Some("dsf")  => "DSD (DSF)",
+        Some("dff")  => "DSD (DSDIFF)",
         _            => "Unknown",
     }
 }
 
 fn is_lossless(path: &Path) -> bool {
-    matches!(path.extension().and_then(|e| e.to_str()), Some("flac") | Some("wav"))
+    matches!(path.extension().and_then(|e| e.to_str()),
+             Some("flac") | Some("wav") | Some("dsf") | Some("dff"))
 }
 
 fn channel_layout(n: u8) -> &'static str {
@@ -518,6 +549,27 @@ struct PendingSeek {
     was_paused: bool,
 }
 
+/// rodio adapter over the decimated-DSD stream, for the fallback path when a
+/// device can't take the DoP carrier rate. Seeking is instant (DSD is
+/// byte-addressable), so `Sink::try_seek` always takes the fast path.
+struct DsdRodioSource(dsd::decimate::DsdFilePcmSource);
+
+impl Iterator for DsdRodioSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> { self.0.next() }
+}
+
+impl Source for DsdRodioSource {
+    fn current_frame_len(&self) -> Option<usize> { None }
+    fn channels(&self) -> u16 { self.0.channels() as u16 }
+    fn sample_rate(&self) -> u32 { self.0.out_rate() }
+    fn total_duration(&self) -> Option<Duration> { Some(self.0.duration()) }
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+        self.0.seek_to_time(pos)
+            .map_err(|e| rodio::source::SeekError::Other(Box::new(e)))
+    }
+}
+
 struct Engine {
     // ── rodio path (normal mode) ───────────────────────────────────────────
     _stream: OutputStream,
@@ -526,6 +578,22 @@ struct Engine {
     // ── bit-perfect path (direct cpal stream fed by a symphonia thread) ────
     bp: Option<bitperfect::BpStream>,
     pub bit_perfect: bool,
+    /// True while the loaded track is DSD, played via DoP on `bp` — always
+    /// bit-perfect regardless of the `bit_perfect` (PCM) toggle, since DoP is
+    /// the only path that can carry it at all. Volume/EQ are hard-bypassed.
+    pub dsd_mode: bool,
+    /// True while a DSD track plays through the *fallback* path: DoP was
+    /// unavailable (device can't take the carrier rate), so the bitstream is
+    /// decimated to PCM and played through the normal rodio path — volume,
+    /// EQ and ReplayGain all apply, exactly like any PCM track.
+    pub dsd_fallback: bool,
+    /// Why DoP was unavailable, for the status line (set with dsd_fallback).
+    pub dsd_fallback_note: Option<String>,
+    /// Target PCM rate for the fallback decimation (mirrors the analyzer's
+    /// DSD rate setting so the realtime spectrum tap matches its axis).
+    pub dsd_fallback_target: u32,
+    /// "DSD64" / "DSD128" / … label for the currently loaded DSD track.
+    pub dsd_label: Option<String>,
     /// Selected bit-perfect output device name; None = system default.
     pub bp_device: Option<String>,
     /// Position within the current track corresponding to `bp_played_at_track_start`
@@ -568,6 +636,11 @@ impl Engine {
             sink: None,
             bp: None,
             bit_perfect: false,
+            dsd_mode: false,
+            dsd_fallback: false,
+            dsd_fallback_note: None,
+            dsd_fallback_target: dsd::decimate::DEFAULT_ANALYSIS_RATE,
+            dsd_label: None,
             bp_device: None,
             bp_base: Duration::ZERO,
             bp_played_at_track_start: Duration::ZERO,
@@ -600,9 +673,31 @@ impl Engine {
     /// Effective rodio sink volume: user volume × ReplayGain.
     fn rodio_volume(&self) -> f32 { self.volume * self.replay_gain }
 
+    /// True when the *active session* lives on the bit-perfect device stream
+    /// (`bp`) rather than the rodio sink. DSD fallback always runs on the
+    /// sink, even while the bit-perfect toggle is globally on — routing
+    /// pause/position/finish through `bp` then would hit a dead stream.
+    fn on_bp_stream(&self) -> bool {
+        self.dsd_mode || (self.bit_perfect && !self.dsd_fallback)
+    }
+
     fn play_file(&mut self, path: &PathBuf, duration: Option<Duration>) -> Result<(), String> {
         self.stop();
-        if self.bit_perfect {
+        if dsd::is_dsd_path(path) {
+            // Bit-perfect DoP first; if the device can't take the carrier
+            // rate, decimate to PCM and play through the normal path so the
+            // track is never simply unplayable.
+            match self.start_dop(path, Duration::ZERO) {
+                Ok(()) => self.dsd_mode = true,
+                Err(dop_err) => {
+                    self.start_dsd_fallback(path, Duration::ZERO).map_err(|e| {
+                        format!("{dop_err}; PCM fallback also failed: {e}")
+                    })?;
+                    self.dsd_fallback = true;
+                    self.dsd_fallback_note = Some(dop_err);
+                }
+            }
+        } else if self.bit_perfect {
             self.start_bp(path, Duration::ZERO)?;
         } else {
             self.ensure_rodio_stream();
@@ -635,7 +730,11 @@ impl Engine {
         self.last_sample_rate = prep.sample_rate;
 
         let reuse = self.bp.as_ref().is_some_and(|s| {
-            s.sample_rate == prep.sample_rate
+            // A DoP (DSD) stream can never be reused for PCM: its device format
+            // was DoP-constrained and its volume/analyzer taps are hard-bypassed
+            // (dop_active). Force a re-open so PCM gets a proper PCM stream.
+            !s.dop
+                && s.sample_rate == prep.sample_rate
                 && s.channels == prep.channels
                 && s.requested_device == self.bp_device
         });
@@ -646,6 +745,7 @@ impl Engine {
                 prep.sample_rate,
                 prep.channels,
                 prep.bits_per_sample,
+                false,
                 self.sample_buf.clone(),
                 self.stereo_buf.clone(),
             ).map_err(|e| format!("Bit-perfect: {e}"))?);
@@ -659,15 +759,103 @@ impl Engine {
         Ok(())
     }
 
+    /// Decode `path` (a `.dsf`/`.dff` file) and play it as DoP on the
+    /// bit-perfect stream, (re)opening it at the DoP carrier rate if the
+    /// device, rate, or channel count changed. `start` seeks within the
+    /// track (each DoP PCM frame is 16 DSD samples, so the seek target is
+    /// converted to a PCM-frame offset before the device format is touched).
+    fn start_dop(&mut self, path: &Path, start: Duration) -> Result<(), String> {
+        let mut stream = dsd::dop::open_dop_stream(path).map_err(|e| format!("DSD: {e}"))?;
+        let carrier = stream.carrier_rate();
+        let channels = stream.info().channels as u16;
+        self.dsd_label = Some(stream.info().rate_label());
+        self.last_sample_rate = carrier;
+
+        let reuse = self.bp.as_ref().is_some_and(|s| {
+            s.dop && s.sample_rate == carrier && s.channels == channels
+                && s.requested_device == self.bp_device
+        });
+        if !reuse {
+            self.bp = None; // release the old stream/device first
+            self.bp = Some(bitperfect::BpStream::open(
+                self.bp_device.as_deref(),
+                carrier,
+                channels,
+                Some(24),
+                true, // dop
+                self.sample_buf.clone(),
+                self.stereo_buf.clone(),
+            ).map_err(|e| format!("DSD (DoP): {e}"))?);
+        }
+        if start > Duration::ZERO {
+            let pcm_frame = (start.as_secs_f64() * carrier as f64) as u64;
+            let _ = stream.seek_to_pcm_frame(pcm_frame);
+        }
+        let bp = self.bp.as_ref().unwrap();
+        bp.resume();
+        bp.start_dop(stream);
+        self.bp_base = start;
+        self.bp_played_at_track_start = Duration::ZERO;
+        self.rodio_stream_dirty = true; // exclusive mode may kill the rodio stream
+        Ok(())
+    }
+
     /// Queue `path` for gapless continuation on the open bit-perfect stream.
     /// Returns false (no gapless) if there is no stream, the file can't be
     /// prepared, or its rate/channels differ from the stream (a format change
     /// forces a device re-open, so the track boundary can't be gapless).
+    /// Decimate a DSD file to PCM and play it through the rodio path — the
+    /// fallback when the device can't take the DoP carrier rate. This is a
+    /// normal-mode session: volume, EQ and ReplayGain apply, the spectrum tap
+    /// feeds the realtime display, and seeks are instant (`try_seek` on the
+    /// source, DSD being byte-addressable).
+    fn start_dsd_fallback(&mut self, path: &Path, start: Duration) -> Result<(), String> {
+        self.ensure_rodio_stream();
+        let mut src = dsd::decimate::open_pcm_source(path, self.dsd_fallback_target)
+            .map_err(|e| format!("DSD decimate: {e}"))?;
+        if start > Duration::ZERO {
+            src.seek_to_time(start).map_err(|e| format!("DSD seek: {e}"))?;
+        }
+        self.dsd_label = dsd::parse_file(path).ok().map(|i| i.rate_label());
+        self.last_sample_rate = src.out_rate();
+        let sink = Sink::try_new(&self.stream_handle).map_err(|e| format!("Sink failed: {e}"))?;
+        sink.set_volume(self.rodio_volume());
+        let tapped = SpectrumSource::new(
+            DsdRodioSource(src), self.sample_buf.clone(), self.stereo_buf.clone());
+        if let Some(ref eq) = self.eq {
+            sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+        } else {
+            sink.append(tapped);
+        }
+        self.sink = Some(sink);
+        Ok(())
+    }
+
+    /// PCM gapless only — a DSD `path` is refused here (it can't ride a PCM
+    /// stream); `bp_queue_next_dop` handles DSD→DSD gapless instead.
     fn bp_queue_next(&self, path: &Path) -> bool {
+        if self.dsd_mode { return false; }
         let Some(bp) = self.bp.as_ref() else { return false };
         let Ok(prep) = bitperfect::prepare(path, Duration::ZERO) else { return false };
         if prep.sample_rate != bp.sample_rate || prep.channels != bp.channels { return false; }
         bp.queue_next(prep);
+        true
+    }
+
+    /// Queue the next DSD track for gapless DoP continuation on the open
+    /// stream. Returns false (no gapless — advance re-opens the device) unless
+    /// there's an open DoP stream and the next file's carrier rate and channel
+    /// count match it exactly.
+    fn bp_queue_next_dop(&self, path: &Path) -> bool {
+        if !self.dsd_mode { return false; }
+        let Some(bp) = self.bp.as_ref() else { return false };
+        if !bp.dop { return false; }
+        let Ok(stream) = dsd::dop::open_dop_stream(path) else { return false };
+        if stream.carrier_rate() != bp.sample_rate
+            || stream.info().channels as u16 != bp.channels {
+            return false;
+        }
+        bp.queue_next_dop(stream);
         true
     }
 
@@ -689,7 +877,14 @@ impl Engine {
 
     /// One-line description of the active bit-perfect stream for the UI.
     fn bp_describe(&self) -> Option<String> {
-        self.bp.as_ref().map(|s| format!("{} → {}", s.describe(), s.device_name))
+        self.bp.as_ref().map(|s| {
+            if s.dop {
+                let label = self.dsd_label.as_deref().unwrap_or("DSD");
+                format!("{label} via DoP · {} → {}", s.describe(), s.device_name)
+            } else {
+                format!("{} → {}", s.describe(), s.device_name)
+            }
+        })
     }
 
     /// Drop the bit-perfect stream entirely (releases the audio device).
@@ -701,7 +896,7 @@ impl Engine {
         // A seek may still be decoding on the worker; remember the intent so it
         // resumes paused.
         if let Some(ps) = self.pending_seek.as_mut() { ps.was_paused = true; }
-        if self.bit_perfect {
+        if self.on_bp_stream() {
             if let Some(ref bp) = self.bp
                 && !bp.is_paused() {
                 bp.pause();
@@ -720,7 +915,7 @@ impl Engine {
 
     fn resume(&mut self) {
         if let Some(ps) = self.pending_seek.as_mut() { ps.was_paused = false; }
-        if self.bit_perfect {
+        if self.on_bp_stream() {
             if let Some(ref bp) = self.bp
                 && bp.is_paused() {
                 bp.resume();
@@ -739,6 +934,9 @@ impl Engine {
             sink.stop();
         }
         if let Some(ref bp) = self.bp { bp.stop_session(); }
+        self.dsd_mode = false;
+        self.dsd_fallback = false;
+        self.dsd_fallback_note = None;
         self.bp_base = Duration::ZERO;
         self.started_at = None;
         self.paused_elapsed = Duration::ZERO;
@@ -746,7 +944,7 @@ impl Engine {
     }
 
     fn is_finished(&self) -> bool {
-        if self.bit_perfect {
+        if self.on_bp_stream() {
             self.bp.as_ref().is_some_and(|bp| bp.is_finished())
         } else {
             self.sink.as_ref().is_some_and(|s| s.empty())
@@ -754,7 +952,7 @@ impl Engine {
     }
 
     fn elapsed(&self) -> Duration {
-        if self.bit_perfect && let Some(ref bp) = self.bp {
+        if self.on_bp_stream() && let Some(ref bp) = self.bp {
             // Sample-accurate: frames delivered to the device, less the frames
             // that belonged to earlier gapless tracks in this session.
             return self.bp_base + bp.played().saturating_sub(self.bp_played_at_track_start);
@@ -769,7 +967,9 @@ impl Engine {
             sink.set_volume(self.rodio_volume());
         }
         // Bit-perfect path gets the raw user volume — never ReplayGain.
-        if let Some(ref bp) = self.bp { bp.set_volume(vol); }
+        // DSD/DoP ignores it entirely: BpStream::set_volume no-ops on a dop
+        // stream, but skip the call outright so intent is obvious here too.
+        if !self.dsd_mode && let Some(ref bp) = self.bp { bp.set_volume(vol); }
     }
 
     /// Set the ReplayGain factor (linear) and apply it live to the rodio sink.
@@ -782,9 +982,23 @@ impl Engine {
 
     /// Append `path` to the current rodio sink for gapless continuation — rodio
     /// plays queued sources back-to-back with no gap. Decoding is lazy, but the
-    /// decoder is opened here so the hand-off never underruns.
+    /// decoder is opened here so the hand-off never underruns. A DSD `path`
+    /// is appended as its decimated-PCM fallback source (used when the current
+    /// session is already on the rodio path — e.g. DSD fallback → DSD).
     fn append_next(&self, path: &Path) -> Result<(), String> {
         let sink = self.sink.as_ref().ok_or("no sink")?;
+        if dsd::is_dsd_path(path) {
+            let src = dsd::decimate::open_pcm_source(path, self.dsd_fallback_target)
+                .map_err(|e| format!("DSD decimate: {e}"))?;
+            let tapped = SpectrumSource::new(
+                DsdRodioSource(src), self.sample_buf.clone(), self.stereo_buf.clone());
+            if let Some(ref eq) = self.eq {
+                sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+            } else {
+                sink.append(tapped);
+            }
+            return Ok(());
+        }
         let file = File::open(path).map_err(|e| format!("Open failed: {e}"))?;
         let decoder = Decoder::new(BufReader::new(file))
             .map_err(|e| format!("Decode failed: {e}"))?;
@@ -818,9 +1032,11 @@ impl Engine {
     /// reach `target`.  Handles FLAC, where symphonia 0.5.5 returns `Unseekable`
     /// because rodio's `ReadSeekSource::byte_len()` always returns `None`.
     fn seek_to(&mut self, path: &Path, target: Duration) {
-        if self.bit_perfect {
+        if self.on_bp_stream() {
             let was_paused = self.bp.as_ref().map(|bp| bp.is_paused()).unwrap_or(false);
-            if let Err(e) = self.start_bp(path, target) {
+            let result = if self.dsd_mode { self.start_dop(path, target) }
+                         else { self.start_bp(path, target) };
+            if let Err(e) = result {
                 eprintln!("seek: {e}");
                 return;
             }
@@ -846,6 +1062,24 @@ impl Engine {
                 self.paused_elapsed = target;
                 if was_paused { self.started_at = None; }
                 else { self.started_at = Some(Instant::now()); }
+            }
+            return;
+        }
+
+        // --- DSD fallback: rebuild in place (byte-addressable, instant) ---
+        // Normally unreachable — try_seek forwards to the DSD source and the
+        // fast path succeeds — but if it ever fails, the rodio-Decoder slow
+        // path below can't open a DSD file, so rebuild the sink directly.
+        if self.dsd_fallback {
+            if let Some(sink) = self.sink.take() { sink.stop(); }
+            if self.start_dsd_fallback(path, target).is_ok() {
+                self.paused_elapsed = target;
+                if was_paused {
+                    if let Some(ref s) = self.sink { s.pause(); }
+                    self.started_at = None;
+                } else {
+                    self.started_at = Some(Instant::now());
+                }
             }
             return;
         }
@@ -912,6 +1146,21 @@ impl Engine {
     ) {
         self.stop(); // release any bp stream/session and supersede a pending seek
         self.current_duration = duration;
+        // DSD can't go through the rodio-Decoder seek worker; its fallback
+        // source seeks instantly, so build it synchronously at the position.
+        if dsd::is_dsd_path(path) {
+            if self.start_dsd_fallback(path, target).is_ok() {
+                self.dsd_fallback = true;
+                self.paused_elapsed = target;
+                if was_paused {
+                    if let Some(ref s) = self.sink { s.pause(); }
+                    self.started_at = None;
+                } else {
+                    self.started_at = Some(Instant::now());
+                }
+            }
+            return;
+        }
         let rx = Self::spawn_seek_worker(path, target);
         self.pending_seek = Some(PendingSeek { rx, target, was_paused });
         self.paused_elapsed = target;
@@ -1377,7 +1626,7 @@ impl ArtCache {
     }
 
     fn extract_bytes(path: &Path) -> Option<Vec<u8>> {
-        let tagged = Probe::open(path).ok()?.read().ok()?;
+        let tagged = probe_tagged(path)?;
         let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
         let pic = tag.pictures().iter()
             .find(|p| p.pic_type() == lofty::picture::PictureType::CoverFront)
@@ -1627,7 +1876,7 @@ impl MoosikApp {
 
     fn add_files(&mut self) {
         let paths = rfd::FileDialog::new()
-            .add_filter("Audio", &["flac", "wav", "mp3", "ogg"])
+            .add_filter("Audio", &["flac", "wav", "mp3", "ogg", "dsf", "dff"])
             .set_title("Add audio files")
             .pick_files();
         if let Some(paths) = paths {
@@ -1646,7 +1895,7 @@ impl MoosikApp {
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                    && matches!(ext.to_lowercase().as_str(), "flac" | "wav" | "mp3" | "ogg") {
+                    && matches!(ext.to_lowercase().as_str(), "flac" | "wav" | "mp3" | "ogg" | "dsf" | "dff") {
                     found.push(path);
                 }
             }
@@ -1666,7 +1915,11 @@ impl MoosikApp {
         let track = &self.playlist[idx];
         let path = track.path.clone();
         let duration = track.duration;
+        let is_dsd = dsd::is_dsd_path(&path);
         let result = if let Some(ref mut engine) = self.engine {
+            // Keep the fallback decimation aligned with the analyzer's DSD
+            // rate so the realtime spectrum tap matches its axis.
+            engine.dsd_fallback_target = self.spectrum_window.analyzer.dsd_rate;
             engine.play_file(&path, duration)
         } else {
             Err("No audio engine".to_string())
@@ -1675,13 +1928,23 @@ impl MoosikApp {
             Ok(()) => {
                 self.play_state = PlayState::Playing;
                 self.status_msg = format!("Playing: {}", self.playlist[idx].title);
-                if self.bit_perfect
+                if (self.bit_perfect || is_dsd)
                     && let Some(desc) = self.engine.as_ref().and_then(|e| e.bp_describe()) {
                     self.status_msg = format!("💎 {desc} — {}", self.playlist[idx].title);
                 }
+                if let Some(e) = self.engine.as_ref().filter(|e| e.dsd_fallback) {
+                    let label = e.dsd_label.as_deref().unwrap_or("DSD");
+                    let note = e.dsd_fallback_note.as_deref().unwrap_or("DoP unavailable");
+                    self.status_msg = format!(
+                        "⚠ {note} — playing {label} as {} PCM — {}",
+                        fmt_hz(e.last_sample_rate), self.playlist[idx].title,
+                    );
+                }
                 self.on_track_started(&path);
             }
-            Err(e) if self.bit_perfect => {
+            // DSD has no fallback path — a raw DSD bitstream can't play through
+            // rodio's normal decoders, so a DoP failure is a hard error.
+            Err(e) if self.bit_perfect && !is_dsd => {
                 // Device rejected the format (or vanished) — drop to normal
                 // mode so playback keeps working, and tell the user why.
                 // Runtime-only: the saved preference is left untouched.
@@ -1756,7 +2019,8 @@ impl MoosikApp {
         // mid-track): open + seek entirely off the UI thread. Skips the
         // play-from-0 blip and keeps every decode off the UI thread — a deep
         // hi-res FLAC seek on the UI thread here is what froze the app.
-        if !engine.bit_perfect && pos > Duration::ZERO {
+        // Never for DSD: it has no rodio path at all, only DoP via engine.seek_to.
+        if !engine.bit_perfect && !engine.dsd_mode && pos > Duration::ZERO {
             engine.play_seeked_async(&path, pos, dur, was_paused);
             self.spectrum_window.on_seek(pos.as_secs_f64());
             return Ok(());
@@ -1807,7 +2071,11 @@ impl MoosikApp {
             engine.bp_device = device.clone();
         }
         self.save_bp_settings();
-        if self.bit_perfect
+        // DSD plays on the picked device regardless of the bit-perfect toggle,
+        // so a device change must move a running DoP session too.
+        let device_in_use = self.bit_perfect
+            || self.engine.as_ref().is_some_and(|e| e.dsd_mode);
+        if device_in_use
             && let Err(e) = self.restart_current_track() {
             // New device refused the current track — roll back.
             self.bp_device = old.clone();
@@ -1881,7 +2149,7 @@ impl MoosikApp {
         let Some(cur) = self.current_index else { return };
         if self.gapless_tried == Some(cur) { return; }
         let Some(dur) = self.playlist.get(cur).and_then(|t| t.duration) else { return };
-        let bp = self.engine.as_ref().map(|e| e.bit_perfect).unwrap_or(false);
+        let bp = self.engine.as_ref().map(|e| e.on_bp_stream()).unwrap_or(false);
         let lead = Duration::from_secs(if bp { 5 } else { 2 });
         if dur.saturating_sub(self.elapsed()) > lead { return; }
 
@@ -1889,8 +2157,27 @@ impl MoosikApp {
         self.gapless_tried = Some(cur);
         let Some(next) = self.upcoming_index() else { return };
         let path = self.playlist[next].path.clone();
+        let next_is_dsd = dsd::is_dsd_path(&path);
         let armed = self.engine.as_ref().map(|e| {
-            if bp { e.bp_queue_next(&path) } else { e.append_next(&path).is_ok() }
+            if e.dsd_mode {
+                // DoP session: only another DSD file at the same carrier can
+                // continue it (bp_queue_next_dop checks the rate) — a PCM
+                // successor needs a device re-open, so no gapless.
+                next_is_dsd && e.bp_queue_next_dop(&path)
+            } else if e.dsd_fallback {
+                // Fallback sink: another DSD track appends as decimated PCM.
+                // A PCM successor restarts cleanly instead (play_index resets
+                // the DSD flags and, with 💎 on, reclaims the device).
+                next_is_dsd && e.append_next(&path).is_ok()
+            } else if bp {
+                // PCM bit-perfect stream: DSD can't ride it.
+                !next_is_dsd && e.bp_queue_next(&path)
+            } else {
+                // Plain rodio: PCM only — a DSD successor restarts through
+                // play_index so it gets its DoP-first treatment and the
+                // right status/flags rather than silently degrading.
+                !next_is_dsd && e.append_next(&path).is_ok()
+            }
         }).unwrap_or(false);
         if armed { self.gapless_next = Some(next); }
     }
@@ -1907,7 +2194,10 @@ impl MoosikApp {
             return;
         }
         let next_dur = self.playlist[next].duration;
-        let bp = self.engine.as_ref().map(|e| e.bit_perfect).unwrap_or(false);
+        // DoP (DSD) uses the same frame-boundary machinery as PCM bit-perfect;
+        // DSD fallback does not, even with the global toggle on — it's really
+        // on the rodio path (on_bp_stream(), not the raw flags, is the truth).
+        let bp = self.engine.as_ref().map(|e| e.on_bp_stream()).unwrap_or(false);
         if let Some(e) = self.engine.as_mut() {
             if bp {
                 e.current_duration = next_dur; // position base advanced in bp_poll_boundary
@@ -1941,7 +2231,11 @@ impl MoosikApp {
     fn flush_gapless(&mut self) {
         if self.gapless_next.take().is_none() { return; }
         self.gapless_tried = None;
-        let bp = self.engine.as_ref().map(|e| e.bit_perfect).unwrap_or(false);
+        // bp_clear_next drops both the PCM and DoP gapless queues; DSD fallback
+        // queued via append_next onto self.sink instead, so it must take the
+        // rodio branch below even with the global toggle on (on_bp_stream()
+        // reflects the actual session, not just the flags).
+        let bp = self.engine.as_ref().map(|e| e.on_bp_stream()).unwrap_or(false);
         if bp {
             if let Some(e) = self.engine.as_ref() { e.bp_clear_next(); }
         } else if self.play_state != PlayState::Stopped
@@ -2094,10 +2388,16 @@ impl MoosikApp {
     // ── ReplayGain ───────────────────────────────────────────────────────────
 
     /// Linear ReplayGain factor for the current track under the current mode.
-    /// 1.0 (no change) when Off, in bit-perfect mode, or when no gain source
-    /// is available yet (untagged track whose loudness scan hasn't finished).
+    /// 1.0 (no change) when Off, when the *active* session is on the
+    /// bit-perfect device stream (PCM bit-perfect, or DSD via DoP — never a
+    /// gain multiply), or when no gain source is available yet (untagged
+    /// track whose loudness scan hasn't finished). Deliberately checks the
+    /// session's actual routing, not just the global bit-perfect toggle: a
+    /// DSD track that fell back to decimated PCM plays on the ordinary rodio
+    /// sink and should get RG like any other PCM track, even with 💎 on.
     fn compute_replay_gain(&self) -> f32 {
-        if self.rg.mode == RgMode::Off || self.bit_perfect {
+        let on_bp = self.engine.as_ref().map(|e| e.on_bp_stream()).unwrap_or(self.bit_perfect);
+        if self.rg.mode == RgMode::Off || on_bp {
             return 1.0;
         }
         let Some(t) = self.current_index.and_then(|i| self.playlist.get(i)) else { return 1.0 };
@@ -2241,9 +2541,14 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectra
 
         // ── Stream ──────────────────────────────────────────────────────
         section(ui, "Stream");
-        row(ui, "Sample Rate", &t.sample_rate.map(|sr| format!("{} Hz  ({})", sr, fmt_hz(sr)))
-                                              .unwrap_or_else(|| "Unknown".into()));
-        row(ui, "Bit Depth",   &t.bit_depth.map(|b| format!("{b} bit"))
+        let is_dsd = t.bit_depth == Some(1);
+        row(ui, "Sample Rate", &t.sample_rate.map(|sr| if is_dsd {
+                                    format!("{} Hz  ({} — {})", sr, dsd::rate_label(sr), dsd::fmt_mhz(sr))
+                                } else {
+                                    format!("{} Hz  ({})", sr, fmt_hz(sr))
+                                }).unwrap_or_else(|| "Unknown".into()));
+        row(ui, "Bit Depth",   &t.bit_depth.map(|b| if is_dsd { format!("{b} bit  (DSD)") }
+                                                    else { format!("{b} bit") })
                                             .unwrap_or_else(|| "Unknown".into()));
         row(ui, "Channels",    &t.channels.map(|c| format!("{c}  ({})", channel_layout(c)))
                                            .unwrap_or_else(|| "Unknown".into()));
@@ -2266,10 +2571,11 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectra
         // ── Inferred ────────────────────────────────────────────────────
         section(ui, "Inferred");
 
-        // PCM throughput
+        // Raw stream throughput
         if let (Some(sr), Some(ch), Some(bd)) = (t.sample_rate, t.channels, t.bit_depth) {
             let kbps = sr as u64 * ch as u64 * bd as u64 / 1000;
-            row(ui, "PCM throughput", &format!("{kbps} kbps  ({sr} × {ch} ch × {bd} bit)"));
+            row(ui, if is_dsd { "DSD throughput" } else { "PCM throughput" },
+                &format!("{kbps} kbps  ({sr} × {ch} ch × {bd} bit)"));
         }
 
         // Nyquist
@@ -2282,7 +2588,8 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectra
             && let (Some(sr), Some(ch), Some(bd), Some(dur)) =
                 (t.sample_rate, t.channels, t.bit_depth, t.duration)
         {
-            let uncompressed = sr as u64 * ch as u64 * (bd as u64 / 8) * dur.as_secs();
+            // Bit-based so 1-bit DSD doesn't truncate to zero.
+            let uncompressed = sr as u64 * ch as u64 * bd as u64 * dur.as_secs() / 8;
             row(ui, "Uncompressed", &fmt_size(uncompressed));
             if uncompressed > 0 && t.file_size > 0 {
                 let ratio = t.file_size as f64 / uncompressed as f64 * 100.0;
@@ -2558,8 +2865,15 @@ impl eframe::App for MoosikApp {
                     self.gapless_rollover();
                 }
                 // Normal mode: no per-source callback, so detect the boundary by time.
+                // Excludes real bp/DoP sessions: those report frame-exact
+                // boundaries above (bp_poll_boundary), and letting the clock
+                // fire first would roll the UI over before the position base
+                // advances (early title switch + position glitch). DSD fallback
+                // is NOT excluded — on_bp_stream() is false for it even with
+                // the global 💎 toggle on, since it's really on the rodio path
+                // and the clock is the only boundary signal it has.
                 let normal_crossed = self.gapless_next.is_some()
-                    && self.engine.as_ref().map(|e| !e.bit_perfect).unwrap_or(false)
+                    && self.engine.as_ref().map(|e| !e.on_bp_stream()).unwrap_or(false)
                     && self.current_index
                         .and_then(|i| self.playlist.get(i)).and_then(|t| t.duration)
                         .map(|d| self.elapsed() >= d).unwrap_or(false);
@@ -2607,6 +2921,14 @@ impl eframe::App for MoosikApp {
         // Advance spectrum analyzer and render window
         let elapsed_secs = self.elapsed().as_secs_f64();
         let is_playing = self.play_state == PlayState::Playing;
+        // Whether EQ is actually out of the current audio path — drives the
+        // "is the plotted spectrum EQ-modified" overlay logic. Pushed every
+        // frame (not just on toggle) so it tracks the *active session*, not
+        // the global bit-perfect toggle: a DSD track played via DoP has EQ
+        // bypassed regardless of that toggle, while a DSD track that fell
+        // back to PCM has EQ applied even with the toggle on.
+        self.spectrum_window.bit_perfect =
+            self.engine.as_ref().map(|e| e.on_bp_stream()).unwrap_or(self.bit_perfect);
         // Push the current appearance into the spectrum window so its visualisers
         // (incl. the spectrogram fed inside tick()) use the selected palette.
         self.spectrum_window.palette_kind = self.appearance.spectrum_palette;
@@ -3020,16 +3342,31 @@ impl eframe::App for MoosikApp {
                     && let Some(ref mut engine) = self.engine {
                     engine.set_volume(self.volume);
                 }
+                let dsd_active = self.engine.as_ref().is_some_and(|e| e.dsd_mode);
                 ui.label(
-                    RichText::new(format!("{}%", (self.volume * 100.0) as u32))
+                    RichText::new(if dsd_active { "bypassed".to_string() }
+                                  else { format!("{}%", (self.volume * 100.0) as u32) })
                         .size(12.0)
                         .color(pal::text_dim(ui.visuals().dark_mode)),
                 );
 
-                // Sample rate + PCM bitrate indicator
+                // Sample rate + PCM bitrate indicator (or DSD/DoP equivalent)
                 if self.play_state != PlayState::Stopped {
                     let sr = self.engine.as_ref().map(|e| e.last_sample_rate).unwrap_or(0);
-                    if sr > 0 {
+                    let dsd_fallback = self.engine.as_ref().is_some_and(|e| e.dsd_fallback);
+                    if dsd_active || dsd_fallback {
+                        let dsd_label = self.engine.as_ref()
+                            .and_then(|e| e.dsd_label.clone())
+                            .unwrap_or_else(|| "DSD".to_string());
+                        let text = if dsd_active {
+                            format!("{dsd_label} via DoP · {}", fmt_hz(sr))
+                        } else {
+                            format!("{dsd_label} → {} PCM (no DoP)", fmt_hz(sr))
+                        };
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(text)
+                            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+                    } else if sr > 0 {
                         let pcm = self.current_index.and_then(|i| {
                             let t = &self.playlist[i];
                             Some(sr * t.channels? as u32 * t.bit_depth? as u32 / 1000)
@@ -3086,18 +3423,25 @@ impl eframe::App for MoosikApp {
                     // ── Bit-perfect: device picker (▾) + toggle ─────────────
                     // right_to_left layout: the toggle is added first so it
                     // sits to the right of the picker.
-                    let bp_label = if self.bit_perfect {
+                    let bp_label = if self.bit_perfect || dsd_active {
                         RichText::new("💎 Bit-Perfect").size(13.0).color(pal::ok(ui.visuals().dark_mode))
                     } else {
                         RichText::new("💎 Bit-Perfect").size(13.0)
                     };
-                    let mut hover = String::from(
-                        "Direct device output at the file's native sample rate.\n\
-                         Decoded at full precision (24-bit safe), EQ bypassed.");
-                    if self.volume < 0.999 {
-                        hover.push_str("\n⚠ Volume below 100% rescales samples — set volume to max for true bit-perfect.");
-                    }
-                    if ui.button(bp_label).on_hover_text(hover).clicked() {
+                    let hover = if dsd_active {
+                        "DSD playback is always bit-perfect via DoP — this toggle only \
+                         affects PCM tracks.".to_string()
+                    } else {
+                        let mut h = String::from(
+                            "Direct device output at the file's native sample rate.\n\
+                             Decoded at full precision (24-bit safe), EQ bypassed.");
+                        if self.volume < 0.999 {
+                            h.push_str("\n⚠ Volume below 100% rescales samples — set volume to max for true bit-perfect.");
+                        }
+                        h
+                    };
+                    if ui.add_enabled(!dsd_active, egui::Button::new(bp_label))
+                        .on_hover_text(hover).clicked() {
                         self.toggle_bit_perfect();
                     }
 
@@ -3161,8 +3505,12 @@ impl eframe::App for MoosikApp {
                     } else {
                         RichText::new("🔊 RG").size(13.0)
                     };
-                    let rg_hover = if self.bit_perfect && rg_active {
-                        "ReplayGain is bypassed in bit-perfect mode — a gain change breaks bit-perfectness.".to_string()
+                    // Reflects the *active session's* routing, not just the global
+                    // toggle — a DSD track that fell back to PCM plays on the
+                    // ordinary sink and gets RG even with 💎 on for PCM tracks.
+                    let on_bp_stream = self.engine.as_ref().is_some_and(|e| e.on_bp_stream());
+                    let rg_hover = if on_bp_stream && rg_active {
+                        "ReplayGain is bypassed on the bit-perfect device stream — a gain change breaks bit-perfectness.".to_string()
                     } else if rg_active {
                         format!("Loudness normalization: {} · currently {:+.1} dB", self.rg.mode.label(), self.rg_applied_db())
                     } else {
@@ -3171,8 +3519,8 @@ impl eframe::App for MoosikApp {
                     ui.menu_button(rg_label, |ui| {
                         ui.set_min_width(250.0);
                         ui.label(RichText::new("ReplayGain — loudness normalization").strong().size(12.0));
-                        if self.bit_perfect {
-                            ui.label(RichText::new("💎 Bypassed in bit-perfect mode")
+                        if on_bp_stream {
+                            ui.label(RichText::new("💎 Bypassed on the bit-perfect device stream")
                                 .size(11.0).color(pal::ok(ui.visuals().dark_mode)));
                         }
                         ui.separator();
@@ -3856,5 +4204,106 @@ impl eframe::App for MoosikApp {
         save_player_prefs(&moosik_dir(), &PlayerPrefs {
             volume: self.volume, loop_mode: self.loop_mode,
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — DSD metadata integration (the parsers themselves are tested in dsd/)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn syncsafe(n: u32) -> [u8; 4] {
+        [(n >> 21) as u8 & 0x7f, (n >> 14) as u8 & 0x7f, (n >> 7) as u8 & 0x7f, n as u8 & 0x7f]
+    }
+
+    /// Minimal ID3v2.3 tag with Latin-1 frames.
+    fn id3v23(frames: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, payload) in frames {
+            body.extend_from_slice(*id);
+            body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(&[0, 0]); // frame flags
+            body.extend_from_slice(payload);
+        }
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.extend_from_slice(&[3, 0, 0]); // v2.3, no flags
+        tag.extend_from_slice(&syncsafe(body.len() as u32));
+        tag.extend_from_slice(&body);
+        tag
+    }
+
+    fn text_frame(s: &str) -> Vec<u8> {
+        let mut v = vec![0u8]; // encoding: Latin-1
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+
+    /// A DSF with a real ID3v2.3 tag must surface its tags, ReplayGain and
+    /// cover art through the shared lofty pipeline, and its stream properties
+    /// from the DSD header.
+    #[test]
+    fn dsf_metadata_flows_through_lofty() {
+        let mut txxx_rg = vec![0u8];
+        txxx_rg.extend_from_slice(b"replaygain_track_gain\0-7.30 dB");
+        let mut apic = vec![0u8];
+        apic.extend_from_slice(b"image/png\0");
+        apic.push(3); // front cover
+        apic.extend_from_slice(b"\0");
+        apic.extend_from_slice(b"FAKEPNGDATA");
+        let tag = id3v23(&[
+            (b"TIT2", text_frame("Ride of the DSD")),
+            (b"TPE1", text_frame("Fable & the Bitstreams")),
+            (b"TALB", text_frame("One-Bit Wonders")),
+            (b"TXXX", txxx_rg),
+            (b"APIC", apic),
+        ]);
+
+        // 1 s of DSD64 declared; audio payload itself can stay tiny.
+        let blocks = vec![vec![vec![0u8; 4], vec![0u8; 4]]];
+        let dsf = dsd::tests::make_dsf(2, dsd::DSD64_RATE, 1, dsd::DSD64_RATE as u64, 4, &blocks, Some(&tag));
+
+        let path = std::env::temp_dir().join(format!("moosik_test_{}.dsf", std::process::id()));
+        std::fs::write(&path, &dsf).unwrap();
+
+        let m = read_metadata(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(m.title, "Ride of the DSD");
+        assert_eq!(m.artist, "Fable & the Bitstreams");
+        assert_eq!(m.album, "One-Bit Wonders");
+        assert_eq!(m.rg_track_gain, Some(-7.3));
+        assert_eq!(m.sample_rate, Some(dsd::DSD64_RATE));
+        assert_eq!(m.bit_depth, Some(1));
+        assert_eq!(m.channels, Some(2));
+        assert_eq!(m.duration, Some(Duration::from_secs(1)));
+        assert_eq!(m.bitrate, Some(2 * dsd::DSD64_RATE / 1000));
+
+        // Cover art comes out of the same tag.
+        std::fs::write(&path, &dsf).unwrap();
+        let tagged = probe_tagged(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let t = tagged.primary_tag().or_else(|| tagged.first_tag()).unwrap();
+        assert_eq!(t.pictures().len(), 1);
+        assert_eq!(t.pictures()[0].data(), b"FAKEPNGDATA");
+    }
+
+    /// An untagged DSF still gets stream properties + filename fallback title.
+    #[test]
+    fn untagged_dsf_falls_back_to_filename() {
+        let blocks = vec![vec![vec![0u8; 4], vec![0u8; 4]]];
+        let dsf = dsd::tests::make_dsf(2, 2 * dsd::DSD64_RATE, 1, 64, 4, &blocks, None);
+        let path = std::env::temp_dir().join(format!("moosik_untagged_{}.dsf", std::process::id()));
+        std::fs::write(&path, &dsf).unwrap();
+        let m = read_metadata(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(m.title.starts_with("moosik_untagged_"));
+        assert_eq!(m.artist, "Unknown Artist");
+        assert_eq!(m.sample_rate, Some(2 * dsd::DSD64_RATE)); // DSD128
+        assert_eq!(m.bit_depth, Some(1));
     }
 }

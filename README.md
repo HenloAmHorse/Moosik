@@ -4,7 +4,7 @@
   <img src="assets/icon.png" width="120" alt="Moosik icon"/>
 </p>
 
-A desktop music player with bit-perfect output, a professional-grade spectrum analyzer, and a parametric EQ, built in Rust.
+A desktop music player with bit-perfect output (PCM and DSD), a professional-grade spectrum analyzer, and a parametric EQ, built in Rust.
 
 ### The icon
 
@@ -30,6 +30,26 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Linux / macOS** — direct cpal output at the exact rate; choosing an ALSA `hw:` device skips the PipeWire/Pulse resampling shims
 - **Device picker** — the 🔈▾ menu lists every output device with its real capabilities (supported rates, sample formats, channels), probed in the background; pick one or stay on the system default. Your choice is remembered
 - **Honest fallbacks** — if a device can't play a track's format, playback drops to normal mode with a message listing what the device *does* support; EQ is bypassed in this mode (and the EQ panel says so), and the 💎 tooltip warns when volume is below 100%, since attenuation breaks bit-perfectness
+
+### DSD Playback
+- **DSF & DSDIFF** — `.dsf`/`.dff` files are first-class: header-parsed stream
+  properties, ID3v2 tags (title/artist/album, ReplayGain, embedded cover art)
+  through the same pipeline as every other format
+- **Bit-perfect DoP** — DSD64/128/256 play as DSD-over-PCM (DoP 1.1): the raw
+  1-bit stream packed untouched into 24-bit words at the carrier rate
+  (176.4/352.8/705.6 kHz), integer-only device formats, volume/EQ/ReplayGain
+  hard-bypassed. The status line shows the exact mode, e.g.
+  *💎 DSD128 via DoP · 352.8 kHz · 2ch · 24i excl*
+- **Gapless DSD** — same-rate DSD tracks hand off with no device re-open and
+  an unbroken DoP marker sequence; sessions lead in and out with DSD-marked
+  silence so the DAC locks (and unlocks) cleanly
+- **Automatic PCM fallback** — if the device can't take the DoP carrier rate,
+  the bitstream is decimated to high-rate PCM and played through the normal
+  path instead (volume/EQ/ReplayGain apply), with a clear status notice —
+  DSD files are never simply unplayable
+- **Analyzer support** — spectrum, waveform, LUFS/DR and spectral ceiling run
+  on a decimated PCM feed (176.4 kHz default, 352.8 kHz selectable for a
+  faster-reacting spectrum); playback stays raw bits over DoP
 
 ### Spectrum Analyzer
 - **Pre-processed + real-time hybrid** — full-track analysis runs in the background while real-time FFT feeds the display during playback; seamlessly switches between the two

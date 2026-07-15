@@ -1,5 +1,144 @@
 # Changelog
 
+## [1.2.0] - 2026-07-15
+
+DSD support. `.dsf`/`.dff` files play bit-perfect over DoP (DSD64/128/256),
+fall back to decimated PCM on devices that can't take the DoP carrier rate,
+get full spectrum/loudness analysis via a separate decimated feed, and play
+gapless with the rest of an album. Verified end-to-end on real DSD hardware.
+DSD512 (native ASIO) remains a future stretch goal — DoP tops out at DSD256
+on any device with a sub-1.4 MHz PCM ceiling.
+
+### DSD hardening, round 2 — session-routing correctness
+A second pass, prompted by the first: every place that had gated behavior on
+the *global* 💎 toggle instead of what the current session is actually doing
+was the same bug shape. Added `Engine::on_bp_stream()` as the single source
+of truth (true only for a real bit-perfect device session — PCM bit-perfect
+or DSD via DoP; false for DSD fallback even with the toggle on) and routed
+everything through it:
+- **ReplayGain silently inert on DSD fallback** — with 💎 on globally, RG
+  computed unity gain even for a DSD track playing decimated PCM on the
+  ordinary sink, where a gain multiply is completely safe. Loudness
+  normalization now works on fallback DSD exactly like any PCM track.
+- **EQ overlay showed the wrong spectrum** — the "is EQ actually in the audio
+  path" flag driving the plotted-bars EQ overlay was only updated on an
+  explicit toggle click, never per-frame, so it could show unmodified bars
+  during real DoP EQ-bypass or (worse) EQ-modified bars during fallback
+  where EQ genuinely is applied. Now synced every frame from the actual
+  session.
+- **Gapless could freeze the UI while audio kept playing** — with 💎 on
+  globally, a DSD-fallback session's queued next track (appended to the
+  rodio sink, same as normal gapless) had no boundary signal reaching the
+  UI: the frame-exact bp path never fires for fallback, and the time-based
+  fallback path was excluded by the toggle. Title/position would stick on
+  the old track while rodio silently moved on to the next. Fixed at the
+  same time as the equivalent `flush_gapless` case (a stale next-track
+  reference could survive an A-B-repeat/seek during fallback).
+
+### DSD hardening (integrity audit + fallback)
+- **Automatic PCM fallback** — when a device can't take the DoP carrier rate
+  (laptop outputs, budget interfaces), the DSD bitstream is decimated to
+  high-rate PCM and played through the normal path: volume, EQ and ReplayGain
+  apply, the realtime spectrum works, seeks are instant, and consecutive DSD
+  tracks still play gapless. The status line says why and at what rate. DSD
+  files are never simply unplayable.
+- **DAC unlock tail** — a DoP session now also *ends* with DSD-marked silence
+  (mirroring the warm-up), so the DAC never loses DSD lock mid-drain on plain
+  zeros at the end of the last track.
+- Audit fixes: the time-based gapless rollover could race the frame-exact DoP
+  boundary (early title/position switch at a DSD track seam); picking a new
+  output device mid-DSD-track did nothing until the next track (DSD uses the
+  device regardless of the 💎 toggle); with 💎 on, a fallback session would
+  have routed pause/position/finish to the idle device stream — session
+  routing now has a single source of truth.
+
+### DSD playback polish
+- **Gapless DSD** — consecutive DSD tracks at the same rate now hand off with
+  no device re-open and no gap, the way an album (SACD rip, live set) should
+  play. The DoP marker phase is carried across the file boundary so the
+  0x05/0xFA alternation stays intact — the DAC never sees a glitch at the
+  seam. Reuses the same frame-exact boundary machinery as PCM gapless.
+- **DAC warm-up** — a DoP session now leads with ~24 ms of DoP-marked silence
+  so the DAC locks into DSD mode before the first audio sample, guarding
+  against a start-of-track transient. (Only at session start, never between
+  gapless tracks.)
+- **Clean DSD↔PCM transitions** — switching between a DSD and a PCM track
+  always re-opens the device with the right format; fixed a latent case where
+  a PCM track at a DoP carrier rate (e.g. 176.4 kHz after DSD64) could have
+  wrongly reused the DoP stream, leaving volume and the analyzer bypassed.
+
+### DSD analysis
+- **Spectrum, waveform, LUFS, DR and spectral ceiling now work for DSD** —
+  a two-stage decimator (byte-table FIR over the raw bits ÷8, then half-band
+  ÷2 cascades) renders the audible band as PCM for the analyzer while
+  stripping the ultrasonic modulator noise that isn't music. Playback is
+  untouched — the DAC still gets the raw bits over DoP.
+- **Selectable analysis rate** — 176.4 kHz default (every DSD rate divides
+  into it exactly), or 352.8 kHz for a faster-reacting spectrum: twice the
+  frame rate at the same FFT size, at the cost of a larger cache and longer
+  analysis. Picked in ⚙ FFT Settings (the row appears when a DSD track is
+  loaded), persisted, and part of the cache key — caches for both rates can
+  coexist, and existing PCM cache files stay valid untouched.
+- 48k-family DSD (2.8 MHz × 48k multiples) lands on its own exact
+  sub-multiples (192/384 kHz) instead of resampling.
+- During DoP playback the display is driven purely by the pre-processed
+  analysis (there is no PCM signal to tap in real time — the stream is DoP
+  words); momentary LUFS and the correlation meter stay dark. (Fallback
+  playback is ordinary decimated PCM, so all of this — including realtime
+  mode — works exactly like a normal track.)
+- **"Analyzing… %" is now visible on the plot itself** — a DSD track's first
+  analysis used to look like a dead spectrum (nothing to show until the
+  background pass lands, and the only progress readout hid inside the 🗄
+  Cache chip). The plot now overlays "Analyzing DSD… N%" with a progress
+  bar whenever it would otherwise be blank, Real-time mode on a DSD track
+  explains itself instead of staying silently empty, and PCM tracks now get
+  the live-FFT fallback while their first analysis runs (the hybrid the
+  README always promised) instead of a blank panel.
+
+### DSD playback
+- **DSD64/128/256 play back bit-perfect via DoP** — `.dsf`/`.dff` files open
+  the bit-perfect output at the DoP carrier rate (176.4 / 352.8 / 705.6 kHz)
+  in a 24-bit-or-wider integer device format; the status line reads e.g.
+  "💎 DSD128 via DoP · 352.8 kHz · 2ch · 24i excl → device". Play/pause,
+  seek, and stop all work; sample-accurate position comes from the same
+  frame-counting the PCM bit-perfect path already used.
+- **Hard bit-perfect, no exceptions** — unlike PCM bit-perfect (which still
+  applies volume below 100%, with a warning), DSD volume and EQ are fully
+  bypassed: any scaling would corrupt the packed marker bits, not just
+  reduce precision. The 💎 toggle is disabled while a DSD track plays (DSD
+  is always bit-perfect via DoP, independent of that PCM-only setting).
+- **`.dsf` / `.dff` recognized** — both DSD containers parse natively (Sony
+  DSF and Philips DSDIFF up to 8 channels; DST-compressed DSDIFF is rejected
+  with a clear message). Files can be added via the file picker and folder
+  scan.
+- **Full metadata** — stream properties (rate, channels, duration, throughput)
+  come from the DSD header; titles, ReplayGain and embedded cover art come from
+  the containers' ID3v2 tags through the same pipeline as every other format.
+- **DSD-aware Info window** — sample rate shown as "DSD64 — 2.8224 MHz" style,
+  1-bit depth labelled, throughput and uncompressed-size math correct for
+  1-bit streams.
+- Gapless is never used across a DSD boundary in either direction — a DoP
+  session is always exactly one file; the next track starts fresh instead.
+- Spectrum analysis for DSD tracks isn't computed yet (the decimated PCM
+  feed lands in a later phase) — the Info window says so plainly instead of
+  spinning forever.
+
+### Internal
+- **Normalised bitstream reader** — streams either container as MSB-first
+  channel-interleaved bytes with seek support, the shared feed for the DoP
+  packer and the future analyzer decimator.
+- **DoP encoder** — packs the DSD bitstream into 24-bit DoP words (alternating
+  `0x05`/`0xFA` markers, 16 DSD bits per sample, carrier = DSD rate ÷ 16) with
+  correct marker phase across reads/seeks, and DSD-silence (`0x69`) padding
+  for stream tails.
+- Device format negotiation (WASAPI exclusive and cpal) is restricted to
+  integer PCM only in DoP mode — never float, never 16-bit — so the DAC
+  always sees the literal packed bit pattern.
+- All new code covered by unit tests, including a proof that the DoP word
+  encoding round-trips bit-exactly through the existing power-of-two device
+  writers, which is what let the whole bit-perfect ring-buffer/backend
+  pipeline be reused unchanged for DSD.
+
 ## [1.1.2] - 2026-07-14
 
 Daily-use conveniences and per-track history.

@@ -516,6 +516,10 @@ pub struct SpectrumAnalyzer {
     pub overlap: f32,
     /// Multi-bin bar weighting strategy.
     pub bar_mapping: BarMappingMode,
+    /// Target PCM rate DSD tracks are decimated to for analysis (176.4 kHz
+    /// default; 352.8 kHz doubles the frame rate for a faster-reacting
+    /// spectrum). Ignored for PCM files.
+    pub dsd_rate: u32,
 
     // Pre-process pending results
     pub pending_waveform: Option<Vec<f32>>,
@@ -567,6 +571,7 @@ impl SpectrumAnalyzer {
             pad_factor: DEFAULT_PAD,
             overlap: 0.875,
             bar_mapping: BarMappingMode::Cqt,
+            dsd_rate: crate::dsd::decimate::DEFAULT_ANALYSIS_RATE,
             pending_waveform: None,
             pending_analysis: None,
             pre_frames: Vec::new(),
@@ -739,6 +744,13 @@ impl SpectrumAnalyzer {
             if self.waterfall_enabled {
                 self.push_waterfall(self.magnitudes.clone());
             }
+        } else {
+            // No pre-processed frames yet (first analysis still running, or no
+            // cache for the current settings) — fall back to the live FFT so
+            // the display isn't dead meanwhile. For DSD there is no live PCM
+            // to tap (the stream is DoP words) and this early-returns; the
+            // plot overlay reports analysis progress instead.
+            self.process_realtime();
         }
     }
 
@@ -751,6 +763,7 @@ impl SpectrumAnalyzer {
         let cache = cache_path_for(
             &path, n_bars, self.fft_size, self.pad_factor, self.overlap,
             &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode,
+            self.dsd_rate,
         );
         if let Some(frames) = load_cache(&cache, n_bars) {
             let hop = ((self.fft_size as f32 * (1.0 - self.overlap)).round() as usize).max(1);
@@ -786,6 +799,7 @@ impl SpectrumAnalyzer {
         let interp_mode = self.interp_mode.clone();
         let overlap     = self.overlap;
         let bar_mapping = self.bar_mapping.clone();
+        let dsd_rate    = self.dsd_rate;
         let flag = Arc::clone(&self.is_analyzing);
         let progress = Arc::clone(&self.analysis_progress);
         std::thread::spawn(move || {
@@ -797,6 +811,7 @@ impl SpectrumAnalyzer {
             let result = preprocess_file(
                 &path, &cache, sr, n_bars, &progress,
                 fft_size, pad_factor, overlap, &window_fn, min_freq, max_freq, &eq_weights, &interp_mode, &bar_mapping,
+                dsd_rate,
             );
             let _ = tx.send(result);
         });
@@ -895,6 +910,7 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cache_path_for(
     path: &PathBuf,
     n_bars: usize,
@@ -906,6 +922,7 @@ fn cache_path_for(
     max_freq: f32,
     bar_mapping: &BarMappingMode,
     interp_mode: &InterpolationMode,
+    dsd_rate: u32,
 ) -> PathBuf {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -927,12 +944,19 @@ fn cache_path_for(
     };
     let min_hz = min_freq.round() as u32;
     let max_hz = max_freq.round() as u32;
+    // DSD analyses depend on the decimation rate, so it joins the key — but
+    // only for DSD files, keeping every existing PCM cache filename valid.
+    let dsd_part = if crate::dsd::is_dsd_path(path) {
+        format!("_d{dsd_rate}")
+    } else {
+        String::new()
+    };
     home_dir()
         .join(".moosik")
         .join("cache")
         .join(format!(
-            "{:016x}_b{}_f{}_w{}_p{}_o{}_n{}_x{}_m{}_i{}.spectrumcache",
-            hash, n_bars, fft_size, window_id, pad_factor, overlap_k, min_hz, max_hz, mapping_id, interp_id,
+            "{:016x}_b{}_f{}_w{}_p{}_o{}_n{}_x{}_m{}_i{}{}.spectrumcache",
+            hash, n_bars, fft_size, window_id, pad_factor, overlap_k, min_hz, max_hz, mapping_id, interp_id, dsd_part,
         ))
 }
 
@@ -1023,21 +1047,77 @@ fn preprocess_file(
     eq_weights: &[f32],
     interp_mode: &InterpolationMode,
     bar_mapping: &BarMappingMode,
+    dsd_rate: u32,
 ) -> PreMessage {
-    use rodio::Decoder;
-    use std::io::BufReader;
+    // ── Phase 1: decode all mono samples sequentially (0–49 %) ──────────────
+    // DSD has no PCM samples to decode — it's low-pass-filtered and decimated
+    // to the analysis rate instead (the audible band survives; the ultrasonic
+    // modulator noise the analyzer shouldn't show is what the filter removes).
+    let (all_mono, sample_rate) = if crate::dsd::is_dsd_path(path) {
+        let mut src = match crate::dsd::decimate::open_pcm_source(path, dsd_rate) {
+            Ok(s) => s,
+            Err(e) => return PreMessage::Error(e),
+        };
+        let sr = src.out_rate();
+        let ch = src.channels().max(1);
+        let total_hint = (src.total_out_samples() / ch as u64) as usize;
+        let mut mono: Vec<f32> = Vec::with_capacity(total_hint.max(1));
+        loop {
+            let mut sum = 0.0f32;
+            let mut got = 0usize;
+            for _ in 0..ch {
+                match src.next() {
+                    Some(s) => { sum += s; got += 1; }
+                    None    => break,
+                }
+            }
+            if got == 0 { break; }
+            mono.push(sum / got as f32);
+            if total_hint > 0 {
+                progress.store((mono.len() * 49 / total_hint).min(49), Ordering::Relaxed);
+            }
+        }
+        (mono, sr)
+    } else {
+        use rodio::Decoder;
+        use std::io::BufReader;
 
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => return PreMessage::Error(e.to_string()),
-    };
-    let decoder = match Decoder::new(BufReader::new(file)) {
-        Ok(d) => d,
-        Err(e) => return PreMessage::Error(e.to_string()),
-    };
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => return PreMessage::Error(e.to_string()),
+        };
+        let decoder = match Decoder::new(BufReader::new(file)) {
+            Ok(d) => d,
+            Err(e) => return PreMessage::Error(e.to_string()),
+        };
 
-    let sample_rate = decoder.sample_rate();
-    let ch = decoder.channels() as usize;
+        let sr = decoder.sample_rate();
+        let ch = (decoder.channels() as usize).max(1);
+
+        // Estimate total mono samples for progress reporting (best-effort).
+        let total_hint = decoder.total_duration()
+            .map(|d| (d.as_secs_f64() * sr as f64) as usize)
+            .unwrap_or(0);
+
+        let mut mono: Vec<f32> = Vec::with_capacity(total_hint.max(1));
+        let mut raw_iter = decoder;
+        loop {
+            let mut sum = 0.0f32;
+            let mut got = 0usize;
+            for _ in 0..ch {
+                match raw_iter.next() {
+                    Some(s) => { sum += s as f32 / 32_768.0; got += 1; }
+                    None    => break,
+                }
+            }
+            if got == 0 { break; }
+            mono.push(sum / got as f32);
+            if total_hint > 0 {
+                progress.store((mono.len() * 49 / total_hint).min(49), Ordering::Relaxed);
+            }
+        }
+        (mono, sr)
+    };
 
     let hop = ((fft_size as f32 * (1.0 - overlap)).round() as usize).max(1);
     let padded_size = fft_size * pad_factor;
@@ -1048,31 +1128,6 @@ fn preprocess_file(
     let scale = fft_size as f32; // normalize by window length, not padded length
     let log_min = min_freq.log10();
     let log_max = (sample_rate as f32 / 2.0).min(max_freq).log10();
-
-    // Estimate total mono samples for progress reporting (best-effort).
-    let total_hint = decoder.total_duration()
-        .map(|d| (d.as_secs_f64() * sample_rate as f64) as usize)
-        .unwrap_or(0);
-
-    // ── Phase 1: decode all mono samples sequentially (0–49 %) ──────────────
-    let ch = ch.max(1);
-    let mut all_mono: Vec<f32> = Vec::with_capacity(total_hint.max(1));
-    let mut raw_iter = decoder;
-    loop {
-        let mut sum = 0.0f32;
-        let mut got = 0usize;
-        for _ in 0..ch {
-            match raw_iter.next() {
-                Some(s) => { sum += s as f32 / 32_768.0; got += 1; }
-                None    => break,
-            }
-        }
-        if got == 0 { break; }
-        all_mono.push(sum / got as f32);
-        if total_hint > 0 {
-            progress.store((all_mono.len() * 49 / total_hint).min(49), Ordering::Relaxed);
-        }
-    }
 
     if all_mono.len() < fft_size {
         return PreMessage::Error("audio too short for analysis".into());
@@ -2217,6 +2272,7 @@ struct SpectrumSettings {
     #[serde(default)] pad_factor:    usize,
     #[serde(default)] overlap:       f32,
     #[serde(default)] bar_mapping:   BarMappingMode,
+    #[serde(default = "def_dsd_rate")] dsd_rate: u32,
     #[serde(default)] show_fft:      bool,
     #[serde(default)] show_peak:     bool,
     #[serde(default)] show_art:      bool,
@@ -2234,6 +2290,7 @@ struct SpectrumSettings {
 }
 
 fn def_true() -> bool { true }
+fn def_dsd_rate() -> u32 { crate::dsd::decimate::DEFAULT_ANALYSIS_RATE }
 fn def_peak_hold() -> f32 { 500.0 }
 fn def_peak_fall() -> f32 { 3.0 }
 fn def_peak_accel() -> f32 { 4.0 }
@@ -2247,6 +2304,16 @@ impl Default for LoudnessMode      { fn default() -> Self { LoudnessMode::Flat }
 impl Default for WindowFn          { fn default() -> Self { WindowFn::Hann } }
 impl Default for InterpolationMode { fn default() -> Self { InterpolationMode::None } }
 impl Default for BarMappingMode    { fn default() -> Self { BarMappingMode::Cqt } }
+
+/// Smallest power-of-two FFT size whose window spans at least 100 ms at
+/// `sample_rate` (so analysis resolution stays consistent across rates).
+fn auto_fft_size_for(sample_rate: u32) -> usize {
+    let min_samples = (sample_rate / 10) as usize;
+    [1024usize, 2048, 4096, 8192, 16384, 32768]
+        .into_iter()
+        .find(|&sz| sz >= min_samples)
+        .unwrap_or(32768)
+}
 
 fn spectrum_settings_path() -> PathBuf {
     home_dir().join(".moosik").join("spectrum.json")
@@ -2508,6 +2575,7 @@ impl SpectrumWindow {
             pad_factor:    self.pad_factor,
             overlap:       self.overlap,
             bar_mapping:   self.bar_mapping.clone(),
+            dsd_rate:      self.analyzer.dsd_rate,
             show_fft:      self.show_fft_settings,
             show_peak:     self.show_peak_settings,
             show_art:      self.show_art_settings,
@@ -2541,6 +2609,11 @@ impl SpectrumWindow {
         self.pad_factor    = s.pad_factor.clamp(1, 64);
         self.overlap       = s.overlap;
         self.bar_mapping   = s.bar_mapping.clone();
+        self.analyzer.dsd_rate = if crate::dsd::decimate::ANALYSIS_RATES.contains(&s.dsd_rate) {
+            s.dsd_rate
+        } else {
+            crate::dsd::decimate::DEFAULT_ANALYSIS_RATE
+        };
         self.show_fft_settings   = s.show_fft;
         self.show_peak_settings  = s.show_peak;
         self.show_art_settings   = s.show_art;
@@ -2602,6 +2675,7 @@ impl SpectrumWindow {
         let cache = cache_path_for(
             &path, self.bar_count, self.fft_size, self.pad_factor, self.overlap,
             &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode,
+            self.analyzer.dsd_rate,
         );
         if let Some(frames) = load_cache(&cache, self.bar_count) {
             let hop = ((self.analyzer.fft_size as f32 * (1.0 - self.overlap)).round() as usize).max(1);
@@ -2725,16 +2799,21 @@ impl SpectrumWindow {
         // Save the active preset for the track we're leaving.
         self.persist_last_used();
 
+        // DSD plays via DoP (the engine reports the carrier rate), but the
+        // analyzer works on the decimated PCM feed — its rate is what every
+        // downstream consumer (auto-FFT, frame timing, axis labels) must see.
+        let sample_rate = if crate::dsd::is_dsd_path(path) {
+            crate::dsd::parse_file(path)
+                .map(|i| crate::dsd::decimate::analysis_rate_for(i.sample_rate, self.analyzer.dsd_rate))
+                .unwrap_or(sample_rate)
+        } else {
+            sample_rate
+        };
+
         // Auto-scale FFT size so the analysis window is 100–200 ms at the
-        // track's sample rate.  Pick the smallest power-of-two that covers
-        // at least 100 ms worth of samples (e.g. 8192 @ 44.1/48 kHz ≈ 170–185 ms,
+        // track's sample rate (e.g. 8192 @ 44.1/48 kHz ≈ 170–185 ms,
         // 16384 @ 96 kHz ≈ 170 ms, 32768 @ 192 kHz ≈ 170 ms).
-        let min_samples = (sample_rate / 10) as usize; // 100 ms minimum
-        let auto_fft = [1024usize, 2048, 4096, 8192, 16384, 32768]
-            .iter()
-            .copied()
-            .find(|&sz| sz >= min_samples)
-            .unwrap_or(32768);
+        let auto_fft = auto_fft_size_for(sample_rate);
         self.fft_size = auto_fft;
         self.analyzer.fft_size = auto_fft;
         self.analyzer.rebuild_fft();
@@ -3185,7 +3264,7 @@ impl SpectrumWindow {
                                     self.cache_file_set.contains(&cache_path_for(
                                         p, self.bar_count, sz, self.pad_factor, self.overlap,
                                         &self.window_fn, self.min_freq, self.max_freq,
-                                        &self.bar_mapping, &self.interp_mode,
+                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate,
                                     ))
                                 }).unwrap_or(false);
                                 let label = if has_cache {
@@ -3210,13 +3289,67 @@ impl SpectrumWindow {
                                 }
                             }
                         });
+                        // DSD analysis rate — only meaningful when a DSD track
+                        // is loaded. Higher rate = shorter window at the same
+                        // FFT size = faster-reacting spectrum (more frames,
+                        // bigger cache, a bit more analysis time).
+                        if self.current_path.as_deref().is_some_and(crate::dsd::is_dsd_path) {
+                            ui.horizontal(|ui| {
+                                ui.label("DSD analysis:");
+                                let mut changed = false;
+                                for &rate in &crate::dsd::decimate::ANALYSIS_RATES {
+                                    let name = format!("{:.1} kHz", rate as f32 / 1000.0);
+                                    let has = self.current_path.as_ref().map(|p| {
+                                        self.cache_file_set.contains(&cache_path_for(
+                                            p, self.bar_count, self.fft_size, self.pad_factor,
+                                            self.overlap, &self.window_fn, self.min_freq, self.max_freq,
+                                            &self.bar_mapping, &self.interp_mode, rate,
+                                        ))
+                                    }).unwrap_or(false);
+                                    let label = if has {
+                                        egui::RichText::new(&name).color(txt_ok(ui.visuals().dark_mode))
+                                    } else {
+                                        egui::RichText::new(&name)
+                                    };
+                                    let hover = if rate > 176_400 {
+                                        "Decimate DSD to 352.8 kHz for analysis — twice the frame rate (faster-reacting spectrum), larger cache."
+                                    } else {
+                                        "Decimate DSD to 176.4 kHz for analysis — the default; every DSD rate divides into it exactly."
+                                    };
+                                    if ui.selectable_label(self.analyzer.dsd_rate == rate, label)
+                                        .on_hover_text(hover).clicked()
+                                        && self.analyzer.dsd_rate != rate {
+                                        self.analyzer.dsd_rate = rate;
+                                        changed = true;
+                                    }
+                                }
+                                if changed {
+                                    // Mirror on_play: the analyzer's world runs at the
+                                    // decimated rate, so retime and re-pick the auto FFT.
+                                    if let Ok(info) = self.current_path.as_deref()
+                                        .ok_or(()).and_then(|p| crate::dsd::parse_file(p).map_err(|_| ())) {
+                                        let sr = crate::dsd::decimate::analysis_rate_for(
+                                            info.sample_rate, self.analyzer.dsd_rate);
+                                        self.analyzer.sample_rate = sr;
+                                        if self.auto_fft_size != 0 {
+                                            let auto = auto_fft_size_for(sr);
+                                            self.fft_size = auto;
+                                            self.analyzer.fft_size = auto;
+                                            self.auto_fft_size = auto;
+                                        }
+                                    }
+                                    rebuild = true;
+                                    self.try_load_or_flag_reanalysis();
+                                }
+                            });
+                        }
                         {
                             let wf_green = |wf: WindowFn| -> egui::RichText {
                                 let has = self.current_path.as_ref().map(|p| {
                                     self.cache_file_set.contains(&cache_path_for(
                                         p, self.bar_count, self.fft_size, self.pad_factor,
                                         self.overlap, &wf, self.min_freq, self.max_freq,
-                                        &self.bar_mapping, &self.interp_mode,
+                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate,
                                     ))
                                 }).unwrap_or(false);
                                 let name = match wf {
@@ -3256,7 +3389,7 @@ impl SpectrumWindow {
                                     self.cache_file_set.contains(&cache_path_for(
                                         p, self.bar_count, self.fft_size, self.pad_factor,
                                         self.overlap, &self.window_fn, self.min_freq, self.max_freq,
-                                        &self.bar_mapping, &im,
+                                        &self.bar_mapping, &im, self.analyzer.dsd_rate,
                                     ))
                                 }).unwrap_or(false);
                                 let name = match im {
@@ -3306,7 +3439,7 @@ impl SpectrumWindow {
                                     let candidate = cache_path_for(
                                         p, self.bar_count, self.fft_size, pf, self.overlap,
                                         &self.window_fn, self.min_freq, self.max_freq,
-                                        &self.bar_mapping, &self.interp_mode,
+                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate,
                                     );
                                     self.cache_file_set.contains(&candidate)
                                 }).unwrap_or(false);
@@ -3343,7 +3476,7 @@ impl SpectrumWindow {
                                     self.cache_file_set.contains(&cache_path_for(
                                         p, self.bar_count, self.fft_size, self.pad_factor, val,
                                         &self.window_fn, self.min_freq, self.max_freq,
-                                        &self.bar_mapping, &self.interp_mode,
+                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate,
                                     ))
                                 }).unwrap_or(false);
                                 let rich = if has_cache {
@@ -3373,7 +3506,7 @@ impl SpectrumWindow {
                                     self.cache_file_set.contains(&cache_path_for(
                                         p, self.bar_count, self.fft_size, self.pad_factor,
                                         self.overlap, &self.window_fn, self.min_freq, self.max_freq,
-                                        &bm, &self.interp_mode,
+                                        &bm, &self.interp_mode, self.analyzer.dsd_rate,
                                     ))
                                 }).unwrap_or(false);
                                 let name = match bm {
@@ -3450,7 +3583,7 @@ impl SpectrumWindow {
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🔄 Re-analyze now")).clicked()
                                 && let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
+                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate);
                                 let _ = std::fs::remove_file(&cache);
                                 self.analyzer.pre_frames.clear();
                                 self.analyzer.start_preprocess(p.clone());
@@ -3485,7 +3618,7 @@ impl SpectrumWindow {
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🗑 Clear Cache")).clicked()
                                 && let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
+                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate);
                                 let existed = cache.exists();
                                 let _ = std::fs::remove_file(&cache);
                                 self.analyzer.pre_frames.clear();
@@ -3500,7 +3633,7 @@ impl SpectrumWindow {
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🔄 Re-analyze")).clicked()
                                 && let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
+                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate);
                                 let _ = std::fs::remove_file(&cache);
                                 self.analyzer.pre_frames.clear();
                                 self.analyzer.start_preprocess(p.clone());
@@ -3782,7 +3915,7 @@ impl SpectrumWindow {
                                     let eq = self.eq_state.lock().unwrap();
                                     let fp = eq.fingerprint();
                                     drop(eq);
-                                    let mut cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode);
+                                    let mut cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate);
                                     // Append EQ fingerprint to filename stem
                                     let stem = cache.file_stem().unwrap_or_default().to_string_lossy().to_string();
                                     cache.set_file_name(format!("{}_eq{:016x}.spectrumcache", stem, fp));
@@ -4311,6 +4444,55 @@ impl SpectrumWindow {
                             draw_phasescope(&painter, &self.phasescope_frames, plot_rect, self.correlation);
                         }
                     }
+                    // ── Analysis-status overlay ───────────────────────────
+                    // Shown only when the plot is genuinely dead. DSD is the
+                    // main case: playback carries DoP words, not PCM, so there
+                    // is no live signal to fall back on and the first analysis
+                    // of a track would otherwise be an unexplained blank panel.
+                    let plot_is_silent = self.analyzer.magnitudes.iter().all(|&m| m <= 0.001);
+                    if plot_is_silent && !matches!(self.style, VizStyle::Phasescope) {
+                        let analyzing = self.analyzer.is_analyzing.load(Ordering::Relaxed);
+                        let is_dsd = self.current_path.as_deref().is_some_and(crate::dsd::is_dsd_path);
+                        if self.mode == SpectrumMode::PreProcess
+                            && analyzing && self.analyzer.pre_frames.is_empty()
+                        {
+                            let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
+                            let label = if is_dsd {
+                                format!("Analyzing DSD…  {pct}%")
+                            } else {
+                                format!("Analyzing…  {pct}%")
+                            };
+                            let center = plot_rect.center();
+                            painter.text(
+                                Pos2::new(center.x, center.y - 14.0),
+                                egui::Align2::CENTER_CENTER,
+                                label,
+                                egui::FontId::proportional(15.0),
+                                Color32::from_gray(200),
+                            );
+                            // Slim progress bar under the text.
+                            let bar_w = 220.0_f32.min(plot_rect.width() * 0.6);
+                            let bar = Rect::from_center_size(
+                                Pos2::new(center.x, center.y + 10.0),
+                                egui::Vec2::new(bar_w, 6.0),
+                            );
+                            painter.rect_filled(bar, 3.0, Color32::from_gray(30));
+                            let fill_w = bar_w * (pct.min(100) as f32 / 100.0);
+                            if fill_w > 1.0 {
+                                let fill = Rect::from_min_size(bar.min, egui::Vec2::new(fill_w, 6.0));
+                                painter.rect_filled(fill, 3.0, pal.line());
+                            }
+                        } else if is_dsd && self.mode == SpectrumMode::RealTime {
+                            painter.text(
+                                plot_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Real-time FFT isn't available for DSD (playback is DoP, not PCM) — switch to Pre-Process mode",
+                                egui::FontId::proportional(13.0),
+                                Color32::from_gray(150),
+                            );
+                        }
+                    }
+
                     // Axis labels — skip for spectrogram (its own freq axis is baked in),
                     // octave bands (draws its own labels below bars), and phasescope.
                     if !matches!(self.style, VizStyle::Spectrogram | VizStyle::OctaveBands | VizStyle::Phasescope) {

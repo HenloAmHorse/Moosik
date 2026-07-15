@@ -70,7 +70,16 @@ fn find_device(name: Option<&str>) -> Result<cpal::Device, String> {
 
 /// Format preference: F32 is lossless for our pipeline, I32 holds 24-bit
 /// exactly, F64 is wider than the source can use, I16 truncates hi-res.
-fn format_rank(f: cpal::SampleFormat) -> u8 {
+///
+/// In DoP mode only I32 is acceptable: the ring carries pre-packed 24-bit DoP
+/// words, and the DAC must see that literal integer bit pattern — routing it
+/// through a float format would send an IEEE-754 encoding of the number
+/// instead of the marker bytes a DoP-aware DAC looks for, and I16 is too
+/// narrow to hold a DoP word at all.
+fn format_rank(f: cpal::SampleFormat, dop: bool) -> u8 {
+    if dop {
+        return if f == cpal::SampleFormat::I32 { 0 } else { u8::MAX };
+    }
     match f {
         cpal::SampleFormat::F32 => 0,
         cpal::SampleFormat::I32 => 1,
@@ -87,6 +96,7 @@ pub fn open(
     sample_rate: u32,
     channels: u16,
     _src_bits: Option<u32>,
+    dop: bool,
     shared: Arc<Shared>,
     mut tap: SpectrumTap,
 ) -> Result<(Handle, String, String), String> {
@@ -101,8 +111,8 @@ pub fn open(
         .filter(|c| c.channels() == channels
             && c.min_sample_rate().0 <= sample_rate
             && sample_rate <= c.max_sample_rate().0
-            && format_rank(c.sample_format()) != u8::MAX)
-        .min_by_key(|c| format_rank(c.sample_format()))
+            && format_rank(c.sample_format(), dop) != u8::MAX)
+        .min_by_key(|c| format_rank(c.sample_format(), dop))
         .map(|c| c.sample_format())
         .ok_or_else(|| {
             let rates: Vec<String> = PROBE_RATES.iter().copied()
@@ -110,7 +120,8 @@ pub fn open(
                     c.min_sample_rate().0 <= r && r <= c.max_sample_rate().0))
                 .map(fmt_khz)
                 .collect();
-            format!("\"{dev_label}\" doesn't accept {} / {channels}ch (supports: {})",
+            let dop_note = if dop { " (DoP requires a 32-bit integer format)" } else { "" };
+            format!("\"{dev_label}\" doesn't accept {} / {channels}ch{dop_note} (supports: {})",
                     fmt_khz(sample_rate),
                     if rates.is_empty() { "none of the standard rates".into() }
                     else { rates.join(", ") })
