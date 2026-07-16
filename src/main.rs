@@ -572,8 +572,11 @@ impl Source for DsdRodioSource {
 
 struct Engine {
     // ── rodio path (normal mode) ───────────────────────────────────────────
-    _stream: OutputStream,
-    stream_handle: OutputStreamHandle,
+    /// Opened lazily on first normal-mode playback. Keeping it closed until
+    /// needed avoids the launch-time "device is no longer available" error:
+    /// the background device scan probes WASAPI *exclusive* formats, which
+    /// invalidates any shared-mode stream that happens to be open.
+    rodio_out: Option<(OutputStream, OutputStreamHandle)>,
     sink: Option<Sink>,
     // ── bit-perfect path (direct cpal stream fed by a symphonia thread) ────
     bp: Option<bitperfect::BpStream>,
@@ -582,6 +585,16 @@ struct Engine {
     /// bit-perfect regardless of the `bit_perfect` (PCM) toggle, since DoP is
     /// the only path that can carry it at all. Volume/EQ are hard-bypassed.
     pub dsd_mode: bool,
+    /// True while a DSD track plays as *native* DSD through an ASIO driver
+    /// (asio-dsd builds) — raw bits, no DoP carrier, the only bit-perfect
+    /// route to DSD512. Volume/EQ are hard-bypassed, like DoP.
+    pub dsd_native: bool,
+    /// Selected ASIO driver for native DSD; None = DSD goes over DoP.
+    /// Persisted in bitperfect.json even on builds without the feature.
+    pub asio_driver: Option<String>,
+    /// The open native-DSD stream (kept across same-rate tracks, like `bp`).
+    #[cfg(all(windows, feature = "asio-dsd"))]
+    asio: Option<bitperfect::asio_dsd::AsioDsdStream>,
     /// True while a DSD track plays through the *fallback* path: DoP was
     /// unavailable (device can't take the carrier rate), so the bitstream is
     /// decimated to PCM and played through the normal rodio path — volume,
@@ -629,14 +642,16 @@ struct Engine {
 
 impl Engine {
     fn new(sample_buf: SampleBuf, stereo_buf: StereoBuf) -> Option<Self> {
-        let (stream, stream_handle) = OutputStream::try_default().ok()?;
         Some(Engine {
-            _stream: stream,
-            stream_handle,
+            rodio_out: None,
             sink: None,
             bp: None,
             bit_perfect: false,
             dsd_mode: false,
+            dsd_native: false,
+            asio_driver: None,
+            #[cfg(all(windows, feature = "asio-dsd"))]
+            asio: None,
             dsd_fallback: false,
             dsd_fallback_note: None,
             dsd_fallback_target: dsd::decimate::DEFAULT_ANALYSIS_RATE,
@@ -658,53 +673,127 @@ impl Engine {
         })
     }
 
-    /// Recreate the rodio output stream if a bit-perfect (exclusive) stream may
-    /// have invalidated it. No-op unless flagged, so normal playback pays
-    /// nothing. Must be called before building any normal-mode sink.
-    fn ensure_rodio_stream(&mut self) {
-        if !self.rodio_stream_dirty { return; }
-        if let Ok((stream, handle)) = OutputStream::try_default() {
-            self._stream = stream;
-            self.stream_handle = handle;
+    /// The rodio output handle, opening the stream on first use and
+    /// recreating it after an exclusive-mode session may have invalidated it
+    /// (`rodio_stream_dirty`). Lazy so nothing holds the device at launch
+    /// while the capability scan probes exclusive formats.
+    fn rodio_handle(&mut self) -> Result<OutputStreamHandle, String> {
+        if self.rodio_stream_dirty {
+            self.rodio_out = None;
+            self.rodio_stream_dirty = false;
         }
-        self.rodio_stream_dirty = false;
+        if self.rodio_out.is_none() {
+            let (stream, handle) = OutputStream::try_default()
+                .map_err(|e| format!("audio output: {e}"))?;
+            self.rodio_out = Some((stream, handle));
+        }
+        Ok(self.rodio_out.as_ref().unwrap().1.clone())
     }
 
     /// Effective rodio sink volume: user volume × ReplayGain.
     fn rodio_volume(&self) -> f32 { self.volume * self.replay_gain }
 
-    /// True when the *active session* lives on the bit-perfect device stream
-    /// (`bp`) rather than the rodio sink. DSD fallback always runs on the
-    /// sink, even while the bit-perfect toggle is globally on — routing
-    /// pause/position/finish through `bp` then would hit a dead stream.
+    /// True when the *active session* lives on a bit-perfect device stream
+    /// (`bp` for PCM/DoP, `asio` for native DSD) rather than the rodio sink.
+    /// DSD fallback always runs on the sink, even while the bit-perfect
+    /// toggle is globally on — routing pause/position/finish through a
+    /// device stream then would hit a dead stream.
     fn on_bp_stream(&self) -> bool {
-        self.dsd_mode || (self.bit_perfect && !self.dsd_fallback)
+        self.dsd_native || self.dsd_mode || (self.bit_perfect && !self.dsd_fallback)
+    }
+
+    // ── Native-DSD (ASIO) session accessors ─────────────────────────────────
+    // Compiled to no-ops without the asio-dsd feature; `dsd_native` can then
+    // never be true, so the no-op returns are unreachable in practice.
+
+    /// Pause the native stream if it was playing; true if state changed.
+    fn asio_pause(&self) -> bool {
+        #[cfg(all(windows, feature = "asio-dsd"))]
+        if let Some(a) = &self.asio && !a.is_paused() { a.pause(); return true; }
+        false
+    }
+
+    /// Resume the native stream if it was paused; true if state changed.
+    fn asio_resume(&self) -> bool {
+        #[cfg(all(windows, feature = "asio-dsd"))]
+        if let Some(a) = &self.asio && a.is_paused() { a.resume(); return true; }
+        false
+    }
+
+    fn asio_is_paused(&self) -> bool {
+        #[cfg(all(windows, feature = "asio-dsd"))]
+        if let Some(a) = &self.asio { return a.is_paused(); }
+        false
+    }
+
+    fn asio_stop_session(&self) {
+        #[cfg(all(windows, feature = "asio-dsd"))]
+        if let Some(a) = &self.asio { a.stop_session(); }
+    }
+
+    fn asio_is_finished(&self) -> bool {
+        #[cfg(all(windows, feature = "asio-dsd"))]
+        if let Some(a) = &self.asio { return a.is_finished(); }
+        false
+    }
+
+    fn asio_played(&self) -> Duration {
+        #[cfg(all(windows, feature = "asio-dsd"))]
+        if let Some(a) = &self.asio { return a.played(); }
+        Duration::ZERO
+    }
+
+    /// Release the ASIO driver (many drivers hold the device exclusively, so
+    /// this must happen before a WASAPI/rodio path can open the same DAC).
+    fn asio_close(&mut self) {
+        #[cfg(all(windows, feature = "asio-dsd"))]
+        { self.asio = None; }
     }
 
     fn play_file(&mut self, path: &PathBuf, duration: Option<Duration>) -> Result<(), String> {
         self.stop();
         if dsd::is_dsd_path(path) {
-            // Bit-perfect DoP first; if the device can't take the carrier
-            // rate, decimate to PCM and play through the normal path so the
-            // track is never simply unplayable.
-            match self.start_dop(path, Duration::ZERO) {
-                Ok(()) => self.dsd_mode = true,
-                Err(dop_err) => {
-                    self.start_dsd_fallback(path, Duration::ZERO).map_err(|e| {
-                        format!("{dop_err}; PCM fallback also failed: {e}")
-                    })?;
-                    self.dsd_fallback = true;
-                    self.dsd_fallback_note = Some(dop_err);
+            // Best transport first: native DSD over ASIO (asio-dsd builds
+            // with a driver selected — the only route to DSD512), then
+            // bit-perfect DoP, then decimated PCM through the normal path so
+            // the track is never simply unplayable.
+            let native_err = if self.asio_driver.is_some() {
+                match self.start_asio_native(path, Duration::ZERO) {
+                    Ok(()) => { self.dsd_native = true; None }
+                    Err(e) => {
+                        // Always audible in the console — a silent fall-through
+                        // to DoP looks like "native just doesn't work".
+                        eprintln!("[asio-dsd] native DSD failed, trying DoP: {e}");
+                        Some(e)
+                    }
+                }
+            } else {
+                None
+            };
+            if !self.dsd_native {
+                match self.start_dop(path, Duration::ZERO) {
+                    Ok(()) => self.dsd_mode = true,
+                    Err(dop_err) => {
+                        let reason = match native_err {
+                            Some(n) => format!("{n}; DoP: {dop_err}"),
+                            None => dop_err,
+                        };
+                        self.start_dsd_fallback(path, Duration::ZERO).map_err(|e| {
+                            format!("{reason}; PCM fallback also failed: {e}")
+                        })?;
+                        self.dsd_fallback = true;
+                        self.dsd_fallback_note = Some(reason);
+                    }
                 }
             }
         } else if self.bit_perfect {
             self.start_bp(path, Duration::ZERO)?;
         } else {
-            self.ensure_rodio_stream();
+            let handle = self.rodio_handle()?;
             let file = File::open(path).map_err(|e| format!("Open failed: {e}"))?;
             let decoder = Decoder::new(BufReader::new(file))
                 .map_err(|e| format!("Decode failed: {e}"))?;
-            let sink = Sink::try_new(&self.stream_handle)
+            let sink = Sink::try_new(&handle)
                 .map_err(|e| format!("Sink failed: {e}"))?;
             sink.set_volume(self.rodio_volume());
             self.last_sample_rate = decoder.sample_rate();
@@ -725,6 +814,7 @@ impl Engine {
     /// Decode `path` from `start` and play it on the bit-perfect stream,
     /// (re)opening the cpal stream if the device or stream format changed.
     fn start_bp(&mut self, path: &Path, start: Duration) -> Result<(), String> {
+        self.asio_close(); // an ASIO driver may hold the device exclusively
         let prep = bitperfect::prepare(path, start)
             .map_err(|e| format!("Bit-perfect: {e}"))?;
         self.last_sample_rate = prep.sample_rate;
@@ -765,6 +855,7 @@ impl Engine {
     /// track (each DoP PCM frame is 16 DSD samples, so the seek target is
     /// converted to a PCM-frame offset before the device format is touched).
     fn start_dop(&mut self, path: &Path, start: Duration) -> Result<(), String> {
+        self.asio_close(); // an ASIO driver may hold the device exclusively
         let mut stream = dsd::dop::open_dop_stream(path).map_err(|e| format!("DSD: {e}"))?;
         let carrier = stream.carrier_rate();
         let channels = stream.info().channels as u16;
@@ -804,13 +895,80 @@ impl Engine {
     /// Returns false (no gapless) if there is no stream, the file can't be
     /// prepared, or its rate/channels differ from the stream (a format change
     /// forces a device re-open, so the track boundary can't be gapless).
+    /// Play a DSD file as raw native DSD through the selected ASIO driver —
+    /// no DoP carrier, so DSD512 works wherever the driver does. Reuses the
+    /// open ASIO stream across same-rate tracks; a rate/driver change
+    /// re-negotiates from scratch.
+    #[cfg(all(windows, feature = "asio-dsd"))]
+    fn start_asio_native(&mut self, path: &Path, start: Duration) -> Result<(), String> {
+        use bitperfect::asio_dsd::{asio_decode_loop, AsioDsdStream};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let driver = self.asio_driver.clone().ok_or("no ASIO driver selected")?;
+        // Release any WASAPI-exclusive stream first — it holds the DAC, and
+        // the DAC's own ASIO driver can't open hardware someone else owns.
+        // (The mirror of asio_close() in start_bp/start_dop.)
+        self.bp = None;
+        self.rodio_stream_dirty = true; // the ASIO driver may invalidate shared streams too
+        let info = dsd::parse_file(path).map_err(|e| format!("DSD: {e}"))?;
+        let channels = info.channels as u16;
+        self.dsd_label = Some(info.rate_label());
+
+        let reuse = self.asio.as_ref().is_some_and(|a| {
+            a.dsd_rate == info.sample_rate && a.channels == channels
+                && a.driver_name == driver && !a.reset_requested()
+        });
+        if !reuse {
+            self.asio = None; // release the driver before re-opening
+            self.asio = Some(AsioDsdStream::open(&driver, info.sample_rate, channels)
+                .map_err(|e| format!("native DSD: {e}"))?);
+        }
+        let stream = self.asio.as_ref().unwrap();
+
+        let mut reader = dsd::open_reader(path)?;
+        if start > Duration::ZERO {
+            let frame = (start.as_secs_f64() * info.sample_rate as f64 / 8.0) as u64;
+            reader.seek_to_frame(frame).map_err(|e| format!("DSD seek: {e}"))?;
+        }
+
+        // ~1 s of interleaved DSD bytes.
+        let ring_cap = (info.sample_rate as usize / 8 * channels as usize).max(65_536);
+        let (prod, cons) = rtrb::RingBuffer::new(ring_cap);
+        let done = Arc::new(AtomicBool::new(false));
+        let session_stop = Arc::new(AtomicBool::new(false));
+        {
+            let done = Arc::clone(&done);
+            let stop = Arc::clone(&session_stop);
+            let lsb = stream.lsb_first;
+            std::thread::Builder::new()
+                .name("asio-dsd-decode".into())
+                .spawn(move || asio_decode_loop(reader, lsb, prod, done, stop))
+                .ok();
+        }
+        stream.resume();
+        stream.start_session(cons, done, session_stop);
+
+        self.last_sample_rate = info.sample_rate / 8; // byte rate; display uses dsd_label
+        self.bp_base = start;
+        self.bp_played_at_track_start = Duration::ZERO;
+        Ok(())
+    }
+
+    /// Stub for builds without the asio-dsd feature: a leftover driver choice
+    /// in the settings file falls straight through to DoP.
+    #[cfg(not(all(windows, feature = "asio-dsd")))]
+    fn start_asio_native(&mut self, _path: &Path, _start: Duration) -> Result<(), String> {
+        Err("native DSD (ASIO) not compiled in — build with --features asio-dsd".into())
+    }
+
     /// Decimate a DSD file to PCM and play it through the rodio path — the
     /// fallback when the device can't take the DoP carrier rate. This is a
     /// normal-mode session: volume, EQ and ReplayGain apply, the spectrum tap
     /// feeds the realtime display, and seeks are instant (`try_seek` on the
     /// source, DSD being byte-addressable).
     fn start_dsd_fallback(&mut self, path: &Path, start: Duration) -> Result<(), String> {
-        self.ensure_rodio_stream();
+        let handle = self.rodio_handle()?;
         let mut src = dsd::decimate::open_pcm_source(path, self.dsd_fallback_target)
             .map_err(|e| format!("DSD decimate: {e}"))?;
         if start > Duration::ZERO {
@@ -818,7 +976,7 @@ impl Engine {
         }
         self.dsd_label = dsd::parse_file(path).ok().map(|i| i.rate_label());
         self.last_sample_rate = src.out_rate();
-        let sink = Sink::try_new(&self.stream_handle).map_err(|e| format!("Sink failed: {e}"))?;
+        let sink = Sink::try_new(&handle).map_err(|e| format!("Sink failed: {e}"))?;
         sink.set_volume(self.rodio_volume());
         let tapped = SpectrumSource::new(
             DsdRodioSource(src), self.sample_buf.clone(), self.stereo_buf.clone());
@@ -877,6 +1035,14 @@ impl Engine {
 
     /// One-line description of the active bit-perfect stream for the UI.
     fn bp_describe(&self) -> Option<String> {
+        #[cfg(all(windows, feature = "asio-dsd"))]
+        if self.dsd_native && let Some(a) = &self.asio {
+            let label = self.dsd_label.as_deref().unwrap_or("DSD");
+            return Some(format!(
+                "{label} native ({}) · {}ch → ASIO: {}",
+                dsd::fmt_mhz(a.dsd_rate), a.channels, a.driver_name,
+            ));
+        }
         self.bp.as_ref().map(|s| {
             if s.dop {
                 let label = self.dsd_label.as_deref().unwrap_or("DSD");
@@ -896,7 +1062,12 @@ impl Engine {
         // A seek may still be decoding on the worker; remember the intent so it
         // resumes paused.
         if let Some(ps) = self.pending_seek.as_mut() { ps.was_paused = true; }
-        if self.on_bp_stream() {
+        if self.dsd_native {
+            if self.asio_pause()
+                && let Some(started) = self.started_at.take() {
+                self.paused_elapsed += started.elapsed();
+            }
+        } else if self.on_bp_stream() {
             if let Some(ref bp) = self.bp
                 && !bp.is_paused() {
                 bp.pause();
@@ -915,7 +1086,11 @@ impl Engine {
 
     fn resume(&mut self) {
         if let Some(ps) = self.pending_seek.as_mut() { ps.was_paused = false; }
-        if self.on_bp_stream() {
+        if self.dsd_native {
+            if self.asio_resume() {
+                self.started_at = Some(Instant::now());
+            }
+        } else if self.on_bp_stream() {
             if let Some(ref bp) = self.bp
                 && bp.is_paused() {
                 bp.resume();
@@ -934,7 +1109,9 @@ impl Engine {
             sink.stop();
         }
         if let Some(ref bp) = self.bp { bp.stop_session(); }
+        self.asio_stop_session();
         self.dsd_mode = false;
+        self.dsd_native = false;
         self.dsd_fallback = false;
         self.dsd_fallback_note = None;
         self.bp_base = Duration::ZERO;
@@ -944,7 +1121,9 @@ impl Engine {
     }
 
     fn is_finished(&self) -> bool {
-        if self.on_bp_stream() {
+        if self.dsd_native {
+            self.asio_is_finished()
+        } else if self.on_bp_stream() {
             self.bp.as_ref().is_some_and(|bp| bp.is_finished())
         } else {
             self.sink.as_ref().is_some_and(|s| s.empty())
@@ -952,6 +1131,9 @@ impl Engine {
     }
 
     fn elapsed(&self) -> Duration {
+        if self.dsd_native {
+            return self.bp_base + self.asio_played().saturating_sub(self.bp_played_at_track_start);
+        }
         if self.on_bp_stream() && let Some(ref bp) = self.bp {
             // Sample-accurate: frames delivered to the device, less the frames
             // that belonged to earlier gapless tracks in this session.
@@ -1033,15 +1215,18 @@ impl Engine {
     /// because rodio's `ReadSeekSource::byte_len()` always returns `None`.
     fn seek_to(&mut self, path: &Path, target: Duration) {
         if self.on_bp_stream() {
-            let was_paused = self.bp.as_ref().map(|bp| bp.is_paused()).unwrap_or(false);
-            let result = if self.dsd_mode { self.start_dop(path, target) }
+            let was_paused = if self.dsd_native { self.asio_is_paused() }
+                             else { self.bp.as_ref().map(|bp| bp.is_paused()).unwrap_or(false) };
+            let result = if self.dsd_native { self.start_asio_native(path, target) }
+                         else if self.dsd_mode { self.start_dop(path, target) }
                          else { self.start_bp(path, target) };
             if let Err(e) = result {
                 eprintln!("seek: {e}");
                 return;
             }
             if was_paused {
-                if let Some(ref bp) = self.bp { bp.pause(); }
+                if self.dsd_native { self.asio_pause(); }
+                else if let Some(ref bp) = self.bp { bp.pause(); }
                 self.started_at = None;
             } else {
                 self.started_at = Some(Instant::now());
@@ -1178,8 +1363,8 @@ impl Engine {
         match ps.rx.try_recv() {
             Ok(Some(decoder)) => {
                 let PendingSeek { target, was_paused, .. } = self.pending_seek.take().unwrap();
-                self.ensure_rodio_stream();
-                let Ok(sink) = Sink::try_new(&self.stream_handle) else { return };
+                let Ok(handle) = self.rodio_handle() else { return };
+                let Ok(sink) = Sink::try_new(&handle) else { return };
                 sink.set_volume(self.rodio_volume());
                 let tapped = SpectrumSource::new(decoder, self.sample_buf.clone(), self.stereo_buf.clone());
                 if let Some(ref eq) = self.eq {
@@ -1721,6 +1906,16 @@ struct MoosikApp {
 impl MoosikApp {
     fn new(cc: &eframe::CreationContext) -> Self {
         setup_fonts(&cc.egui_ctx);
+        // Give the ASIO host the real main-window handle for driver init —
+        // drivers parent hidden notification windows to it.
+        #[cfg(all(windows, feature = "asio-dsd"))]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(h) = cc.window_handle()
+                && let RawWindowHandle::Win32(w) = h.as_raw() {
+                bitperfect::asio_dsd::set_app_hwnd(w.hwnd.get() as *mut std::ffi::c_void);
+            }
+        }
         let appearance = load_appearance(&moosik_dir());
         apply_theme(&cc.egui_ctx, appearance.theme.is_dark());
         let mut spectrum_window = SpectrumWindow::new();
@@ -1735,6 +1930,7 @@ impl MoosikApp {
         if let Some(ref mut e) = engine {
             e.bit_perfect = bp_settings.enabled;
             e.bp_device = bp_settings.device.clone();
+            e.asio_driver = bp_settings.asio_driver.clone();
         }
         spectrum_window.bit_perfect = bp_settings.enabled;
         // Default the spectrum animation cap to the monitor's refresh rate
@@ -1982,6 +2178,7 @@ impl MoosikApp {
         bitperfect::save_settings(&moosik_dir(), &bitperfect::BpSettings {
             enabled: self.bit_perfect,
             device: self.bp_device.clone(),
+            asio_driver: self.engine.as_ref().and_then(|e| e.asio_driver.clone()),
         });
     }
 
@@ -2015,12 +2212,13 @@ impl MoosikApp {
         let dur        = self.playlist[idx].duration;
         let engine = self.engine.as_mut().ok_or("No audio engine")?;
 
-        // Normal mode with a real position (e.g. toggling bit-perfect OFF
-        // mid-track): open + seek entirely off the UI thread. Skips the
-        // play-from-0 blip and keeps every decode off the UI thread — a deep
-        // hi-res FLAC seek on the UI thread here is what froze the app.
-        // Never for DSD: it has no rodio path at all, only DoP via engine.seek_to.
-        if !engine.bit_perfect && !engine.dsd_mode && pos > Duration::ZERO {
+        // Rodio-session restart with a real position (e.g. toggling
+        // bit-perfect OFF mid-track): open + seek entirely off the UI thread.
+        // Skips the play-from-0 blip and keeps every decode off the UI thread
+        // — a deep hi-res FLAC seek on the UI thread here is what froze the
+        // app. Device sessions (bp/DoP/native DSD) take the play_file+seek
+        // path below instead.
+        if !engine.on_bp_stream() && pos > Duration::ZERO {
             engine.play_seeked_async(&path, pos, dur, was_paused);
             self.spectrum_window.on_seek(pos.as_secs_f64());
             return Ok(());
@@ -2159,7 +2357,12 @@ impl MoosikApp {
         let path = self.playlist[next].path.clone();
         let next_is_dsd = dsd::is_dsd_path(&path);
         let armed = self.engine.as_ref().map(|e| {
-            if e.dsd_mode {
+            if e.dsd_native {
+                // Native ASIO: no gapless queue yet (first hardware-validated
+                // cut keeps one session per file) — the advance re-opens,
+                // reusing the driver when the rate matches.
+                false
+            } else if e.dsd_mode {
                 // DoP session: only another DSD file at the same carrier can
                 // continue it (bp_queue_next_dop checks the rate) — a PCM
                 // successor needs a device re-open, so no gapless.
@@ -3342,7 +3545,7 @@ impl eframe::App for MoosikApp {
                     && let Some(ref mut engine) = self.engine {
                     engine.set_volume(self.volume);
                 }
-                let dsd_active = self.engine.as_ref().is_some_and(|e| e.dsd_mode);
+                let dsd_active = self.engine.as_ref().is_some_and(|e| e.dsd_mode || e.dsd_native);
                 ui.label(
                     RichText::new(if dsd_active { "bypassed".to_string() }
                                   else { format!("{}%", (self.volume * 100.0) as u32) })
@@ -3358,7 +3561,10 @@ impl eframe::App for MoosikApp {
                         let dsd_label = self.engine.as_ref()
                             .and_then(|e| e.dsd_label.clone())
                             .unwrap_or_else(|| "DSD".to_string());
-                        let text = if dsd_active {
+                        let native = self.engine.as_ref().is_some_and(|e| e.dsd_native);
+                        let text = if native {
+                            format!("{dsd_label} native (ASIO)")
+                        } else if dsd_active {
                             format!("{dsd_label} via DoP · {}", fmt_hz(sr))
                         } else {
                             format!("{dsd_label} → {} PCM (no DoP)", fmt_hz(sr))
@@ -3492,6 +3698,50 @@ impl eframe::App for MoosikApp {
                         }
                         if let Some(dev) = pick {
                             self.select_bp_device(dev);
+                        }
+
+                        // ── Native DSD via ASIO (asio-dsd builds) ─────────
+                        #[cfg(all(windows, feature = "asio-dsd"))]
+                        {
+                            ui.separator();
+                            ui.label(RichText::new("Native DSD (ASIO)").strong().size(12.0));
+                            let current = self.engine.as_ref().and_then(|e| e.asio_driver.clone());
+                            let mut pick_asio: Option<Option<String>> = None;
+                            if ui.selectable_label(current.is_none(), "Off — DSD plays via DoP")
+                                .clicked() {
+                                pick_asio = Some(None);
+                                ui.close_menu();
+                            }
+                            let drivers = bitperfect::asio_dsd::list_asio_drivers();
+                            if drivers.is_empty() {
+                                ui.label(RichText::new("No ASIO drivers installed")
+                                    .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+                            }
+                            for d in drivers {
+                                let sel = current.as_deref() == Some(d.as_str());
+                                if ui.selectable_label(sel, &d)
+                                    .on_hover_text("Route DSD tracks as raw native DSD through \
+                                                    this ASIO driver — bit-perfect up to DSD512, \
+                                                    no DoP carrier-rate ceiling.")
+                                    .clicked() {
+                                    pick_asio = Some(Some(d));
+                                    ui.close_menu();
+                                }
+                            }
+                            if let Some(sel) = pick_asio {
+                                if let Some(e) = self.engine.as_mut() { e.asio_driver = sel.clone(); }
+                                self.save_bp_settings();
+                                self.status_msg = match &sel {
+                                    Some(n) => format!("Native DSD via ASIO: {n}"),
+                                    None    => "DSD output: DoP".to_string(),
+                                };
+                                // Move a playing DSD track onto the new route now.
+                                let dsd_playing = self.engine.as_ref()
+                                    .is_some_and(|e| e.dsd_native || e.dsd_mode || e.dsd_fallback);
+                                if dsd_playing && let Err(e) = self.restart_current_track() {
+                                    self.status_msg = format!("Native DSD unavailable: {e}");
+                                }
+                            }
                         }
                     }).response.on_hover_text("Choose the output device for bit-perfect playback");
 

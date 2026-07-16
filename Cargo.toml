@@ -1,11 +1,25 @@
 [package]
 name = "moosik"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 
 [[bin]]
 name = "moosik"
 path = "src/main.rs"
+
+[features]
+default = ["asio-dsd"]
+# Native DSD output through ASIO drivers (Windows x86_64 only) — the route to
+# bit-perfect DSD512, which exceeds DoP's carrier-rate ceiling. Talks COM
+# directly to third-party ASIO drivers; no Steinberg SDK needed, the interface
+# is declared by hand (x64-only, where the ASIO thiscall ABI quirk doesn't
+# exist). Gated to `cfg(windows)` everywhere it's used, so this is a no-op on
+# Linux/macOS regardless of this default. On Windows, defaulting it on just
+# surfaces "Native DSD (ASIO)" in the 🔈 menu — actually using it still
+# requires picking a specific driver by hand, so it stays inert until a user
+# opts in. Disable with `--no-default-features` if you want a build with no
+# ASIO/COM code at all.
+asio-dsd = []
 
 [dependencies]
 eframe = { version = "0.31", features = ["default"] }
@@ -35,9 +49,19 @@ wasapi = "0.23.0"
 # thread::sleep is accurate enough for high-refresh displays.
 # Win32_Graphics_Gdi — EnumDisplaySettingsW, to default Max FPS to the monitor's
 # refresh rate.
-windows-sys = { version = "0.59", features = ["Win32_Media", "Win32_Graphics_Gdi"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Media", "Win32_Graphics_Gdi",
+    # asio-dsd: driver discovery (registry) + COM instantiation + a desktop
+    # HWND for drivers that refuse a null init handle.
+    "Win32_System_Registry", "Win32_System_Com", "Win32_System_Ole", "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 # Extract the HWND from eframe for SMTC media controls (souvlaki needs it).
 raw-window-handle = "0.6"
+# asio-dsd: registry driver discovery + COM instantiation for ASIO.
+# (Feature-gating optional deps per-target isn't expressive enough in Cargo,
+# so the extra windows-sys features ride along unconditionally on Windows —
+# they only add API declarations, not linked code.)
 
 [profile.release]
 opt-level = 3

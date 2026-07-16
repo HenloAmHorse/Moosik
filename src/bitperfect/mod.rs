@@ -23,6 +23,8 @@
 // session slot, contended only for the instant a track change / seek swaps it.
 // ---------------------------------------------------------------------------
 
+#[cfg(all(windows, feature = "asio-dsd"))]
+pub mod asio_dsd;
 #[cfg(not(windows))]
 mod cpal_out;
 #[cfg(windows)]
@@ -719,6 +721,11 @@ pub struct BpSettings {
     pub enabled: bool,
     /// Selected output device name; None = system default.
     pub device: Option<String>,
+    /// Selected ASIO driver for native DSD (Windows, asio-dsd builds).
+    /// None = DSD uses DoP. Kept in the settings file on every platform so
+    /// the choice survives builds without the feature.
+    #[serde(default)]
+    pub asio_driver: Option<String>,
 }
 
 fn settings_path(dir: &Path) -> PathBuf { dir.join("bitperfect.json") }

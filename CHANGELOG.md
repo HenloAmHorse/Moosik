@@ -1,5 +1,70 @@
 # Changelog
 
+## [1.2.1] - 2026-07-16
+
+Native DSD output via ASIO — hardware-validated, driving the DAC's own
+driver directly for the DSD512 headroom DoP's carrier rate can't reach.
+On by default so more real-world drivers get exercised.
+
+### Native DSD via ASIO (experimental, on by default)
+- **Raw native DSD to ASIO drivers** — a new output path hands the
+  untouched 1-bit stream straight to the DAC vendor's ASIO driver
+  (`kAsioSetIoFormat` DSD mode), with no DoP carrier and therefore no
+  carrier-rate ceiling: **DSD512 plays bit-perfect** wherever the driver
+  supports it. Selected per-driver in the 🔈 menu ("Native DSD (ASIO)"),
+  persisted, with automatic fallback ordering: native → DoP → decimated PCM.
+- **No Steinberg SDK needed** — the driver interface is declared by hand for
+  x86_64 (where the ASIO thiscall ABI quirk doesn't exist), so the feature
+  builds with stock Rust.
+- **On by default** (still Windows x86_64 only, still gated to
+  `cfg(windows)` everywhere it's used — a no-op on Linux/macOS regardless).
+  With only one DAC hardware-validated so far, the goal is more real-world
+  drivers exercising the path so undiscovered quirks surface and get fixed
+  faster. Still inert until a user explicitly picks a driver in the 🔈
+  menu — nothing changes for anyone who doesn't. Build with
+  `--no-default-features` for a binary with no ASIO/COM code at all.
+- Pause holds the DAC on DSD-marked silence (no lock drop), seeks are
+  sample-accurate, position comes from the same frame-counting the other
+  bit-perfect paths use, and the driver is released cleanly when a PCM
+  track needs the device back (and vice versa — WASAPI exclusive is
+  released before ASIO opens).
+- **Verified on real hardware** (SMSL C200Pro, USB DAC ASIO driver): the DAC
+  locks into native DSD mode with clean audio, play/pause/seek all correct.
+  ASIO driver behavior varies by vendor, so other DACs/drivers may need
+  further quirk-fixing the first time they're tried — one session per file
+  for now (no native gapless yet), stereo-focused. Status line reads e.g.
+  *💎 DSD512 native (22.5792 MHz) · 2ch → ASIO: <driver>*.
+
+### Fixes
+- **Launch-time "device is no longer available" console error** — the rodio
+  output stream opened eagerly at startup, and the background device scan's
+  WASAPI *exclusive-mode* format probing invalidated it, tripping its error
+  callback. The stream now opens lazily on first normal-mode playback (and
+  is rebuilt after any exclusive session), so nothing holds the device while
+  the scan runs.
+- **Native ASIO silently losing to DoP** — `start_asio_native` never released
+  the WASAPI-exclusive stream, so the DAC's own ASIO driver couldn't open
+  hardware the DoP path still held, failed, and the error was swallowed when
+  DoP succeeded. The exclusive stream is now released before ASIO opens
+  (mirroring the existing ASIO-before-WASAPI release), the native failure is
+  always logged to the console, drivers get a real window handle at init
+  (ASIO4ALL refuses a null one), an extra rate convention (bit rate ÷16) is
+  probed, and every negotiation step logs its result so driver quirks are
+  diagnosable from the console.
+- **`kAsioCanDoIoFormat`/`kAsioSetIoFormat` misreported as failing** —
+  `ASIOFuture` signals success with a dedicated code (`0x3f4847a0`,
+  distinct from the ordinary `ASE_OK`), which was being read as an error and
+  made capable drivers look like they didn't support DSD mode.
+- **Crash right after `start()` on the first real driver test** — ASIO
+  expresses DSD buffer size in 1-bit *samples*, not bytes, so an Int8 buffer
+  actually holds `bufferSize ÷ 8` bytes per channel; the fill callback was
+  writing the full sample count as bytes, overrunning the driver's buffer
+  allocation by 8× and corrupting its heap on the very first callback.
+  Diagnosed from the driver's own (adjacent, 8×-too-close) buffer pointers
+  in the debug log; every negotiation and callback step now logs to the
+  console (`[asio-dsd]` prefix) to make future driver quirks this
+  traceable.
+
 ## [1.2.0] - 2026-07-15
 
 DSD support. `.dsf`/`.dff` files play bit-perfect over DoP (DSD64/128/256),
