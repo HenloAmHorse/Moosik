@@ -34,6 +34,13 @@ On by default so more real-world drivers get exercised.
   further quirk-fixing the first time they're tried — one session per file
   for now (no native gapless yet), stereo-focused. Status line reads e.g.
   *💎 DSD512 native (22.5792 MHz) · 2ch → ASIO: <driver>*.
+- **DSD1024 (and beyond) should work too, untested** — nothing in the native
+  path is hardcoded to DSD64/128/256/512: the rate comes straight from the
+  file header and is negotiated with the driver's own `canSampleRate`/
+  `setSampleRate`, rate labels are computed from a formula (not a lookup
+  table), and the buffer/ring math has no rate ceiling. It should play
+  bit-perfect on any driver that accepts the rate in DSD mode — just not
+  hardware-validated yet, since DSD1024 gear hasn't been tested against it.
 
 ### Fixes
 - **Launch-time "device is no longer available" console error** — the rodio

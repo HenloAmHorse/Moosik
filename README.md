@@ -53,11 +53,14 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Native DSD via ASIO** (experimental, Windows x86_64, on by default —
   build with `--no-default-features` to exclude it) — pick your DAC's ASIO
   driver in the 🔈 menu and DSD plays as raw native DSD with no DoP carrier
-  ceiling, unlocking **bit-perfect DSD512**. No Steinberg SDK required.
-  Falls back to DoP, then decimated PCM, automatically. Hardware-verified
-  on an SMSL C200Pro; ASIO driver behavior varies by vendor, so other DACs
-  may surface new quirks the first time they're tried — if yours does,
-  the console log (run from a terminal) will show exactly where
+  ceiling, unlocking **bit-perfect DSD512** — and likely **DSD1024** too:
+  the rate is negotiated with the driver directly rather than picked from a
+  fixed list, so nothing in the code stops at 512. Not hardware-verified at
+  1024 yet, only at DSD512 and below. No Steinberg SDK required. Falls back
+  to DoP, then decimated PCM, automatically. Hardware-verified on an SMSL
+  C200Pro; ASIO driver behavior varies by vendor, so other DACs may surface
+  new quirks the first time they're tried — if yours does, the console log
+  (run from a terminal) will show exactly where
 
 ### Spectrum Analyzer
 - **Pre-processed + real-time hybrid** — full-track analysis runs in the background while real-time FFT feeds the display during playback; seamlessly switches between the two
