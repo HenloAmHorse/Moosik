@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased]
+
+### Native DSD via ALSA — Linux joins the DSD512 party (experimental, on by default)
+- **Raw native DSD on Linux** — pick a direct `hw:` device under the 🔈
+  menu's new "Native DSD (ALSA)" section and DSD plays through the kernel's
+  native DSD formats (`DSD_U32_BE`/`U16_BE`/`U8`, plus the `_LE` layouts),
+  no DoP carrier and no carrier-rate ceiling — the same transport MPD and
+  HQPlayer use. Format and rate are negotiated with the driver directly
+  (resampling explicitly disabled, exact-rate or bust), so DSD512 — and
+  DSD1024 — work wherever the card's driver does.
+- **Same architecture as the Windows ASIO path, same behavior** — the two
+  backends share the ring-feed loop and the session model: pause holds the
+  DAC on DSD-marked silence (no lock drop), seeks are sample-accurate,
+  position comes from byte-frames actually delivered, automatic fallback
+  ordering stays native → DoP → decimated PCM, and every negotiation step
+  logs to the console (`[alsa-dsd]` prefix) so driver quirks are diagnosable
+  from a terminal.
+- **Costs nothing to carry** — cpal already links alsa-lib into every Linux
+  build, so the feature adds no new dependency; like the ASIO path it's
+  inert until a device is explicitly selected, and `--no-default-features`
+  removes it entirely.
+- **Exercised end-to-end in tests** (negotiation, the writer thread,
+  position accounting and finish detection all run against ALSA's `null`
+  device in CI), but not yet validated on a physical DAC — reports welcome.
+  Note for PipeWire/PulseAudio systems: native DSD needs exclusive `hw:`
+  access, so the sound server must release the card first.
+
 ## [1.2.1] - 2026-07-16
 
 Native DSD output via ASIO — hardware-validated, driving the DAC's own

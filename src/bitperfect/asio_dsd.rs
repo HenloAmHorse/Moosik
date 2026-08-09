@@ -520,61 +520,8 @@ impl Drop for AsioDsdStream {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Decode thread — reader bytes → ring, with lead-in/out DSD silence
-// ---------------------------------------------------------------------------
-
-/// Stream a DSD file's bytes into the ring: ~24 ms of DSD silence first (DAC
-/// settle), then the audio (bit-reversed per byte if the driver is
-/// LSB-first), then a silence tail so the device idles at DSD zero while the
-/// ring drains. Mirrors `dop_decode_loop`, minus the packing.
-pub fn asio_decode_loop(
-    mut reader: crate::dsd::DsdFileReader,
-    lsb_first: bool,
-    mut prod: rtrb::Producer<u8>,
-    done: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-) {
-    let info = reader.info().clone();
-    let ch = info.channels as usize;
-    let lead_frames = (info.sample_rate as usize / 8 * 24 / 1000).max(64);
-
-    let push_all = |bytes: &[u8], prod: &mut rtrb::Producer<u8>, stop: &AtomicBool| -> bool {
-        for &b in bytes {
-            loop {
-                if stop.load(Ordering::Relaxed) { return true; }
-                match prod.push(b) {
-                    Ok(()) => break,
-                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
-                }
-            }
-        }
-        false
-    };
-
-    let silence = vec![DSD_SILENCE; lead_frames * ch];
-    if push_all(&silence, &mut prod, &stop) { return; }
-
-    let mut buf = vec![0u8; 4096 * ch];
-    loop {
-        if stop.load(Ordering::Relaxed) { return; }
-        let n = match reader.read_frames(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => { eprintln!("[asio-dsd] read error: {e}"); break; }
-        };
-        let chunk = &mut buf[..n * ch];
-        if lsb_first {
-            for b in chunk.iter_mut() { *b = b.reverse_bits(); }
-        }
-        if push_all(chunk, &mut prod, &stop) { return; }
-    }
-
-    if !stop.load(Ordering::Relaxed) {
-        let _ = push_all(&silence, &mut prod, &stop);
-    }
-    done.store(true, Ordering::Release);
-}
+// (The decode-thread ring feed lives in `super::native_dsd::feed_loop` — it's
+// shared verbatim with the Linux ALSA backend.)
 
 // ---------------------------------------------------------------------------
 // Host thread — owns the driver COM object for its whole life

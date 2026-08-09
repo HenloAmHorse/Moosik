@@ -50,17 +50,28 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Analyzer support** — spectrum, waveform, LUFS/DR and spectral ceiling run
   on a decimated PCM feed (176.4 kHz default, 352.8 kHz selectable for a
   faster-reacting spectrum); playback stays raw bits over DoP
-- **Native DSD via ASIO** (experimental, Windows x86_64, on by default —
-  build with `--no-default-features` to exclude it) — pick your DAC's ASIO
-  driver in the 🔈 menu and DSD plays as raw native DSD with no DoP carrier
-  ceiling, unlocking **bit-perfect DSD512** — and likely **DSD1024** too:
-  the rate is negotiated with the driver directly rather than picked from a
-  fixed list, so nothing in the code stops at 512. Not hardware-verified at
-  1024 yet, only at DSD512 and below. No Steinberg SDK required. Falls back
-  to DoP, then decimated PCM, automatically. Hardware-verified on an SMSL
-  C200Pro; ASIO driver behavior varies by vendor, so other DACs may surface
-  new quirks the first time they're tried — if yours does, the console log
-  (run from a terminal) will show exactly where
+- **Native DSD** (experimental, on by default — build with
+  `--no-default-features` to exclude it) — pick a native output in the 🔈
+  menu and DSD plays as raw native DSD with no DoP carrier ceiling,
+  unlocking **bit-perfect DSD512** — and likely **DSD1024** too: the rate
+  is negotiated with the driver directly rather than picked from a fixed
+  list, so nothing in the code stops at 512 (not hardware-verified at 1024
+  yet). Falls back to DoP, then decimated PCM, automatically.
+  - **Windows (x86_64): ASIO** — pick your DAC's ASIO driver under
+    "Native DSD (ASIO)". No Steinberg SDK required. Hardware-verified on
+    an SMSL C200Pro.
+  - **Linux: ALSA** — pick your DAC's direct `hw:` device under
+    "Native DSD (ALSA)"; playback uses the kernel's native DSD formats
+    (`DSD_U32_BE`/`U16`/`U8`), the same route MPD uses. The card's driver
+    must advertise DSD formats, and the device must be free — PipeWire /
+    PulseAudio hold `hw:` devices, so reserve or release the card first.
+    Not yet hardware-verified (the transport is exercised end-to-end in
+    tests; a real DAC report would be very welcome).
+  - Driver behavior varies by vendor on both platforms, so a new DAC may
+    surface new quirks the first time it's tried — if yours does, the
+    console log (run from a terminal) shows each negotiation step
+  - macOS has no native-DSD transport (CoreAudio is DoP-only), so DSD
+    plays via DoP there
 
 ### Spectrum Analyzer
 - **Pre-processed + real-time hybrid** — full-track analysis runs in the background while real-time FFT feeds the display during playback; seamlessly switches between the two

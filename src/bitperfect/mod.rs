@@ -23,12 +23,82 @@
 // session slot, contended only for the instant a track change / seek swaps it.
 // ---------------------------------------------------------------------------
 
+#[cfg(all(target_os = "linux", feature = "alsa-dsd"))]
+pub mod alsa_dsd;
 #[cfg(all(windows, feature = "asio-dsd"))]
 pub mod asio_dsd;
 #[cfg(not(windows))]
 mod cpal_out;
 #[cfg(windows)]
 mod wasapi_out;
+
+/// True when a native-DSD backend (ASIO on Windows, ALSA on Linux) is
+/// compiled in — the gate for the shared ring-feed loop below.
+#[cfg(any(
+    all(windows, feature = "asio-dsd"),
+    all(target_os = "linux", feature = "alsa-dsd"),
+))]
+pub mod native_dsd {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::dsd::dop::DSD_SILENCE;
+
+    /// Stream a DSD file's bytes into a native-DSD ring: ~24 ms of DSD
+    /// silence first (DAC settle), then the audio (bit-reversed per byte if
+    /// the device wants oldest-sample-in-LSB; the reader's native order is
+    /// MSB-first), then a silence tail so the device idles at DSD zero while
+    /// the ring drains. Transport-agnostic — the ASIO and ALSA backends both
+    /// feed from this. Mirrors `dop_decode_loop`, minus the packing.
+    pub fn feed_loop(
+        mut reader: crate::dsd::DsdFileReader,
+        lsb_first: bool,
+        mut prod: rtrb::Producer<u8>,
+        done: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+    ) {
+        let info = reader.info().clone();
+        let ch = info.channels as usize;
+        let lead_frames = (info.sample_rate as usize / 8 * 24 / 1000).max(64);
+
+        let push_all = |bytes: &[u8], prod: &mut rtrb::Producer<u8>, stop: &AtomicBool| -> bool {
+            for &b in bytes {
+                loop {
+                    if stop.load(Ordering::Relaxed) { return true; }
+                    match prod.push(b) {
+                        Ok(()) => break,
+                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            }
+            false
+        };
+
+        let silence = vec![DSD_SILENCE; lead_frames * ch];
+        if push_all(&silence, &mut prod, &stop) { return; }
+
+        let mut buf = vec![0u8; 4096 * ch];
+        loop {
+            if stop.load(Ordering::Relaxed) { return; }
+            let n = match reader.read_frames(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => { eprintln!("[native-dsd] read error: {e}"); break; }
+            };
+            let chunk = &mut buf[..n * ch];
+            if lsb_first {
+                for b in chunk.iter_mut() { *b = b.reverse_bits(); }
+            }
+            if push_all(chunk, &mut prod, &stop) { return; }
+        }
+
+        if !stop.load(Ordering::Relaxed) {
+            let _ = push_all(&silence, &mut prod, &stop);
+        }
+        done.store(true, Ordering::Release);
+    }
+}
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -726,6 +796,10 @@ pub struct BpSettings {
     /// the choice survives builds without the feature.
     #[serde(default)]
     pub asio_driver: Option<String>,
+    /// Selected ALSA device for native DSD (Linux, alsa-dsd builds).
+    /// None = DSD uses DoP. Same cross-platform persistence as asio_driver.
+    #[serde(default)]
+    pub alsa_dsd_device: Option<String>,
 }
 
 fn settings_path(dir: &Path) -> PathBuf { dir.join("bitperfect.json") }

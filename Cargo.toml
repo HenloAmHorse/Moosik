@@ -8,7 +8,7 @@ name = "moosik"
 path = "src/main.rs"
 
 [features]
-default = ["asio-dsd"]
+default = ["asio-dsd", "alsa-dsd"]
 # Native DSD output through ASIO drivers (Windows x86_64 only) — the route to
 # bit-perfect DSD512, which exceeds DoP's carrier-rate ceiling. Talks COM
 # directly to third-party ASIO drivers; no Steinberg SDK needed, the interface
@@ -20,6 +20,12 @@ default = ["asio-dsd"]
 # opts in. Disable with `--no-default-features` if you want a build with no
 # ASIO/COM code at all.
 asio-dsd = []
+# Native DSD output through ALSA (Linux only) — the same idea over the kernel's
+# DSD_U32_BE/U16/U8 formats on a direct hw: device. cpal already links libasound
+# into every Linux build, so this adds no system dependency; gated to
+# `cfg(target_os = "linux")` everywhere it's used, a no-op elsewhere. Like the
+# ASIO path, inert until a user picks a device in the 🔈 menu.
+alsa-dsd = ["dep:alsa"]
 
 [dependencies]
 eframe = { version = "0.31", features = ["default"] }
@@ -39,6 +45,11 @@ cpal = "0.15"
 # OS media-key / now-playing integration (MPRIS, SMTC, macOS MediaPlayer).
 # use_zbus = pure-Rust D-Bus on Linux, so no system libdbus-1-dev needed.
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# alsa-dsd: direct hw: access for native DSD (cpal already pulls this crate in
+# on Linux, so it costs nothing new — this just makes it a direct dependency).
+alsa = { version = "0.9", optional = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

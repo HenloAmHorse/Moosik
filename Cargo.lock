@@ -2336,6 +2336,7 @@ dependencies = [
 name = "moosik"
 version = "1.2.1"
 dependencies = [
+ "alsa",
  "cpal",
  "eframe",
  "egui",
