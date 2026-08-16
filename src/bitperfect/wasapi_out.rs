@@ -23,7 +23,7 @@ use wasapi::{
     WasapiError, WaveFormat,
 };
 
-use super::{fmt_khz, render_samples, DeviceCaps, Shared, SpectrumTap, PROBE_RATES};
+use super::{fmt_khz, render_samples, AudioPriority, DeviceCaps, Shared, SpectrumTap, PROBE_RATES};
 
 // HRESULTs from AUDCLNT_ERR (audioclient.h) we want to recognise.
 const E_BUFFER_SIZE_NOT_ALIGNED: i32 = 0x8889_0019u32 as i32;
@@ -206,6 +206,10 @@ fn render_thread(
         return;
     }
     let _ = tx.send(Ok((label.clone(), dev_label)));
+
+    // Held for the life of the loop: this thread has a hard deadline the rest
+    // of the process (notably the rayon pre-process pool) does not.
+    let _prio = AudioPriority::claim();
 
     let mut scratch: Vec<f32> = Vec::with_capacity(16_384);
     let mut bytes: Vec<u8> = Vec::with_capacity(65_536);

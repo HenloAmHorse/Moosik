@@ -282,6 +282,13 @@ struct Shared {
     /// `volume_bits` (any scaling corrupts the marker/bit pattern, not just
     /// precision) and the spectrum tap isn't fed.
     dop_active: AtomicBool,
+    /// Count of render calls that could not fill the device buffer while a
+    /// track was genuinely playing — i.e. the decoder fell behind or this
+    /// thread was descheduled past the buffer depth. Each one is a stretch of
+    /// silence the DAC played, so this is the only direct evidence of a
+    /// dropout the process can produce: the test suite cannot observe one, and
+    /// by the time a listener hears it there is nothing left to inspect.
+    underruns: AtomicU64,
 }
 
 impl Shared {
@@ -296,8 +303,62 @@ impl Shared {
             next_dop: Mutex::new(None),
             boundaries: Mutex::new(std::collections::VecDeque::new()),
             dop_active: AtomicBool::new(false),
+            underruns: AtomicU64::new(0),
         }
     }
+}
+
+/// Register the calling thread with MMCSS as a "Pro Audio" task, and leave the
+/// task again when the returned guard drops.
+///
+/// The render threads are ordinary threads running a poll/sleep loop against a
+/// device buffer measured in milliseconds. Everything else in this process is
+/// also an ordinary thread — including a rayon pool that, during a superlet
+/// pre-process, wants every core it can get for minutes at a time. Losing that
+/// race by more than the buffer depth means the device plays whatever it has
+/// left, which is audible.
+///
+/// MMCSS is the documented fix and what every WASAPI exclusive-mode host uses:
+/// the scheduler guarantees the registered thread a share of the CPU regardless
+/// of what else is runnable, instead of the blunt `THREAD_PRIORITY_TIME_CRITICAL`
+/// which can starve everything else if the loop ever misbehaves. Failure is
+/// silently fine — the thread simply runs at normal priority, exactly as it did
+/// before, so a machine with the service disabled loses nothing it had.
+#[cfg(windows)]
+pub(crate) struct AudioPriority(isize);
+
+#[cfg(windows)]
+impl AudioPriority {
+    pub(crate) fn claim() -> Self {
+        use windows_sys::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+        // UTF-16, NUL-terminated: the task name must match a subkey of the
+        // MMCSS Tasks registry key, and "Pro Audio" is the standard one.
+        let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+        let mut index: u32 = 0;
+        let h = unsafe { AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut index) };
+        AudioPriority(h as isize)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AudioPriority {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::AvRevertMmThreadCharacteristics;
+        if self.0 != 0 {
+            unsafe { AvRevertMmThreadCharacteristics(self.0 as _) };
+        }
+    }
+}
+
+/// No-op elsewhere: cpal owns its own callback thread and asks the platform for
+/// realtime scheduling itself, and Linux's equivalent (SCHED_FIFO) needs
+/// privileges this process has no business demanding.
+#[cfg(not(windows))]
+pub(crate) struct AudioPriority;
+
+#[cfg(not(windows))]
+impl AudioPriority {
+    pub(crate) fn claim() -> Self { AudioPriority }
 }
 
 /// Fill `scratch` with up to `want` samples from the active session, handle
@@ -324,12 +385,17 @@ fn render_samples(
             }
         }
         // Drained and the decoder has finished → track over.
-        if scratch.len() < want
-            && sess.decode_done.load(Ordering::Acquire)
-            && sess.cons.is_empty()
-        {
-            *guard = None;
-            sh.finished.store(true, Ordering::Release);
+        let ended = sess.decode_done.load(Ordering::Acquire) && sess.cons.is_empty();
+        if scratch.len() < want {
+            if ended {
+                *guard = None;
+                sh.finished.store(true, Ordering::Release);
+            } else {
+                // Short buffer with the decoder still running: the caller is
+                // about to pad the rest with zeroes and the device will play
+                // them. Not a track boundary, not a pause — a real dropout.
+                sh.underruns.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -563,6 +629,13 @@ impl BpStream {
     /// Short description for the status line, e.g. "192 kHz · 2ch · 24i excl".
     pub fn describe(&self) -> String {
         format!("{} · {}ch · {}", fmt_khz(self.sample_rate), self.channels, self.format_label)
+    }
+
+    /// How many times the render loop has come up short mid-track since this
+    /// stream opened. Non-zero means the DAC has played silence it shouldn't
+    /// have — see `Shared::underruns`.
+    pub fn underruns(&self) -> u64 {
+        self.shared.underruns.load(Ordering::Relaxed)
     }
 }
 
@@ -821,6 +894,66 @@ pub fn save_settings(dir: &Path, s: &BpSettings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Shared` with one session holding `queued` samples, ready to render.
+    /// Returns the producer too — dropping it would not end the track, only
+    /// `decode_done` does that.
+    fn staged(queued: &[f32]) -> (Shared, rtrb::Producer<f32>, Arc<AtomicBool>) {
+        let (mut prod, cons) = rtrb::RingBuffer::new(1024);
+        for &s in queued { prod.push(s).expect("ring big enough for the test"); }
+        let done = Arc::new(AtomicBool::new(false));
+        let sh = Shared::new();
+        *sh.session.lock().unwrap() = Some(Session {
+            cons,
+            decode_done: Arc::clone(&done),
+            stop: Arc::new(AtomicBool::new(false)),
+        });
+        (sh, prod, done)
+    }
+
+    fn tap() -> SpectrumTap {
+        SpectrumTap::new(2, Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())))
+    }
+
+    /// The three ways a render call can end, and the one that means the DAC
+    /// played silence it should not have. Without this distinction a dropout
+    /// and a track boundary look identical from the outside, which is how a
+    /// pop stays invisible to every test in the suite.
+    #[test]
+    fn a_short_buffer_counts_as_a_dropout_only_when_the_track_is_still_running() {
+        let mut scratch = Vec::new();
+        let mut t = tap();
+
+        // Enough samples: no dropout, track still open.
+        let (sh, _prod, _done) = staged(&[0.5; 64]);
+        render_samples(&sh, &mut scratch, &mut t, 2, 64);
+        assert_eq!(scratch.len(), 64);
+        assert_eq!(sh.underruns.load(Ordering::Relaxed), 0);
+        assert!(!sh.finished.load(Ordering::Relaxed));
+
+        // Short, decoder still working → dropout, session stays open.
+        let (sh, _prod, _done) = staged(&[0.5; 16]);
+        render_samples(&sh, &mut scratch, &mut t, 2, 64);
+        assert_eq!(scratch.len(), 16);
+        assert_eq!(sh.underruns.load(Ordering::Relaxed), 1);
+        assert!(!sh.finished.load(Ordering::Relaxed));
+        assert!(sh.session.lock().unwrap().is_some());
+
+        // Short because the track genuinely ended → not a dropout.
+        let (sh, _prod, done) = staged(&[0.5; 16]);
+        done.store(true, Ordering::Release);
+        render_samples(&sh, &mut scratch, &mut t, 2, 64);
+        assert_eq!(sh.underruns.load(Ordering::Relaxed), 0);
+        assert!(sh.finished.load(Ordering::Relaxed));
+        assert!(sh.session.lock().unwrap().is_none());
+
+        // Paused: the render call is short by design, and silence is correct.
+        let (sh, _prod, _done) = staged(&[0.5; 64]);
+        sh.paused.store(true, Ordering::Relaxed);
+        render_samples(&sh, &mut scratch, &mut t, 2, 64);
+        assert!(scratch.is_empty());
+        assert_eq!(sh.underruns.load(Ordering::Relaxed), 0);
+    }
 
     /// Minimal 16-bit PCM WAV writer (44-byte canonical header).
     fn write_wav(path: &Path, samples: &[i16], sample_rate: u32, channels: u16) {

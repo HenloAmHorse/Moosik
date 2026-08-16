@@ -1,5 +1,9 @@
 pub mod eq;
 pub mod art;
+pub mod aslt;
+pub mod gpu;
+pub mod gpu_calib;
+pub mod freq_scale;
 
 use egui::{Color32, Pos2, Rect, Shape, Stroke};
 use serde::{Deserialize, Serialize};
@@ -22,6 +26,10 @@ pub const DEFAULT_FFT_SIZE: usize = 8192;
 pub const DEFAULT_BAR_COUNT: usize = 1024;
 pub const MIN_BAR_COUNT: usize = 16;
 pub const MAX_BAR_COUNT: usize = 1024;
+/// Pre-process frame rate. Display-side, not analysis-side: the renderer
+/// interpolates between frames, so this is the rate above which extra frames
+/// stop being visible. Cost scales linearly with it.
+pub const DEFAULT_PRE_FPS: f32 = 180.0;
 pub const DEFAULT_MIN_FREQ: f32 = 20.0;
 pub const DEFAULT_MAX_FREQ: f32 = 24_000.0;
 const WATERFALL_ROWS: usize = 120;
@@ -65,7 +73,23 @@ pub enum BarMappingMode {
     /// Constant-Q transform — Hann kernel whose bandwidth scales with frequency (f/Q).
     /// Each bar has the same relative frequency resolution regardless of pitch.
     Cqt,
+    /// Adaptive Superlet Transform — not an FFT mapping at all, but a direct
+    /// wavelet analysis of the time-domain signal (see [`aslt`]).
+    ///
+    /// Pre-process only. The live path has ~2 ms per frame to work with and a
+    /// superlet needs orders of magnitude more, so real-time display keeps using
+    /// the FFT and falls back to the CQT kernel below.
+    Superlet,
 }
+
+/// dB reference that lines the superlet up with the FFT path.
+///
+/// The FFT path reports `20·log10(|X| / fft_size)`. A unit-amplitude sine
+/// through a Hann window peaks at `fft_size/4` (coherent gain ½, and half the
+/// energy goes to the negative frequency), so it lands at −12.04 dB. ASLT
+/// magnitudes are normalised so the same sine reads 1.0, i.e. 0 dB. Without this
+/// factor, switching bar-mapping mode would jump the whole display 12 dB.
+const ASLT_DB_REF: f32 = 0.25;
 
 // ---------------------------------------------------------------------------
 // Peak hold
@@ -110,6 +134,55 @@ impl Default for PeakHoldConfig {
             decay_mode:     PeakDecayMode::Gravity,
             peak_thickness: 2,
             color:          Color32::WHITE,
+        }
+    }
+}
+
+// Progress is split into three named stages rather than one 0–100 ramp, because
+// the middle one used to look like a hang: decoding reported 0–49, the transform
+// reported 50–99, and the loudness/chroma pass between them reported nothing at
+// all, so the bar sat frozen at exactly 50 % for as long as that pass took.
+const PROG_DECODE_END: usize = 39;
+const PROG_LOUDNESS_END: usize = 49;
+
+/// Which stage a raw progress percentage belongs to. Named so a stalled-looking
+/// number is at least an *explained* stalled-looking number.
+fn phase_label(pct: usize) -> &'static str {
+    match pct {
+        0..=PROG_DECODE_END   => "Decoding…",
+        40..=PROG_LOUDNESS_END => "Loudness/key…",
+        100                    => "Finishing…",
+        _                      => "Transform…",
+    }
+}
+
+/// Store `v` only if it beats what is already there.
+///
+/// The transform reports from many rayon threads at once. Each reads a running
+/// total and then stores a percentage, and nothing stops a thread that read an
+/// older total from storing after one that read a newer total — which shows up
+/// as a progress bar that twitches backwards.
+fn store_progress_max(progress: &Arc<AtomicUsize>, v: usize) {
+    let mut cur = progress.load(Ordering::Relaxed);
+    while v > cur {
+        match progress.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Coarse "time remaining" wording. Rounded hard on purpose — a superlet ETA
+/// is an extrapolation, and second-level precision would imply it is not.
+fn fmt_eta(secs: usize) -> String {
+    match secs {
+        0..=5           => "a few seconds".to_string(),
+        6..=89          => format!("{secs}s"),
+        90..=3599       => format!("{}m", (secs + 30) / 60),
+        _               => {
+            let h = secs / 3600;
+            let m = (secs % 3600 + 30) / 60;
+            if m == 0 { format!("{h}h") } else { format!("{h}h {m}m") }
         }
     }
 }
@@ -205,18 +278,88 @@ fn iso226_spl_40phon(freq: f32) -> f32 {
 
 /// Build a per-bar equal-loudness correction vector (dB offset added to raw dB).
 /// Positive at 3–5 kHz (ear very sensitive there), negative in bass and highs.
-pub fn compute_eq_weights(n_bars: usize, min_freq: f32, max_freq: f32) -> Vec<f32> {
+pub fn compute_eq_weights(
+    n_bars: usize, min_freq: f32, max_freq: f32, scale: freq_scale::FreqScale,
+) -> Vec<f32> {
     let ref_spl = iso226_spl_40phon(1000.0); // ≈ 40.0 by definition
-    let log_min = min_freq.log10();
-    let log_max = max_freq.log10();
-    (0..n_bars)
+    let mut w: Vec<f32> = (0..n_bars)
         .map(|b| {
-            let t = (b as f32 + 0.5) / n_bars as f32;
-            let freq = 10_f32.powf(log_min + t * (log_max - log_min));
+            // Read at the frequency bar `b` actually sits at, which is what the
+            // scale decides. A weight computed on the log axis and applied to
+            // ERB-spaced bars is the wrong correction for every bar.
+            let freq = scale.bar_center(b, n_bars, min_freq, max_freq);
             let freq_clamped = freq.clamp(20.0, 12_500.0);
             ref_spl - iso226_spl_40phon(freq_clamped)
         })
-        .collect()
+        .collect();
+
+    // Referenced to 1 kHz the curve *boosts* by up to +22 dB across 2-10 kHz,
+    // where the ear is most sensitive. Bar heights arrive normalised to 0..1
+    // over an 80 dB range, so a positive correction has nowhere to go: every bar
+    // in that region pinned to the ceiling and stopped moving, a static block an
+    // octave and a half wide.
+    //
+    // Sliding the whole curve down so its peak sits at 0 dB fixes the clipping
+    // and is wrong in the other direction: it drags 1 kHz down 22 dB and the
+    // bass past the floor, so the entire display goes dim. That was tried and
+    // is what "everything looks really quiet" was.
+    //
+    // Clamping the positive lobe instead keeps 1 kHz where it has always been
+    // and costs only the boost: 2-10 kHz reads exactly as it does with weighting
+    // off, and everything below 1 kHz carries the ISO tilt in full. The tilt is
+    // the informative half — it is what makes bass look as quiet as it sounds —
+    // and on a relative display, giving up the boost costs far less than pulling
+    // every bar down by a fixed 22 dB.
+    for v in &mut w { *v = v.min(0.0); }
+    w
+}
+
+#[cfg(test)]
+mod iso226_tests {
+    use super::*;
+
+    /// The curve itself, against the published 40-phon values.
+    #[test]
+    fn matches_the_standard_at_known_points() {
+        // ISO 226:2003 Table 1: the 40 phon contour passes through 40 dB SPL at
+        // 1 kHz by definition, and ~99.85 dB at 20 Hz.
+        assert!((iso226_spl_40phon(1000.0) - 40.0).abs() < 0.1);
+        assert!((iso226_spl_40phon(20.0) - 99.85).abs() < 0.5);
+        // Most sensitive around 3–4 kHz, where it dips well below 40.
+        assert!(iso226_spl_40phon(3150.0) < 30.0);
+        assert!(iso226_spl_40phon(3150.0) < iso226_spl_40phon(1000.0));
+    }
+
+    /// No weight may be positive.
+    ///
+    /// Bar heights reach the display as 0..1 over an 80 dB range, so a positive
+    /// correction has nowhere to go: referenced to 1 kHz this curve boosts by up
+    /// to +22 dB across 2–10 kHz, which pinned every bar in that octave-and-a-half
+    /// to the ceiling and held it there. A static block from 2 kHz to 10 kHz is
+    /// what that looked like on screen.
+    #[test]
+    fn weights_never_boost_so_nothing_can_saturate() {
+        let w = compute_eq_weights(1024, 20.0, 24_000.0, freq_scale::FreqScale::Log);
+        assert_eq!(w.len(), 1024);
+        assert!(w.iter().all(|&v| v <= 1e-3), "no bar may be boosted");
+
+        let at = |hz: f32| {
+            let t = (hz.log10() - 20f32.log10()) / (24_000f32.log10() - 20f32.log10());
+            w[((t * 1024.0) as usize).min(1023)]
+        };
+
+        // 1 kHz keeps full height. Referencing the curve to its own peak instead
+        // satisfies "never boosts" just as well and drags every bar down 22 dB
+        // with it — the display goes uniformly dim and the tilt is no easier to
+        // read. Whatever else changes here, this must not.
+        assert!(at(1000.0) > -1.0, "1 kHz must stay at full height, got {}", at(1000.0));
+        assert!(at(3500.0) > -1.0, "the boosted region flattens rather than lifting");
+
+        // The tilt below 1 kHz is the informative half and survives in full.
+        assert!(at(1000.0) > at(200.0), "1 kHz should sit above 200 Hz");
+        assert!(at(200.0) > at(60.0), "200 Hz should sit above 60 Hz");
+        assert!(at(60.0) < -20.0, "bass should be clearly attenuated, got {}", at(60.0));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +624,10 @@ pub enum PreMessage {
         analysis: TrackAnalysis,
     },
     Error(String),
+    /// The user pressed Abort. Distinct from `Error` so the UI can drop back to
+    /// the live view quietly instead of reporting a failure, and so nothing is
+    /// written to the cache.
+    Aborted,
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +667,29 @@ pub struct SpectrumAnalyzer {
     /// default; 352.8 kHz doubles the frame rate for a faster-reacting
     /// spectrum). Ignored for PCM files.
     pub dsd_rate: u32,
+    /// Superlet parameters, live only when `bar_mapping == Superlet`.
+    pub aslt_cfg: aslt::AsltConfig,
+    /// Which rung of the quality ladder `aslt_cfg` came from; `None` = Custom,
+    /// i.e. the user is driving `o_min`/`o_max` by hand.
+    pub aslt_preset: Option<aslt::AsltPreset>,
+    /// Pre-process frame rate, in frames per second.
+    ///
+    /// The FFT path derives its frame rate from window length and overlap; the
+    /// superlet has no window length to derive it from, so it is stated
+    /// directly. Defining it in *time* rather than in samples also keeps cost
+    /// linear in sample rate — with a sample-denominated hop, a 176.4 kHz DSD
+    /// analysis would cost 16× a 44.1 kHz one instead of 4×.
+    pub pre_fps: f32,
+    /// Set to abort a running analysis. The worker checks it between bars and
+    /// returns [`PreMessage::Aborted`] without writing a cache.
+    pub abort_analysis: Arc<AtomicBool>,
+    /// Seconds remaining in the running analysis; `usize::MAX` = not yet known.
+    pub eta_secs: Arc<AtomicUsize>,
+    /// Track the in-flight analysis belongs to, so a repeat of the same file can
+    /// be recognised and left alone rather than restarted.
+    pub analyzing_path: Option<PathBuf>,
+    /// Ceiling on the whole cache directory, in gigabytes. 0 disables eviction.
+    pub cache_budget_gb: f32,
 
     // Pre-process pending results
     pub pending_waveform: Option<Vec<f32>>,
@@ -537,6 +707,9 @@ pub struct SpectrumAnalyzer {
     // Waterfall
     pub waterfall: Vec<Vec<f32>>,
     pub waterfall_dirty: bool,
+    /// Total rows ever pushed. The renderer diffs this against what it has
+    /// already uploaded to know how many rows are genuinely new.
+    pub waterfall_seq: u64,
     /// When false, push_waterfall() is a no-op (used when the waterfall viz is not active).
     pub waterfall_enabled: bool,
     /// Raw FFT bin magnitudes (half-spectrum) from the most recent real-time frame.
@@ -572,6 +745,13 @@ impl SpectrumAnalyzer {
             overlap: 0.875,
             bar_mapping: BarMappingMode::Cqt,
             dsd_rate: crate::dsd::decimate::DEFAULT_ANALYSIS_RATE,
+            aslt_cfg: aslt::AsltPreset::Standard.config(),
+            aslt_preset: Some(aslt::AsltPreset::Standard),
+            pre_fps: DEFAULT_PRE_FPS,
+            abort_analysis: Arc::new(AtomicBool::new(false)),
+            eta_secs: Arc::new(AtomicUsize::new(usize::MAX)),
+            analyzing_path: None,
+            cache_budget_gb: DEFAULT_CACHE_BUDGET_GB,
             pending_waveform: None,
             pending_analysis: None,
             pre_frames: Vec::new(),
@@ -581,6 +761,7 @@ impl SpectrumAnalyzer {
             analysis_progress: Arc::new(AtomicUsize::new(0)),
             waterfall: Vec::new(),
             waterfall_dirty: false,
+            waterfall_seq: 0,
             waterfall_enabled: false,
             last_fft_norms: Vec::new(),
         }
@@ -611,17 +792,21 @@ impl SpectrumAnalyzer {
 
         (0..n_bars)
             .map(|bar| {
+                // Bar edges follow whichever scale the display is on, or the
+                // FFT bins would be gathered into bars that sit somewhere else.
+                let fscale = self.aslt_cfg.scale;
+                let (lo_hz, hi_hz) = (self.min_freq, self.max_freq);
                 let mag = if self.bar_mapping == BarMappingMode::Cqt {
                     // CQT: centre-frequency Hann kernel with constant-Q bandwidth
                     let tc  = (bar as f32 + 0.5) / n_bars as f32;
-                    let f_c = 10_f32.powf(log_min + tc * (log_max - log_min));
+                    let f_c = fscale.freq_at(tc, lo_hz, hi_hz);
                     let bc  = (f_c * padded_size as f32 / sr as f32).clamp(1.0, half as f32 - 1.0);
                     cqt_kernel(&norms, bc, cqt_q, half)
                 } else {
                     let t0 = bar as f32 / n_bars as f32;
                     let t1 = (bar + 1) as f32 / n_bars as f32;
-                    let freq_lo = 10_f32.powf(log_min + t0 * (log_max - log_min));
-                    let freq_hi = 10_f32.powf(log_min + t1 * (log_max - log_min));
+                    let freq_lo = fscale.freq_at(t0, lo_hz, hi_hz);
+                    let freq_hi = fscale.freq_at(t1, lo_hz, hi_hz);
                     let fbin_lo = (freq_lo * padded_size as f32 / sr as f32).max(1.0);
                     let fbin_hi = (freq_hi * padded_size as f32 / sr as f32)
                         .max(fbin_lo + 0.001).min(half as f32 - 0.001);
@@ -643,7 +828,9 @@ impl SpectrumAnalyzer {
                                 BarMappingMode::FlatOverlap => {
                                     (fbin_hi.min(b as f32 + 1.0) - fbin_lo.max(b as f32)).max(0.0)
                                 }
-                                BarMappingMode::Gaussian | BarMappingMode::Cqt => {
+                                BarMappingMode::Gaussian
+                                | BarMappingMode::Cqt
+                                | BarMappingMode::Superlet => {
                                     let center_b = b as f32 + 0.5;
                                     (-(center_b - bc).powi(2) / (2.0 * sigma * sigma)).exp()
                                 }
@@ -709,11 +896,22 @@ impl SpectrumAnalyzer {
         if let Some(ref rx) = self.pre_receiver && let Ok(msg) = rx.try_recv() {
             match msg {
                 PreMessage::Done { frames, frame_rate, waveform, analysis } => {
+                    // The worker has just written a cache file; keep the whole
+                    // directory inside its budget now rather than letting it
+                    // grow unbounded between sessions.
+                    if self.cache_budget_gb > 0.0 {
+                        let budget = (self.cache_budget_gb as f64 * 1e9) as u64;
+                        let (n, freed) = evict_cache_to_budget(budget, None);
+                        if n > 0 {
+                            eprintln!("[cache] evicted {n} file(s), freed {:.1} MB",
+                                      freed as f64 / 1e6);
+                        }
+                    }
                     ready = Some((frames, frame_rate));
                     self.pending_waveform = Some(waveform);
                     self.pending_analysis = Some(analysis);
                 }
-                PreMessage::Error(_) => {
+                PreMessage::Error(_) | PreMessage::Aborted => {
                     // is_analyzing already cleared by ClearOnDrop in thread
                 }
             }
@@ -733,8 +931,20 @@ impl SpectrumAnalyzer {
             if self.smoothed.len() != mags.len() {
                 self.smoothed = vec![0.0; mags.len()];
             }
-            for (s, m) in self.smoothed.iter_mut().zip(mags.iter()) {
-                *s = *s * 0.5 + m * 0.5;
+            // Equal-loudness weighting is applied *here*, not baked into the
+            // cache. It used to be folded in during analysis, which made it
+            // inert: `loudness_mode` is not part of the cache key, so switching
+            // it changed nothing and re-analysing simply reloaded the same file.
+            // Whichever mode happened to be selected when a track was first
+            // analysed was the mode it kept, permanently. As a per-bar dB offset
+            // on an already-normalised value it costs one add, so there is no
+            // reason for it to touch the expensive path at all.
+            for (bar, (s, m)) in self.smoothed.iter_mut().zip(mags.iter()).enumerate() {
+                let v = match self.eq_weights.get(bar) {
+                    Some(&w) => (m + w / 80.0).clamp(0.0, 1.0),
+                    None => *m,
+                };
+                *s = *s * 0.5 + v * 0.5;
             }
             if self.magnitudes.len() != self.smoothed.len() {
                 self.magnitudes = vec![0.0; self.smoothed.len()];
@@ -754,6 +964,22 @@ impl SpectrumAnalyzer {
         }
     }
 
+    /// Hop between pre-processed frames, in samples. Superlet states its frame
+    /// rate directly; the FFT path derives it from window length and overlap.
+    pub fn pre_hop(&self) -> usize {
+        if self.bar_mapping == BarMappingMode::Superlet {
+            aslt::hop_for_fps(self.sample_rate, self.pre_fps)
+        } else {
+            ((self.fft_size as f32 * (1.0 - self.overlap)).round() as usize).max(1)
+        }
+    }
+
+    /// Ask a running analysis to stop. Returns to the live view; no cache is
+    /// written, so nothing partial is ever reloaded later as if it were whole.
+    pub fn abort_preprocess(&self) {
+        self.abort_analysis.store(true, Ordering::Relaxed);
+    }
+
     pub fn start_preprocess(&mut self, path: PathBuf) {
         // Guard: refuse to spawn a second thread if one is already running.
         if self.is_analyzing.load(Ordering::Relaxed) {
@@ -763,11 +989,10 @@ impl SpectrumAnalyzer {
         let cache = cache_path_for(
             &path, n_bars, self.fft_size, self.pad_factor, self.overlap,
             &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode,
-            self.dsd_rate,
+            self.dsd_rate, &self.aslt_cfg, self.pre_fps,
         );
         if let Some(frames) = load_cache(&cache, n_bars) {
-            let hop = ((self.fft_size as f32 * (1.0 - self.overlap)).round() as usize).max(1);
-            let rate = self.sample_rate as f64 / hop as f64;
+            let rate = self.sample_rate as f64 / self.pre_hop() as f64;
             // Derive a waveform from cached frames using mean bar magnitude per frame.
             if !frames.is_empty() {
                 let wf_n = 1000usize;
@@ -786,6 +1011,11 @@ impl SpectrumAnalyzer {
         }
         self.pre_frames.clear();
         self.analysis_progress.store(0, Ordering::Relaxed);
+        self.analyzing_path = Some(path.clone());
+        // Fresh Arc rather than storing false: a previous aborted run may still
+        // be unwinding and holding a clone of the old one.
+        self.abort_analysis = Arc::new(AtomicBool::new(false));
+        self.eta_secs.store(usize::MAX, Ordering::Relaxed);
         self.is_analyzing.store(true, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
         self.pre_receiver = Some(rx);
@@ -795,23 +1025,44 @@ impl SpectrumAnalyzer {
         let window_fn   = self.window_fn.clone();
         let min_freq    = self.min_freq;
         let max_freq    = self.max_freq;
-        let eq_weights  = self.eq_weights.clone();
         let interp_mode = self.interp_mode.clone();
         let overlap     = self.overlap;
         let bar_mapping = self.bar_mapping.clone();
         let dsd_rate    = self.dsd_rate;
+        let aslt_cfg    = self.aslt_cfg.clone();
+        let pre_fps     = self.pre_fps;
+        let abort       = Arc::clone(&self.abort_analysis);
+        let eta         = Arc::clone(&self.eta_secs);
         let flag = Arc::clone(&self.is_analyzing);
         let progress = Arc::clone(&self.analysis_progress);
+        let mapping_dbg = format!("{:?}", self.bar_mapping);
         std::thread::spawn(move || {
             struct ClearOnDrop(Arc<AtomicBool>);
             impl Drop for ClearOnDrop {
                 fn drop(&mut self) { self.0.store(false, Ordering::Relaxed); }
             }
             let _guard = ClearOnDrop(flag);
+            // Logged because a second analysis starting behind the first is
+            // invisible from the UI — the progress bar simply appears to restart.
+            let t0 = Instant::now();
+            eprintln!(
+                "[analysis] start {mapping_dbg} {} bars @ {pre_fps} fps — {}",
+                n_bars,
+                path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            );
             let result = preprocess_file(
                 &path, &cache, sr, n_bars, &progress,
-                fft_size, pad_factor, overlap, &window_fn, min_freq, max_freq, &eq_weights, &interp_mode, &bar_mapping,
-                dsd_rate,
+                fft_size, pad_factor, overlap, &window_fn, min_freq, max_freq, &interp_mode, &bar_mapping,
+                dsd_rate, &aslt_cfg, pre_fps, &abort, &eta,
+            );
+            eprintln!(
+                "[analysis] {} after {:.1}s",
+                match &result {
+                    PreMessage::Done { frames, .. } => format!("done, {} frames", frames.len()),
+                    PreMessage::Aborted => "aborted".to_string(),
+                    PreMessage::Error(e) => format!("error: {e}"),
+                },
+                t0.elapsed().as_secs_f32(),
             );
             let _ = tx.send(result);
         });
@@ -824,6 +1075,10 @@ impl SpectrumAnalyzer {
             self.waterfall.remove(0);
         }
         self.waterfall_dirty = true;
+        // Counts rows ever pushed, so the renderer can tell how many are new
+        // since it last uploaded. A bare dirty flag cannot: two rows arriving
+        // between frames would upload only the newer one and lose the other.
+        self.waterfall_seq = self.waterfall_seq.wrapping_add(1);
     }
 
     /// Resize to a new bar count and clear all derived state.
@@ -838,19 +1093,55 @@ impl SpectrumAnalyzer {
         self.waterfall_dirty = false;
         self.pre_frames.clear();
         self.pre_receiver = None;
+        // Clearing the flag without cancelling would leave the old run computing
+        // a bar count nothing will ever read, while a new one starts beside it.
+        self.abort_analysis.store(true, Ordering::Relaxed);
+        self.abort_analysis = Arc::new(AtomicBool::new(false));
         self.is_analyzing.store(false, Ordering::Relaxed);
         self.analysis_progress.store(0, Ordering::Relaxed);
+        self.eta_secs.store(usize::MAX, Ordering::Relaxed);
     }
 
     pub fn reset(&mut self) {
+        self.reset_inner(true);
+    }
+
+    /// Reset the display state but leave a running analysis alone.
+    ///
+    /// For a track repeating — or being restarted from the top — the analysis
+    /// in flight is for exactly the file about to play again, so throwing it
+    /// away and starting over means a superlet run can never finish on a track
+    /// shorter than itself. On loop it would restart forever.
+    pub fn reset_keeping_analysis(&mut self) {
+        self.reset_inner(false);
+    }
+
+    fn reset_inner(&mut self, cancel_analysis: bool) {
         let n = self.bar_count;
         self.magnitudes = vec![0.0; n];
         self.smoothed = vec![0.0; n];
         self.eq_weights.clear();
         self.waterfall.clear();
         self.waterfall_dirty = false;
+        if let Ok(mut b) = self.sample_buf.lock() {
+            b.clear();
+        }
+        if !cancel_analysis {
+            // Keep pre_receiver, pre_frames and every flag Arc: dropping the
+            // receiver would strand the worker's result and the analysis would
+            // run to completion with nothing left to deliver it to.
+            return;
+        }
         self.pre_frames.clear();
         self.pre_receiver = None;
+        // Tell any in-flight analysis to stop *before* the flag Arcs are
+        // swapped. Replacing them alone only orphans that thread: it keeps
+        // running, keeps a whole CPU busy, and the guard it would have tripped
+        // now belongs to nobody — so a new analysis starts alongside it. With a
+        // superlet run lasting minutes, two or three of those stack up and every
+        // one of them gets slower.
+        self.abort_analysis.store(true, Ordering::Relaxed);
+        self.abort_analysis = Arc::new(AtomicBool::new(false));
         // Replace the Arcs rather than just storing false/0 into them.
         // Any lingering old-thread ClearOnDrop guard holds a clone of the
         // *previous* Arc; when it fires it writes to that abandoned Arc
@@ -858,11 +1149,10 @@ impl SpectrumAnalyzer {
         // to start.
         self.is_analyzing = Arc::new(AtomicBool::new(false));
         self.analysis_progress = Arc::new(AtomicUsize::new(0));
+        self.eta_secs = Arc::new(AtomicUsize::new(usize::MAX));
+        self.analyzing_path = None;
         self.pending_waveform = None;
         self.pending_analysis = None;
-        if let Ok(mut b) = self.sample_buf.lock() {
-            b.clear();
-        }
     }
 
     /// Poll the background pre-process channel and store frames if ready,
@@ -872,12 +1162,23 @@ impl SpectrumAnalyzer {
         if let Some(ref rx) = self.pre_receiver && let Ok(msg) = rx.try_recv() {
             match msg {
                 PreMessage::Done { frames, frame_rate, waveform, analysis } => {
+                    // The worker has just written a cache file; keep the whole
+                    // directory inside its budget now rather than letting it
+                    // grow unbounded between sessions.
+                    if self.cache_budget_gb > 0.0 {
+                        let budget = (self.cache_budget_gb as f64 * 1e9) as u64;
+                        let (n, freed) = evict_cache_to_budget(budget, None);
+                        if n > 0 {
+                            eprintln!("[cache] evicted {n} file(s), freed {:.1} MB",
+                                      freed as f64 / 1e6);
+                        }
+                    }
                     self.pre_frames = frames;
                     self.pre_frame_rate = frame_rate;
                     self.pending_waveform = Some(waveform);
                     self.pending_analysis = Some(analysis);
                 }
-                PreMessage::Error(_) => {}
+                PreMessage::Error(_) | PreMessage::Aborted => {}
             }
             self.pre_receiver = None;
         }
@@ -903,6 +1204,63 @@ fn cache_dir_stats() -> (usize, u64) {
     (count, bytes)
 }
 
+/// Default ceiling on the whole cache directory, in gigabytes.
+///
+/// A superlet track at 180 fps and 1024 bars costs 45–80 MB and the encoding
+/// cannot be made much smaller — the low byte of every value is quantisation
+/// noise, so no lossless coder beats about 12 %, and even truncating to a depth
+/// finer than a 4K pixel only reaches 14 %. Bounding the total is therefore the
+/// real control, not the packing. 4 GB is roughly 60 superlet tracks, or several
+/// hundred FFT-mode ones.
+pub const DEFAULT_CACHE_BUDGET_GB: f32 = 4.0;
+
+/// Delete least-recently-used caches until the directory fits `budget_bytes`.
+///
+/// Returns (files removed, bytes freed). `keep` is spared regardless — it is
+/// normally the analysis that just finished, and evicting it immediately would
+/// mean a long run wrote a file nobody ever reads.
+///
+/// LRU also cleans up after cache-key changes for free: caches whose key format
+/// no longer exists can never be read, so they are never touched, so they are
+/// always first out.
+fn evict_cache_to_budget(budget_bytes: u64, keep: Option<&Path>) -> (usize, u64) {
+    evict_in_dir(&home_dir().join(".moosik").join("cache"), budget_bytes, keep)
+}
+
+fn evict_in_dir(dir: &Path, budget_bytes: u64, keep: Option<&Path>) -> (usize, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return (0, 0); };
+
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total = 0u64;
+    for e in entries.filter_map(|e| e.ok()) {
+        let p = e.path();
+        if !p.extension().map(|x| x == "spectrumcache").unwrap_or(false) { continue; }
+        let Ok(m) = e.metadata() else { continue };
+        // Accessed time is what LRU wants, but it is unreliable — Windows
+        // updates it lazily and many Linux mounts disable it outright. Modified
+        // time is the honest fallback: for these files it is the time the
+        // analysis was written, so it evicts oldest-analysed first.
+        let when = m.accessed().or_else(|_| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+        total += m.len();
+        files.push((when, m.len(), p));
+    }
+    if total <= budget_bytes { return (0, 0); }
+
+    files.sort_by_key(|(when, _, _)| *when);
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    for (_, len, p) in files {
+        if total <= budget_bytes { break; }
+        if keep.is_some_and(|k| k == p) { continue; }
+        if std::fs::remove_file(&p).is_ok() {
+            total = total.saturating_sub(len);
+            freed += len;
+            removed += 1;
+        }
+    }
+    (removed, freed)
+}
+
 fn home_dir() -> PathBuf {
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -923,25 +1281,35 @@ fn cache_path_for(
     bar_mapping: &BarMappingMode,
     interp_mode: &InterpolationMode,
     dsd_rate: u32,
+    aslt_cfg: &aslt::AsltConfig,
+    pre_fps: f32,
 ) -> PathBuf {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     path.hash(&mut h);
     let hash = h.finish();
-    let overlap_k  = (overlap * 1000.0) as u32;
-    let window_id: u8 = match window_fn {
+    let is_aslt = *bar_mapping == BarMappingMode::Superlet;
+    // Superlet ignores every FFT knob, so they are zeroed out of its key rather
+    // than baked in — otherwise changing the FFT size while in superlet mode
+    // would silently invalidate caches that are still perfectly valid. Nothing
+    // can collide with an FFT cache regardless, because `mapping_id` differs.
+    let overlap_k  = if is_aslt { 0 } else { (overlap * 1000.0) as u32 };
+    let fft_id     = if is_aslt { 0 } else { fft_size };
+    let pad_id     = if is_aslt { 0 } else { pad_factor };
+    let window_id: u8 = if is_aslt { 0 } else { match window_fn {
         WindowFn::Hann => 0, WindowFn::Hamming => 1,
         WindowFn::Blackman => 2, WindowFn::FlatTop => 3,
-    };
+    }};
     let mapping_id: u8 = match bar_mapping {
-        BarMappingMode::FlatOverlap => 0, BarMappingMode::Gaussian => 1, BarMappingMode::Cqt => 2,
+        BarMappingMode::FlatOverlap => 0, BarMappingMode::Gaussian => 1,
+        BarMappingMode::Cqt => 2, BarMappingMode::Superlet => 3,
     };
-    let interp_id: u8 = match interp_mode {
+    let interp_id: u8 = if is_aslt { 0 } else { match interp_mode {
         InterpolationMode::None => 0, InterpolationMode::Linear => 1,
         InterpolationMode::CatmullRom => 2, InterpolationMode::Pchip => 3,
         InterpolationMode::Akima => 4, InterpolationMode::Lanczos => 5,
-    };
+    }};
     let min_hz = min_freq.round() as u32;
     let max_hz = max_freq.round() as u32;
     // DSD analyses depend on the decimation rate, so it joins the key — but
@@ -951,12 +1319,47 @@ fn cache_path_for(
     } else {
         String::new()
     };
+    // Superlet parameters change the frames completely, so they must be in the
+    // key. Tenths, because the order ramp is fractional. Frame rate joins too —
+    // it is a free parameter here, not derived from the window length.
+    let aslt_part = if is_aslt {
+        format!(
+            "_s{}-{}-{}-{}-{}{}",
+            (aslt_cfg.q_ratio * 100.0).round() as u32,
+            (aslt_cfg.max_window_s * 100.0).round() as u32,
+            aslt_cfg.n_wavelets,
+            (aslt_cfg.spread * 100.0).round() as u32,
+            pre_fps.round() as u32,
+            // Only stamped for the non-default scale, so every cache file
+            // written before this existed keeps its name and stays valid.
+            match aslt_cfg.scale {
+                freq_scale::FreqScale::Log => String::new(),
+                freq_scale::FreqScale::Erb => "-erb".to_string(),
+                // Tilt in hundredths, so -0.35 and 0.40 get distinct caches.
+                freq_scale::FreqScale::Blend(t) => {
+                    format!("-w{}", (t * 100.0).round() as i32)
+                }
+                freq_scale::FreqScale::Lens { tilt, hz, oct, gain } => {
+                    format!(
+                        "-w{}z{}-{}-{}",
+                        (tilt * 100.0).round() as i32,
+                        hz.round() as u32,
+                        (oct * 10.0).round() as u32,
+                        (gain * 10.0).round() as u32,
+                    )
+                }
+            },
+        )
+    } else {
+        String::new()
+    };
     home_dir()
         .join(".moosik")
         .join("cache")
         .join(format!(
-            "{:016x}_b{}_f{}_w{}_p{}_o{}_n{}_x{}_m{}_i{}{}.spectrumcache",
-            hash, n_bars, fft_size, window_id, pad_factor, overlap_k, min_hz, max_hz, mapping_id, interp_id, dsd_part,
+            "{:016x}_b{}_f{}_w{}_p{}_o{}_n{}_x{}_m{}_i{}{}{}.spectrumcache",
+            hash, n_bars, fft_id, window_id, pad_id, overlap_k, min_hz, max_hz,
+            mapping_id, interp_id, dsd_part, aslt_part,
         ))
 }
 
@@ -965,6 +1368,22 @@ fn cache_path_for(
 // Old f32 caches (no magic header) are auto-rejected: their first 4 bytes decode as a frame
 // count that won't match CACHE_MAGIC, so they recompute silently.
 const CACHE_MAGIC: u32 = 0x4D535032; // "MSP2"
+
+// Cache format v3: same header, but the payload is delta-coded across frequency
+// and split into byte planes before LZ4.
+//
+// Measured on a real 44 645 × 1024 superlet cache: 78.8 MB as v2, 69.1 MB as v3.
+// That 12 % is close to the whole prize — the low byte of each u16 is 46 MB of
+// uniform quantisation noise, so *no* lossless coder can beat ~77 MB, and even
+// truncating to a depth finer than a 4K pixel (12-bit) only reaches 68 MB. The
+// file is large because 44 645 frames × 1024 bars is a lot of data, not because
+// it is badly packed. Bounding the cache as a whole is the real fix; this is
+// just the part that is free.
+//
+// Neighbouring bars correlate slightly better than consecutive frames, which is
+// why the delta runs across frequency — at 180 fps the frames are so similar
+// that their difference is dominated by the same noise floor.
+const CACHE_MAGIC_V3: u32 = 0x4D535033; // "MSP3"
 
 fn load_cache(cache_path: &PathBuf, n_bars: usize) -> Option<Vec<Vec<f32>>> {
     use std::io::Read;
@@ -977,26 +1396,50 @@ fn load_cache(cache_path: &PathBuf, n_bars: usize) -> Option<Vec<Vec<f32>>> {
     let num_frames = u32::from_le_bytes(raw[4..8].try_into().ok()?) as usize;
     let num_bars   = u32::from_le_bytes(raw[8..12].try_into().ok()?) as usize;
 
-    if magic != CACHE_MAGIC || num_bars != n_bars || num_bars > MAX_BAR_COUNT || num_frames > 500_000 {
+    let v3 = magic == CACHE_MAGIC_V3;
+    if (!v3 && magic != CACHE_MAGIC) || num_bars != n_bars
+        || num_bars > MAX_BAR_COUNT || num_frames > 500_000
+    {
         return None;
     }
 
     let decompressed = lz4_flex::decompress_size_prepended(&raw[12..]).ok()?;
 
-    // Each value is a u16 LE → 2 bytes per bar per frame.
-    let expected_bytes = num_frames.saturating_mul(num_bars).saturating_mul(2);
+    // Each value is a u16 → 2 bytes per bar per frame.
+    let count = num_frames.checked_mul(num_bars)?;
+    let expected_bytes = count.checked_mul(2)?;
     if decompressed.len() < expected_bytes { return None; }
 
-    let frames: Vec<Vec<f32>> = (0..num_frames)
-        .map(|f| {
-            let base = f * num_bars * 2;
-            (0..num_bars).map(|b| {
-                let off = base + b * 2;
-                let v = u16::from_le_bytes([decompressed[off], decompressed[off + 1]]);
-                v as f32 / 65535.0
-            }).collect()
-        })
-        .collect();
+    if !v3 {
+        // v2: plain u16 LE, interleaved.
+        return Some((0..num_frames)
+            .map(|f| {
+                let base = f * num_bars * 2;
+                (0..num_bars).map(|b| {
+                    let off = base + b * 2;
+                    let v = u16::from_le_bytes([decompressed[off], decompressed[off + 1]]);
+                    v as f32 / 65535.0
+                }).collect()
+            })
+            .collect());
+    }
+
+    // v3: high-byte plane, then low-byte plane, each holding a zigzag delta
+    // taken across frequency within a frame.
+    let (hi, lo) = decompressed.split_at(count);
+    let mut frames = Vec::with_capacity(num_frames);
+    for f in 0..num_frames {
+        let base = f * num_bars;
+        let mut row = Vec::with_capacity(num_bars);
+        let mut prev: i32 = 0;
+        for b in 0..num_bars {
+            let z = u16::from_le_bytes([lo[base + b], hi[base + b]]) as u32;
+            let d = ((z >> 1) as i32) ^ -((z & 1) as i32);
+            prev = (prev + d) & 0xFFFF;
+            row.push(prev as f32 / 65535.0);
+        }
+        frames.push(row);
+    }
     Some(frames)
 }
 
@@ -1007,18 +1450,34 @@ fn save_cache(cache_path: &PathBuf, frames: &[Vec<f32>]) {
     }
     let n_bars = frames.first().map(|f| f.len()).unwrap_or(0);
 
-    // Flatten to u16 LE bytes, then LZ4-compress.
-    let mut payload: Vec<u8> = Vec::with_capacity(frames.len() * n_bars * 2);
+    // Zigzag delta across frequency, then split the two bytes of every value
+    // into separate planes. Interleaved, the noisy low byte sits between every
+    // pair of compressible high bytes and stops LZ4 finding any run at all.
+    let count = frames.len() * n_bars;
+    let mut hi: Vec<u8> = Vec::with_capacity(count);
+    let mut lo: Vec<u8> = Vec::with_capacity(count);
     for frame in frames {
+        let mut prev: i32 = 0;
         for &v in frame {
-            let q = (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
-            payload.extend_from_slice(&q.to_le_bytes());
+            let q = (v.clamp(0.0, 1.0) * 65535.0).round() as i32;
+            // Wrap the difference into i16 before zigzagging. The raw difference
+            // spans ±65535 and needs 17 bits; wrapped, it still reconstructs
+            // exactly because the values themselves are 16-bit, and it keeps the
+            // common small steps small — which is the entire point of the delta.
+            let d = (q - prev) as i16 as i32;
+            prev = q;
+            let z = ((d << 1) ^ (d >> 31)) as u32 as u16;
+            let [b0, b1] = z.to_le_bytes();
+            lo.push(b0);
+            hi.push(b1);
         }
     }
+    let mut payload = hi;
+    payload.append(&mut lo);
     let compressed = lz4_flex::compress_prepend_size(&payload);
 
     let mut header = Vec::with_capacity(12 + compressed.len());
-    header.extend_from_slice(&CACHE_MAGIC.to_le_bytes());
+    header.extend_from_slice(&CACHE_MAGIC_V3.to_le_bytes());
     header.extend_from_slice(&(frames.len() as u32).to_le_bytes());
     header.extend_from_slice(&(n_bars as u32).to_le_bytes());
     header.extend_from_slice(&compressed);
@@ -1032,6 +1491,7 @@ fn save_cache(cache_path: &PathBuf, frames: &[Vec<f32>]) {
 // Background pre-processing (uses rodio Decoder directly)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn preprocess_file(
     path: &PathBuf,
     cache_path: &PathBuf,
@@ -1044,10 +1504,13 @@ fn preprocess_file(
     window_fn: &WindowFn,
     min_freq: f32,
     max_freq: f32,
-    eq_weights: &[f32],
     interp_mode: &InterpolationMode,
     bar_mapping: &BarMappingMode,
     dsd_rate: u32,
+    aslt_cfg: &aslt::AsltConfig,
+    pre_fps: f32,
+    abort: &Arc<AtomicBool>,
+    eta_secs: &Arc<AtomicUsize>,
 ) -> PreMessage {
     // ── Phase 1: decode all mono samples sequentially (0–49 %) ──────────────
     // DSD has no PCM samples to decode — it's low-pass-filtered and decimated
@@ -1074,7 +1537,10 @@ fn preprocess_file(
             if got == 0 { break; }
             mono.push(sum / got as f32);
             if total_hint > 0 {
-                progress.store((mono.len() * 49 / total_hint).min(49), Ordering::Relaxed);
+                progress.store(
+                    (mono.len() * PROG_DECODE_END / total_hint).min(PROG_DECODE_END),
+                    Ordering::Relaxed,
+                );
             }
         }
         (mono, sr)
@@ -1113,13 +1579,24 @@ fn preprocess_file(
             if got == 0 { break; }
             mono.push(sum / got as f32);
             if total_hint > 0 {
-                progress.store((mono.len() * 49 / total_hint).min(49), Ordering::Relaxed);
+                progress.store(
+                    (mono.len() * PROG_DECODE_END / total_hint).min(PROG_DECODE_END),
+                    Ordering::Relaxed,
+                );
             }
         }
         (mono, sr)
     };
 
-    let hop = ((fft_size as f32 * (1.0 - overlap)).round() as usize).max(1);
+    // The superlet has no analysis window to derive a frame rate from, so its
+    // hop comes straight from the target frame rate instead of from
+    // window × overlap.
+    let is_aslt = *bar_mapping == BarMappingMode::Superlet;
+    let hop = if is_aslt {
+        aslt::hop_for_fps(sample_rate, pre_fps)
+    } else {
+        ((fft_size as f32 * (1.0 - overlap)).round() as usize).max(1)
+    };
     let padded_size = fft_size * pad_factor;
     let window = make_window(fft_size, window_fn);
     let mut planner = FftPlanner::new();
@@ -1129,10 +1606,13 @@ fn preprocess_file(
     let log_min = min_freq.log10();
     let log_max = (sample_rate as f32 / 2.0).min(max_freq).log10();
 
-    if all_mono.len() < fft_size {
+    // Superlet needs no particular window length, but the loudness/chroma pass
+    // below still runs a 4096-point FFT, so that is the real floor.
+    let min_len = if is_aslt { CHROMA_FFT } else { fft_size };
+    if all_mono.len() < min_len {
         return PreMessage::Error("audio too short for analysis".into());
     }
-    progress.store(50, Ordering::Relaxed);
+    progress.store(PROG_DECODE_END + 1, Ordering::Relaxed);
 
     // ── Waveform + analysis pass (single-threaded over already-decoded data) ──
     let waveform_n_cols = 1000usize;
@@ -1176,7 +1656,17 @@ fn preprocess_file(
     const CLIP_THRESH: f32 = 0.9999;
     let total_samples = all_mono.len();
 
+    // One update per 1 % of the pass; per-sample would be millions of atomic
+    // stores for a bar that only moves ten steps.
+    let loudness_step = (total_samples / 100).max(1);
     for (idx, &s) in all_mono.iter().enumerate() {
+        if idx % loudness_step == 0 && total_samples > 0 {
+            let span = PROG_LOUDNESS_END - PROG_DECODE_END;
+            progress.store(
+                PROG_DECODE_END + (idx * span / total_samples).min(span),
+                Ordering::Relaxed,
+            );
+        }
         rms_sq += s * s;
         rms_count += 1;
         if rms_count >= CHUNK {
@@ -1277,6 +1767,103 @@ fn preprocess_file(
         loudness_history,
     };
 
+    // ── Phase 2a: superlet (50–99 %) ─────────────────────────────────────────
+    // Wholly replaces the FFT pipeline — no bins, no window, no bar mapping.
+    // The frame layout it produces is identical, so the cache format, the
+    // renderer and the waterfall are all untouched.
+    if is_aslt {
+        use std::sync::atomic::AtomicU64;
+
+        // Same bar grid as the FFT path, Nyquist clamp included, so switching
+        // modes does not shift the bars sideways.
+        let a_max = (sample_rate as f32 / 2.0).min(max_freq);
+        let per_frame = aslt::bar_taps_per_frame(sample_rate, n_bars, min_freq, a_max, aslt_cfg);
+        let n_frames = aslt::frame_count(all_mono.len(), hop) as f64;
+        let total_taps = (per_frame.iter().sum::<f64>() * n_frames).max(1.0);
+
+        let done_taps = AtomicU64::new(0);
+        let started = Instant::now();
+        // (taps at last sample, elapsed at last sample, smoothed taps/sec).
+        // A mutex rather than atomics because the three move together and this
+        // is touched once per finished bar, not per frame.
+        let rate_window = std::sync::Mutex::new((0.0f64, 0.0f64, 0.0f64));
+        eta_secs.store((total_taps / aslt::TAPS_PER_SEC_HINT) as usize, Ordering::Relaxed);
+
+        // Held to the user's core budget. `install` makes that pool current, so
+        // every nested `par_iter` inside the transform inherits the limit.
+        let raw = gpu_calib::install(|| aslt::analyze_with_progress(
+            &all_mono, sample_rate, n_bars, min_freq, a_max, hop, aslt_cfg,
+            &|| !abort.load(Ordering::Relaxed),
+            &|bar| {
+                let cost = per_frame[bar] * n_frames;
+                let done = done_taps.fetch_add(cost as u64, Ordering::Relaxed) as f64 + cost;
+                store_progress_max(
+                    progress,
+                    50 + ((done / total_taps).clamp(0.0, 1.0) * 49.0) as usize,
+                );
+                // Rate over the last second or so, not since the run started.
+                //
+                // A cumulative average assumes the work ahead costs what the
+                // work behind did, and here it does not: the frequency-domain
+                // bars finish first and the short-kernel bars, which are
+                // computed frame by frame, come last. A tap on that route costs
+                // more wall clock than a tap on the transform route, so the
+                // average was always flattering and the last stretch always
+                // overran its own estimate. Measuring recent throughput instead
+                // lets the estimate notice the slowdown while it is happening,
+                // which is the difference between an estimate and a guess.
+                let elapsed = started.elapsed().as_secs_f64();
+                let recent = {
+                    let mut g = rate_window.lock().unwrap_or_else(|e| e.into_inner());
+                    let (last_done, last_at, ema) = *g;
+                    if elapsed - last_at >= 1.0 && done > last_done {
+                        let inst = (done - last_done) / (elapsed - last_at);
+                        // Smoothed, because bars land in bursts as the pool
+                        // drains and a raw sample swings wildly.
+                        let next = if ema <= 0.0 { inst } else { ema * 0.6 + inst * 0.4 };
+                        *g = (done, elapsed, next);
+                        next
+                    } else {
+                        ema
+                    }
+                };
+                let rate = if recent > 0.0 {
+                    recent
+                } else if done > total_taps * 0.02 && elapsed > 0.5 {
+                    done / elapsed
+                } else {
+                    aslt::TAPS_PER_SEC_HINT
+                };
+                eta_secs.store(((total_taps - done) / rate).max(0.0) as usize, Ordering::Relaxed);
+            },
+        ));
+
+        if abort.load(Ordering::Relaxed) { return PreMessage::Aborted; }
+        if raw.is_empty() {
+            return PreMessage::Error("superlet analysis produced no frames".into());
+        }
+
+        let frames: Vec<Vec<f32>> = raw
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .map(|(bar, &mag)| {
+                        let _ = bar;
+                        let db = (20.0 * (mag * ASLT_DB_REF).log10()).max(-80.0);
+                        ((db + 80.0) / 80.0).clamp(0.0, 1.0)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        progress.store(100, Ordering::Relaxed);
+        eta_secs.store(0, Ordering::Relaxed);
+        let frame_rate = sample_rate as f64 / hop as f64;
+        save_cache(cache_path, &frames);
+        return PreMessage::Done { frames, frame_rate, waveform, analysis };
+    }
+
     // ── Phase 2: process frames in parallel with rayon (50–99 %) ─────────────
     let num_frames = (all_mono.len() - fft_size) / hop + 1;
     let done = AtomicUsize::new(0);
@@ -1304,16 +1891,17 @@ fn preprocess_file(
 
             let bars: Vec<f32> = (0..n_bars)
                 .map(|bar| {
+                    let fscale = aslt_cfg.scale;
                     let mag = if *bar_mapping == BarMappingMode::Cqt {
                         let tc  = (bar as f32 + 0.5) / n_bars as f32;
-                        let f_c = 10_f32.powf(log_min + tc * (log_max - log_min));
+                        let f_c = fscale.freq_at(tc, min_freq, max_freq);
                         let bc  = (f_c * padded_size as f32 / sample_rate as f32).clamp(1.0, half as f32 - 1.0);
                         cqt_kernel(&norms, bc, cqt_q_pp, half)
                     } else {
                         let t0 = bar as f32 / n_bars as f32;
                         let t1 = (bar + 1) as f32 / n_bars as f32;
-                        let freq_lo = 10_f32.powf(log_min + t0 * (log_max - log_min));
-                        let freq_hi = 10_f32.powf(log_min + t1 * (log_max - log_min));
+                        let freq_lo = fscale.freq_at(t0, min_freq, max_freq);
+                        let freq_hi = fscale.freq_at(t1, min_freq, max_freq);
                         let fbin_lo = (freq_lo * padded_size as f32 / sample_rate as f32).max(1.0);
                         let fbin_hi = (freq_hi * padded_size as f32 / sample_rate as f32)
                             .max(fbin_lo + 0.001).min(half as f32 - 0.001);
@@ -1333,7 +1921,9 @@ fn preprocess_file(
                                     BarMappingMode::FlatOverlap => {
                                         (fbin_hi.min(b as f32 + 1.0) - fbin_lo.max(b as f32)).max(0.0)
                                     }
-                                    BarMappingMode::Gaussian | BarMappingMode::Cqt => {
+                                    BarMappingMode::Gaussian
+                                    | BarMappingMode::Cqt
+                                    | BarMappingMode::Superlet => {
                                         let center_b = b as f32 + 0.5;
                                         (-(center_b - bc).powi(2) / (2.0 * sigma * sigma)).exp()
                                     }
@@ -1343,8 +1933,7 @@ fn preprocess_file(
                             if weight > 0.0 { wsum / weight } else { 0.0 }
                         }
                     };
-                    let raw_db = 20.0 * (mag / scale).log10().max(-80.0);
-                    let db = if let Some(&w) = eq_weights.get(bar) { raw_db + w } else { raw_db };
+                    let db = 20.0 * (mag / scale).log10().max(-80.0);
                     ((db + 80.0) / 80.0).clamp(0.0, 1.0)
                 })
                 .collect();
@@ -1354,6 +1943,10 @@ fn preprocess_file(
             bars
         })
         .collect();
+
+    // The FFT path is fast enough that Abort rarely gets a chance to fire, but
+    // it must still honour it rather than write a cache the user cancelled.
+    if abort.load(Ordering::Relaxed) { return PreMessage::Aborted; }
 
     progress.store(100, Ordering::Relaxed);
 
@@ -1431,6 +2024,7 @@ fn matches_standard_nyquist(ceiling_hz: f32) -> Option<u32> {
 /// Analyse pre-processed FFT frames and return spectral ceiling + rolloff shape.
 fn compute_spectral_ceiling(
     frames: &[Vec<f32>], n_bars: usize, min_freq: f32, max_freq: f32,
+    scale: freq_scale::FreqScale,
 ) -> Option<SpectralCeiling> {
     if frames.is_empty() || n_bars == 0 { return None; }
     let noise = 0.15_f32;
@@ -1442,10 +2036,7 @@ fn compute_spectral_ceiling(
     }
     let highest = peak.iter().enumerate().rev()
         .find(|&(_, &v)| v > noise).map(|(i, _)| i)?;
-    let log_min = min_freq.log10();
-    let log_max = max_freq.log10();
-    let t = (highest as f32 + 0.5) / n_bars as f32;
-    let hz = 10_f32.powf(log_min + t * (log_max - log_min));
+    let hz = scale.bar_center(highest, n_bars, min_freq, max_freq);
     let rolloff_octaves      = rolloff_width_octaves(&peak, min_freq, max_freq);
     let matched_standard_sr  = matches_standard_nyquist(hz);
     Some(SpectralCeiling { hz, rolloff_octaves, matched_standard_sr })
@@ -1908,10 +2499,14 @@ fn txt_accent(dark: bool) -> Color32 {
 /// EQ dB range shown on the overlay (±DB_RANGE maps to ±half plot height).
 const EQ_DB_RANGE: f32 = 24.0;
 
-fn eq_node_pos(band: &EqBand, plot_rect: Rect, min_freq: f32, max_freq: f32) -> egui::Pos2 {
-    let log_min = min_freq.log10();
-    let log_span = (max_freq.log10() - log_min).max(1e-6);
-    let t = ((band.freq.log10() - log_min) / log_span).clamp(0.0, 1.0);
+fn eq_node_pos(
+    band: &EqBand, plot_rect: Rect, min_freq: f32, max_freq: f32,
+    scale: freq_scale::FreqScale,
+) -> egui::Pos2 {
+    // Positioned on the same axis the bars are drawn on. On the ERB scale a
+    // node placed by the log formula would sit more than an octave away from
+    // the band it represents down in the bass.
+    let t = scale.position_of(band.freq, min_freq, max_freq).clamp(0.0, 1.0);
     let x = plot_rect.left() + t * plot_rect.width();
     let gain = if band.kind.has_gain() { band.gain_db } else { 0.0 };
     let y_center = plot_rect.center().y;
@@ -1930,11 +2525,10 @@ fn draw_eq_overlay(
     draw_curve: bool,
     hovered: Option<usize>,
     dragging: Option<usize>,
+    scale: freq_scale::FreqScale,
 ) {
     use egui::{Color32, Pos2, Stroke};
 
-    let log_min  = min_freq.log10();
-    let log_span = (max_freq.log10() - log_min).max(1e-6);
     let y_center = plot_rect.center().y;
     let y_per_db = (plot_rect.height() * 0.5) / EQ_DB_RANGE;
     let w = plot_rect.width() as usize;
@@ -1952,7 +2546,7 @@ fn draw_eq_overlay(
             let col = eq_band_color(i).linear_multiply(0.35);
             let pts: Vec<Pos2> = (0..=w).map(|px| {
                 let t = px as f32 / w as f32;
-                let freq = 10f32.powf(log_min + t * log_span);
+                let freq = scale.freq_at(t, min_freq, max_freq);
                 let (bv, av) = eq_biquad_coeffs(band, sr);
                 let db = biquad_response_db(bv, av, freq, sr).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
                 Pos2::new(plot_rect.left() + t * plot_rect.width(),
@@ -1966,7 +2560,7 @@ fn draw_eq_overlay(
         // Combined response curve
         let pts: Vec<Pos2> = (0..=w).map(|px| {
             let t = px as f32 / w as f32;
-            let freq = 10f32.powf(log_min + t * log_span);
+            let freq = scale.freq_at(t, min_freq, max_freq);
             let db = total_eq_response_db(bands, sr, freq).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
             Pos2::new(plot_rect.left() + t * plot_rect.width(),
                       (y_center - db * y_per_db).clamp(plot_rect.top(), plot_rect.bottom()))
@@ -1980,7 +2574,7 @@ fn draw_eq_overlay(
     // Band nodes
     for (i, band) in bands.iter().enumerate() {
         if !band.enabled { continue; }
-        let pos = eq_node_pos(band, plot_rect, min_freq, max_freq);
+        let pos = eq_node_pos(band, plot_rect, min_freq, max_freq, scale);
         let is_active = hovered == Some(i) || dragging == Some(i);
         let r = if is_active { 9.0 } else { 6.0 };
         let col = eq_band_color(i);
@@ -2133,21 +2727,29 @@ fn draw_filled(painter: &egui::Painter, mags: &[f32], rect: Rect, pal: &Palette)
     draw_line(painter, mags, rect, line_color);
 }
 
-fn waterfall_to_color_image(waterfall: &[Vec<f32>], pal: &Palette) -> Option<egui::ColorImage> {
-    let n = waterfall.first().map(|r| r.len()).unwrap_or(0);
-    if n == 0 { return None; }
-    let h = WATERFALL_ROWS;
-    let mut pixels = vec![Color32::BLACK; n * h];
-    for (row_idx, row) in waterfall.iter().enumerate() {
-        // row 0 is most recent (rendered at bottom in original draw_waterfall).
-        // In texture coordinates, row 0 is the top, so we flip.
-        let tex_row = h.saturating_sub(1 + row_idx);
-        let cols = row.len().min(n);
-        for col in 0..cols {
-            pixels[tex_row * n + col] = pal.heat(row[col]);
-        }
+/// How to cut the waterfall ring into two quads so it reads in order on screen.
+///
+/// `head` is where the *next* row will be written; because rows are written
+/// backwards, the newest is at `head + 1`. Screen top-to-bottom is therefore
+/// ascending texture rows starting there, which wraps exactly once.
+///
+/// Returns the screen fraction at which the wrap falls, and the texture
+/// v-ranges of the top and bottom quads.
+fn waterfall_slices(head: usize, h: usize) -> (f32, (f32, f32), (f32, f32)) {
+    let start = (head + 1) % h.max(1);
+    let v = start as f32 / h as f32;
+    // The top quad shows [start, h), which is (h - start) of h rows, so it must
+    // occupy exactly that fraction of the height or the rows would be stretched.
+    ((h - start) as f32 / h as f32, (v, 1.0), (0.0, v))
+}
+
+/// One waterfall row as a 1-pixel-tall image, for a partial texture upload.
+fn waterfall_row_image(row: &[f32], n: usize, pal: &Palette) -> egui::ColorImage {
+    let mut pixels = vec![Color32::BLACK; n];
+    for (col, px) in pixels.iter_mut().enumerate().take(row.len().min(n)) {
+        *px = pal.heat(row[col]);
     }
-    Some(egui::ColorImage { size: [n, h], pixels })
+    egui::ColorImage { size: [n, 1], pixels }
 }
 
 fn draw_phasescope(painter: &egui::Painter, frames: &[[f32; 2]], rect: Rect, correlation: f32) {
@@ -2273,6 +2875,11 @@ struct SpectrumSettings {
     #[serde(default)] overlap:       f32,
     #[serde(default)] bar_mapping:   BarMappingMode,
     #[serde(default = "def_dsd_rate")] dsd_rate: u32,
+    /// `None` here means Custom — the user is driving `aslt_cfg` by hand.
+    #[serde(default)] aslt_preset:   Option<aslt::AsltPreset>,
+    #[serde(default)] aslt_cfg:      aslt::AsltConfig,
+    #[serde(default = "def_pre_fps")] pre_fps: f32,
+    #[serde(default = "def_cache_budget")] cache_budget_gb: f32,
     #[serde(default)] show_fft:      bool,
     #[serde(default)] show_peak:     bool,
     #[serde(default)] show_art:      bool,
@@ -2283,6 +2890,11 @@ struct SpectrumSettings {
     #[serde(default = "def_true")]       peak_enabled:      bool,
     #[serde(default = "def_peak_hold")]  peak_hold_ms:      f32,
     #[serde(default = "def_peak_fall")]  peak_fall_speed:   f32,
+    /// Whether the pre-process may use the GPU. `Auto` follows the per-machine
+    /// calibration, which is the measured answer; the other two override it.
+    #[serde(default)] gpu_mode: gpu_calib::GpuMode,
+    /// Cores the pre-process may use. 0 = the default (`cores - 2`).
+    #[serde(default)] worker_threads: usize,
     #[serde(default = "def_peak_accel")] peak_acceleration: f32,
     #[serde(default)]                    peak_decay_mode:   PeakDecayMode,
     #[serde(default = "def_peak_thick")] peak_thickness:    u8,
@@ -2291,6 +2903,8 @@ struct SpectrumSettings {
 
 fn def_true() -> bool { true }
 fn def_dsd_rate() -> u32 { crate::dsd::decimate::DEFAULT_ANALYSIS_RATE }
+fn def_pre_fps() -> f32 { DEFAULT_PRE_FPS }
+fn def_cache_budget() -> f32 { DEFAULT_CACHE_BUDGET_GB }
 fn def_peak_hold() -> f32 { 500.0 }
 fn def_peak_fall() -> f32 { 3.0 }
 fn def_peak_accel() -> f32 { 4.0 }
@@ -2376,7 +2990,18 @@ pub struct SpectrumWindow {
     pub correlation: f32,
     spectrogram: Spectrogram,
     spectrogram_texture: Option<egui::TextureHandle>,
+    // The waterfall texture is a ring: a new row overwrites the oldest in
+    // place, and the two halves are drawn as two quads to put them back in
+    // order. Rebuilding the whole image for one new row meant re-palettising
+    // and re-uploading 1024x120 pixels at the frame rate to change 1024 of
+    // them — about 99% of that work thrown away, every frame.
     waterfall_texture: Option<egui::TextureHandle>,
+    /// Next ring row to overwrite.
+    waterfall_head: usize,
+    /// Bar count the texture was allocated for; a change forces a rebuild.
+    waterfall_tex_w: usize,
+    /// `Analyzer::waterfall_seq` as of the last upload.
+    waterfall_uploaded_seq: u64,
     octave_bands: Vec<(f32, f32)>,
     octave_smoothed: Vec<f32>,
     auto_fft_size: usize,         // last FFT size chosen automatically; 0 = user overrode it
@@ -2391,6 +3016,13 @@ pub struct SpectrumWindow {
     pub overlap: f32,
     pub bar_mapping: BarMappingMode,
     pub show_debug: bool,
+    /// GPU policy for the pre-process, mirrored into `gpu_calib`'s global.
+    pub gpu_mode: gpu_calib::GpuMode,
+    /// Cores the pre-process may use; 0 = default. Mirrored the same way.
+    pub worker_threads: usize,
+    /// Set while a re-calibration runs on a worker thread, so the button can
+    /// disable itself instead of queueing probes.
+    recalibrating: Option<std::sync::mpsc::Receiver<()>>,
     /// True when settings changed and no cache exists for the new combo.
     needs_reanalysis: bool,
     /// Cached (count, bytes) of all .spectrumcache files; refreshed lazily.
@@ -2468,6 +3100,70 @@ pub struct SpectrumWindow {
 }
 
 impl SpectrumWindow {
+    /// Push whatever waterfall rows are new into the ring texture.
+    ///
+    /// Only the rows that actually arrived are palettised and uploaded. The
+    /// previous version rebuilt the entire image — 1024×120 pixels — every time
+    /// a single 1024-pixel row changed, at the frame rate.
+    fn update_waterfall_texture(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let h = WATERFALL_ROWS;
+        let n = self.analyzer.waterfall.first().map(|r| r.len()).unwrap_or(0);
+        if n == 0 { return; }
+
+        // A bar-count change makes every stored row the wrong width, so the
+        // texture is thrown away and refilled from what the ring still holds.
+        if self.waterfall_tex_w != n {
+            self.waterfall_texture = None;
+            self.waterfall_tex_w = n;
+            self.waterfall_head = 0;
+            self.waterfall_uploaded_seq =
+                self.analyzer.waterfall_seq - self.analyzer.waterfall.len() as u64;
+        }
+        let th = self.waterfall_texture.get_or_insert_with(|| {
+            ctx.load_texture(
+                "moosik_waterfall",
+                egui::ColorImage::new([n, h], Color32::BLACK),
+                egui::TextureOptions::NEAREST,
+            )
+        });
+
+        // Never more rows than the ring holds: after a seek or a stall the
+        // counter can jump far ahead, and redrawing the ring twice over would
+        // cost more than the whole optimisation saves.
+        let new = (self.analyzer.waterfall_seq - self.waterfall_uploaded_seq)
+            .min(h as u64).min(self.analyzer.waterfall.len() as u64) as usize;
+        let first = self.analyzer.waterfall.len() - new;
+        // Written *backwards* through the texture. The display puts the newest
+        // row at the top and scrolls downward, so chronological order has to run
+        // up the texture; writing forwards would silently invert the waterfall.
+        for row in &self.analyzer.waterfall[first..] {
+            th.set_partial([0, self.waterfall_head], waterfall_row_image(row, n, pal),
+                           egui::TextureOptions::NEAREST);
+            self.waterfall_head = (self.waterfall_head + h - 1) % h;
+        }
+        self.waterfall_uploaded_seq = self.analyzer.waterfall_seq;
+        self.analyzer.waterfall_dirty = false;
+    }
+
+    /// Draw the ring as two quads, newest at the top.
+    fn draw_waterfall(&self, painter: &egui::Painter, rect: Rect) {
+        let Some(th) = &self.waterfall_texture else { return };
+        let (split, top_uv, bot_uv) =
+            waterfall_slices(self.waterfall_head, WATERFALL_ROWS);
+        let uv = |(v0, v1): (f32, f32)| egui::Rect::from_min_max(
+            egui::Pos2::new(0.0, v0), egui::Pos2::new(1.0, v1));
+        let band = |y0: f32, y1: f32| Rect::from_min_max(
+            egui::Pos2::new(rect.left(), y0), egui::Pos2::new(rect.right(), y1));
+
+        let mid = rect.top() + rect.height() * split;
+        if top_uv.1 > top_uv.0 {
+            painter.image(th.id(), band(rect.top(), mid), uv(top_uv), Color32::WHITE);
+        }
+        if bot_uv.1 > bot_uv.0 {
+            painter.image(th.id(), band(mid, rect.bottom()), uv(bot_uv), Color32::WHITE);
+        }
+    }
+
     pub fn new() -> Self {
         let buf = new_sample_buf();
         let analyzer = SpectrumAnalyzer::new(Arc::clone(&buf));
@@ -2500,6 +3196,9 @@ impl SpectrumWindow {
             spectrogram: Spectrogram::new(),
             spectrogram_texture: None,
             waterfall_texture: None,
+            waterfall_head: 0,
+            waterfall_tex_w: 0,
+            waterfall_uploaded_seq: 0,
             octave_bands: Vec::new(),
             octave_smoothed: Vec::new(),
             stereo_buf: new_stereo_buf(),
@@ -2515,6 +3214,9 @@ impl SpectrumWindow {
             overlap: 0.875,
             bar_mapping: BarMappingMode::Cqt,
             show_debug: false,
+            gpu_mode: gpu_calib::GpuMode::default(),
+            worker_threads: 0,
+            recalibrating: None,
             needs_reanalysis: false,
             cache_stats: (0, 0),
             cache_stats_at: None,
@@ -2559,6 +3261,122 @@ impl SpectrumWindow {
         w
     }
 
+    /// Who computes the pre-process: how many cores, and whether the GPU helps.
+    ///
+    /// Both settings are visible and overridable rather than inferred silently,
+    /// because both were constants baked in from one machine's measurements
+    /// before this existed, and neither generalises: the GPU crossover is a
+    /// property of a particular device against a particular core count, and the
+    /// right number of worker threads depends on what else the machine is doing.
+    fn compute_budget_ui(&mut self, ui: &mut egui::Ui) {
+        let dark = ui.visuals().dark_mode;
+
+        // Finished re-calibration hands back a token; until then the button is
+        // disabled rather than able to queue a second probe behind the first.
+        if let Some(rx) = &self.recalibrating
+            && rx.try_recv().is_ok()
+        {
+            self.recalibrating = None;
+        }
+        let busy = self.recalibrating.is_some();
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Cores:");
+            let cores = gpu_calib::core_count();
+            let mut n = if self.worker_threads == 0 {
+                gpu_calib::default_workers()
+            } else {
+                self.worker_threads
+            };
+            if ui.add(egui::Slider::new(&mut n, 1..=cores).suffix(format!(" / {cores}")))
+                .on_hover_text(
+                    "Cores the pre-process may use. The default leaves two free: \
+                     the output thread has a hard deadline and the decoder feeds \
+                     it, and a saturated machine is how an analysis turns into an \
+                     audible dropout. The transform scales sub-linearly at the top \
+                     end, so the last two cores buy less than they look like they \
+                     would.")
+                .changed()
+            {
+                self.worker_threads = n;
+                gpu_calib::set_workers(n);
+            }
+            if ui.small_button("Default")
+                .on_hover_text(format!("{} of {cores}", gpu_calib::default_workers()))
+                .clicked()
+            {
+                self.worker_threads = 0;
+                gpu_calib::set_workers(0);
+            }
+        });
+
+        if !gpu_calib::device_present() {
+            ui.label(egui::RichText::new("No GPU available — CPU route only.")
+                .size(10.0).color(txt_dim(dark)));
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("GPU:");
+            let mut m = self.gpu_mode;
+            egui::ComboBox::from_id_salt("gpu_mode")
+                .selected_text(match m {
+                    gpu_calib::GpuMode::Auto   => "Auto (measured)",
+                    gpu_calib::GpuMode::Always => "Always",
+                    gpu_calib::GpuMode::Off    => "Off",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut m, gpu_calib::GpuMode::Auto, "Auto (measured)")
+                        .on_hover_text(
+                            "Use the device for exactly the block sizes it has been \
+                             measured to win on this machine.");
+                    ui.selectable_value(&mut m, gpu_calib::GpuMode::Always, "Always")
+                        .on_hover_text(
+                            "Send every eligible block size to the device. Not \
+                             necessarily faster — on the smaller sizes the transfer \
+                             costs more than the transform saves.");
+                    ui.selectable_value(&mut m, gpu_calib::GpuMode::Off, "Off")
+                        .on_hover_text("CPU only.");
+                });
+            if m != self.gpu_mode {
+                self.gpu_mode = m;
+                gpu_calib::set_mode(m);
+            }
+
+            if ui.add_enabled(!busy, egui::Button::new(if busy { "Measuring…" } else { "Re-measure" }))
+                .on_hover_text(
+                    "Throw away this machine's calibration and probe again. Takes \
+                     a few seconds. Worth doing after a driver update, or if the \
+                     machine was busy when it was first measured.")
+                .clicked()
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.recalibrating = Some(rx);
+                // Off the UI thread: the probe runs real transforms and holds
+                // the calibration lock while it does.
+                std::thread::Builder::new()
+                    .name("moosik-gpu-probe".into())
+                    .spawn(move || { gpu_calib::recalibrate(); let _ = tx.send(()); })
+                    .ok();
+            }
+        });
+
+        // What the machine has actually decided, per block size. "(probe)" means
+        // the synthetic bootstrap is still in charge and real A/B samples are
+        // still being collected.
+        for line in gpu_calib::describe() {
+            ui.label(egui::RichText::new(line).size(10.0).monospace().color(txt_dim(dark)));
+        }
+        let st = aslt::stats();
+        if st.used_gpu() {
+            ui.label(egui::RichText::new(format!(
+                "last run: {:.1} s · device busy {:.0}% of its own phases · {} bars on device, {} on cores",
+                st.total_s, st.device_duty() * 100.0, st.gpu_bars, st.cpu_bars,
+            )).size(10.0).color(txt_dim(dark)));
+        }
+    }
+
     /// Current persistable view settings.
     fn snapshot(&self) -> SpectrumSettings {
         SpectrumSettings {
@@ -2576,6 +3394,12 @@ impl SpectrumWindow {
             overlap:       self.overlap,
             bar_mapping:   self.bar_mapping.clone(),
             dsd_rate:      self.analyzer.dsd_rate,
+            aslt_preset:   self.analyzer.aslt_preset,
+            aslt_cfg:      self.analyzer.aslt_cfg.clone(),
+            pre_fps:       self.analyzer.pre_fps,
+            cache_budget_gb: self.analyzer.cache_budget_gb,
+            gpu_mode:       self.gpu_mode,
+            worker_threads: self.worker_threads,
             show_fft:      self.show_fft_settings,
             show_peak:     self.show_peak_settings,
             show_art:      self.show_art_settings,
@@ -2609,6 +3433,22 @@ impl SpectrumWindow {
         self.pad_factor    = s.pad_factor.clamp(1, 64);
         self.overlap       = s.overlap;
         self.bar_mapping   = s.bar_mapping.clone();
+        // A stored preset wins over a stored config: if the ladder's numbers are
+        // ever retuned, saved settings should follow the new ladder rather than
+        // pin users to the old one. Custom (`None`) keeps its explicit config.
+        self.analyzer.aslt_preset = s.aslt_preset;
+        self.analyzer.aslt_cfg = match s.aslt_preset {
+            Some(p) => p.config(),
+            None    => s.aslt_cfg.clone(),
+        };
+        self.analyzer.pre_fps = s.pre_fps.clamp(24.0, 480.0);
+        self.analyzer.cache_budget_gb = s.cache_budget_gb.clamp(0.0, 200.0);
+        // These two live in globals the transform reads, so the stored value has
+        // to be pushed there as well as mirrored on the window.
+        self.gpu_mode = s.gpu_mode;
+        gpu_calib::set_mode(s.gpu_mode);
+        self.worker_threads = s.worker_threads.min(gpu_calib::core_count());
+        gpu_calib::set_workers(self.worker_threads);
         self.analyzer.dsd_rate = if crate::dsd::decimate::ANALYSIS_RATES.contains(&s.dsd_rate) {
             s.dsd_rate
         } else {
@@ -2661,7 +3501,8 @@ impl SpectrumWindow {
         self.analyzer.max_freq = self.max_freq;
         self.analyzer.smoothing = self.smoothing;
         self.analyzer.eq_weights = if self.loudness_mode == LoudnessMode::EqualLoudness {
-            compute_eq_weights(self.bar_count, self.min_freq, self.max_freq)
+            compute_eq_weights(self.bar_count, self.min_freq, self.max_freq,
+                               self.analyzer.aslt_cfg.scale)
         } else {
             Vec::new()
         };
@@ -2670,16 +3511,30 @@ impl SpectrumWindow {
     /// After any quality-setting change, check whether a cache file already exists
     /// for the current path + new settings.  If yes, load it instantly and return true.
     /// If no, clear pre_frames and set `needs_reanalysis` so the UI can prompt the user.
+    /// Whether the FFT-only controls (size, window, padding, overlap,
+    /// interpolation) affect the pre-processed result.
+    ///
+    /// They do not under Superlet, which analyses the time-domain signal
+    /// directly. Their cache keys correctly ignore them — but that made every
+    /// value of every one of them light up as "cached", since they all resolve
+    /// to the same file. Technically true, thoroughly misleading, so the
+    /// indicator is suppressed instead.
+    fn fft_knobs_apply(&self) -> bool {
+        self.bar_mapping != BarMappingMode::Superlet
+    }
+
     fn try_load_or_flag_reanalysis(&mut self) {
         let Some(path) = self.current_path.clone() else { return; };
         let cache = cache_path_for(
             &path, self.bar_count, self.fft_size, self.pad_factor, self.overlap,
             &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode,
-            self.analyzer.dsd_rate,
+            self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
         );
         if let Some(frames) = load_cache(&cache, self.bar_count) {
-            let hop = ((self.analyzer.fft_size as f32 * (1.0 - self.overlap)).round() as usize).max(1);
-            let rate = self.analyzer.sample_rate as f64 / hop as f64;
+            // Via pre_hop(), not fft_size: a superlet cache is spaced by frame
+            // rate, and using the FFT hop here would drift the spectrum against
+            // playback for the whole track.
+            let rate = self.analyzer.sample_rate as f64 / self.analyzer.pre_hop() as f64;
             self.analyzer.pre_frames = frames;
             self.analyzer.pre_frame_rate = rate;
             self.spectral_ceiling = None; // recompute on next tick
@@ -2822,7 +3677,17 @@ impl SpectrumWindow {
         self.current_path = Some(path.to_path_buf());
         // Auto-load the last-used (or default) preset for the new track.
         self.auto_load_preset_for(path);
-        self.analyzer.reset();
+        // A repeat, or a restart from the top, calls this for the file already
+        // being analysed. Cancelling and relaunching there means a superlet run
+        // can never outlive the track it is analysing — on loop it restarts for
+        // ever and never finishes. Recognise that case and let it run.
+        let resuming = self.analyzer.is_analyzing.load(Ordering::Relaxed)
+            && self.analyzer.analyzing_path.as_deref() == Some(path);
+        if resuming {
+            self.analyzer.reset_keeping_analysis();
+        } else {
+            self.analyzer.reset();
+        }
         self.analyzer.sample_rate = sample_rate;
         self.analyzer.bar_count = self.bar_count;
         self.sync_params();
@@ -2838,8 +3703,13 @@ impl SpectrumWindow {
         self.correlation = 1.0;
         self.needs_reanalysis = false;
         if let Ok(mut v) = self.stereo_buf.lock() { v.clear(); }
-        // Always preprocess — needed for spectral ceiling even in real-time mode
-        self.analyzer.start_preprocess(path.to_path_buf());
+        // Always preprocess — needed for spectral ceiling even in real-time mode.
+        // Skipped while resuming: the existing thread is already doing exactly
+        // this work, and start_preprocess would only be turned away by its own
+        // is_analyzing guard anyway.
+        if !resuming {
+            self.analyzer.start_preprocess(path.to_path_buf());
+        }
         self.waveform_rx = None;
     }
 
@@ -2873,6 +3743,7 @@ impl SpectrumWindow {
             self.spectral_ceiling = compute_spectral_ceiling(
                 &self.analyzer.pre_frames, self.bar_count,
                 self.min_freq, self.max_freq.min(self.analyzer.sample_rate as f32 / 2.0),
+                self.analyzer.aslt_cfg.scale,
             );
             self.spectral_ceiling_attempted = true;
         }
@@ -3011,7 +3882,14 @@ impl SpectrumWindow {
         if self.mode == SpectrumMode::PreProcess && !self.analyzer.pre_frames.is_empty() {
             let frame = ((elapsed_secs * self.analyzer.pre_frame_rate) as usize)
                 .min(self.analyzer.pre_frames.len().saturating_sub(1));
-            self.analyzer.magnitudes = self.analyzer.pre_frames[frame].clone();
+            let src = &self.analyzer.pre_frames[frame];
+            let w = &self.analyzer.eq_weights;
+            self.analyzer.magnitudes = src.iter().enumerate()
+                .map(|(bar, &v)| match w.get(bar) {
+                    Some(&db) => (v + db / 80.0).clamp(0.0, 1.0),
+                    None => v,
+                })
+                .collect();
             self.analyzer.smoothed = self.analyzer.magnitudes.clone();
         }
         // Reset peak hold state so peaks don't hang from the old position
@@ -3236,7 +4114,7 @@ impl SpectrumWindow {
                             *open = !*open;
                         }
                     };
-                    chip(&mut self.show_fft_settings, "⚙ FFT Settings");
+                    chip(&mut self.show_fft_settings, "⚙ Analysis");
                     if self.style == VizStyle::Bars {
                         chip(&mut self.show_peak_settings, "📌 Peak Hold");
                     }
@@ -3264,9 +4142,9 @@ impl SpectrumWindow {
                                     self.cache_file_set.contains(&cache_path_for(
                                         p, self.bar_count, sz, self.pad_factor, self.overlap,
                                         &self.window_fn, self.min_freq, self.max_freq,
-                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate,
+                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
                                     ))
-                                }).unwrap_or(false);
+                                }).unwrap_or(false) && self.fft_knobs_apply();
                                 let label = if has_cache {
                                     egui::RichText::new(&text).color(txt_ok(ui.visuals().dark_mode))
                                 } else if is_auto {
@@ -3304,6 +4182,7 @@ impl SpectrumWindow {
                                             p, self.bar_count, self.fft_size, self.pad_factor,
                                             self.overlap, &self.window_fn, self.min_freq, self.max_freq,
                                             &self.bar_mapping, &self.interp_mode, rate,
+                                            &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
                                         ))
                                     }).unwrap_or(false);
                                     let label = if has {
@@ -3349,9 +4228,9 @@ impl SpectrumWindow {
                                     self.cache_file_set.contains(&cache_path_for(
                                         p, self.bar_count, self.fft_size, self.pad_factor,
                                         self.overlap, &wf, self.min_freq, self.max_freq,
-                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate,
+                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
                                     ))
-                                }).unwrap_or(false);
+                                }).unwrap_or(false) && self.fft_knobs_apply();
                                 let name = match wf {
                                     WindowFn::Hann    => "Hann",
                                     WindowFn::Hamming => "Hamming",
@@ -3389,9 +4268,9 @@ impl SpectrumWindow {
                                     self.cache_file_set.contains(&cache_path_for(
                                         p, self.bar_count, self.fft_size, self.pad_factor,
                                         self.overlap, &self.window_fn, self.min_freq, self.max_freq,
-                                        &self.bar_mapping, &im, self.analyzer.dsd_rate,
+                                        &self.bar_mapping, &im, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
                                     ))
-                                }).unwrap_or(false);
+                                }).unwrap_or(false) && self.fft_knobs_apply();
                                 let name = match im {
                                     InterpolationMode::None      => "None",
                                     InterpolationMode::Linear    => "Linear",
@@ -3439,10 +4318,10 @@ impl SpectrumWindow {
                                     let candidate = cache_path_for(
                                         p, self.bar_count, self.fft_size, pf, self.overlap,
                                         &self.window_fn, self.min_freq, self.max_freq,
-                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate,
+                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
                                     );
                                     self.cache_file_set.contains(&candidate)
-                                }).unwrap_or(false);
+                                }).unwrap_or(false) && self.fft_knobs_apply();
                                 let rich = if has_cache {
                                     egui::RichText::new(label_text).color(txt_ok(ui.visuals().dark_mode))
                                 } else {
@@ -3476,9 +4355,9 @@ impl SpectrumWindow {
                                     self.cache_file_set.contains(&cache_path_for(
                                         p, self.bar_count, self.fft_size, self.pad_factor, val,
                                         &self.window_fn, self.min_freq, self.max_freq,
-                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate,
+                                        &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
                                     ))
-                                }).unwrap_or(false);
+                                }).unwrap_or(false) && self.fft_knobs_apply();
                                 let rich = if has_cache {
                                     egui::RichText::new(text).color(txt_ok(ui.visuals().dark_mode))
                                 } else {
@@ -3506,13 +4385,14 @@ impl SpectrumWindow {
                                     self.cache_file_set.contains(&cache_path_for(
                                         p, self.bar_count, self.fft_size, self.pad_factor,
                                         self.overlap, &self.window_fn, self.min_freq, self.max_freq,
-                                        &bm, &self.interp_mode, self.analyzer.dsd_rate,
+                                        &bm, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
                                     ))
                                 }).unwrap_or(false);
                                 let name = match bm {
                                     BarMappingMode::FlatOverlap => "Flat",
                                     BarMappingMode::Gaussian    => "Gaussian",
                                     BarMappingMode::Cqt         => "CQT",
+                                    BarMappingMode::Superlet    => "Superlet",
                                 };
                                 if has { egui::RichText::new(name).color(txt_ok(ui.visuals().dark_mode)) }
                                 else   { egui::RichText::new(name) }
@@ -3520,6 +4400,13 @@ impl SpectrumWindow {
                             let lbl_flat  = bm_green(BarMappingMode::FlatOverlap);
                             let lbl_gauss = bm_green(BarMappingMode::Gaussian);
                             let lbl_cqt   = bm_green(BarMappingMode::Cqt);
+                            let lbl_slt   = bm_green(BarMappingMode::Superlet);
+                            if !self.fft_knobs_apply() {
+                                ui.label(egui::RichText::new(
+                                    "Superlet analyses the waveform directly — FFT size, window, \
+                                     padding, overlap and interpolation do not apply.")
+                                    .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            }
                             ui.horizontal(|ui| {
                                 ui.label("Bar mapping:");
                                 let prev = self.bar_mapping.clone();
@@ -3529,11 +4416,299 @@ impl SpectrumWindow {
                                     .on_hover_text("Bins near the bar's centre frequency weighted more heavily. More natural.");
                                 ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Cqt, lbl_cqt)
                                     .on_hover_text("Constant-Q Transform — Hann kernel with bandwidth ∝ frequency.\nEach bar has identical relative frequency resolution. Best for music.");
+                                ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Superlet, lbl_slt)
+                                    .on_hover_text(format!(
+                                        "Adaptive Superlet Transform — a direct wavelet analysis, not an FFT mapping.\n\
+                                         Highest resolution available, at minutes of pre-processing per track.\n\
+                                         Pre-process only; live view keeps using the FFT.\n\n\
+                                         Current: {} — bass window {:.2} s, grid Q {:.0} @ {:.0} fps",
+                                        self.analyzer.aslt_preset.map(|p| p.label()).unwrap_or("Custom"),
+                                        aslt::window_seconds_at(
+                                            self.min_freq,
+                                            aslt::grid_q(self.bar_count, self.min_freq, self.max_freq),
+                                            &self.analyzer.aslt_cfg,
+                                        ),
+                                        aslt::grid_q(self.bar_count, self.min_freq, self.max_freq),
+                                        self.analyzer.pre_fps,
+                                    ));
                                 if self.bar_mapping != prev {
                                     self.analyzer.bar_mapping = self.bar_mapping.clone();
                                     self.try_load_or_flag_reanalysis();
                                 }
                             });
+
+                            // Superlet quality ladder — only meaningful while
+                            // Superlet is the active mapping, so it stays hidden
+                            // otherwise rather than sitting there greyed out.
+                            if self.bar_mapping == BarMappingMode::Superlet {
+                                // The grid Q the readouts quote has to be the
+                                // one at the frequency being quoted: under ERB
+                                // it varies along the spectrum, and a single
+                                // number would describe a display that is not
+                                // on screen.
+                                let n_bars = self.bar_count;
+                                let (lo_hz, hi_hz) = (self.min_freq, self.max_freq);
+                                let grid_at_hz = |sc: freq_scale::FreqScale, f: f32| {
+                                    // Straight inversion, not a search. Scanning
+                                    // every bar for the nearest centre meant a
+                                    // thousand `bar_center` calls per lookup, and
+                                    // on a blended scale each of those is a
+                                    // bisection — about a third of a million
+                                    // evaluations per frame with this panel open,
+                                    // which is what dropped the frame rate while
+                                    // it was.
+                                    let t = sc.position_of(f, lo_hz, hi_hz);
+                                    let bar = (t * n_bars as f32 - 0.5)
+                                        .round()
+                                        .clamp(0.0, n_bars.saturating_sub(1) as f32)
+                                        as usize;
+                                    sc.grid_q_at(bar, n_bars, lo_hz, hi_hz)
+                                };
+                                // What the transform is competing against, so the
+                                // labels can say "better than the FFT" and mean it.
+                                let fft_sigma = aslt::fft_sigma_hz(
+                                    self.analyzer.sample_rate, self.fft_size);
+                                let mut retune: Option<(Option<aslt::AsltPreset>, aslt::AsltConfig)> = None;
+                                ui.horizontal(|ui| {
+                                    ui.label("Quality:");
+                                    for p in [
+                                        aslt::AsltPreset::Fast, aslt::AsltPreset::Standard,
+                                        aslt::AsltPreset::High, aslt::AsltPreset::Ultra,
+                                        aslt::AsltPreset::Extreme,
+                                    ] {
+                                        let cfg = p.config();
+                                        let selected = self.analyzer.aslt_preset == Some(p);
+                                        let beats_fft = 60.0 / aslt::effective_q_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg)
+                                            < fft_sigma;
+                                        if ui.selectable_label(selected, p.label())
+                                            .on_hover_text(format!(
+                                                "Bass window {:.2} s, Q {:.0} at 60 Hz.\n{}",
+                                                aslt::window_seconds_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
+                                                aslt::effective_q_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
+                                                if beats_fft {
+                                                    "Resolves bass detail the FFT cannot reach."
+                                                } else {
+                                                    "Below FFT resolution in the bass; still much faster in the treble."
+                                                },
+                                            ))
+                                            .clicked() && !selected
+                                        {
+                                            retune = Some((Some(p), cfg));
+                                        }
+                                    }
+                                    let custom = self.analyzer.aslt_preset.is_none();
+                                    if ui.selectable_label(custom, "Custom")
+                                        .on_hover_text("Set the window budget and wavelet spread by hand.")
+                                        .clicked() && !custom
+                                    {
+                                        retune = Some((None, self.analyzer.aslt_cfg.clone()));
+                                    }
+                                });
+                                if self.analyzer.aslt_preset.is_none() {
+                                    let mut cfg = self.analyzer.aslt_cfg.clone();
+                                    let before = cfg.clone();
+                                    ui.horizontal(|ui| {
+                                        ui.label("Max window:");
+                                        ui.add(egui::Slider::new(&mut cfg.max_window_s, 0.1..=8.0)
+                                            .logarithmic(true).suffix(" s"))
+                                            .on_hover_text(
+                                                "Longest analysis window. This is the bass trade: \
+                                                 constant-Q at 20 Hz needs ~10 s, so whatever you \
+                                                 set here is where bass detail stops. Never binds \
+                                                 above ~1 kHz.");
+                                        // The same setting stated as what it
+                                        // actually decides. Both are live and
+                                        // either can be driven — the seconds are
+                                        // the cost, the hertz are the result,
+                                        // and which one someone thinks in is
+                                        // their business.
+                                        ui.label("= full detail above:");
+                                        let mut hz = aslt::full_detail_above(grid_at_hz(cfg.scale, 1000.0), &cfg);
+                                        if ui.add(egui::DragValue::new(&mut hz)
+                                            .range(30.0..=8000.0).speed(5.0).suffix(" Hz"))
+                                            .on_hover_text(
+                                                "The lowest frequency that still lands in a single \
+                                                 bar. Below it the window cap binds and a tone \
+                                                 spreads over roughly grid-Q ÷ its own Q bars — \
+                                                 that spreading is the uncertainty principle, not \
+                                                 a defect, and no setting removes it. Driving this \
+                                                 sets the window above.")
+                                            .changed()
+                                        {
+                                            cfg.max_window_s = aslt::window_for_full_detail_above(
+                                                hz, grid_at_hz(cfg.scale, hz), &cfg,
+                                            ).clamp(0.1, 8.0);
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Sharpness:");
+                                        ui.add(egui::Slider::new(&mut cfg.q_ratio, 0.25..=2.0)
+                                            .suffix("× grid"))
+                                            .on_hover_text(
+                                                "Target Q relative to the bar grid. 1.0 resolves \
+                                                 exactly what the bars can draw; above that is \
+                                                 detail the display cannot show.");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Wavelets:");
+                                        ui.add(egui::Slider::new(&mut cfg.n_wavelets, 1..=9))
+                                            .on_hover_text(
+                                                "Members per superlet. 1 is a plain wavelet transform \
+                                                 — sharpest peak, no cross-checking. More suppress \
+                                                 energy the set disagrees about.");
+                                        ui.label("Spread:");
+                                        ui.add(egui::Slider::new(&mut cfg.spread, 0.0..=0.95))
+                                            .on_hover_text(
+                                                "Shortest member as a fraction of the longest. 0 is \
+                                                 the paper's layout and costs 1.73× resolution for \
+                                                 the same time; ~0.5 keeps most of the cross-checking \
+                                                 for 1.31×.");
+                                    });
+                                    let (lens_hz, lens_oct, lens_gain) =
+                                        cfg.scale.lens().unwrap_or((1000.0, 2.0, 0.0));
+                                    ui.horizontal(|ui| {
+                                        ui.label("Bass width:");
+                                        let mut tilt = cfg.scale.tilt();
+                                        // Reversed range so dragging right
+                                        // widens the bass, which is the
+                                        // direction the label promises.
+                                        let r = ui.add(
+                                            egui::Slider::new(&mut tilt, 1.0..=-1.0)
+                                                .step_by(0.05)
+                                                .custom_formatter(|v, _| match v {
+                                                    v if v == 0.0 => "log".into(),
+                                                    v if v == 1.0 => "ERB".into(),
+                                                    v if v > 0.0 => format!("-{:.0}%", v * 100.0),
+                                                    v => format!("+{:.0}%", -v * 100.0),
+                                                }))
+                                            .on_hover_text(
+                                                "How much of the display the bass gets. 'log' is \
+                                                 constant bars per octave, the classic analyser \
+                                                 axis. 'ERB' is constant bars per auditory filter \
+                                                 (Glasberg & Moore 1990) — the bass narrows and \
+                                                 the treble opens up. Past log, the bass keeps \
+                                                 widening.\n\nThis is taste, not accuracy. A tone's \
+                                                 blur and a bassline's travel both scale with bar \
+                                                 density, so the ratio between them is the same \
+                                                 everywhere on this slider — what changes is how \
+                                                 much screen the bass gets to move across. And \
+                                                 while the window cap is binding down there, \
+                                                 which it is at any setting below about 1 s, \
+                                                 widening the bass costs no extra compute at all.\
+                                                 \n\nEach setting caches separately, so moving \
+                                                 back and forth is free after the first analysis.");
+                                        if r.changed() {
+                                            cfg.scale = freq_scale::FreqScale::from_parts(
+                                                tilt, lens_hz, lens_oct, lens_gain);
+                                        }
+                                        if ui.small_button("log").clicked() {
+                                            cfg.scale = freq_scale::FreqScale::from_parts(
+                                                0.0, lens_hz, lens_oct, lens_gain);
+                                        }
+                                        if ui.small_button("ERB").clicked() {
+                                            cfg.scale = freq_scale::FreqScale::from_parts(
+                                                1.0, lens_hz, lens_oct, lens_gain);
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Zoom:");
+                                        let mut on = lens_gain > 0.0;
+                                        if ui.checkbox(&mut on, "").changed() {
+                                            cfg.scale = freq_scale::FreqScale::from_parts(
+                                                cfg.scale.tilt(), lens_hz, lens_oct,
+                                                if on { 2.0 } else { 0.0 },
+                                            );
+                                        }
+                                        let mut hz = lens_hz;
+                                        let mut oct = lens_oct;
+                                        let mut gain = lens_gain;
+                                        let e = ui.add_enabled_ui(on, |ui| {
+                                            let a = ui.add(egui::DragValue::new(&mut hz)
+                                                .range(20.0..=20_000.0).speed(10.0).suffix(" Hz"))
+                                                .on_hover_text("Where the extra detail goes.");
+                                            let b = ui.add(egui::Slider::new(&mut oct, 0.25..=6.0)
+                                                .suffix(" oct").text(""))
+                                                .on_hover_text("How wide the magnified region is.");
+                                            let c = ui.add(egui::Slider::new(&mut gain, 0.5..=8.0)
+                                                .text("×"))
+                                                .on_hover_text(
+                                                    "How much extra detail at the centre. Bars are \
+                                                     taken from the rest of the spectrum to pay \
+                                                     for it — the count never changes.");
+                                            a.changed() || b.changed() || c.changed()
+                                        }).inner;
+                                        if e {
+                                            cfg.scale = freq_scale::FreqScale::from_parts(
+                                                cfg.scale.tilt(), hz, oct, gain);
+                                        }
+                                    });
+                                    // Zooming above the bass is not free: nothing
+                                    // caps the window up there, so packing bars in
+                                    // raises the resolution actually demanded.
+                                    // Quoted as a ratio against the same settings
+                                    // with the lens off, because a multiplier on a
+                                    // twelve-minute analysis is the part that
+                                    // matters.
+                                    if cfg.scale.lens().is_some() {
+                                        let mut flat = cfg.clone();
+                                        flat.scale =
+                                            freq_scale::FreqScale::from_tilt(cfg.scale.tilt());
+                                        let cost = |c: &aslt::AsltConfig| -> f64 {
+                                            aslt::bar_taps_per_frame(
+                                                self.analyzer.sample_rate, self.bar_count,
+                                                self.min_freq, self.max_freq, c,
+                                            ).iter().sum()
+                                        };
+                                        let (a, b) = (cost(&cfg), cost(&flat));
+                                        let ratio = if b > 0.0 { a / b } else { 1.0 };
+                                        let msg = format!("zoom costs {ratio:.2}x the analysis time");
+                                        let col = if ratio > 1.5 {
+                                            txt_warn(ui.visuals().dark_mode)
+                                        } else {
+                                            txt_dim(ui.visuals().dark_mode)
+                                        };
+                                        ui.label(egui::RichText::new(msg).size(10.0).color(col));
+                                    }
+                                    ui.label(egui::RichText::new(format!(
+                                        "60 Hz: σ {:.2} Hz over {:.2} s  ·  FFT gives σ {fft_sigma:.2} Hz over {:.0} ms  ·  10 kHz: {:.0} ms",
+                                        60.0 / aslt::effective_q_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
+                                        aslt::window_seconds_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
+                                        1000.0 * self.fft_size as f32 / self.analyzer.sample_rate as f32,
+                                        1000.0 * aslt::window_seconds_at(10_000.0, grid_at_hz(cfg.scale, 10_000.0), &cfg),
+                                    )).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
+                                    // How wide a single bass tone will actually
+                                    // draw, which is the thing people notice
+                                    // first and the hardest to predict from a
+                                    // window length in seconds.
+                                    let spread_at = |f: f32| {
+                                        let g = grid_at_hz(cfg.scale, f);
+                                        (g / aslt::effective_q_at(f, g, &cfg)).max(1.0)
+                                    };
+                                    ui.label(egui::RichText::new(format!(
+                                        "a pure tone covers ≈{:.0} bars at 60 Hz, ≈{:.0} at 200 Hz, 1 bar above {:.0} Hz",
+                                        spread_at(60.0), spread_at(200.0),
+                                        aslt::full_detail_above(grid_at_hz(cfg.scale, 1000.0), &cfg),
+                                    )).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
+                                    if cfg != before { retune = Some((None, cfg)); }
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label("Frame rate:");
+                                    let mut fps = self.analyzer.pre_fps;
+                                    if ui.add(egui::Slider::new(&mut fps, 30.0..=240.0).step_by(30.0).suffix(" fps"))
+                                        .on_hover_text("Pre-processed frames per second. Cost scales linearly, and so does cache size.")
+                                        .changed()
+                                    {
+                                        self.analyzer.pre_fps = fps;
+                                        self.try_load_or_flag_reanalysis();
+                                    }
+                                });
+                                self.compute_budget_ui(ui);
+                                if let Some((preset, cfg)) = retune {
+                                    self.analyzer.aslt_preset = preset;
+                                    self.analyzer.aslt_cfg = cfg;
+                                    self.try_load_or_flag_reanalysis();
+                                }
+                            }
                         }
                         ui.horizontal(|ui| {
                             ui.label("Smoothing:");
@@ -3583,7 +4758,7 @@ impl SpectrumWindow {
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🔄 Re-analyze now")).clicked()
                                 && let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate);
+                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
                                 let _ = std::fs::remove_file(&cache);
                                 self.analyzer.pre_frames.clear();
                                 self.analyzer.start_preprocess(p.clone());
@@ -3618,7 +4793,7 @@ impl SpectrumWindow {
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🗑 Clear Cache")).clicked()
                                 && let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate);
+                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
                                 let existed = cache.exists();
                                 let _ = std::fs::remove_file(&cache);
                                 self.analyzer.pre_frames.clear();
@@ -3633,7 +4808,7 @@ impl SpectrumWindow {
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🔄 Re-analyze")).clicked()
                                 && let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate);
+                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
                                 let _ = std::fs::remove_file(&cache);
                                 self.analyzer.pre_frames.clear();
                                 self.analyzer.start_preprocess(p.clone());
@@ -3642,12 +4817,86 @@ impl SpectrumWindow {
                             }
                             if analyzing {
                                 let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
+                                let eta = self.analyzer.eta_secs.load(Ordering::Relaxed);
                                 ui.spinner();
-                                ui.label(egui::RichText::new(format!("Analyzing… {}%", pct))
-                                    .size(11.0).color(txt_dim(ui.visuals().dark_mode)));
+                                // The ETA lives here rather than only on the plot
+                                // overlay: that overlay is gated on the plot being
+                                // silent, so during normal PCM playback — the live
+                                // FFT still drawing — it never appears at all.
+                                ui.label(egui::RichText::new(format!(
+                                    "{} {}%{}",
+                                    phase_label(pct), pct,
+                                    if eta == usize::MAX {
+                                        String::new()
+                                    } else {
+                                        format!(" — about {} left", fmt_eta(eta))
+                                    },
+                                )).size(11.0).color(txt_dim(ui.visuals().dark_mode)));
+                                if ui.add(egui::Button::new("✖ Abort").small()).clicked() {
+                                    self.analyzer.abort_preprocess();
+                                    self.status_msg = "Analysis aborted.".into();
+                                }
                             } else if !self.status_msg.is_empty() {
                                 ui.label(egui::RichText::new(&self.status_msg)
                                     .size(11.0).color(txt_dim(ui.visuals().dark_mode)));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Budget:");
+                            let mut unlimited = self.analyzer.cache_budget_gb <= 0.0;
+                            if ui.checkbox(&mut unlimited, "Unlimited")
+                                .on_hover_text("No eviction — the cache grows until you clear it.")
+                                .changed()
+                            {
+                                self.analyzer.cache_budget_gb =
+                                    if unlimited { 0.0 } else { DEFAULT_CACHE_BUDGET_GB };
+                            }
+                            if !unlimited {
+                                let mut gb = self.analyzer.cache_budget_gb;
+                                // Logarithmic: the useful range runs from a
+                                // couple of superlet tracks to a whole library,
+                                // which linear steps cannot cover usefully.
+                                let changed = ui.add(egui::Slider::new(&mut gb, 0.1..=500.0)
+                                    .logarithmic(true)
+                                    .suffix(" GB")
+                                    .custom_formatter(|v, _| if v < 1.0 {
+                                        format!("{:.0} MB", v * 1000.0)
+                                    } else {
+                                        format!("{v:.1}")
+                                    }))
+                                    .on_hover_text(
+                                        "Ceiling on the whole cache directory. Least-recently-used \
+                                         files are evicted after each analysis to stay under it. \
+                                         Type a number here to set it exactly.\n\nA superlet track \
+                                         at 180 fps costs 45–80 MB and cannot be packed much \
+                                         smaller — the low byte of every stored value is \
+                                         quantisation noise, so no lossless coder beats ~12 %. \
+                                         Bounding the total is the real control.")
+                                    .changed();
+                                if changed { self.analyzer.cache_budget_gb = gb.max(0.05); }
+                                // What that budget actually holds, in the units
+                                // the user is spending it in.
+                                let per_track = 60.0; // MB, typical superlet track
+                                ui.label(egui::RichText::new(format!(
+                                    "≈ {:.0} superlet tracks", gb * 1000.0 / per_track,
+                                )).size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            }
+                            let busy = self.analyzer.is_analyzing.load(Ordering::Relaxed);
+                            if ui.add_enabled(
+                                self.analyzer.cache_budget_gb > 0.0 && !busy,
+                                egui::Button::new("Trim now").small(),
+                            ).on_hover_text("Evict least-recently-used caches down to the budget.")
+                                .clicked()
+                            {
+                                let budget = (self.analyzer.cache_budget_gb as f64 * 1e9) as u64;
+                                let (n, freed) = evict_cache_to_budget(budget, None);
+                                self.cache_stats_at = None;
+                                self.status_msg = if n == 0 {
+                                    "Cache already within budget.".into()
+                                } else {
+                                    format!("Removed {n} cache file(s), freed {:.1} MB",
+                                            freed as f64 / 1e6)
+                                };
                             }
                         });
                         let (count, bytes) = self.cache_stats;
@@ -3663,6 +4912,12 @@ impl SpectrumWindow {
                                 format!("Cache: {} file{} — {}", count, if count == 1 { "" } else { "s" }, size_str))
                                 .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
                             let analyzing = self.analyzer.is_analyzing.load(Ordering::Relaxed);
+                            let over = self.analyzer.cache_budget_gb > 0.0
+                                && bytes as f64 > self.analyzer.cache_budget_gb as f64 * 1e9;
+                            if over {
+                                ui.label(egui::RichText::new("over budget")
+                                    .size(10.0).color(Color32::from_rgb(220, 160, 60)));
+                            }
                             if ui.add_enabled(count > 0 && !analyzing,
                                 egui::Button::new("🗑 Clear All").small()).clicked() {
                                 let dir = home_dir().join(".moosik").join("cache");
@@ -3915,7 +5170,7 @@ impl SpectrumWindow {
                                     let eq = self.eq_state.lock().unwrap();
                                     let fp = eq.fingerprint();
                                     drop(eq);
-                                    let mut cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate);
+                                    let mut cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
                                     // Append EQ fingerprint to filename stem
                                     let stem = cache.file_stem().unwrap_or_default().to_string_lossy().to_string();
                                     cache.set_file_name(format!("{}_eq{:016x}.spectrumcache", stem, fp));
@@ -4383,30 +5638,8 @@ impl SpectrumWindow {
                         VizStyle::Line       => draw_line(&painter, mags, plot_rect, pal.line()),
                         VizStyle::FilledArea => draw_filled(&painter, mags, plot_rect, &pal),
                         VizStyle::Waterfall  => {
-                            if self.analyzer.waterfall_dirty {
-                                if let Some(img) = waterfall_to_color_image(&self.analyzer.waterfall, &pal) {
-                                    if let Some(ref mut th) = self.waterfall_texture {
-                                        th.set(img, egui::TextureOptions::NEAREST);
-                                    } else {
-                                        let th = vp_ctx.load_texture(
-                                            "moosik_waterfall", img,
-                                            egui::TextureOptions::NEAREST,
-                                        );
-                                        self.waterfall_texture = Some(th);
-                                    }
-                                }
-                                self.analyzer.waterfall_dirty = false;
-                            }
-                            if let Some(ref th) = self.waterfall_texture {
-                                painter.image(
-                                    th.id(), plot_rect,
-                                    egui::Rect::from_min_max(
-                                        egui::Pos2::ZERO,
-                                        egui::Pos2::new(1.0, 1.0),
-                                    ),
-                                    Color32::WHITE,
-                                );
-                            }
+                            self.update_waterfall_texture(vp_ctx, &pal);
+                            self.draw_waterfall(&painter, plot_rect);
                         },
                         VizStyle::Spectrogram => {
                             if self.spectrogram.dirty {
@@ -4482,6 +5715,31 @@ impl SpectrumWindow {
                                 let fill = Rect::from_min_size(bar.min, egui::Vec2::new(fill_w, 6.0));
                                 painter.rect_filled(fill, 3.0, pal.line());
                             }
+                            // Superlet analyses run for minutes, not seconds, so
+                            // the wait needs a number attached to it and a way
+                            // out. Both are shown for every mode — an ETA is
+                            // just as welcome on a fast one.
+                            let eta = self.analyzer.eta_secs.load(Ordering::Relaxed);
+                            painter.text(
+                                Pos2::new(center.x, center.y + 26.0),
+                                egui::Align2::CENTER_CENTER,
+                                if eta == usize::MAX {
+                                    "estimating…".to_string()
+                                } else {
+                                    format!("about {} remaining", fmt_eta(eta))
+                                },
+                                egui::FontId::proportional(11.0),
+                                Color32::from_gray(140),
+                            );
+                            let abort_rect = Rect::from_center_size(
+                                Pos2::new(center.x, center.y + 48.0),
+                                egui::Vec2::new(76.0, 22.0),
+                            );
+                            if ui.put(abort_rect, egui::Button::new(
+                                egui::RichText::new("Abort").size(11.0)
+                            )).clicked() {
+                                self.analyzer.abort_preprocess();
+                            }
                         } else if is_dsd && self.mode == SpectrumMode::RealTime {
                             painter.text(
                                 plot_rect.center(),
@@ -4510,17 +5768,17 @@ impl SpectrumWindow {
                         let draw_curve = matches!(self.eq_overlay, EqOverlayMode::Curve | EqOverlayMode::Both);
                         draw_eq_overlay(&painter, &bands, sr, plot_rect,
                             self.min_freq, self.max_freq, draw_curve,
-                            self.eq_hovered_node, self.eq_dragging_node);
+                            self.eq_hovered_node, self.eq_dragging_node,
+                            self.analyzer.aslt_cfg.scale);
 
                         // Mouse hit-test: find nearest node within 14px
-                        let log_min  = self.min_freq.log10();
-                        let log_span = (self.max_freq.log10() - log_min).max(1e-6);
 
                         if let Some(ptr) = spec_response.hover_pos() {
                             self.eq_hovered_node = None;
                             for (i, band) in bands.iter().enumerate() {
                                 if !band.enabled { continue; }
-                                let np = eq_node_pos(band, plot_rect, self.min_freq, self.max_freq);
+                                let np = eq_node_pos(band, plot_rect, self.min_freq, self.max_freq,
+                                                     self.analyzer.aslt_cfg.scale);
                                 if (np - ptr).length() < 14.0 {
                                     self.eq_hovered_node = Some(i);
                                     break;
@@ -4541,8 +5799,16 @@ impl SpectrumWindow {
                                 let mut eq = self.eq_state.lock().unwrap();
                                 if let Some(band) = eq.bands.get_mut(drag_idx) {
                                     // Horizontal → frequency (log scale)
-                                    let freq_delta = delta.x / plot_rect.width() * log_span;
-                                    band.freq = (band.freq * 10f32.powf(freq_delta)).clamp(20.0, 20_000.0);
+                                    // Along whichever axis is on screen, so the
+                                    // node tracks the pointer instead of
+                                    // sliding away from it.
+                                    let fscale = self.analyzer.aslt_cfg.scale;
+                                    let t = fscale.position_of(
+                                        band.freq, self.min_freq, self.max_freq,
+                                    ) + delta.x / plot_rect.width();
+                                    band.freq = fscale
+                                        .freq_at(t.clamp(0.0, 1.0), self.min_freq, self.max_freq)
+                                        .clamp(20.0, 20_000.0);
                                     // Vertical → gain
                                     if band.kind.has_gain() {
                                         let db_per_px = EQ_DB_RANGE / (plot_rect.height() * 0.5);
@@ -4566,7 +5832,9 @@ impl SpectrumWindow {
                             && let Some(click) = spec_response.interact_pointer_pos()
                             && plot_rect.contains(click) {
                             let t = (click.x - plot_rect.left()) / plot_rect.width();
-                            let freq = 10f32.powf(log_min + t * log_span).clamp(20.0, 20_000.0);
+                            let freq = self.analyzer.aslt_cfg.scale
+                                .freq_at(t, self.min_freq, self.max_freq)
+                                .clamp(20.0, 20_000.0);
                             let db_per_px = EQ_DB_RANGE / (plot_rect.height() * 0.5);
                             let gain = ((plot_rect.center().y - click.y) * db_per_px).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
                             let mut eq = self.eq_state.lock().unwrap();
@@ -4602,6 +5870,51 @@ impl SpectrumWindow {
                             Color32::from_rgba_unmultiplied(180, 220, 180, 160),
                         );
                     }
+                    // Analysis progress, wherever the plot happens to be.
+                    //
+                    // The centred "Analyzing..." text below only appears when
+                    // there is nothing else to draw, so re-analysing a track
+                    // that already has frames on screen used to show no
+                    // progress at all unless the Cache panel was open — which
+                    // is not somewhere anyone would think to look for it.
+                    if self.analyzer.is_analyzing.load(Ordering::Relaxed)
+                        && !self.analyzer.pre_frames.is_empty()
+                    {
+                        let dark = ui.visuals().dark_mode;
+                        let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
+                        let eta = self.analyzer.eta_secs.load(Ordering::Relaxed);
+                        let text = if eta == usize::MAX {
+                            format!("analysing {pct}%")
+                        } else {
+                            format!("analysing {pct}%  ~{}", fmt_eta(eta))
+                        };
+                        let pos = Pos2::new(rect.right() - 8.0, rect.top() + 6.0);
+                        let gal = painter.layout_no_wrap(
+                            text, egui::FontId::monospace(11.0), txt_accent(dark),
+                        );
+                        let bg = egui::Rect::from_min_size(
+                            Pos2::new(pos.x - gal.size().x - 6.0, pos.y - 3.0),
+                            gal.size() + egui::vec2(12.0, 6.0),
+                        );
+                        painter.rect_filled(
+                            bg, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 120));
+                        // A bar under the text, so the rate is readable at a
+                        // glance without reading the number.
+                        let track = egui::Rect::from_min_size(
+                            Pos2::new(bg.left() + 4.0, bg.bottom() + 2.0),
+                            egui::vec2(bg.width() - 8.0, 2.0),
+                        );
+                        painter.rect_filled(
+                            track, 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40));
+                        let done = egui::Rect::from_min_size(
+                            track.min,
+                            egui::vec2(track.width() * (pct as f32 / 100.0).clamp(0.0, 1.0), 2.0),
+                        );
+                        painter.rect_filled(done, 1.0, txt_accent(dark));
+                        painter.galley(
+                            Pos2::new(bg.left() + 6.0, bg.top() + 3.0), gal, txt_accent(dark));
+                    }
+
                     // Debug overlay (F3)
                     if self.show_debug {
                         let interp_name = format!("{:?}", self.interp_mode);
@@ -4609,12 +5922,13 @@ impl SpectrumWindow {
                         let mode_name = format!("{:?}", self.mode);
                         let analyzing = self.analyzer.is_analyzing.load(Ordering::Relaxed);
                         let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
-                        let lines = vec![
+                        let mut lines = vec![
                             format!("── Spectrum Debug ──────────────────"),
                             format!("Mode:        {}", mode_name),
                             format!("FFT size:    {}  pad: {}×  padded: {}", self.fft_size, self.pad_factor, self.fft_size * self.pad_factor),
-                            format!("Overlap:     {:.0}%  hop: {} smp", self.overlap * 100.0,
-                                ((self.fft_size as f32 * (1.0 - self.overlap)).round() as usize).max(1)),
+                            format!("Overlap:     {:.0}%  hop: {} smp ({:.1} fps)", self.overlap * 100.0,
+                                self.analyzer.pre_hop(),
+                                self.analyzer.sample_rate as f32 / self.analyzer.pre_hop() as f32),
                             format!("Interp:      {}  mapping: {}", interp_name, mapping_name),
                             format!("Bars:        {}  sr: {} Hz", self.bar_count, self.analyzer.sample_rate),
                             format!("freq range:  {:.0}–{:.0} Hz", self.min_freq, self.max_freq),
@@ -4629,6 +5943,65 @@ impl SpectrumWindow {
                             format!("Correlation: {:.3}", self.correlation),
                             format!("FFT norms:   {} bins", self.analyzer.last_fft_norms.len()),
                         ];
+
+                        // Where the last pre-process actually spent itself.
+                        //
+                        // A GPU monitor reads the device at a fraction of its
+                        // capacity during an analysis, and the obvious reading
+                        // — "the shader is too small" — is wrong. The phases
+                        // inside a group run one after another, so the device
+                        // idles through everything that is not `device`. This
+                        // panel shows that directly, because four rewrites of
+                        // this path were aimed at the wrong phase for want of
+                        // exactly these six numbers.
+                        let st = aslt::stats();
+                        lines.push("── Pre-process cost ────────────────".into());
+                        if st.total_s <= 0.0 {
+                            lines.push("(no analysis has run this session)".into());
+                        } else {
+                            lines.push(format!("Wall clock:  {:.2} s", st.total_s));
+                            lines.push(format!(
+                                "Route:       {}",
+                                match aslt::gpu_device_name() {
+                                    Some(n) if st.used_gpu() => n,
+                                    Some(n) => format!("{n} (idle — no batch qualified)"),
+                                    None => "CPU only (no device)".into(),
+                                },
+                            ));
+                            if st.used_gpu() {
+                                lines.push(format!(
+                                    "Bars:        {} on device, {} on cores",
+                                    st.gpu_bars, st.cpu_bars,
+                                ));
+                                lines.push(format!(
+                                    "Batches:     {}  kernels: {}", st.chunks, st.kernels,
+                                ));
+                                // Thread-summed, so these exceed wall clock on a
+                                // parallel run; they are for weighing the phases
+                                // against each other, which is the whole point.
+                                lines.push(format!(
+                                    "  build      {:>7.2} s   (kernel taps)", st.build_s,
+                                ));
+                                lines.push(format!(
+                                    "  stage      {:>7.2} s   (signal upload)", st.stage_s,
+                                ));
+                                lines.push(format!(
+                                    "  device     {:>7.2} s   (GPU)", st.device_s,
+                                ));
+                                lines.push(format!(
+                                    "  fill       {:>7.2} s   (edges + CPU wavelets)", st.fill_s,
+                                ));
+                                lines.push(format!(
+                                    "Device duty: {:.0}% of the whole analysis",
+                                    st.device_duty() * 100.0,
+                                ));
+                            }
+                            // Which block sizes this machine has decided on.
+                            // "(probe)" means the synthetic bootstrap is still
+                            // in charge and real A/B samples are still coming.
+                            lines.push("── Calibration (this machine) ──────".into());
+                            lines.extend(gpu_calib::describe());
+                        }
                         let x = rect.left() + 8.0;
                         let mut y = rect.top() + 20.0;
                         let line_h = 13.0;
@@ -4659,5 +6032,560 @@ impl SpectrumWindow {
         // Record the wall-clock cost of this full draw (EMA-smoothed).
         let ms = show_start.elapsed().as_secs_f32() * 1000.0;
         self.draw_ms = self.draw_ms * 0.9 + ms * 0.1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod waterfall_ring_tests {
+    use super::*;
+
+    /// Every row must be shown exactly once, and at the right size.
+    ///
+    /// The ring is drawn as two quads and the split has to line up with where
+    /// the texture wraps — get it wrong by a row and the whole display is
+    /// stretched or a row is drawn twice, which is the sort of thing that looks
+    /// almost right and never gets noticed.
+    #[test]
+    fn slices_tile_the_texture_exactly_once() {
+        let h = WATERFALL_ROWS;
+        for head in 0..h {
+            let (split, top, bot) = waterfall_slices(head, h);
+            assert!((0.0..=1.0).contains(&split), "head {head}: split {split}");
+            // The two v-ranges must cover [0,1] with no gap and no overlap.
+            assert!((bot.0 - 0.0).abs() < 1e-6);
+            assert!((top.1 - 1.0).abs() < 1e-6);
+            assert!((bot.1 - top.0).abs() < 1e-6, "head {head}: gap at the seam");
+            // Each quad's share of the screen must equal its share of the
+            // texture, or its rows are scaled differently from the other's.
+            assert!((split - (top.1 - top.0)).abs() < 1e-6,
+                    "head {head}: top quad stretched");
+            assert!(((1.0 - split) - (bot.1 - bot.0)).abs() < 1e-6,
+                    "head {head}: bottom quad stretched");
+        }
+    }
+
+    /// Rows are written backwards, so the newest sits at `head + 1` — which is
+    /// exactly where the top of the screen starts reading.
+    #[test]
+    fn the_newest_row_lands_at_the_top() {
+        let h = WATERFALL_ROWS;
+        // Just after writing row `t`, the head has moved back to `t - 1`.
+        for t in [0usize, 1, 7, h - 1] {
+            let head = (t + h - 1) % h;
+            let (_, top, bot) = waterfall_slices(head, h);
+            let newest_v = t as f32 / h as f32;
+            // The newest row is the first row the top quad shows — unless it is
+            // row 0, in which case the top quad is empty and the bottom starts there.
+            let starts_at = if top.1 > top.0 { top.0 } else { bot.0 };
+            assert!((starts_at - newest_v).abs() < 1e-6,
+                    "row {t}: screen starts at {starts_at}, newest is at {newest_v}");
+        }
+    }
+
+    /// A full wrap must return to where it started, or the ring drifts.
+    #[test]
+    fn writing_a_full_ring_returns_the_head() {
+        let h = WATERFALL_ROWS;
+        let mut head = 0usize;
+        for _ in 0..h { head = (head + h - 1) % h; }
+        assert_eq!(head, 0);
+    }
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::*;
+
+    fn key(bm: &BarMappingMode, cfg: &aslt::AsltConfig, fps: f32) -> String {
+        cache_path_for(
+            &PathBuf::from("/music/track.flac"), 1024, 8192, 16, 0.875,
+            &WindowFn::Hann, 20.0, 24_000.0, bm, &InterpolationMode::None,
+            crate::dsd::decimate::DEFAULT_ANALYSIS_RATE, cfg, fps,
+        )
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+    }
+
+    /// The failure this guards against is silent: without the superlet
+    /// parameters in the key, switching Fast → Extreme reloads the Fast cache
+    /// and the display never changes, which reads as "the preset does nothing"
+    /// rather than as a bug.
+    #[test]
+    fn superlet_params_change_the_cache_key() {
+        let fast = aslt::AsltPreset::Fast.config();
+        let extreme = aslt::AsltPreset::Extreme.config();
+        let bm = BarMappingMode::Superlet;
+        assert_ne!(key(&bm, &fast, 180.0), key(&bm, &extreme, 180.0));
+        // Frame rate is a free parameter here, so it has to be in the key too.
+        assert_ne!(key(&bm, &fast, 180.0), key(&bm, &fast, 60.0));
+    }
+
+    /// A superlet cache must never be mistaken for an FFT one, even though the
+    /// FFT knobs are zeroed out of its key.
+    #[test]
+    fn superlet_never_collides_with_fft_modes() {
+        let cfg = aslt::AsltPreset::Standard.config();
+        let slt = key(&BarMappingMode::Superlet, &cfg, 180.0);
+        for bm in [BarMappingMode::FlatOverlap, BarMappingMode::Gaussian, BarMappingMode::Cqt] {
+            assert_ne!(slt, key(&bm, &cfg, 180.0));
+        }
+    }
+
+    /// Existing caches must stay valid: superlet settings are invisible to the
+    /// FFT modes, and so is the pre-process frame rate.
+    #[test]
+    fn fft_keys_ignore_superlet_settings() {
+        let a = aslt::AsltPreset::Fast.config();
+        let b = aslt::AsltPreset::Extreme.config();
+        for bm in [BarMappingMode::FlatOverlap, BarMappingMode::Gaussian, BarMappingMode::Cqt] {
+            assert_eq!(key(&bm, &a, 180.0), key(&bm, &b, 60.0));
+        }
+    }
+
+    /// Every stage must be named. A bar frozen at 50 % with no label was read as
+    /// a hang; the same freeze labelled "Loudness/key…" is just slow.
+    #[test]
+    fn every_progress_value_has_a_phase() {
+        assert_eq!(phase_label(0), "Decoding…");
+        assert_eq!(phase_label(PROG_DECODE_END), "Decoding…");
+        assert_eq!(phase_label(PROG_DECODE_END + 1), "Loudness/key…");
+        assert_eq!(phase_label(PROG_LOUDNESS_END), "Loudness/key…");
+        assert_eq!(phase_label(50), "Transform…");
+        assert_eq!(phase_label(99), "Transform…");
+        assert_eq!(phase_label(100), "Finishing…");
+    }
+
+    /// Progress must never twitch backwards, however the threads interleave.
+    #[test]
+    fn progress_only_moves_forward() {
+        let p = Arc::new(AtomicUsize::new(0));
+        for v in [10usize, 40, 25, 55, 51, 99, 70] {
+            store_progress_max(&p, v);
+        }
+        assert_eq!(p.load(Ordering::Relaxed), 99);
+    }
+
+    /// A repeat of the track being analysed must not cancel the analysis.
+    ///
+    /// `on_play` fires again on every loop, and it used to call `reset()`, which
+    /// aborts. A superlet run lasting longer than the track could therefore
+    /// never finish: each repeat sent it back to zero, for ever.
+    #[test]
+    fn repeat_keeps_the_running_analysis() {
+        let mut a = SpectrumAnalyzer::new(new_sample_buf());
+        let (_tx, rx) = std::sync::mpsc::channel::<PreMessage>();
+        a.pre_receiver = Some(rx);
+        a.is_analyzing.store(true, Ordering::Relaxed);
+        a.analysis_progress.store(63, Ordering::Relaxed);
+        a.analyzing_path = Some(PathBuf::from("/music/track.flac"));
+        let abort = Arc::clone(&a.abort_analysis);
+
+        a.reset_keeping_analysis();
+
+        assert!(a.pre_receiver.is_some(), "receiver dropped — the result would be stranded");
+        assert!(a.is_analyzing.load(Ordering::Relaxed), "analysis flag cleared");
+        assert!(!abort.load(Ordering::Relaxed), "analysis was told to abort");
+        assert_eq!(a.analysis_progress.load(Ordering::Relaxed), 63, "progress was reset");
+        assert!(a.analyzing_path.is_some());
+    }
+
+    /// …but a genuine track change still cancels, so two multi-minute runs never
+    /// overlap.
+    #[test]
+    fn track_change_cancels_the_running_analysis() {
+        let mut a = SpectrumAnalyzer::new(new_sample_buf());
+        let (_tx, rx) = std::sync::mpsc::channel::<PreMessage>();
+        a.pre_receiver = Some(rx);
+        a.is_analyzing.store(true, Ordering::Relaxed);
+        a.analyzing_path = Some(PathBuf::from("/music/track.flac"));
+        let abort = Arc::clone(&a.abort_analysis);
+
+        a.reset();
+
+        assert!(abort.load(Ordering::Relaxed), "old run was not told to stop");
+        assert!(a.pre_receiver.is_none());
+        assert!(a.analyzing_path.is_none());
+    }
+
+    /// Measurement, not a test: try candidate cache encodings against a real
+    /// file on this machine and print what each would have saved.
+    ///
+    /// `cargo test --release -- --ignored --nocapture cache_encoding_survey`
+    #[test]
+    #[ignore = "measurement — needs a populated cache, run explicitly"]
+    fn cache_encoding_survey() {
+        let dir = home_dir().join(".moosik").join("cache");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            println!("no cache dir at {}", dir.display());
+            return;
+        };
+        let mut best: Option<(u64, PathBuf)> = None;
+        for e in entries.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.extension().map(|x| x == "spectrumcache").unwrap_or(false)
+                && let Ok(m) = e.metadata()
+                && best.as_ref().is_none_or(|(len, _)| m.len() > *len)
+            {
+                best = Some((m.len(), p));
+            }
+        }
+        let Some((on_disk, path)) = best else { println!("cache is empty"); return; };
+
+        let raw = std::fs::read(&path).unwrap();
+        let frames = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+        let bars = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+        let flat = lz4_flex::decompress_size_prepended(&raw[12..]).unwrap();
+        let vals: Vec<u16> = flat
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        println!("\n{}", path.file_name().unwrap().to_string_lossy());
+        println!("{frames} frames x {bars} bars = {:.1} MB raw, {:.1} MB on disk\n",
+                 flat.len() as f64 / 1e6, on_disk as f64 / 1e6);
+
+        let mb = |b: usize| b as f64 / 1e6;
+        let report = |name: &str, bytes: Vec<u8>| {
+            let c = lz4_flex::compress_prepend_size(&bytes).len();
+            println!("{name:<34} {:>7.1} MB  ({:.2}x vs raw)", mb(c), flat.len() as f64 / c as f64);
+        };
+
+        report("current: u16 interleaved", flat.clone());
+
+        // Delta along time: consecutive frames overlap ~97 % at 180 fps, so the
+        // difference should be small even though the absolute values are not.
+        let zig = |d: i32| ((d << 1) ^ (d >> 31)) as u32 as u16;
+        let mut dt = Vec::with_capacity(flat.len());
+        for f in 0..frames {
+            for b in 0..bars {
+                let cur = vals[f * bars + b] as i32;
+                let prev = if f == 0 { 0 } else { vals[(f - 1) * bars + b] as i32 };
+                dt.extend_from_slice(&zig(cur - prev).to_le_bytes());
+            }
+        }
+        report("delta-in-time, zigzag", dt.clone());
+
+        // Same, but with the two bytes of every value separated. The high byte
+        // carries the picture and should compress; the low byte is mostly
+        // quantisation noise and will not, so interleaving them lets the noise
+        // spoil the whole stream.
+        let split = |src: &[u8]| {
+            let mut out = Vec::with_capacity(src.len());
+            out.extend(src.iter().skip(1).step_by(2));
+            out.extend(src.iter().step_by(2));
+            out
+        };
+        report("delta-in-time, byte planes", split(&dt));
+        report("plain, byte planes", split(&flat));
+
+        // Delta across frequency instead — neighbouring bars are correlated too.
+        let mut df = Vec::with_capacity(flat.len());
+        for f in 0..frames {
+            for b in 0..bars {
+                let cur = vals[f * bars + b] as i32;
+                let prev = if b == 0 { 0 } else { vals[f * bars + b - 1] as i32 };
+                df.extend_from_slice(&zig(cur - prev).to_le_bytes());
+            }
+        }
+        report("delta-in-freq, byte planes", split(&df));
+
+        // How much of the cost is the noisy low byte? Upper bound on any
+        // lossless scheme that keeps all 16 bits.
+        let hi: Vec<u8> = vals.iter().map(|v| (v >> 8) as u8).collect();
+        let mut hi_dt = Vec::with_capacity(hi.len());
+        for f in 0..frames {
+            for b in 0..bars {
+                let cur = hi[f * bars + b] as i32;
+                let prev = if f == 0 { 0 } else { hi[(f - 1) * bars + b] as i32 };
+                hi_dt.push(((cur - prev) as i8) as u8);
+            }
+        }
+        let hi_c = lz4_flex::compress_prepend_size(&hi_dt).len();
+        println!("\n  high byte alone, delta-in-time: {:.1} MB.", mb(hi_c));
+        println!("  So a lossless scheme cannot beat ~{:.0} MB: the low byte is {:.0} MB \
+                  of uniform noise and no coder compresses that.\n",
+                 mb(hi_c) + mb(vals.len()), mb(vals.len()));
+
+        // Bit depth is therefore the only real lever. The stored value spans an
+        // 80 dB display range, so a level is 80/2^bits dB — compare that with
+        // what one screen pixel is worth.
+        println!("{:<34} {:>7}  {:>9}  {:>10}", "bit depth", "size", "dB/level", "vs 4K px");
+        for bits in [16u32, 14, 12, 11, 10, 8] {
+            let levels = 1u32 << bits;
+            let q: Vec<u16> = vals
+                .iter()
+                .map(|&v| {
+                    let step = 65_536 / levels;
+                    (v / step as u16) * step as u16
+                })
+                .collect();
+            let mut d = Vec::with_capacity(q.len() * 2);
+            for f in 0..frames {
+                for b in 0..bars {
+                    let cur = q[f * bars + b] as i32;
+                    let prev = if f == 0 { 0 } else { q[(f - 1) * bars + b] as i32 };
+                    d.extend_from_slice(&zig(cur - prev).to_le_bytes());
+                }
+            }
+            let c = lz4_flex::compress_prepend_size(&split(&d)).len();
+            let db_per_level = 80.0 / levels as f64;
+            // A 4K panel is 2160 px tall; the plot gets most of that.
+            let db_per_px = 80.0 / 2160.0;
+            println!("{:<34} {:>7.1} MB {:>9.4} {:>9.1}x",
+                     format!("  {bits}-bit, delta, planes"), mb(c), db_per_level,
+                     db_per_level / db_per_px);
+        }
+        println!("\n  A level coarser than 1.0x a 4K pixel is visible banding; finer is not.");
+    }
+
+    /// v3 must survive a round trip to within its own quantisation step, and v2
+    /// files must still load — there are gigabytes of them on real machines.
+    #[test]
+    fn cache_round_trips_and_reads_v2() {
+        let n_bars = 64;
+        let frames: Vec<Vec<f32>> = (0..40)
+            .map(|f| {
+                (0..n_bars)
+                    .map(|b| {
+                        let x = (f as f32 * 0.13 + b as f32 * 0.017).sin() * 0.5 + 0.5;
+                        x.clamp(0.0, 1.0)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let p = std::env::temp_dir().join("moosik_cache_v3_roundtrip.spectrumcache");
+        let _ = std::fs::remove_file(&p);
+        save_cache(&p, &frames);
+        let back = load_cache(&p, n_bars).expect("v3 failed to load");
+        assert_eq!(back.len(), frames.len());
+        let worst = frames.iter().flatten().zip(back.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // One u16 step is 1/65535; rounding can cost half of one either way.
+        assert!(worst <= 1.0 / 65535.0 + 1e-7, "round trip lost {worst}");
+
+        // Hand-build a v2 file and check the reader still accepts it.
+        let mut payload = Vec::new();
+        for row in &frames {
+            for &v in row {
+                payload.extend_from_slice(&(((v * 65535.0).round()) as u16).to_le_bytes());
+            }
+        }
+        let comp = lz4_flex::compress_prepend_size(&payload);
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&CACHE_MAGIC.to_le_bytes());
+        blob.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&(n_bars as u32).to_le_bytes());
+        blob.extend_from_slice(&comp);
+        let p2 = std::env::temp_dir().join("moosik_cache_v2_compat.spectrumcache");
+        std::fs::write(&p2, &blob).unwrap();
+        let old = load_cache(&p2, n_bars).expect("v2 file no longer loads");
+        let worst_v2 = frames.iter().flatten().zip(old.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst_v2 <= 1.0 / 65535.0 + 1e-7);
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    /// A cache written for a different bar count must be rejected, not
+    /// reinterpreted — the v3 reader indexes two planes and would read garbage.
+    #[test]
+    fn cache_rejects_mismatched_bar_count() {
+        let frames: Vec<Vec<f32>> = (0..8).map(|_| vec![0.5f32; 32]).collect();
+        let p = std::env::temp_dir().join("moosik_cache_bars_mismatch.spectrumcache");
+        let _ = std::fs::remove_file(&p);
+        save_cache(&p, &frames);
+        assert!(load_cache(&p, 64).is_none(), "accepted a 32-bar cache as 64 bars");
+        assert!(load_cache(&p, 32).is_some());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Eviction must free enough, take the oldest first, and touch nothing that
+    /// is not a cache file.
+    #[test]
+    fn eviction_removes_oldest_until_under_budget() {
+        let dir = std::env::temp_dir().join("moosik_evict_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 5 files of 1000 bytes, written oldest-first.
+        let mut paths = Vec::new();
+        for i in 0..5 {
+            let p = dir.join(format!("f{i}.spectrumcache"));
+            std::fs::write(&p, vec![0u8; 1000]).unwrap();
+            // Space the timestamps so the sort is unambiguous.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            paths.push(p);
+        }
+        let innocent = dir.join("notes.txt");
+        std::fs::write(&innocent, vec![0u8; 4000]).unwrap();
+
+        // 5000 bytes against a 3000 budget: drop the two oldest, landing exactly
+        // on the limit.
+        let (removed, freed) = evict_in_dir(&dir, 3000, None);
+        assert_eq!(removed, 2, "removed {removed}, expected 2");
+        assert_eq!(freed, 2000);
+        assert!(!paths[0].exists() && !paths[1].exists(), "oldest not evicted first");
+        assert!(paths[2].exists() && paths[3].exists() && paths[4].exists());
+        assert!(innocent.exists(), "deleted a file that was not a cache");
+
+        // Already under budget: nothing happens.
+        assert_eq!(evict_in_dir(&dir, 10_000, None), (0, 0));
+
+        // `keep` is spared even when it is the oldest.
+        let (removed, _) = evict_in_dir(&dir, 1000, Some(&paths[2]));
+        assert!(paths[2].exists(), "kept file was evicted anyway");
+        assert!(removed >= 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eta_wording_is_coarse() {
+        assert_eq!(fmt_eta(0), "a few seconds");
+        assert_eq!(fmt_eta(45), "45s");
+        assert_eq!(fmt_eta(150), "3m");
+        assert_eq!(fmt_eta(3600), "1h");
+        assert_eq!(fmt_eta(4500), "1h 15m");
+    }
+}
+
+#[cfg(test)]
+mod superlet_pipeline_tests {
+    use super::*;
+
+    /// Minimal 16-bit mono WAV. Hand-rolled rather than pulling in a writer
+    /// crate for four tests.
+    fn write_wav(path: &PathBuf, samples: &[f32], sr: u32) {
+        let data: Vec<u8> = samples
+            .iter()
+            .flat_map(|&s| ((s.clamp(-1.0, 1.0) * 32_767.0) as i16).to_le_bytes())
+            .collect();
+        let mut out = Vec::with_capacity(44 + data.len());
+        out.extend(b"RIFF");
+        out.extend(((36 + data.len()) as u32).to_le_bytes());
+        out.extend(b"WAVEfmt ");
+        out.extend(16u32.to_le_bytes());
+        out.extend(1u16.to_le_bytes());   // PCM
+        out.extend(1u16.to_le_bytes());   // mono
+        out.extend(sr.to_le_bytes());
+        out.extend((sr * 2).to_le_bytes());
+        out.extend(2u16.to_le_bytes());
+        out.extend(16u16.to_le_bytes());
+        out.extend(b"data");
+        out.extend((data.len() as u32).to_le_bytes());
+        out.extend(data);
+        std::fs::write(path, out).expect("write wav");
+    }
+
+    struct Fixture { wav: PathBuf, cache: PathBuf }
+
+    impl Fixture {
+        fn new(tag: &str, freq: f32, secs: f32, sr: u32) -> Self {
+            let dir = std::env::temp_dir();
+            let wav = dir.join(format!("moosik_aslt_{tag}.wav"));
+            let cache = dir.join(format!("moosik_aslt_{tag}.spectrumcache"));
+            let n = (secs * sr as f32) as usize;
+            let sig: Vec<f32> = (0..n)
+                .map(|i| 0.8 * (std::f32::consts::TAU * freq * i as f32 / sr as f32).sin())
+                .collect();
+            write_wav(&wav, &sig, sr);
+            let _ = std::fs::remove_file(&cache);
+            Self { wav, cache }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.wav);
+            let _ = std::fs::remove_file(&self.cache);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(f: &Fixture, n_bars: usize, fps: f32, abort: &Arc<AtomicBool>) -> PreMessage {
+        preprocess_file(
+            &f.wav, &f.cache, 44_100, n_bars,
+            &Arc::new(AtomicUsize::new(0)),
+            8192, 16, 0.875, &WindowFn::Hann, 200.0, 5000.0,
+            &InterpolationMode::None, &BarMappingMode::Superlet,
+            crate::dsd::decimate::DEFAULT_ANALYSIS_RATE,
+            &aslt::AsltPreset::Fast.config(), fps, abort,
+            &Arc::new(AtomicUsize::new(usize::MAX)),
+        )
+    }
+
+    /// Decode → loudness pass → superlet → dB → cache, on a real file.
+    #[test]
+    fn end_to_end_produces_a_peak_at_the_right_bar() {
+        let f = Fixture::new("tone", 1000.0, 1.0, 44_100);
+        let n_bars = 64;
+        let abort = Arc::new(AtomicBool::new(false));
+        let PreMessage::Done { frames, frame_rate, .. } = run(&f, n_bars, 60.0, &abort) else {
+            panic!("expected Done");
+        };
+
+        // Frame rate must come from the requested fps, not from window/overlap.
+        assert!((frame_rate - 60.0).abs() < 1.0, "frame rate was {frame_rate}");
+        assert!(frames.len() > 30, "only {} frames", frames.len());
+        assert!(frames.iter().all(|r| r.len() == n_bars));
+
+        let mid = &frames[frames.len() / 2];
+        let (peak_bar, &peak) = mid.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+        let peak_hz = aslt::bar_center_freq(peak_bar, n_bars, 200.0, 5000.0);
+        assert!((peak_hz - 1000.0).abs() < 120.0, "peak landed at {peak_hz} Hz");
+        assert!(peak > 0.5, "peak only reached {peak} of full scale");
+
+        // Everything stays inside the normalised display range.
+        assert!(frames.iter().flatten().all(|&v| (0.0..=1.0).contains(&v)));
+        assert!(f.cache.exists(), "cache was not written");
+    }
+
+    /// dB calibration: a −20 dBFS tone must sit ~20 dB below a 0 dBFS one on the
+    /// normalised 80 dB scale, i.e. a quarter of the range.
+    #[test]
+    fn amplitude_maps_to_the_expected_db_offset() {
+        let sr = 44_100u32;
+        let dir = std::env::temp_dir();
+        let mut levels = Vec::new();
+        for (tag, amp) in [("loud", 1.0f32), ("quiet", 0.1f32)] {
+            let wav = dir.join(format!("moosik_aslt_lvl_{tag}.wav"));
+            let cache = dir.join(format!("moosik_aslt_lvl_{tag}.spectrumcache"));
+            let n = sr as usize;
+            let sig: Vec<f32> = (0..n)
+                .map(|i| amp * (std::f32::consts::TAU * 1000.0 * i as f32 / sr as f32).sin())
+                .collect();
+            write_wav(&wav, &sig, sr);
+            let _ = std::fs::remove_file(&cache);
+            let f = Fixture { wav, cache };
+            let abort = Arc::new(AtomicBool::new(false));
+            let PreMessage::Done { frames, .. } = run(&f, 64, 60.0, &abort) else {
+                panic!("expected Done");
+            };
+            let mid = &frames[frames.len() / 2];
+            levels.push(mid.iter().cloned().fold(0.0f32, f32::max));
+        }
+        // 20 dB out of the 80 dB display range = 0.25 of full scale.
+        let delta = levels[0] - levels[1];
+        assert!((delta - 0.25).abs() < 0.06, "expected ~0.25 drop, got {delta} ({levels:?})");
+    }
+
+    /// Abort must stop the run and leave no cache behind — a partial cache would
+    /// be reloaded later as though it were a complete analysis.
+    #[test]
+    fn abort_yields_no_cache() {
+        let f = Fixture::new("abort", 1000.0, 1.0, 44_100);
+        let abort = Arc::new(AtomicBool::new(true));
+        assert!(matches!(run(&f, 64, 60.0, &abort), PreMessage::Aborted));
+        assert!(!f.cache.exists(), "aborted run still wrote a cache");
     }
 }

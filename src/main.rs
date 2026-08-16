@@ -1,7 +1,10 @@
 mod bitperfect;
 mod dsd;
+mod fonts;
+mod lyrics;
 mod media_controls;
 mod spectrum;
+mod tags;
 
 use eframe::egui;
 use egui::{Color32, RichText, Slider, Vec2};
@@ -105,7 +108,12 @@ fn dim_for_light(c: egui::Color32) -> egui::Color32 {
     egui::Color32::from_rgb(m(c.r()), m(c.g()), m(c.b()))
 }
 
-fn setup_fonts(ctx: &egui::Context) {
+/// Install the UI font (`chosen`, by family name) plus the CJK fallbacks.
+///
+/// Called again whenever the choice changes, so the whole set is rebuilt from
+/// scratch rather than mutated — egui owns the font atlas and a partial update
+/// would leave stale faces in the family lists.
+fn setup_fonts(ctx: &egui::Context, chosen: Option<&str>) {
     // Each entry: (font key, candidate paths in priority order).
     // We try every path for each script; first hit wins.
     // All loaded fonts are pushed as fallbacks so egui uses them for missing glyphs.
@@ -140,6 +148,26 @@ fn setup_fonts(ctx: &egui::Context) {
 
     let mut fonts = egui::FontDefinitions::default();
     let mut any = false;
+
+    // The chosen font goes in front of egui's own, so it is what the UI reads
+    // as. The CJK fallbacks below are still *appended*, so picking a Latin-only
+    // font does not turn Japanese tags into tofu — egui walks the family list
+    // for any glyph the first face lacks.
+    if let Some(name) = chosen
+        && let Some(entry) = fonts::find(name)
+        && let Ok(data) = std::fs::read(&entry.path)
+    {
+        let key = "ui_choice".to_string();
+        fonts.font_data.insert(key.clone(), std::sync::Arc::new(egui::FontData {
+            font: std::borrow::Cow::Owned(data),
+            index: entry.index,
+            tweak: Default::default(),
+        }));
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(fam).or_default().insert(0, key.clone());
+        }
+        any = true;
+    }
 
     for (name, paths) in scripts {
         for path in *paths {
@@ -323,9 +351,31 @@ fn install_crash_logger() {
     }));
 }
 
+/// Leave the audio thread room to run.
+///
+/// The superlet pre-process is rayon-parallel and saturating: on a default
+/// global pool it takes one worker per hardware thread and holds them all, at
+/// normal priority, for minutes on end. The output callback is one more thread
+/// wanting the same cores, and it has a hard deadline — miss it and the device
+/// plays whatever is left in its buffer, which is audible.
+///
+/// Reserving two threads costs a little throughput (the analyser is the only
+/// heavy rayon user, and it scales sub-linearly at the top end anyway) and buys
+/// the scheduler somewhere to put the render thread that isn't "preempt a
+/// worker mid-FFT". `build_global` can only be called once and only before the
+/// pool is first used, so it happens here, before anything spawns.
+fn cap_worker_threads() {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let workers = cores.saturating_sub(2).max(1);
+    // Failure means the pool was already built — nothing to do, and not worth
+    // failing a launch over.
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(workers).build_global();
+}
+
 fn main() -> eframe::Result {
     raise_timer_resolution();
     install_crash_logger();
+    cap_worker_threads();
     let icon = eframe::icon_data::from_png_bytes(
         include_bytes!("../assets/icon.png")
     ).expect("invalid icon PNG");
@@ -1155,12 +1205,21 @@ impl Engine {
             ));
         }
         self.bp.as_ref().map(|s| {
-            if s.dop {
+            let mut line = if s.dop {
                 let label = self.dsd_label.as_deref().unwrap_or("DSD");
                 format!("{label} via DoP · {} → {}", s.describe(), s.device_name)
             } else {
                 format!("{} → {}", s.describe(), s.device_name)
+            };
+            // Only ever shown once something has actually gone wrong: a dropout
+            // is otherwise invisible after the fact, and "did that pop come
+            // from Moosik or from the DAC?" is not a question guesswork should
+            // answer.
+            let dropped = s.underruns();
+            if dropped > 0 {
+                line.push_str(&format!(" · ⚠ {dropped} dropout(s)"));
             }
+            line
         })
     }
 
@@ -1743,6 +1802,12 @@ struct Appearance {
     #[serde(default)] theme: ThemeMode,
     /// Show each track's play count in the playlist rows.
     #[serde(default)] show_play_count: bool,
+    /// Family name of the chosen UI font, or `None` for egui's own.
+    ///
+    /// Stored by family name rather than by path so the setting survives a font
+    /// being reinstalled or the app moving between machines; a name that no
+    /// longer resolves falls back to the default instead of failing.
+    #[serde(default)] ui_font: Option<String>,
 }
 
 impl Default for Appearance {
@@ -1753,6 +1818,7 @@ impl Default for Appearance {
             art_accent: true,
             theme: ThemeMode::Dark,
             show_play_count: false,
+            ui_font: None,
         }
     }
 }
@@ -1943,6 +2009,8 @@ struct MoosikApp {
     seeking: bool,
     status_msg: String,
     spectrum_window: SpectrumWindow,
+    lyrics_window: lyrics::ui::LyricsWindow,
+    tag_window: tags::ui::TagWindow,
     info_open: bool,
     loop_mode: LoopMode,
     /// Last (volume, loop_mode) written to player.json, for change detection.
@@ -2012,11 +2080,19 @@ struct MoosikApp {
     /// The `current_index` we've already made a prebuffer decision for, so the
     /// decision runs once per track rather than every frame.
     gapless_tried: Option<usize>,
+    /// System fonts for the picker, filled the first time the Look menu opens.
+    font_list: Vec<fonts::FontEntry>,
+    /// Substring filter for the font list — a machine can easily have a couple
+    /// of hundred families, which is not a thing to scroll through.
+    font_filter: String,
 }
 
 impl MoosikApp {
     fn new(cc: &eframe::CreationContext) -> Self {
-        setup_fonts(&cc.egui_ctx);
+        // Read the font choice before anything draws, so the window never
+        // flashes the default face on the way to the chosen one. The full
+        // `Appearance` is loaded again below; this only needs the one field.
+        setup_fonts(&cc.egui_ctx, load_appearance(&moosik_dir()).ui_font.as_deref());
         // Give the ASIO host the real main-window handle for driver init —
         // drivers parent hidden notification windows to it.
         #[cfg(all(windows, feature = "asio-dsd"))]
@@ -2063,6 +2139,8 @@ impl MoosikApp {
             seeking: false,
             status_msg: String::new(),
             spectrum_window,
+            lyrics_window: lyrics::ui::LyricsWindow::default(),
+            tag_window: tags::ui::TagWindow::default(),
             info_open: false,
             loop_mode: player_prefs.loop_mode,
             saved_player: player_prefs,
@@ -2103,6 +2181,8 @@ impl MoosikApp {
             track_accent: pal::ACCENT,
             gapless_next: None,
             gapless_tried: None,
+            font_list: Vec::new(),
+            font_filter: String::new(),
         }
     }
 
@@ -3290,6 +3370,39 @@ impl eframe::App for MoosikApp {
         }
 
         // ---------------------------------------------------------------
+        // Lyrics window (own viewport, so it can live on a second screen)
+        // ---------------------------------------------------------------
+        if self.lyrics_window.open {
+            let pos = self.elapsed();
+            let tref = self.current_index.map(|i| {
+                let t = &self.playlist[i];
+                lyrics::ui::TrackRef {
+                    path: &t.path, title: &t.title, artist: &t.artist,
+                    album: &t.album, duration: t.duration,
+                }
+            });
+            // The window never touches playback; it reports what it wants.
+            if let lyrics::ui::LyricsAction::Seek(to) =
+                self.lyrics_window.ui(ctx, tref, pos)
+            {
+                self.seek_to(to);
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Tag editor (own viewport)
+        // ---------------------------------------------------------------
+        if self.tag_window.open
+            && let Some(i) = self.current_index
+        {
+            let (path, title) = (self.playlist[i].path.clone(), self.playlist[i].title.clone());
+            if self.tag_window.ui(ctx, Some(&path), &title) {
+                // Tags changed on disk — the playlist row is now stale.
+                self.playlist[i] = Track::load(path);
+            }
+        }
+
+        // ---------------------------------------------------------------
         // Top panel – now playing metadata
         // ---------------------------------------------------------------
         egui::TopBottomPanel::top("now_playing").min_height(70.0).show(ctx, |ui| {
@@ -3739,6 +3852,36 @@ impl eframe::App for MoosikApp {
                         self.info_open = !self.info_open;
                     }
                     ui.add_space(8.0);
+                    let lyr_label = if self.lyrics_window.open {
+                        RichText::new("🎤 Lyrics").size(13.0).color(pal::accent(ui.visuals().dark_mode))
+                    } else {
+                        RichText::new("🎤 Lyrics").size(13.0)
+                    };
+                    if ui.add_enabled(info_enabled, egui::Button::new(lyr_label))
+                        .on_hover_text(
+                            "Lyrics for the playing track.\n\nReads a .lrc beside the file \
+                             or the file's own tags, and can look the track up on LRCLIB. \
+                             Saved lyrics go to a .lrc — the audio file is never modified.")
+                        .clicked()
+                    {
+                        self.lyrics_window.open = !self.lyrics_window.open;
+                    }
+                    ui.add_space(8.0);
+                    let tag_label = if self.tag_window.open {
+                        RichText::new("🏷 Tags").size(13.0).color(pal::accent(ui.visuals().dark_mode))
+                    } else {
+                        RichText::new("🏷 Tags").size(13.0)
+                    };
+                    if ui.add_enabled(info_enabled, egui::Button::new(tag_label))
+                        .on_hover_text(
+                            "Edit the playing track's tags, and see every tag it carries.\n\n\
+                             Writes go to a copy which then replaces the original, and are \
+                             read back and checked. DSD files are read-only here.")
+                        .clicked()
+                    {
+                        self.tag_window.open = !self.tag_window.open;
+                    }
+                    ui.add_space(8.0);
 
                     // ── Bit-perfect: device picker (▾) + toggle ─────────────
                     // right_to_left layout: the toggle is added first so it
@@ -3998,6 +4141,57 @@ impl eframe::App for MoosikApp {
                                 }
                             }
                         });
+
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.label(RichText::new("Font")
+                            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+                        // Enumerating every system font means reading a few
+                        // hundred files, so it happens once, when the menu is
+                        // first opened, rather than every frame.
+                        if self.font_list.is_empty() { self.font_list = fonts::list(); }
+                        let current = self.appearance.ui_font.clone();
+                        let mut pick: Option<Option<String>> = None;
+                        // A plain scrolling list, not a ComboBox. A ComboBox
+                        // popup is its own egui Area, so a click inside it reads
+                        // as a click *outside* this menu — the menu closes and
+                        // swallows the click, and the font silently never
+                        // changed. Widgets placed directly in the menu do not
+                        // have that problem.
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.font_filter)
+                                   .desired_width(150.0).hint_text("filter…"));
+                            if ui.small_button("✖").clicked() { self.font_filter.clear(); }
+                        });
+                        egui::ScrollArea::vertical().max_height(190.0)
+                            .id_salt("ui_font_list")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if ui.selectable_label(current.is_none(), "Default").clicked() {
+                                    pick = Some(None);
+                                }
+                                ui.separator();
+                                let needle = self.font_filter.to_lowercase();
+                                for f in &self.font_list {
+                                    if !needle.is_empty()
+                                        && !f.family.to_lowercase().contains(&needle) { continue; }
+                                    let sel = current.as_deref() == Some(f.family.as_str());
+                                    if ui.selectable_label(sel, &f.family).clicked() {
+                                        pick = Some(Some(f.family.clone()));
+                                    }
+                                }
+                            });
+                        if let Some(choice) = pick {
+                            self.appearance.ui_font = choice;
+                            // Rebuild the whole set: the CJK fallbacks have to be
+                            // reinstalled behind the new primary, or Japanese
+                            // tags turn to tofu the moment a Latin font is picked.
+                            setup_fonts(ctx, self.appearance.ui_font.as_deref());
+                            changed = true;
+                        }
+                        ui.label(RichText::new(
+                            "CJK fallbacks stay active whatever you pick")
+                            .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
 
                         ui.add_space(6.0);
                         ui.separator();

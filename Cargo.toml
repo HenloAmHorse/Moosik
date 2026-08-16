@@ -1,6 +1,6 @@
 [package]
 name = "moosik"
-version = "1.2.1"
+version = "1.4.0"
 edition = "2024"
 
 [[bin]]
@@ -45,6 +45,19 @@ cpal = "0.15"
 # OS media-key / now-playing integration (MPRIS, SMTC, macOS MediaPlayer).
 # use_zbus = pure-Rust D-Bus on Linux, so no system libdbus-1-dev needed.
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
+# GPU compute for the superlet pre-process. wgpu is already in the tree via
+# eframe, so this only declares it directly; it runs on Vulkan and Metal, so
+# AMD, Intel and Apple are covered as well as NVIDIA.
+#
+# default-features would pull in the DX12 backend, whose `gpu-allocator`
+# dependency wants a different `windows` crate version than this tree already
+# resolves — the two cannot coexist. Vulkan covers every Windows GPU that could
+# run this work anyway, and a machine with neither simply falls back to the CPU
+# path, which is mandatory regardless.
+wgpu = { version = "24", default-features = false, features = ["wgsl", "wgc", "metal"] }
+pollster = "0.4"
+bytemuck = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # alsa-dsd: direct hw: access for native DSD (cpal already pulls this crate in
@@ -60,8 +73,10 @@ wasapi = "0.23.0"
 # thread::sleep is accurate enough for high-refresh displays.
 # Win32_Graphics_Gdi — EnumDisplaySettingsW, to default Max FPS to the monitor's
 # refresh rate.
+# Win32_System_Threading — MMCSS ("Pro Audio"), so the render thread keeps its
+# deadline while the superlet pre-process has every other core busy.
 windows-sys = { version = "0.59", features = [
-    "Win32_Media", "Win32_Graphics_Gdi",
+    "Win32_Media", "Win32_Graphics_Gdi", "Win32_System_Threading",
     # asio-dsd: driver discovery (registry) + COM instantiation + a desktop
     # HWND for drivers that refuse a null init handle.
     "Win32_System_Registry", "Win32_System_Com", "Win32_System_Ole", "Win32_Foundation",

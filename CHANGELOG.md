@@ -1,6 +1,321 @@
 # Changelog
 
-## [Unreleased]
+## [1.4.0] - 2026-08-16
+
+Two things: the pre-process learned to use the GPU, and the display stopped
+assuming there is one right way to lay out a spectrum. Plus the honest
+accounting that made both possible, and three bugs that had been quietly
+wrong for a while.
+
+### The pre-process uses the GPU
+
+Measured per 5 minutes of audio at 1024 bars, against the same build with the
+device switched off:
+
+| preset   | before | after |       |
+|----------|--------|-------|-------|
+| Fast     | 0.7    | 0.7   | —     |
+| Standard | 1.3    | 1.3   | —     |
+| High     | 3.2    | 2.6   | 1.23x |
+| Ultra    | 6.0    | 3.5   | 1.71x |
+| Extreme  | 12.7   | 9.6   | 1.32x |
+
+Fast and Standard are unchanged by design: their kernels never reach a block
+size where a device beats eight cores, so they keep the CPU route.
+
+Worth recording how this went, because the numbers do not show it. The first
+working version made Extreme *slower* — 19.4 minutes against 12.7 — and stayed
+that way through three fixes aimed squarely at the device. Per-phase timings
+then showed it spending 0.11 s per chunk on the GPU and 0.46 s on the CPU work
+that followed. The device had never been the bottleneck. What was: a parallel
+loop over three bars on an eight-core machine, a full-signal transform being
+redone per wavelet, kernels built one at a time on a single thread, and
+dispatches that waited for the assembly instead of running beside it.
+`MOOSIK_GPU_TRACE=1` prints those timings and stays in the tree.
+
+The threshold between GPU and CPU is **measured on each machine, not
+hardcoded** — it is a property of one device against one core count, and a card
+that is slow but working would clear a fixed gate and never fall back. A probe
+on first run picks a starting point; real analyses then A/B the two routes and
+settle it on evidence, switching the device off by itself if it loses.
+
+- Settings: GPU **Auto / Always / Off**, a **Re-measure** button, the per-size
+  calibration table, and what the last run cost.
+- Settings: an **analysis core budget**, defaulting to two fewer than the
+  machine has.
+- `MOOSIK_GPU=0` forces the CPU route, which is unchanged and is what every
+  number above is measured against.
+
+### Bar spacing is now a choice
+
+Where the bars land, independent of how many there are. The count never
+changes; every setting redistributes the same bars.
+
+- **Bass width** — a slider from wider-than-log, through **log** (the classic
+  analyser axis, still the default), to **ERB** (constant bars per auditory
+  filter, Glasberg & Moore 1990).
+- **Zoom** — a lens anywhere on the axis, with centre, width and strength.
+
+The bass slider is not a resolution control, which is the surprising part. A
+tone's blur in bars and a bassline's travel in bars both scale with bar
+density, so the ratio between them is the same at every setting — 6.3 on log,
+6.6 on ERB. What changes is how much screen the bass gets to move across.
+Below a capped analysis window it is also free: the window fixes resolution in
+Hz, so widening the bass adds no work at all.
+
+The lens is not free. Above roughly a kilohertz nothing caps the window, so
+concentrating bars there raises the resolution actually demanded. The panel
+quotes the cost multiplier rather than leaving it to be discovered.
+
+Every setting is the normalised integral of a strictly positive density, so no
+combination can fold the axis back on itself or push a bar off the display —
+that is structural, not a clamp. Selecting `log` delegates to the original
+functions rather than reimplementing them, so it is not merely equivalent to
+the previous behaviour, it is that behaviour; a test asserts exact equality
+against the pre-scale code path.
+
+### Audio output holds its deadline under load
+- **The render thread registers with MMCSS as a "Pro Audio" task.** It was an
+  ordinary-priority poll loop competing with a rayon pool that takes every core
+  for minutes during a pre-process; losing that race by more than the device
+  buffer is audible.
+- **The worker pool leaves two threads free** rather than taking every hardware
+  thread.
+- **Dropouts are counted and shown.** A render call that comes up short with
+  the decoder still running — not a track boundary, not a pause — is silence
+  the DAC played, and the status line now says so. No test in this suite can
+  observe a dropout, so this is the only evidence the process can produce about
+  its own output.
+
+### Fixed
+- **ISO 226 weighting did nothing in pre-process mode**, which is the default.
+  The weights were folded into the frames during analysis, but `loudness_mode`
+  is not part of the cache key — so switching it changed nothing and
+  re-analysing loaded the same file back. Whichever mode happened to be
+  selected when a track was first analysed was the mode it kept, permanently.
+  It is now applied at display time, one add per bar, and toggling is instant.
+- **ISO 226 pinned everything from 2 kHz to 10 kHz to the ceiling.** Referenced
+  to 1 kHz the curve asks for up to +22 dB there, and bar heights arrive
+  normalised, so a positive correction has nowhere to go. The positive lobe is
+  now clamped: 1 kHz keeps full height, that region reads as it does with
+  weighting off, and the tilt below 1 kHz — the informative half — survives
+  intact.
+- **The debug overlay cost about half the frame rate.** It asked for the
+  adapter name once a frame, and that built a fresh wgpu instance and
+  enumerated adapters every time.
+- **Analysis progress is visible without opening a panel.** It now draws on the
+  plot itself whenever a track is being analysed. The old indicator only
+  appeared when there was nothing else to draw, so re-analysing a track that
+  already had frames showed nothing anywhere obvious.
+- **The ETA notices when it is wrong.** It averaged over the whole run, which
+  assumes the work ahead costs what the work behind did — it does not, since
+  the short-kernel bars come last and cost more wall clock per tap. It now
+  measures recent throughput, so the last stretch stops overrunning its own
+  estimate quite so confidently.
+- The Analysis settings panel is no longer called "FFT Settings". It has not
+  been FFT-only since the superlet path landed.
+
+## [1.3.1] - 2026-08-15
+
+Everything 1.3.0 added, put through a real library — and mostly what that
+found. Thirteen tracks that could not be matched, a font picker that silently
+did nothing, a scrollbar in the middle of the window, and a waterfall doing
+about a hundred times more work than it needed to.
+
+### Lyrics: found the ones that were missing
+- **A second source (NetEase Cloud Music) alongside LRCLIB.** Measured against
+  a real set of thirteen failing tracks, LRCLIB returned *zero* hits for nine
+  of them: a Japanese and Vocaloid library is largely absent from it, and no
+  amount of better matching invents a record that is not there. NetEase had
+  synced lyrics for effectively all of them.
+- Genius and UtaTen were considered and rejected: neither publishes lyrics
+  through an API (Genius's deliberately excludes them), so the only route is
+  scraping HTML that breaks on any redesign — and neither carries timestamps,
+  so even a successful scrape yields an unsynced sheet that still needs timing
+  by hand. The paste box already covers that, without a scraper to maintain.
+- **Wrong lyrics are now refused.** `SWIPE×SWIPE` was being given the lyrics of
+  an unrelated song called `Swipe`: a synced sheet with a plausible duration
+  outscored the nothing it earned on the title, and no rule required the title
+  to agree at all. An automatic match must now clear a bar — and a matching
+  title alone does not clear it, since covers and same-name songs both pass
+  that. Wrong lyrics applied confidently are worse than none, because nothing
+  tells you to go looking.
+- **Matching works on Japanese now.** Word-token overlap is meaningless without
+  spaces — every CJK title is a single token, so the score was 1 or 0 with
+  nothing between. Replaced with a character-based measure that needs no word
+  segmenter. Artist comparison also learned that a credit list is a superset,
+  not a different artist: a tag of `TAK` against a database row of
+  `TAK/Hatsune Miku` was being refused.
+- **Length disagreements no longer lose a match.** A flat ±8 s gate threw away
+  a record whose title *and* artist were identical, because a database recorded
+  the track 9 s longer than the file. The gate now widens when everything else
+  corroborates, and stays narrow when it does not.
+- **A source that cannot answer never reports "no lyrics".** NetEase rate-limits
+  by replying HTTP 200 with the real status buried in the body, which reads as
+  an empty result to anything checking only the transport. Being told a track
+  has no lyrics, when the truth was to wait a minute, sends you off to
+  transcribe something for nothing.
+- **"📋 Paste…"** takes lyrics from anywhere for the tracks no database has.
+  Plain text drops straight into the sync editor; LRC keeps its timing.
+
+### Appearance
+- **Choose the UI font.** Families are read from each font file's own name
+  table rather than guessed from filenames, so the list says *Fira Code Medium*
+  rather than `FiraCode-Medium`; collections are handled, so every face in a
+  `.ttc` is offered. A filter box, because a machine can easily carry a couple
+  of hundred families. CJK fallbacks are reinstalled behind whatever is chosen,
+  so picking a Latin-only font does not turn Japanese tags into tofu.
+
+### Performance
+- **The waterfall uploads only the rows that changed.** It had been rebuilding
+  and re-uploading its entire texture whenever one new row arrived — at 1024
+  bars that is 1024×120 pixels re-palettised and pushed to the GPU, at the
+  frame rate, to change 1024 of them. Now a ring buffer with partial uploads,
+  which took waterfall mode from about 20% CPU to about 10% at 180 fps.
+
+### Fixes
+- The lyrics scrollbar sat stranded in the middle of the window, against the
+  longest line rather than the window edge.
+- The font picker never applied anything. A dropdown nested inside a menu opens
+  its own overlay, so clicking it counts as clicking *outside* the menu — the
+  menu closed and swallowed the click before it reached anything.
+- A NetEase track id could appear in the lyrics pane where the song should be.
+
+## [1.3.0] - 2026-08-13
+
+Two things the spectrum could not do before: analyse the waveform directly
+with wavelets instead of mapping FFT bins, and play native DSD on Linux.
+Plus lyrics and tag editing, so the player stops needing a second app.
+
+### Lyrics
+- **New window (🎤 Lyrics).** Its own viewport, so it can sit on a second
+  screen while the player stays where it is. The current line highlights and
+  centres itself, sung lines dim, and there is a text-size slider — a lyrics
+  view on another monitor is read from across the room.
+- **Reads a `.lrc` beside the track, or the file's own tags.** Sheets are
+  written as sidecars, never into the audio file. That is what every other
+  player reads, so a fix here is a fix everywhere; it is hand-editable; and it
+  keeps DSD safe, where the ID3 blob sits behind a header pointer.
+- **"Find lyrics" looks the track up on LRCLIB, then NetEase Cloud Music** —
+  neither needs an account or an API key, and both serve *synced* lyrics rather
+  than plain text.
+- **Two sources because one was not enough.** Against a real set of thirteen
+  failing tracks, LRCLIB returned *zero* hits for nine of them — a Japanese and
+  Vocaloid library is mostly absent from it, and no amount of better matching
+  invents a record that is not there. NetEase has synced lyrics for effectively
+  all of them.
+- Genius and UtaTen were considered and rejected: neither publishes lyrics
+  through an API (Genius's deliberately excludes them), so the only route is
+  scraping HTML that breaks on any redesign — and neither carries timestamps,
+  so even a successful scrape gives an unsynced sheet that still needs timing
+  by hand. The paste box already covers that, without a scraper to maintain.
+- **A source that cannot answer never reports "no lyrics".** NetEase rate-limits
+  by replying HTTP 200 with the real status buried in the body, which reads as
+  an empty result to anything checking only the transport. Telling someone their
+  track has no lyrics, when the truth was to wait a minute, would send them off
+  to transcribe by hand for nothing.
+- **The matching is the part that matters.** Fetching is easy; finding the
+  right record is where a paid lyrics plugin fails on a well-known song. Tags
+  carry decoration the database does not — `【初音ミク】タイトル【オリジナルMV】`,
+  a producer where the database has the vocalist, full-width punctuation,
+  `feat.` chains. So the lookup is a ladder: exact match, exact without the
+  album, structured search on normalised fields, then normalised title alone,
+  with duration filtering and ranking at every rung because duration is the one
+  field decoration cannot corrupt.
+- **"Search…" is the manual override** — type anything, see what came back
+  with synced-versus-plain marked, pick one. No automatic match is right every
+  time, and being unable to correct it by hand is what makes a lyrics feature
+  feel broken.
+- **"Sync…" times a sheet by tapping along.** Play the song and press Space as
+  each line starts; Back undoes a stamp, a timestamp click seeks the player to
+  it, lines can be edited and reordered. It re-times an existing sheet as
+  happily as a plain one, and resumes at the first untimed line so an
+  interrupted sync picks up where it stopped. This is what makes the plain-text
+  fallback worth having — a sheet the database only has unsynced is a few
+  minutes of tapping from a proper one.
+- An offset control nudges timing on a sheet that is close but not aligned.
+
+### Tag editing
+- **New window (🏷 Tags):** the common fields, plus a viewer for every tag the
+  file carries — including keys the editor does not touch, which are preserved
+  on save.
+- **Writes go to a copy which then replaces the original by rename**, so an
+  interrupted write cannot leave a half-rewritten file. The result is read back
+  and compared before it is accepted: a tag that silently did not take is worse
+  than an error, because the user believes it worked.
+- **DSD is read-only here** and says so. DSF stores its ID3 blob behind a
+  header pointer, and the player reaches it with a read-only trick; writing
+  through that path would cost the audio rather than the metadata.
+- Blanking a field removes the key rather than storing an empty one, which is
+  not the same thing to other readers.
+
+### Adaptive Superlet Transform — a spectrum that isn't an FFT (pre-process only)
+- **New bar mapping: Superlet.** Instead of mapping FFT bins onto bars, it
+  analyses the waveform directly with sets of Morlet wavelets and takes the
+  geometric mean of their responses (Moca et al., *Nature Communications*
+  2021). An FFT uses one window width for the whole spectrum; a log bar grid
+  wants a different width at every frequency, and that mismatch is what this
+  fixes. Pre-process only — the live view has about 2 ms per frame and a
+  superlet needs orders of magnitude more, so real-time keeps its FFT.
+- **What it actually buys, measured against the 171 ms FFT it replaces:**
+  - *Bass* — resolves detail no FFT setting can reach. At 60 Hz it separates
+    two tones 1.5 Hz apart that the FFT renders as one blob (σ 0.33 Hz vs
+    3.58 Hz). The price is real and stated plainly: constant-Q at the bottom
+    of hearing needs windows measured in seconds, so bass responds more
+    slowly. That trade is a slider, not a hidden curve.
+  - *Treble* — strictly better at no cost: 24 ms of smearing at 10 kHz
+    against the FFT's 171 ms, losing no frequency detail 1024 bars can draw.
+  - *Roughly 500 Hz – 2 kHz* — a wash. An FFT is genuinely hard to beat
+    there and the presets don't pretend otherwise.
+- **Five presets plus Custom.** Presets are stated as window budgets rather
+  than abstract orders; Custom exposes window, sharpness (relative to the bar
+  grid), wavelet count and spread, with a live readout comparing each setting
+  against the FFT. Analysis costs roughly 1–17 minutes per five-minute track.
+- **Long wavelets are convolved in the frequency domain** — overlap-save,
+  4–5× faster, and numerically identical to the direct route (worst measured
+  difference 2×10⁻⁷ end-to-end). Frames at the very start and end of a track
+  stay on the direct path, because their windows are renormalised over the
+  samples that exist and a convolution cannot express that.
+- **Frame rate is now stated in time, not samples** — 180 fps by default.
+  Besides matching high-refresh displays, this stops cost growing with the
+  square of the sample rate, which had made a 176.4 kHz DSD analysis cost 16×
+  a 44.1 kHz one instead of 4×.
+- **Progress, ETA and Abort.** Analysis reports three named stages
+  (Decoding, Loudness/key, Transform) with a time estimate that starts from a
+  throughput model and switches to the observed rate once the work is
+  underway. Abort stops within a second and never writes a partial cache.
+- **A repeat no longer restarts the analysis.** Looping a track used to
+  cancel and relaunch on every pass, so a run lasting longer than the track
+  could never finish. A genuine track change still cancels.
+
+### Superlet: sharpness comes from the bar grid, and nothing else
+- **"Follow vibrato" is gone.** It shortened the window in bands whose pitch
+  was moving, on the reasoning that a sweep already sets the width there so
+  extra sharpness is wasted. The reasoning holds; the rendering does not. A
+  wavelet is normalised so a *tone* reads the same at any bandwidth, which
+  means broadband content in the same band reads proportional to the square
+  root of that bandwidth. Give one band a different sharpness from its
+  neighbours and it draws as a bright stripe across the waterfall — up to
+  9.5 dB on real material, where the estimator also fired on far more bands
+  than intended.
+- No per-band gain can correct it: the correction a tone needs is 0 dB and
+  the correction noise needs is not. The only sharpness reduction small
+  enough to hide the step is too small to save any time, so the feature has
+  no working setting and was removed rather than defaulted off. `aslt.rs`
+  keeps the measurement as a test, so anything that reintroduces per-band
+  sharpness variation has to answer it first.
+
+### Cache management
+- **Size budget with LRU eviction** (4 GB by default, adjustable, 0 disables)
+  runs after each analysis, with a "Trim now" button and an over-budget
+  warning. Superlet caches run 45–80 MB per track and no amount of packing
+  changes that — the low byte of every stored value is quantisation noise, so
+  no lossless coder beats about 12 % and even truncating to a depth finer
+  than a 4K pixel only reaches 14 %. Bounding the total is the real control.
+- **Cache format v3** takes that 12 % anyway: values are delta-coded across
+  frequency and split into byte planes before LZ4, so the compressor is no
+  longer defeated by noise sitting between every pair of compressible bytes.
+  Existing v2 caches still load.
 
 ### Native DSD via ALSA — Linux joins the DSD512 party (experimental, on by default)
 - **Raw native DSD on Linux** — pick a direct `hw:` device under the 🔈
