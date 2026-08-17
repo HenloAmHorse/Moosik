@@ -84,7 +84,7 @@ pub mod native_dsd {
             let n = match reader.read_frames(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
-                Err(e) => { eprintln!("[native-dsd] read error: {e}"); break; }
+                Err(e) => { crate::mlog!("[native-dsd] read error: {e}"); break; }
             };
             let chunk = &mut buf[..n * ch];
             if lsb_first {
@@ -289,6 +289,17 @@ struct Shared {
     /// dropout the process can produce: the test suite cannot observe one, and
     /// by the time a listener hears it there is nothing left to inspect.
     underruns: AtomicU64,
+    /// Set when a session is installed, cleared the first time the ring hands
+    /// over a full buffer.
+    ///
+    /// A seek tears the session down and builds a new one, so the ring is empty
+    /// for however long the decoder needs to reach the new position. The render
+    /// thread asks for samples in that window and gets none — which is a gap in
+    /// the audio, but an expected one at a point the listener just asked to jump
+    /// to, not the mid-track glitch the dropout counter exists to report. Every
+    /// dropout counted so far has been one of these, which makes the counter
+    /// noise rather than a signal.
+    priming: AtomicBool,
 }
 
 impl Shared {
@@ -304,6 +315,7 @@ impl Shared {
             boundaries: Mutex::new(std::collections::VecDeque::new()),
             dop_active: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
+            priming: AtomicBool::new(false),
         }
     }
 }
@@ -390,12 +402,19 @@ fn render_samples(
             if ended {
                 *guard = None;
                 sh.finished.store(true, Ordering::Release);
+            } else if sh.priming.load(Ordering::Relaxed) {
+                // Still filling after a seek or a fresh start: the gap is the
+                // one the listener asked for.
             } else {
                 // Short buffer with the decoder still running: the caller is
                 // about to pad the rest with zeroes and the device will play
                 // them. Not a track boundary, not a pause — a real dropout.
                 sh.underruns.fetch_add(1, Ordering::Relaxed);
             }
+        } else {
+            // A full buffer means the ring has caught up; anything short from
+            // here is a genuine starvation.
+            sh.priming.store(false, Ordering::Relaxed);
         }
     }
 
@@ -518,6 +537,7 @@ impl BpStream {
 
         self.set_volume(volume);
         self.shared.finished.store(false, Ordering::Relaxed);
+        self.shared.priming.store(true, Ordering::Relaxed);
         self.shared.frames_played.store(0, Ordering::Relaxed);
         if let Ok(mut g) = self.shared.session.lock() {
             *g = Some(Session { cons, decode_done: done, stop }); // old Session drop signals its thread
@@ -555,6 +575,7 @@ impl BpStream {
         // that reads volume_bits directly gets a stale attenuated value.
         self.shared.volume_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.shared.finished.store(false, Ordering::Relaxed);
+        self.shared.priming.store(true, Ordering::Relaxed);
         self.shared.frames_played.store(0, Ordering::Relaxed);
         if let Ok(mut g) = self.shared.session.lock() {
             *g = Some(Session { cons, decode_done: done, stop });
@@ -605,6 +626,7 @@ impl BpStream {
     pub fn stop_session(&self) {
         if let Ok(mut g) = self.shared.session.lock() { *g = None; }
         self.shared.finished.store(false, Ordering::Relaxed);
+        self.shared.priming.store(true, Ordering::Relaxed);
         self.shared.frames_played.store(0, Ordering::Relaxed);
     }
 
@@ -650,6 +672,7 @@ struct SpectrumTap {
     channels: u16,
     ch_idx: u16,
     pending_l: f32,
+    frame_sum: f32,
     sample_buf: SampleBuf,
     stereo_buf: StereoBuf,
     batch: Vec<f32>,
@@ -661,20 +684,32 @@ const TAP_BATCH: usize = 512;
 impl SpectrumTap {
     fn new(channels: u16, sample_buf: SampleBuf, stereo_buf: StereoBuf) -> Self {
         Self {
-            channels, ch_idx: 0, pending_l: 0.0, sample_buf, stereo_buf,
+            channels, ch_idx: 0, pending_l: 0.0, frame_sum: 0.0, sample_buf, stereo_buf,
             batch: Vec::with_capacity(TAP_BATCH * 2),
             stereo_batch: Vec::with_capacity(TAP_BATCH),
         }
     }
 
     fn feed(&mut self, samples: &[f32]) {
+        let ch = self.channels.max(1);
         for &f in samples {
             if self.channels == 2 {
                 if self.ch_idx == 0 { self.pending_l = f; }
                 else { self.stereo_batch.push([self.pending_l, f]); }
-                self.ch_idx = (self.ch_idx + 1) % 2;
             }
-            self.batch.push(f);
+            // The analyser reads this buffer as one mono stream sampled at the
+            // track's rate. Pushing interleaved channels made it a 2× (or N×)
+            // sample-and-hold instead: every partial appeared at f/N with a
+            // mirror image at Nyquist − f/N, which is why bass showed up again
+            // at the top of the display. Average each frame down, exactly as
+            // the pre-process decoder does.
+            self.frame_sum += f;
+            self.ch_idx += 1;
+            if self.ch_idx >= ch {
+                self.batch.push(self.frame_sum / ch as f32);
+                self.frame_sum = 0.0;
+                self.ch_idx = 0;
+            }
         }
         if self.batch.len() >= TAP_BATCH {
             if let Ok(mut v) = self.sample_buf.try_lock() {
@@ -721,14 +756,14 @@ fn decode_loop(
                 Ok(p) => p,
                 Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(SymError::ResetRequired) => break,
-                Err(e) => { eprintln!("[bit-perfect] read error: {e}"); break; }
+                Err(e) => { crate::mlog!("[bit-perfect] read error: {e}"); break; }
             };
             if packet.track_id() != prep.track_id { continue; }
 
             let decoded = match prep.decoder.decode(&packet) {
                 Ok(d) => d,
-                Err(SymError::DecodeError(e)) => { eprintln!("[bit-perfect] skipping bad packet: {e}"); continue; }
-                Err(e) => { eprintln!("[bit-perfect] decode error: {e}"); break; }
+                Err(SymError::DecodeError(e)) => { crate::mlog!("[bit-perfect] skipping bad packet: {e}"); continue; }
+                Err(e) => { crate::mlog!("[bit-perfect] decode error: {e}"); break; }
             };
 
             let spec = *decoded.spec();
@@ -804,7 +839,7 @@ fn dop_decode_loop(
             words.clear();
             let n = match stream.read_dop(CHUNK_PCM_FRAMES, &mut words) {
                 Ok(n) => n,
-                Err(e) => { eprintln!("[dsd] read error: {e}"); break 'file; }
+                Err(e) => { crate::mlog!("[dsd] read error: {e}"); break 'file; }
             };
             if n == 0 { break; }
             if push_words(&words, &mut prod, &stop) { return; }
@@ -953,6 +988,61 @@ mod tests {
         render_samples(&sh, &mut scratch, &mut t, 2, 64);
         assert!(scratch.is_empty());
         assert_eq!(sh.underruns.load(Ordering::Relaxed), 0);
+    }
+
+    /// Every dropout observed in the field so far arrived within milliseconds
+    /// of a seek, which is the ring refilling rather than the device starving.
+    /// A counter that fires on both cannot report either.
+    #[test]
+    fn the_gap_right_after_a_seek_is_not_counted_as_a_dropout() {
+        let mut scratch = Vec::new();
+        let mut t = tap();
+
+        // Fresh session, ring not yet filled: short, but expected.
+        let (sh, _prod, _done) = staged(&[0.5; 16]);
+        sh.priming.store(true, Ordering::Relaxed);
+        render_samples(&sh, &mut scratch, &mut t, 2, 64);
+        assert_eq!(sh.underruns.load(Ordering::Relaxed), 0, "seek gap is not a dropout");
+        assert!(sh.priming.load(Ordering::Relaxed), "still priming until a full buffer lands");
+
+        // The ring catches up: priming ends.
+        let (sh, mut prod, _done) = staged(&[0.5; 64]);
+        sh.priming.store(true, Ordering::Relaxed);
+        render_samples(&sh, &mut scratch, &mut t, 2, 64);
+        assert!(!sh.priming.load(Ordering::Relaxed), "a full buffer ends priming");
+
+        // And from there a short buffer is a real dropout again.
+        for _ in 0..16 { prod.push(0.5).unwrap(); }
+        render_samples(&sh, &mut scratch, &mut t, 2, 64);
+        assert_eq!(sh.underruns.load(Ordering::Relaxed), 1, "starvation after priming counts");
+    }
+
+    /// The spectrum analyser treats `sample_buf` as one mono stream sampled at
+    /// the track's rate. If the tap pushes interleaved channels instead, the
+    /// stream is really an N× sample-and-hold and every partial gains a mirror
+    /// image at Nyquist − f/N — bass reappearing at the top of the display.
+    #[test]
+    fn the_tap_hands_the_analyser_one_mono_sample_per_frame() {
+        let mono = Arc::new(Mutex::new(Vec::new()));
+        let stereo = Arc::new(Mutex::new(Vec::new()));
+        let mut t = SpectrumTap::new(2, Arc::clone(&mono), Arc::clone(&stereo));
+
+        // One flush worth of frames, left and right pulled apart so an
+        // interleaved push cannot accidentally look like the average.
+        let frames = TAP_BATCH;
+        let mut interleaved = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            interleaved.push(i as f32);
+            interleaved.push(i as f32 + 2.0);
+        }
+        t.feed(&interleaved);
+
+        let got = mono.lock().unwrap();
+        assert_eq!(got.len(), frames, "one sample per frame, not per channel");
+        for (i, &v) in got.iter().enumerate() {
+            assert_eq!(v, i as f32 + 1.0, "frame {i} should be the channel average");
+        }
+        assert_eq!(stereo.lock().unwrap().len(), frames);
     }
 
     /// Minimal 16-bit PCM WAV writer (44-byte canonical header).

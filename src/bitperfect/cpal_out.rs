@@ -143,7 +143,7 @@ pub fn open(
             render_samples(&shared, &mut scratch, &mut tap, channels, data.len());
             write_data(data, &scratch);
         },
-        |e| eprintln!("[bit-perfect] stream error: {e}"),
+        |e| crate::mlog!("[bit-perfect] stream error: {e}"),
         None,
     ).map_err(|e| format!("stream open failed: {e}"))?;
     stream.play().map_err(|e| format!("stream start failed: {e}"))?;

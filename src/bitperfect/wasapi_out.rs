@@ -60,14 +60,43 @@ const CANDIDATES: [(usize, usize, SampleType, DevFmt, &str); 5] = [
 /// DoP-aware DAC must see that literal integer bit pattern; F32 would send an
 /// IEEE-754 encoding instead, and I16 (index 0) is too narrow to hold one.
 fn candidate_order(src_bits: Option<u32>, dop: bool) -> Vec<usize> {
+    if let Some(i) = forced_candidate() {
+        return vec![i];
+    }
     if dop {
+        // Left alone deliberately. DoP is the one path where the device must
+        // see an exact 24-bit word, it is verified working on real DoP DACs
+        // with the packed container, and it is not what the Realtek problem
+        // below is about.
         return vec![1, 2, 3];
     }
     match src_bits {
-        Some(b) if b <= 16 => vec![0, 1, 2, 3, 4],
-        Some(b) if b > 24 => vec![3, 4, 1, 2, 0],
-        _ => vec![1, 2, 3, 4, 0], // 24-bit or unknown
+        Some(b) if b <= 16 => vec![0, 2, 3, 1, 4],
+        Some(b) if b > 24 => vec![3, 4, 2, 1, 0],
+        _ => vec![2, 1, 3, 4, 0], // 24-bit or unknown
     }
+}
+
+/// `MOOSIK_BP_FORMAT=16i|24i|24i32|32i|32f` pins the device format to one
+/// candidate.
+///
+/// Bisecting a format problem otherwise means a rebuild per guess, and the
+/// machine that has the problem is usually not the machine with the compiler.
+fn forced_candidate() -> Option<usize> {
+    let want = std::env::var("MOOSIK_BP_FORMAT").ok()?;
+    let i = match want.trim() {
+        "16i" => 0,
+        "24i" => 1,
+        "24i32" => 2,
+        "32i" => 3,
+        "32f" => 4,
+        other => {
+            crate::mlog!("bp      MOOSIK_BP_FORMAT=\"{other}\" not recognised, ignoring");
+            return None;
+        }
+    };
+    crate::mlog!("bp      MOOSIK_BP_FORMAT pins the device format to {}", CANDIDATES[i].4);
+    Some(i)
 }
 
 fn wave_format(c: &(usize, usize, SampleType, DevFmt, &str), rate: u32, channels: u16) -> WaveFormat {
@@ -205,6 +234,11 @@ fn render_thread(
         let _ = tx.send(Err(format!("stream start failed: {e}")));
         return;
     }
+    crate::mlog!(
+        "bp      streaming \"{dev_label}\" as {label}: {} Hz, {}ch, blockalign {blockalign}, \
+         period {:.2} ms",
+        fmt.get_samplespersec(), fmt.get_nchannels(), period_hns as f64 / 10_000.0,
+    );
     let _ = tx.send(Ok((label.clone(), dev_label)));
 
     // Held for the life of the loop: this thread has a hard deadline the rest
@@ -214,23 +248,61 @@ fn render_thread(
     let mut scratch: Vec<f32> = Vec::with_capacity(16_384);
     let mut bytes: Vec<u8> = Vec::with_capacity(65_536);
 
+    // Per-write detail, opt-in. What the device is actually being handed, and
+    // whether the ring is keeping up with it — the two things a "sounds wrong"
+    // report cannot distinguish from the outside. The first writes carry the
+    // interesting evidence, so they are logged in full and the steady state is
+    // sampled after that.
+    let trace = std::env::var("MOOSIK_BP_TRACE").is_ok_and(|v| v != "0");
+    let mut iters: u64 = 0;
+    let mut last_underruns = 0u64;
+    let mut peak = 0.0f32;
+
     loop {
         if stop.load(Ordering::Relaxed) { break; }
         let avail = match client.get_available_space_in_frames() {
             Ok(a) => a as usize,
-            Err(e) => { eprintln!("[bit-perfect] wasapi error: {e}"); break; }
+            Err(e) => { crate::mlog!("[bit-perfect] wasapi error: {e}"); break; }
         };
         if avail > 0 {
-            render_samples(&shared, &mut scratch, &mut tap, channels, avail * channels as usize);
-            fill_bytes(&mut bytes, &scratch, avail * channels as usize, dev_fmt);
+            let want = avail * channels as usize;
+            render_samples(&shared, &mut scratch, &mut tap, channels, want);
+            let got = scratch.len();
+            fill_bytes(&mut bytes, &scratch, want, dev_fmt);
+            if trace {
+                // The sample values themselves. If these are sane and the audio
+                // is not, the fault is past this point — in the container or the
+                // driver, not in what was decoded.
+                for &s in scratch.iter() { peak = peak.max(s.abs()); }
+                iters += 1;
+                if iters <= 20 || iters.is_multiple_of(500) {
+                    crate::mlog!(
+                        "bp      write #{iters}: avail {avail}f, want {want}, got {got}, \
+                         {} bytes ({} expected), peak {peak:.4}",
+                        bytes.len(), avail * blockalign,
+                    );
+                    peak = 0.0;
+                }
+            }
             if let Err(e) = render.write_to_device(avail, &bytes, None) {
-                eprintln!("[bit-perfect] wasapi write error: {e}");
+                crate::mlog!("[bit-perfect] wasapi write error: {e}");
                 break;
+            }
+            // Always reported, trace or not: a dropout is the one thing that is
+            // audible and otherwise leaves no record at all.
+            let u = shared.underruns.load(Ordering::Relaxed);
+            if u != last_underruns {
+                crate::mlog!("bp      {} dropout(s) so far", u);
+                last_underruns = u;
             }
         }
         std::thread::sleep(sleep);
     }
 
+    crate::mlog!(
+        "bp      stream closed after {iters} writes, {} dropout(s)",
+        shared.underruns.load(Ordering::Relaxed)
+    );
     let _ = client.stop_stream();
 }
 
@@ -278,15 +350,46 @@ fn setup_stream(
     let mut client = device.get_iaudioclient()
         .map_err(|e| format!("audio client failed: {e}"))?;
 
+    crate::mlog!(
+        "bp      negotiating \"{dev_label}\": {sample_rate} Hz, {channels}ch, src_bits {:?}, dop {dop}",
+        src_bits
+    );
+
     // Negotiate the device format in exclusive mode.
     let mut chosen: Option<(WaveFormat, DevFmt, &str)> = None;
     for idx in candidate_order(src_bits, dop) {
         let c = &CANDIDATES[idx];
-        if let Ok(accepted) =
-            client.is_supported_exclusive_with_quirks(&wave_format(c, sample_rate, channels))
-        {
-            chosen = Some((accepted, c.3, c.4));
-            break;
+        match client.is_supported_exclusive_with_quirks(&wave_format(c, sample_rate, channels)) {
+            Ok(accepted) => {
+                // What the device agreed to, read back from the format it
+                // returned rather than assumed from the candidate. The writer
+                // below lays out bytes from the *candidate*, so if these ever
+                // disagree the device is fed a frame of the wrong width — which
+                // sounds like noise playing at the wrong speed, and is the first
+                // thing to check when it does.
+                crate::mlog!(
+                    "bp      accepted {} → {} Hz, {}ch, {} bits, blockalign {}",
+                    c.4,
+                    accepted.get_samplespersec(),
+                    accepted.get_nchannels(),
+                    accepted.get_bitspersample(),
+                    accepted.get_blockalign(),
+                );
+                let want_align = (c.0 / 8) * channels as usize;
+                if accepted.get_samplespersec() != sample_rate
+                    || accepted.get_nchannels() != channels
+                    || accepted.get_blockalign() as usize != want_align
+                {
+                    crate::mlog!(
+                        "bp      MISMATCH requested {sample_rate} Hz/{channels}ch/align {want_align} \
+                         — refusing rather than writing frames of the wrong width"
+                    );
+                    continue;
+                }
+                chosen = Some((accepted, c.3, c.4));
+                break;
+            }
+            Err(e) => crate::mlog!("bp      rejected {}: {e}", c.4),
         }
     }
     let (fmt, dev_fmt, label) = chosen.ok_or_else(|| {

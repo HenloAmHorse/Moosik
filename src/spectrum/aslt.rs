@@ -1522,7 +1522,7 @@ pub fn analyze_with_progress(
                         add(&STATS.device_ns, device);
                     }
                     if gpu_trace() {
-                        eprintln!(
+                        crate::mlog!(
                             "[gpu] n={group_n:<9} bars={:<4} kernels={:<5} blocks={blocks:<3} \
                              build={:>7.2}s stage={:>6.2}s device={:>7.2}s (fill overlapped)",
                             end - at, n_kernels,

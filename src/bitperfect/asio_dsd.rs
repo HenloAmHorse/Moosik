@@ -352,7 +352,7 @@ static FIRST_SWITCH_LOGGED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" fn cb_buffer_switch(index: i32, _direct: AsioBool) {
     if !FIRST_SWITCH_LOGGED.swap(true, Ordering::Relaxed) {
-        eprintln!("[asio-dsd] first bufferSwitch (index {index}) — callbacks are flowing");
+        crate::mlog!("[asio-dsd] first bufferSwitch (index {index}) — callbacks are flowing");
     }
     let ctx = ACTIVE.load(Ordering::Acquire);
     if !ctx.is_null() {
@@ -366,7 +366,7 @@ unsafe extern "system" fn cb_buffer_switch_time_info(
     _direct: AsioBool,
 ) -> *mut c_void {
     if !TIME_INFO_LOGGED.swap(true, Ordering::Relaxed) {
-        eprintln!("[asio-dsd] driver callback: bufferSwitchTimeInfo (driver ignores our 'no time-info' answer — fine)");
+        crate::mlog!("[asio-dsd] driver callback: bufferSwitchTimeInfo (driver ignores our 'no time-info' answer — fine)");
     }
     unsafe { cb_buffer_switch(index, ASIO_FALSE) };
     null_mut()
@@ -375,7 +375,7 @@ unsafe extern "system" fn cb_buffer_switch_time_info(
 static TIME_INFO_LOGGED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" fn cb_sample_rate_did_change(rate: f64) {
-    eprintln!("[asio-dsd] driver callback: sampleRateDidChange({rate})");
+    crate::mlog!("[asio-dsd] driver callback: sampleRateDidChange({rate})");
 }
 
 unsafe extern "system" fn cb_asio_message(
@@ -386,7 +386,7 @@ unsafe extern "system" fn cb_asio_message(
 ) -> i32 {
     // asioMessage traffic is sparse (setup-time negotiation, rare runtime
     // notifications) — log every call while the path is being proven.
-    eprintln!("[asio-dsd] driver callback: asioMessage(selector={selector}, value={value})");
+    crate::mlog!("[asio-dsd] driver callback: asioMessage(selector={selector}, value={value})");
     match selector {
         K_ASIO_SELECTOR_SUPPORTED => i32::from(matches!(
             value,
@@ -562,7 +562,7 @@ fn host_thread(
                 let ctx_ptr = Box::into_raw(ctx_box);
                 ACTIVE.store(ctx_ptr, Ordering::Release);
                 let rc = asio_call!(driver, start);
-                eprintln!("[asio-dsd] \"{name}\": start rc={rc}");
+                crate::mlog!("[asio-dsd] \"{name}\": start rc={rc}");
                 if rc != ASE_OK {
                     ACTIVE.store(null_mut(), Ordering::Release);
                     let e = driver_error(driver, "ASIO start failed");
@@ -628,19 +628,19 @@ unsafe fn host_setup(
             windows_sys::Win32::UI::WindowsAndMessaging::GetDesktopWindow()
         } as *mut c_void;
     }
-    eprintln!("[asio-dsd] \"{name}\": init with hwnd {sys_handle:?}");
+    crate::mlog!("[asio-dsd] \"{name}\": init with hwnd {sys_handle:?}");
     if unsafe { asio_call!(driver, init, sys_handle) } != ASIO_TRUE {
         let e = driver_error(driver, "driver init failed");
         bail!(format!("ASIO \"{name}\": {e}"));
     }
-    eprintln!("[asio-dsd] \"{name}\": loaded, init ok (driver version {})",
+    crate::mlog!("[asio-dsd] \"{name}\": loaded, init ok (driver version {})",
               unsafe { asio_call!(driver, get_driver_version) });
 
     // Switch the driver into DSD mode BEFORE querying channel formats or
     // negotiating the rate — everything downstream depends on the mode.
     let mut fmt = AsioIoFormat { format_type: K_ASIO_FORMAT_DSD, future: [0; 508] };
     let can = unsafe { asio_call!(driver, future, K_ASIO_CAN_DO_IO_FORMAT, &mut fmt as *mut _ as *mut c_void) };
-    eprintln!("[asio-dsd] \"{name}\": kAsioCanDoIoFormat(DSD) = {can:#x} (ok={})", future_ok(can));
+    crate::mlog!("[asio-dsd] \"{name}\": kAsioCanDoIoFormat(DSD) = {can:#x} (ok={})", future_ok(can));
     if !future_ok(can) {
         bail!(format!(
             "ASIO \"{name}\" doesn't support native DSD (kAsioCanDoIoFormat returned {can}) — DoP is this device's ceiling"
@@ -648,7 +648,7 @@ unsafe fn host_setup(
     }
     let mut fmt = AsioIoFormat { format_type: K_ASIO_FORMAT_DSD, future: [0; 508] };
     let set = unsafe { asio_call!(driver, future, K_ASIO_SET_IO_FORMAT, &mut fmt as *mut _ as *mut c_void) };
-    eprintln!("[asio-dsd] \"{name}\": kAsioSetIoFormat(DSD) = {set:#x} (ok={})", future_ok(set));
+    crate::mlog!("[asio-dsd] \"{name}\": kAsioSetIoFormat(DSD) = {set:#x} (ok={})", future_ok(set));
     if !future_ok(set) {
         bail!(format!("ASIO \"{name}\": switching to DSD mode failed ({set})"));
     }
@@ -664,7 +664,7 @@ unsafe fn host_setup(
         } else {
             can
         };
-        eprintln!("[asio-dsd] \"{name}\": rate {cand}: canSampleRate={can} setSampleRate={set}");
+        crate::mlog!("[asio-dsd] \"{name}\": rate {cand}: canSampleRate={can} setSampleRate={set}");
         if set == ASE_OK {
             rate_used = cand;
             break;
@@ -678,7 +678,7 @@ unsafe fn host_setup(
     // Channel sanity + sample type.
     let (mut n_in, mut n_out) = (0i32, 0i32);
     let rc = unsafe { asio_call!(driver, get_channels, &mut n_in, &mut n_out) };
-    eprintln!("[asio-dsd] \"{name}\": getChannels rc={rc}, in={n_in}, out={n_out}");
+    crate::mlog!("[asio-dsd] \"{name}\": getChannels rc={rc}, in={n_in}, out={n_out}");
     if rc != ASE_OK || n_out < channels as i32 {
         bail!(format!("ASIO \"{name}\": needs {channels} output channels, driver has {n_out}"));
     }
@@ -687,7 +687,7 @@ unsafe fn host_setup(
         channel_group: 0, sample_type: 0, name: [0; 32],
     };
     let rc = unsafe { asio_call!(driver, get_channel_info, &mut info) };
-    eprintln!("[asio-dsd] \"{name}\": getChannelInfo rc={rc}, sample type {}", info.sample_type);
+    crate::mlog!("[asio-dsd] \"{name}\": getChannelInfo rc={rc}, sample type {}", info.sample_type);
     if rc != ASE_OK {
         bail!(format!("ASIO \"{name}\": channel info query failed"));
     }
@@ -702,7 +702,7 @@ unsafe fn host_setup(
     // Buffers at the driver's preferred size.
     let (mut min, mut max, mut preferred, mut gran) = (0i32, 0i32, 0i32, 0i32);
     let rc = unsafe { asio_call!(driver, get_buffer_size, &mut min, &mut max, &mut preferred, &mut gran) };
-    eprintln!("[asio-dsd] \"{name}\": getBufferSize rc={rc}, min={min} max={max} preferred={preferred} gran={gran}");
+    crate::mlog!("[asio-dsd] \"{name}\": getBufferSize rc={rc}, min={min} max={max} preferred={preferred} gran={gran}");
     if rc != ASE_OK || preferred <= 0 {
         bail!(format!("ASIO \"{name}\": buffer size query failed"));
     }
@@ -724,7 +724,7 @@ unsafe fn host_setup(
         asio_message: cb_asio_message,
         buffer_switch_time_info: cb_buffer_switch_time_info,
     }));
-    eprintln!(
+    crate::mlog!(
         "[asio-dsd] \"{name}\": calling createBuffers(numChannels={}, bufferSize={preferred})…",
         channels,
     );
@@ -732,7 +732,7 @@ unsafe fn host_setup(
         driver, create_buffers,
         buffer_infos.as_mut_ptr(), channels as i32, preferred, callbacks
     ) };
-    eprintln!(
+    crate::mlog!(
         "[asio-dsd] \"{name}\": createBuffers rc={rc}, ch0 buffers = {:?}/{:?}",
         buffer_infos[0].buffers[0], buffer_infos[0].buffers[1],
     );
@@ -742,7 +742,7 @@ unsafe fn host_setup(
     }
 
     let supports_output_ready = unsafe { asio_call!(driver, output_ready) } == ASE_OK;
-    eprintln!("[asio-dsd] \"{name}\": outputReady supported = {supports_output_ready}");
+    crate::mlog!("[asio-dsd] \"{name}\": outputReady supported = {supports_output_ready}");
 
     let ctx = Box::new(CallbackCtx {
         shared: Arc::clone(shared),
@@ -753,7 +753,7 @@ unsafe fn host_setup(
         scratch: Vec::with_capacity(buffer_bytes * channels as usize),
         supports_output_ready,
     });
-    eprintln!(
+    crate::mlog!(
         "[asio-dsd] \"{name}\": DSD mode on, rate accepted as {rate_used} \
          ({}), sample type {} ({}), buffer {preferred} samples = {buffer_bytes} bytes/ch",
         crate::dsd::rate_label(dsd_rate),

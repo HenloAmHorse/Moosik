@@ -100,6 +100,14 @@ fn path() -> PathBuf {
 
 static STATE: Mutex<Option<Calibration>> = Mutex::new(None);
 
+/// Adapter presence, as decided once by [`warm`]: 0 unknown, 1 yes, 2 no.
+///
+/// Cached in an atomic rather than asked each time because the question is
+/// posed from inside a repaint, and answering it the honest way means building
+/// a wgpu instance and enumerating adapters — first-call-only, but that first
+/// call is exactly the one a broken driver can sit on.
+static DEVICE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 fn load_or_default(adapter: &str, cores: usize) -> Calibration {
     let fresh = || Calibration {
         adapter: adapter.to_string(), cores, probed: false, sizes: BTreeMap::new(),
@@ -208,6 +216,11 @@ fn probe(c: &mut Calibration) {
 
         let e = c.sizes.entry(n).or_default();
         e.probe_ok = gpu_secs > 0.0 && gpu_secs * PROBE_MARGIN < cpu_secs;
+        crate::mlog!(
+            "gpu     probe 2^{:<2} cores {cpu_secs:.3}s device {gpu_secs:.3}s → {}",
+            n.trailing_zeros(),
+            if e.probe_ok { "device" } else { "cores" },
+        );
     }
 }
 
@@ -320,8 +333,12 @@ pub fn recalibrate() {
 }
 
 /// True while a device exists at all — the checkbox is meaningless without one.
+///
+/// Reads the answer [`warm`] cached. Until that lands this reports `false`,
+/// which shows the "no device" note for a moment on a cold start rather than
+/// stalling the frame to find out.
 pub fn device_present() -> bool {
-    super::gpu::GpuFft::describe().is_some()
+    DEVICE.load(std::sync::atomic::Ordering::Acquire) == 1
 }
 
 /// Whether this group's block size should go to the device.
@@ -395,27 +412,72 @@ pub fn record(n: usize, units: f64, secs: f64, used_gpu: bool) {
 }
 
 /// Human-readable state, for the debug panel.
+///
+/// Never blocks and never starts a probe. This runs inside a repaint, and the
+/// probe behind `with` holds the calibration lock for as long as it takes to
+/// time six block sizes on both routes — seconds on a fast machine, far longer
+/// on a slow one. Calling `with` from here froze the whole window the first
+/// time the panel was opened on an un-probed machine, which looked like a hang
+/// rather than a measurement. The warm-up thread does the work; the panel only
+/// ever reports what is already known.
 pub fn describe() -> Vec<String> {
-    with(|c| {
-        let mut out = Vec::new();
-        for (&n, s) in &c.sizes {
-            let (use_gpu, settled) = s.verdict();
-            let ratio = match (s.gpu_cost(), s.cpu_cost()) {
-                (Some(g), Some(cc)) if g > 0.0 => format!("{:.2}× cores", cc / g),
-                _ => "—".into(),
-            };
-            out.push(format!(
-                "  2^{:<2} {:<8} {:>10}  gpu {}/cpu {}{}",
-                n.trailing_zeros(),
-                if use_gpu { "device" } else { "cores" },
-                ratio, s.gpu_n, s.cpu_n,
-                if settled { "" } else { " (probe)" },
-            ));
-        }
-        if out.is_empty() { out.push("  (no calibration yet)".into()); }
-        out
-    })
-    .unwrap_or_else(|| vec!["  (no device)".into()])
+    match STATE.try_lock() {
+        Ok(g) => match g.as_ref() {
+            Some(c) => describe_calibration(c),
+            None => vec!["  (not measured yet)".into()],
+        },
+        Err(_) => vec!["  (measuring…)".into()],
+    }
+}
+
+fn describe_calibration(c: &Calibration) -> Vec<String> {
+    let mut out = Vec::new();
+    for (&n, s) in &c.sizes {
+        let (use_gpu, settled) = s.verdict();
+        let ratio = match (s.gpu_cost(), s.cpu_cost()) {
+            (Some(g), Some(cc)) if g > 0.0 => format!("{:.2}× cores", cc / g),
+            _ => "—".into(),
+        };
+        out.push(format!(
+            "  2^{:<2} {:<8} {:>10}  gpu {}/cpu {}{}",
+            n.trailing_zeros(),
+            if use_gpu { "device" } else { "cores" },
+            ratio, s.gpu_n, s.cpu_n,
+            if settled { "" } else { " (probe)" },
+        ));
+    }
+    if out.is_empty() { out.push("  (no calibration yet)".into()); }
+    out
+}
+
+/// Do the first-touch work — adapter enumeration and the probe — on a thread
+/// that is allowed to take its time.
+///
+/// Both halves are first-call-only and both can be slow on hardware nobody
+/// tested on: `GpuFft::describe` builds a wgpu instance and enumerates
+/// adapters, which a sick driver can sit on for seconds, and the probe times
+/// real convolutions at six block sizes. Neither belongs on the UI thread, and
+/// before this existed both could land there.
+pub fn warm() {
+    std::thread::Builder::new()
+        .name("moosik-gpu-warm".into())
+        .spawn(|| {
+            let t = std::time::Instant::now();
+            let adapter = super::gpu::GpuFft::describe();
+            crate::mlog!(
+                "gpu     adapter {} ({:.2}s)",
+                adapter.as_deref().unwrap_or("none — CPU only"),
+                t.elapsed().as_secs_f64()
+            );
+            DEVICE.store(if adapter.is_some() { 1 } else { 2 }, std::sync::atomic::Ordering::Release);
+            if adapter.is_none() { return }
+
+            let t = std::time::Instant::now();
+            let n = with(|c| c.sizes.len()).unwrap_or(0);
+            crate::mlog!("gpu     calibration ready, {n} size(s), {:.2}s", t.elapsed().as_secs_f64());
+            for line in describe() { crate::mlog!("gpu    {line}"); }
+        })
+        .ok();
 }
 
 #[cfg(test)]

@@ -1,5 +1,75 @@
 # Changelog
 
+## [1.4.1] - 2026-08-17
+
+A build on a second machine misbehaved in four different ways at once, with
+nothing to show for any of it. So this release is a session log, and then the
+bugs the log found — including one that killed the process outright.
+
+### There is a log now
+
+Every run writes a file to `~/.moosik/logs/`, ten kept. The **🗎 Log** button
+next to 🎨 Look opens the folder; no console needed, which matters because the
+build that needs it most is the one somebody double-clicked.
+
+Every line is flushed as it is written rather than buffered, since a buffer
+loses precisely the lines that describe the failure. Timestamps count from
+process start — when reading a session back, what matters is that the stall
+began 4 s after the analysis did, not what o'clock it was. The banner records
+version, OS, cores, exe path and build profile before anything can fail, so
+even a log with one line in it says what it ran on.
+
+Panics record a forced backtrace. The previous crash log wrote a single line
+saying something had died, without the path that reached it.
+
+If you hit something odd, the log is the bug report.
+
+### Fixed
+
+- **Playing a 44.1 kHz track could kill the app.** `max_freq` defaults to
+  24 kHz, above Nyquist for CD-rate audio, and the bin lookup bounded the top
+  of its range but not the bottom — so a bar past Nyquist indexed off the end
+  of the spectrum. Invisible on 48 kHz material, where Nyquist is *exactly*
+  the default ceiling and nothing above it is ever asked for. Bars above
+  Nyquist now read the topmost bin, which is what the constant-Q path has
+  always done with them.
+- **Bass appeared a second time at the top of the real-time display.** The tap
+  fed interleaved channels into a buffer the analyser reads as one mono
+  stream, making it an N-times sample-and-hold: every partial at f/N with a
+  mirror image at Nyquist − f/N. Frames are averaged down now, as the
+  pre-process decoder always did. Momentary LUFS was reading the same
+  interleaved stream and is corrected with it.
+- **Bit-perfect output could be noise, played fast, at a volume the slider did
+  not affect.** Negotiation offered packed 24-bit before 24-in-32; Realtek
+  reports support for the 6-byte frame and mishandles it. 24-in-32 is equally
+  bit-exact and is now preferred. Negotiation also logs every candidate and
+  refuses outright any format whose rate, channels or block alignment disagree
+  with what was requested.
+- **The app could start in the wrong theme.** egui defaults to following the
+  system theme and re-applies its own visuals over ours; on a machine set to
+  Light that landed on the first frame, showing stock light styling while the
+  settings panel still read Dark.
+- **Opening the spectrum settings could freeze the window.** The GPU probe ran
+  under a lock held across six block sizes timed on both routes — 35.7 s on a
+  four-core machine — and adapter enumeration ran on first touch. Both could
+  land inside a repaint. A warm-up thread does the work at startup; the panel
+  reports what is known and never blocks.
+- **The analysis progress readout was missing during a first analysis** — the
+  one case where it is most wanted. It keyed on whether cached frames existed
+  while the centred notice keyed on whether the plot was silent, and a first
+  run satisfied neither.
+- **Dropouts are no longer counted while the ring refills after a seek.** That
+  gap is the one you asked for by jumping. Every dropout observed in testing
+  so far was this and nothing else, which made the counter noise.
+
+### For diagnosing a device
+
+- `MOOSIK_BP_FORMAT=16i|24i|24i32|32i|32f` pins the output format, so a format
+  problem can be bisected on the machine that has it rather than the one with
+  the compiler.
+- `MOOSIK_BP_TRACE=1` logs each write: frames available, samples wanted and
+  received, byte count against expected, and peak sample value.
+
 ## [1.4.0] - 2026-08-16
 
 Two things: the pre-process learned to use the GPU, and the display stopped

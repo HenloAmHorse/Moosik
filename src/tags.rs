@@ -229,6 +229,97 @@ mod tests {
         assert_eq!(Edits::empty().values.len(), EDITABLE.len());
     }
 
+    /// Decode a file to PCM and hash it, so two files can be compared without
+    /// holding a whole album in memory. FNV-1a — no dependency, and collisions
+    /// are not the threat model here.
+    fn audio_fingerprint(path: &Path) -> Result<(u64, usize), String> {
+        use rodio::Source as _;
+        let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let d = rodio::Decoder::new(std::io::BufReader::new(f)).map_err(|e| e.to_string())?;
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut n = 0usize;
+        for s in d.convert_samples::<f32>() {
+            for b in s.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+            n += 1;
+        }
+        Ok((h, n))
+    }
+
+    /// The one thing in this player that can destroy a stranger's library, run
+    /// against real containers rather than a hand-built WAV. A tag write moves
+    /// a region in the middle of the file; the failure that matters is not a
+    /// wrong tag, it is audio that no longer decodes to what it did before.
+    ///
+    /// Point it at *copies*:
+    ///
+    /// `MOOSIK_TAG_FIXTURES=/path/to/copies cargo test --bin moosik -- --ignored --nocapture real_files`
+    #[test]
+    #[ignore = "needs real files — set MOOSIK_TAG_FIXTURES to a folder of copies"]
+    fn real_files_keep_their_audio_through_a_tag_write() {
+        let Ok(src_dir) = std::env::var("MOOSIK_TAG_FIXTURES") else {
+            panic!("set MOOSIK_TAG_FIXTURES to a folder holding copies of real music files");
+        };
+        let work = std::env::temp_dir().join("moosik-tag-fixtures");
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+
+        let mut checked = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("fixture folder is readable") {
+            let src = entry.unwrap().path();
+            if !src.is_file() { continue; }
+            let name = src.file_name().unwrap().to_string_lossy().into_owned();
+            let path = work.join(&name);
+            std::fs::copy(&src, &path).unwrap();
+
+            if let Err(why) = writable(&path) {
+                skipped.push(format!("{name}: refused — {why}"));
+                continue;
+            }
+            let before = match audio_fingerprint(&path) {
+                Ok(v) => v,
+                Err(e) => { skipped.push(format!("{name}: undecodable — {e}")); continue; }
+            };
+
+            // Write every editable field, including non-ASCII and a blanking,
+            // so container-specific key handling is actually exercised.
+            let original = read_edits(&path);
+            let mut e = original.clone();
+            e.values[0] = "ヴァンパイア".into();
+            e.values[1] = "DECO*27".into();
+            e.values[4] = "3".into();
+            e.values[9] = String::new(); // genre blanked → key removed
+            write(&path, &e).unwrap_or_else(|err| panic!("{name}: write failed — {err}"));
+
+            let back = read_edits(&path);
+            assert_eq!(back.values[0], "ヴァンパイア", "{name}: unicode title");
+            assert_eq!(back.values[1], "DECO*27", "{name}: artist");
+            assert_eq!(back.values[4], "3", "{name}: track number");
+            assert_eq!(back.values[9], "", "{name}: blanked genre should be gone");
+
+            let after = audio_fingerprint(&path)
+                .unwrap_or_else(|err| panic!("{name}: no longer decodes after write — {err}"));
+            assert_eq!(after, before, "{name}: AUDIO CHANGED — {} samples before, {} after",
+                       before.1, after.1);
+
+            // Restore, and confirm a write can put a file back as it was.
+            write(&path, &original).unwrap_or_else(|err| panic!("{name}: restore failed — {err}"));
+            assert_eq!(read_edits(&path), original, "{name}: not restorable");
+            assert_eq!(audio_fingerprint(&path).unwrap(), before, "{name}: audio changed on restore");
+
+            assert_eq!(staged_count(&work), 0, "{name}: staging file leaked");
+            println!("ok   {name}  ({} samples intact)", before.1);
+            checked += 1;
+        }
+        for s in &skipped { println!("skip {s}"); }
+        assert!(checked > 0, "no fixture was actually written — nothing was proven");
+        println!("\n{checked} file(s) round-tripped with audio intact, {} skipped", skipped.len());
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
     /// Round-trips a real file. Ignored by default because it writes to disk.
     ///
     /// `cargo test --bin moosik -- --ignored --nocapture tag_round_trip`

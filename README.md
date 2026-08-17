@@ -163,6 +163,7 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **ReplayGain** — loudness normalization (Track / Album), reading ReplayGain tags when present and falling back to Moosik's own measured LUFS for untagged files; clip-prevention toggle; bypassed in bit-perfect mode
 - Momentary LUFS display
 - Stereo correlation meter
+- **Session log** — every run writes a timestamped file to `~/.moosik/logs/` (last ten kept), recording the machine, the output device and format actually negotiated, analysis timings, and a full backtrace on any panic. The **🗎 Log** button opens the folder. If something goes wrong, attach it to the bug report
 
 ## Building
 

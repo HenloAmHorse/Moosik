@@ -1,6 +1,8 @@
 mod bitperfect;
 mod dsd;
 mod fonts;
+#[macro_use]
+mod log;
 mod lyrics;
 mod media_controls;
 mod spectrum;
@@ -282,7 +284,23 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     style.spacing.item_spacing = egui::vec2(8.0, 5.0);
     style.spacing.button_padding = egui::vec2(7.0, 3.0);
 
+    // Pin egui to the theme the user picked before installing the style.
+    //
+    // egui defaults `theme_preference` to `System` (`Memory::Options`), and on
+    // any frame where the OS reports its theme it re-applies its *own*
+    // `dark_style`/`light_style` over whatever `set_style` last put there. On a
+    // machine whose Windows is set to Light that lands on the first frame: the
+    // app starts in egui's stock light visuals while the settings panel still
+    // reads "Dark", and toggling the switch appears to fix it only because
+    // this function runs again. Declaring the preference stops egui resolving
+    // a theme we did not ask for; setting both slots means that if it ever
+    // does resolve one, it finds this style in both.
+    let theme = if dark { egui::Theme::Dark } else { egui::Theme::Light };
+    ctx.set_theme(egui::ThemePreference::from(theme));
+    ctx.set_visuals_of(egui::Theme::Dark, style.visuals.clone());
+    ctx.set_visuals_of(egui::Theme::Light, style.visuals.clone());
     ctx.set_style(style);
+    mlog!("theme   applied {}", if dark { "dark" } else { "light" });
 }
 
 /// Raise the Windows system timer resolution to 1 ms. The default (~15.6 ms)
@@ -320,37 +338,6 @@ fn monitor_refresh_hz() -> Option<f32> {
 #[cfg(not(windows))]
 fn monitor_refresh_hz() -> Option<f32> { None }
 
-/// Record panics to `~/.moosik/crash.log` (and still print to stderr). The
-/// release profile uses `panic = "abort"`, so a panic on *any* thread (decode,
-/// output, seek worker) takes the whole process down with no visible stack —
-/// this leaves a durable breadcrumb of the message, location, and thread so a
-/// "crash" can be diagnosed from evidence instead of guessed at.
-fn install_crash_logger() {
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let loc = info.location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "?".into());
-        let msg = info.payload().downcast_ref::<&str>().map(|s| (*s).to_string())
-            .or_else(|| info.payload().downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "<non-string panic payload>".into());
-        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let dir = moosik_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).append(true).open(dir.join("crash.log"))
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "[{secs}] panic on '{thread}' at {loc}: {msg}");
-        }
-        default(info); // keep the normal stderr output
-    }));
-}
-
 /// Leave the audio thread room to run.
 ///
 /// The superlet pre-process is rayon-parallel and saturating: on a default
@@ -373,12 +360,18 @@ fn cap_worker_threads() {
 }
 
 fn main() -> eframe::Result {
+    log::init();
+    log::install_panic_hook();
     raise_timer_resolution();
-    install_crash_logger();
     cap_worker_threads();
     let icon = eframe::icon_data::from_png_bytes(
         include_bytes!("../assets/icon.png")
     ).expect("invalid icon PNG");
+    mlog!("icon    window icon decoded, {}x{}", icon.width, icon.height);
+    // Adapter enumeration and the one-off GPU probe, off the UI thread. Both
+    // are first-call-only and both can be slow on unfamiliar hardware; done
+    // lazily they landed inside a repaint and looked like a hang.
+    spectrum::gpu_calib::warm();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -859,7 +852,7 @@ impl Engine {
                     Err(e) => {
                         // Always audible in the console — a silent fall-through
                         // to DoP looks like "native just doesn't work".
-                        eprintln!("[native-dsd] native DSD failed, trying DoP: {e}");
+                        crate::mlog!("[native-dsd] native DSD failed, trying DoP: {e}");
                         Some(e)
                     }
                 }
@@ -911,8 +904,21 @@ impl Engine {
     /// (re)opening the cpal stream if the device or stream format changed.
     fn start_bp(&mut self, path: &Path, start: Duration) -> Result<(), String> {
         self.native_close(); // a native-DSD output may hold the device exclusively
+        // Timed because this decodes: `prepare` opens the file and seeks it,
+        // and a FLAC without a seek table is scanned from the beginning. On the
+        // UI thread that is a stall the length of the scan.
+        let t_prep = std::time::Instant::now();
         let prep = bitperfect::prepare(path, start)
             .map_err(|e| format!("Bit-perfect: {e}"))?;
+        let prep_ms = t_prep.elapsed().as_secs_f64() * 1e3;
+        if prep_ms > 100.0 {
+            mlog!("bp      SLOW prepare: {prep_ms:.0} ms to seek to {:.2}s", start.as_secs_f64());
+        }
+        mlog!(
+            "bp      source {} Hz, {}ch, {:?} bits — {}",
+            prep.sample_rate, prep.channels, prep.bits_per_sample,
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        );
         self.last_sample_rate = prep.sample_rate;
 
         let reuse = self.bp.as_ref().is_some_and(|s| {
@@ -1391,7 +1397,7 @@ impl Engine {
                          else if self.dsd_mode { self.start_dop(path, target) }
                          else { self.start_bp(path, target) };
             if let Err(e) = result {
-                eprintln!("seek: {e}");
+                crate::mlog!("seek: {e}");
                 return;
             }
             if was_paused {
@@ -2707,6 +2713,13 @@ impl MoosikApp {
     /// OS media-key seeking.
     fn seek_to(&mut self, target: Duration) {
         let Some(idx) = self.current_index else { return };
+        // Logged *before* each stage rather than after, so that if one of them
+        // never returns the last line in the log names it. A hang leaves no
+        // completion record by definition, and this path runs on the UI thread
+        // — `engine.seek_to` opens and seeks a decoder here, which is the same
+        // shape as the deep-FLAC stall already noted in `restart_stream`.
+        let t0 = std::time::Instant::now();
+        mlog!("seek    → {:.2}s: flushing gapless", target.as_secs_f64());
         // A seek reshapes the current stream — discard any gapless queue so the
         // engine and our roll-over bookkeeping can't diverge.
         self.flush_gapless();
@@ -2714,9 +2727,12 @@ impl MoosikApp {
         let target = dur.map_or(target, |d| target.min(d));
         let path = self.playlist[idx].path.clone();
         if let Some(ref mut engine) = self.engine {
+            mlog!("seek    engine.seek_to ({:.0} ms in)", t0.elapsed().as_secs_f64() * 1e3);
             engine.seek_to(&path, target);
         }
+        mlog!("seek    spectrum on_seek ({:.0} ms in)", t0.elapsed().as_secs_f64() * 1e3);
         self.spectrum_window.on_seek(target.as_secs_f64());
+        mlog!("seek    done in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
         self.seek_pos = dur
             .map(|d| (target.as_secs_f32() / d.as_secs_f32().max(0.001)).clamp(0.0, 1.0))
             .unwrap_or(0.0);
@@ -4122,6 +4138,28 @@ impl eframe::App for MoosikApp {
                     // ── Appearance (text size · accent) ─────────────────────
                     // The spectrum palette lives in the spectrum window itself
                     // (next to the View controls), since it only affects that view.
+                    // ── Session log ─────────────────────────────────────────
+                    // Reachable without a console, because the build that most
+                    // needs it is the one someone double-clicked. A bug report
+                    // that can attach this file is worth more than any amount
+                    // of asking what happened.
+                    if ui.button(RichText::new("🗎 Log").size(13.0))
+                        .on_hover_text(match log::path() {
+                            Some(p) => format!("Open this session's log\n{}", p.display()),
+                            None => "Open the log folder".into(),
+                        })
+                        .clicked()
+                    {
+                        let dir = log::dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        #[cfg(windows)]
+                        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                        #[cfg(target_os = "macos")]
+                        let _ = std::process::Command::new("open").arg(&dir).spawn();
+                        #[cfg(all(unix, not(target_os = "macos")))]
+                        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+                    }
+
                     ui.menu_button(RichText::new("🎨 Look").size(13.0), |ui| {
                         ui.set_min_width(230.0);
                         ui.label(RichText::new("Appearance").strong().size(12.0));

@@ -179,7 +179,7 @@ impl AlsaDsdStream {
             let rate = dsd_rate / (8 * bps as u32);
             match try_format(&pcm, format, rate, channels as u32) {
                 Ok((period, buffer)) => {
-                    eprintln!(
+                    crate::mlog!(
                         "[alsa-dsd] \"{device}\": {format} @ {rate} Hz accepted \
                          (period {period} frames, buffer {buffer})"
                     );
@@ -187,7 +187,7 @@ impl AlsaDsdStream {
                     break;
                 }
                 Err(e) => {
-                    eprintln!("[alsa-dsd] \"{device}\": {format} @ {rate} Hz: {e}");
+                    crate::mlog!("[alsa-dsd] \"{device}\": {format} @ {rate} Hz: {e}");
                     if !errors.is_empty() { errors.push_str("; "); }
                     errors.push_str(&format!("{format}: {e}"));
                 }
@@ -377,7 +377,7 @@ fn writer_thread(
                     // Underrun/suspend recover in place; anything else
                     // (device unplugged, format yanked) ends the stream.
                     if pcm.try_recover(e, true).is_err() {
-                        eprintln!("[alsa-dsd] \"{device}\": unrecoverable write error: {e}");
+                        crate::mlog!("[alsa-dsd] \"{device}\": unrecoverable write error: {e}");
                         shared.failed.store(true, Ordering::Release);
                         shared.finished.store(true, Ordering::Release);
                         break 'outer;
@@ -477,7 +477,7 @@ mod tests {
     fn null_device_end_to_end() {
         let stream = match AlsaDsdStream::open("null", 2_822_400, 2) {
             Ok(s) => s,
-            Err(e) => { eprintln!("skipping: {e}"); return; }
+            Err(e) => { crate::mlog!("skipping: {e}"); return; }
         };
         assert_eq!(stream.format_label, "DSD_U32_BE"); // first preference
         assert!(!stream.lsb_first);

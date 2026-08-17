@@ -315,6 +315,58 @@ pub fn compute_eq_weights(
 }
 
 #[cfg(test)]
+mod nyquist_tests {
+    use super::*;
+
+    /// A 44.1 kHz track with the default 24 kHz ceiling asks for bars above
+    /// Nyquist. Every bar must still resolve to a bin that exists.
+    ///
+    /// This killed the process on the first 44.1 kHz file played with a
+    /// non-constant-Q mapping: 48 kHz material has Nyquist exactly at the
+    /// default `max_freq`, so nothing above the ceiling was ever requested and
+    /// the missing bound stayed invisible.
+    #[test]
+    fn bars_above_nyquist_stay_inside_the_spectrum() {
+        let mut a = SpectrumAnalyzer::new(new_sample_buf());
+        a.sample_rate = 44_100;
+        a.min_freq = DEFAULT_MIN_FREQ;
+        a.max_freq = DEFAULT_MAX_FREQ; // 24 kHz — above Nyquist here
+        let padded = a.fft_size * 2;
+        let buf = vec![Complex { re: 0.5f32, im: 0.0 }; padded];
+
+        // The constant-Q branch always clamped; the others are the ones that
+        // reached the unguarded index, and every interpolation mode routes
+        // through it.
+        for mapping in [BarMappingMode::Superlet, BarMappingMode::FlatOverlap,
+                        BarMappingMode::Gaussian, BarMappingMode::Cqt] {
+            for interp in [InterpolationMode::None, InterpolationMode::Linear,
+                           InterpolationMode::CatmullRom, InterpolationMode::Pchip] {
+                a.bar_mapping = mapping.clone();
+                a.interp_mode = interp.clone();
+                let bars = a.bins_to_bars(&buf, a.sample_rate, 1024, padded);
+                assert_eq!(bars.len(), 1024, "{mapping:?}/{interp:?}");
+                assert!(bars.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+                        "{mapping:?}/{interp:?} produced a value outside 0..1");
+            }
+        }
+    }
+
+    /// The unguarded index itself, at and past the end.
+    #[test]
+    fn sub_bin_interpolation_holds_at_the_edges() {
+        let norms = [1.0f32, 2.0, 3.0, 4.0];
+        for mode in [InterpolationMode::None, InterpolationMode::Linear,
+                     InterpolationMode::CatmullRom, InterpolationMode::Pchip] {
+            for &c in &[-5.0f32, -0.4, 0.0, 1.5, 3.0, 3.9, 4.0, 99.0] {
+                let v = interp_sub_bin(&norms, c, &mode);
+                assert!(v.is_finite(), "{mode:?} at {c} gave {v}");
+            }
+        }
+        assert_eq!(interp_sub_bin(&norms, 2.0, &InterpolationMode::None), 3.0);
+    }
+}
+
+#[cfg(test)]
 mod iso226_tests {
     use super::*;
 
@@ -530,6 +582,7 @@ where
     channels: u16,
     ch_idx: u16,
     pending_l: f32,
+    frame_sum: f32,
     sample_batch: Vec<f32>,
     stereo_batch: Vec<[f32; 2]>,
 }
@@ -542,7 +595,7 @@ where
     pub fn new(inner: S, buf: SampleBuf, stereo_buf: StereoBuf) -> Self {
         let channels = inner.channels();
         Self {
-            inner, buf, stereo_buf, channels, ch_idx: 0, pending_l: 0.0,
+            inner, buf, stereo_buf, channels, ch_idx: 0, pending_l: 0.0, frame_sum: 0.0,
             sample_batch: Vec::with_capacity(BATCH_SIZE),
             stereo_batch: Vec::with_capacity(BATCH_SIZE / 2),
         }
@@ -567,9 +620,21 @@ where
             } else {
                 self.stereo_batch.push([self.pending_l, f]);
             }
-            self.ch_idx = (self.ch_idx + 1) % 2;
         }
-        self.sample_batch.push(f);
+        // The analyser reads this buffer as one mono stream sampled at the
+        // track's rate. Pushing interleaved channels made it a 2× (or N×)
+        // sample-and-hold instead: every partial appeared at f/N with a mirror
+        // image at Nyquist − f/N, which is why bass showed up again at the top
+        // of the display. Average each frame down, exactly as the pre-process
+        // decoder does.
+        let ch = self.channels.max(1);
+        self.frame_sum += f;
+        self.ch_idx += 1;
+        if self.ch_idx >= ch {
+            self.sample_batch.push(self.frame_sum / ch as f32);
+            self.frame_sum = 0.0;
+            self.ch_idx = 0;
+        }
 
         // Flush to shared buffers once per batch — one lock per 512 samples
         if self.sample_batch.len() >= BATCH_SIZE {
@@ -807,9 +872,20 @@ impl SpectrumAnalyzer {
                     let t1 = (bar + 1) as f32 / n_bars as f32;
                     let freq_lo = fscale.freq_at(t0, lo_hz, hi_hz);
                     let freq_hi = fscale.freq_at(t1, lo_hz, hi_hz);
-                    let fbin_lo = (freq_lo * padded_size as f32 / sr as f32).max(1.0);
+                    // Both ends are bounded by the spectrum that exists.
+                    //
+                    // `max_freq` defaults to 24 kHz, which is above Nyquist for
+                    // a 44.1 kHz track, so the top bars ask for bins the FFT
+                    // never produced. Only `fbin_hi` used to be clamped; a bar
+                    // whose *low* edge was already past the end then produced a
+                    // negative width, took the sub-bin branch, and indexed the
+                    // midpoint of a range that started off the end of the array.
+                    // Those bars read the topmost bin instead, which is what the
+                    // constant-Q branch has always done with them.
+                    let top = half as f32 - 1.0;
+                    let fbin_lo = (freq_lo * padded_size as f32 / sr as f32).clamp(1.0, top);
                     let fbin_hi = (freq_hi * padded_size as f32 / sr as f32)
-                        .max(fbin_lo + 0.001).min(half as f32 - 0.001);
+                        .clamp(fbin_lo, top);
 
                     // Sub-bin: interpolated; Multi-bin: weighted overlap average.
                     if fbin_hi - fbin_lo <= 1.0 {
@@ -903,7 +979,7 @@ impl SpectrumAnalyzer {
                         let budget = (self.cache_budget_gb as f64 * 1e9) as u64;
                         let (n, freed) = evict_cache_to_budget(budget, None);
                         if n > 0 {
-                            eprintln!("[cache] evicted {n} file(s), freed {:.1} MB",
+                            crate::mlog!("[cache] evicted {n} file(s), freed {:.1} MB",
                                       freed as f64 / 1e6);
                         }
                     }
@@ -917,6 +993,7 @@ impl SpectrumAnalyzer {
             }
         }
         if let Some((frames, rate)) = ready {
+            crate::mlog!("[analysis] {} frames received by the display", frames.len());
             self.pre_frames = frames;
             self.pre_frame_rate = rate;
             self.pre_receiver = None;
@@ -983,6 +1060,10 @@ impl SpectrumAnalyzer {
     pub fn start_preprocess(&mut self, path: PathBuf) {
         // Guard: refuse to spawn a second thread if one is already running.
         if self.is_analyzing.load(Ordering::Relaxed) {
+            crate::mlog!(
+                "[analysis] refused, one already running at {}%",
+                self.analysis_progress.load(Ordering::Relaxed),
+            );
             return;
         }
         let n_bars = self.bar_count;
@@ -1039,13 +1120,16 @@ impl SpectrumAnalyzer {
         std::thread::spawn(move || {
             struct ClearOnDrop(Arc<AtomicBool>);
             impl Drop for ClearOnDrop {
-                fn drop(&mut self) { self.0.store(false, Ordering::Relaxed); }
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Relaxed);
+                    crate::mlog!("[analysis] busy flag cleared");
+                }
             }
             let _guard = ClearOnDrop(flag);
             // Logged because a second analysis starting behind the first is
             // invisible from the UI — the progress bar simply appears to restart.
             let t0 = Instant::now();
-            eprintln!(
+            crate::mlog!(
                 "[analysis] start {mapping_dbg} {} bars @ {pre_fps} fps — {}",
                 n_bars,
                 path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -1055,7 +1139,7 @@ impl SpectrumAnalyzer {
                 fft_size, pad_factor, overlap, &window_fn, min_freq, max_freq, &interp_mode, &bar_mapping,
                 dsd_rate, &aslt_cfg, pre_fps, &abort, &eta,
             );
-            eprintln!(
+            crate::mlog!(
                 "[analysis] {} after {:.1}s",
                 match &result {
                     PreMessage::Done { frames, .. } => format!("done, {} frames", frames.len()),
@@ -1169,10 +1253,11 @@ impl SpectrumAnalyzer {
                         let budget = (self.cache_budget_gb as f64 * 1e9) as u64;
                         let (n, freed) = evict_cache_to_budget(budget, None);
                         if n > 0 {
-                            eprintln!("[cache] evicted {n} file(s), freed {:.1} MB",
+                            crate::mlog!("[cache] evicted {n} file(s), freed {:.1} MB",
                                       freed as f64 / 1e6);
                         }
                     }
+                    crate::mlog!("[analysis] {} frames received (paused path)", frames.len());
                     self.pre_frames = frames;
                     self.pre_frame_rate = frame_rate;
                     self.pending_waveform = Some(waveform);
@@ -2266,8 +2351,13 @@ fn akima_tangent(d_prev2: f32, d_prev1: f32, d_curr: f32, d_next: f32) -> f32 {
 /// Unified sub-bin dispatcher.  `center` is a fractional bin index into `norms`.
 fn interp_sub_bin(norms: &[f32], center: f32, mode: &InterpolationMode) -> f32 {
     let half = norms.len();
-    let b1 = center.floor() as usize;
-    let t  = center - b1 as f32;
+    if half == 0 { return 0.0 }
+    // Every neighbour below is clamped into range; `b1` was not, which made
+    // this function safe for the bins around the one it actually reads and
+    // unsafe for that one. It is the index that is always used, so it is the
+    // one that has to hold on its own.
+    let b1 = (center.floor().max(0.0) as usize).min(half - 1);
+    let t  = (center - b1 as f32).clamp(0.0, 1.0);
     match mode {
         InterpolationMode::None => {
             norms[b1] // nearest bin — no interpolation
@@ -5877,9 +5967,18 @@ impl SpectrumWindow {
                     // that already has frames on screen used to show no
                     // progress at all unless the Cache panel was open — which
                     // is not somewhere anyone would think to look for it.
-                    if self.analyzer.is_analyzing.load(Ordering::Relaxed)
-                        && !self.analyzer.pre_frames.is_empty()
-                    {
+                    // Anywhere the centred notice is not already saying it.
+                    //
+                    // This used to require `!pre_frames.is_empty()`, to pair with
+                    // the centred notice's `pre_frames.is_empty()`. That looked
+                    // like a clean split and was not: a *first* analysis clears
+                    // pre_frames, and the live-FFT fallback keeps drawing bars,
+                    // so the plot is not silent either — the centred notice was
+                    // ruled out by the plot and this one by the frames, and the
+                    // most important case in the app showed no progress at all.
+                    // The real condition is the plot, which is what the centred
+                    // notice actually keys on.
+                    if self.analyzer.is_analyzing.load(Ordering::Relaxed) && !plot_is_silent {
                         let dark = ui.visuals().dark_mode;
                         let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
                         let eta = self.analyzer.eta_secs.load(Ordering::Relaxed);
