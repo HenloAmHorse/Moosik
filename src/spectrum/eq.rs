@@ -72,20 +72,6 @@ impl EqState {
     pub fn is_active(&self) -> bool {
         self.enabled && self.bands.iter().any(|b| b.enabled)
     }
-    /// Approximate fingerprint used for the bake-to-cache key.
-    pub fn fingerprint(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        for b in &self.bands {
-            if !b.enabled { continue; }
-            ((b.freq   * 10.0) as i32).hash(&mut h);
-            ((b.gain_db * 10.0) as i32).hash(&mut h);
-            ((b.q      * 100.0) as i32).hash(&mut h);
-            (b.kind.label()).hash(&mut h);
-        }
-        h.finish()
-    }
 }
 
 pub type EqStateHandle = Arc<Mutex<EqState>>;

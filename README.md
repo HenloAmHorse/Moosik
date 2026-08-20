@@ -27,7 +27,7 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 ### Bit-Perfect Output
 - **Native-rate, bit-transparent playback** — toggle the 💎 button and audio is sent to the device at the file's exact sample rate, decoded at full precision (24-bit safe) and converted to the device's native format with exact power-of-two scaling, so integer sources reach the DAC unchanged
 - **Windows: WASAPI exclusive mode** — opens the device exclusively, like foobar2000's WASAPI output, bypassing the Windows mixer; a DAC pinned to e.g. 384 kHz in the control panel still plays 44.1/48/96/192 kHz tracks at their native rate
-- **Linux / macOS** — direct cpal output at the exact rate; choosing an ALSA `hw:` device skips the PipeWire/Pulse resampling shims
+- **Linux / macOS** — cpal requests the application's exact format and rate; whether that survives end to end depends on the route it actually takes, since ALSA, PipeWire, Pulse and `dmix` may each resample or mix on the way to the hardware. Choosing a direct `hw:` device is the way to skip those shims, and CoreAudio has its own device-level behaviour — Moosik asks for the exact format, but it cannot promise the platform grants it
 - **Device picker** — the 🔈▾ menu lists every output device with its real capabilities (supported rates, sample formats, channels), probed in the background; pick one or stay on the system default. Your choice is remembered
 - **Honest fallbacks** — if a device can't play a track's format, playback drops to normal mode with a message listing what the device *does* support; EQ is bypassed in this mode (and the EQ panel says so), and the 💎 tooltip warns when volume is below 100%, since attenuation breaks bit-perfectness
 
@@ -43,10 +43,14 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Gapless DSD** — same-rate DSD tracks hand off with no device re-open and
   an unbroken DoP marker sequence; sessions lead in and out with DSD-marked
   silence so the DAC locks (and unlocks) cleanly
-- **Automatic PCM fallback** — if the device can't take the DoP carrier rate,
-  the bitstream is decimated to high-rate PCM and played through the normal
-  path instead (volume/EQ/ReplayGain apply), with a clear status notice —
-  DSD files are never simply unplayable
+- **Automatic PCM fallback, for device limitations only** — if the failure is
+  classified as a device limitation, such as a DAC that can't take the DoP
+  carrier rate, the bitstream is decimated to high-rate PCM and played through
+  the normal path instead (volume/EQ/ReplayGain apply), with a clear status
+  notice. Every other failure stops with a visible error rather than quietly
+  processing the audio: an invalid `MOOSIK_BP_FORMAT` override, a request that
+  contradicts itself, and any file, parse or seek failure all report the real
+  problem instead of decimating around it
 - **Analyzer support** — spectrum, waveform, LUFS/DR and spectral ceiling run
   on a decimated PCM feed (176.4 kHz default, 352.8 kHz selectable for a
   faster-reacting spectrum); playback stays raw bits over DoP
@@ -56,7 +60,9 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
   unlocking **bit-perfect DSD512** — and likely **DSD1024** too: the rate
   is negotiated with the driver directly rather than picked from a fixed
   list, so nothing in the code stops at 512 (not hardware-verified at 1024
-  yet). Falls back to DoP, then decimated PCM, automatically.
+  yet). A native output that can't be opened falls back to DoP, and only a
+  DoP or output failure classified as a device limitation continues on to
+  decimated PCM.
   - **Windows (x86_64): ASIO** — pick your DAC's ASIO driver under
     "Native DSD (ASIO)". No Steinberg SDK required. Hardware-verified on
     an SMSL C200Pro.
@@ -91,7 +97,7 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Refresh-rate-aware frame cap** — Max FPS defaults to the monitor's refresh rate (up to 240) so the animation is as smooth as the display allows, adjustable in the settings
 - **Analysis caching** — pre-processed frames cached to disk; settings buttons highlight green when a cache exists for that combination; "Clear All" button; reanalysis warning fires on any cache-key change. A size budget (4 GB by default) evicts least-recently-used caches after each analysis, since a superlet track at 180 fps costs 45–80 MB and cannot be packed much smaller — the low byte of every stored value is quantisation noise, so no lossless coder beats about 12 %
 - **GPU acceleration** — the superlet pre-process offloads its large convolutions to the GPU through wgpu (Vulkan or Metal, so AMD, Intel, NVIDIA and Apple are all covered). Measured against the same build with the device off: High 1.23×, Ultra 1.71×, Extreme 1.32×. Fast and Standard are unchanged by design — their kernels never reach a size where a device beats the cores
-  - *Calibrated per machine, not assumed.* The crossover between GPU and CPU is a property of one device against one core count, so it is measured rather than hardcoded: a probe on first run picks a starting point, then real analyses A/B the two routes and settle it on evidence. A device that turns out slower gets switched off by itself. Settings expose Auto / Always / Off, a Re-measure button, and the per-size table
+  - *Calibrated per machine, above a fixed floor.* Blocks below 2^17 samples never reach the device at all — that eligibility floor is a conservative constant compiled in, not a measurement. Above it the crossover is a property of one device against one core count, so it is settled per machine rather than assumed: a probe on first run picks a starting point, then real analyses A/B the two routes on the eligible sizes and adapt on evidence. A device that turns out slower gets switched off by itself. Settings expose Auto / Always / Off, a Re-measure button, and the per-size table
   - *Analysis core budget* — a slider, defaulting to two fewer threads than the machine has, so the output thread keeps its deadline while a track is being analysed
 - **Bar spacing** — where the bars land, independent of how many there are
   - *Bass width*, a slider from wider-than-log through **log** (the classic analyser axis) to **ERB** (constant bars per auditory filter, Glasberg & Moore 1990). Not a resolution control: a tone's blur in bars and a bassline's travel in bars both scale with bar density, so the ratio is constant across the slider — what changes is how much screen the bass gets to move across. Below a capped window it costs nothing
@@ -104,7 +110,6 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **Biquad IIR filters** (Audio EQ Cookbook) — applied in real time via a `rodio` Source wrapper
 - **Draggable nodes on the spectrum** — click to add a band, drag horizontally for frequency, drag vertically for gain, right-click to remove
 - **EQ overlay modes** — Curve (response curve drawn over spectrum), Apply (bar heights reflect EQ gain), Both
-- **Bake to cache** — re-analyze the track with EQ applied and cache the result
 
 ### EQ Presets
 - **Global and song-specific presets** — two separate dropdowns, one active at a time
@@ -163,7 +168,9 @@ The waveform is **Kugelblitz** (#94b1ff) — the theoretical RGB of an infinite-
 - **ReplayGain** — loudness normalization (Track / Album), reading ReplayGain tags when present and falling back to Moosik's own measured LUFS for untagged files; clip-prevention toggle; bypassed in bit-perfect mode
 - Momentary LUFS display
 - Stereo correlation meter
-- **Session log** — every run writes a timestamped file to `~/.moosik/logs/` (last ten kept), recording the machine, the output device and format actually negotiated, analysis timings, and a full backtrace on any panic. The **🗎 Log** button opens the folder. If something goes wrong, attach it to the bug report
+- **Session log** — every run normally creates a timestamped file in `~/.moosik/logs/` (creation can fail; the 🗎 Log button then says why), recording the machine, GPU and analysis timings and a full backtrace on any panic. **WASAPI exclusive** and **native ASIO / ALSA DSD** additionally log the device and the format, rate and buffer they negotiated; normal shared-mode playback and non-Windows CPAL PCM/DoP do not yet report theirs. The **🗎 Log** button opens the folder, and older sessions are pruned back to roughly ten
+  - *Before sharing one:* a log can contain your user name and file paths, track file names, audio device / GPU / driver details, and panic backtraces. Read it first — there is no redaction step yet
+  - Retention is per-process: running two copies of Moosik at once can prune a log the other is still writing
 
 ## Building
 
@@ -208,9 +215,9 @@ All pulled automatically via Cargo:
 
 | Platform | Status | Bit-perfect backend |
 |---|---|---|
-| Linux | Tested | cpal — direct ALSA `hw:` device for true bit-perfect |
+| Linux | Tested | cpal — exact format requested; a direct ALSA `hw:` device avoids the mixing/resampling shims |
 | Windows | Tested | WASAPI exclusive mode |
-| macOS | Should work | cpal — direct CoreAudio output |
+| macOS | Should work | cpal — exact format requested; CoreAudio device behaviour decides the rest |
 
 ## License
 

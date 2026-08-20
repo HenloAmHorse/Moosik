@@ -706,11 +706,21 @@ fn gpu_min_block() -> usize {
     init
 }
 
+/// How a block size is routed.
+///
+/// Supplied as an argument rather than read from a mutable global. The global
+/// version was writable by tests, and two of them steered each other through
+/// it: one rewrote the threshold three times while another demanded bit-exact
+/// equality between consecutive analyses, which routed one call to the device
+/// and one to the cores. Those agree to a tolerance, not bit for bit, so the
+/// second test failed intermittently under a parallel suite and passed alone.
+type RouteDecision = fn(usize) -> bool;
+
 /// Whether a group of this block size goes to the device.
 ///
-/// `MOOSIK_GPU=0` (or a forced threshold, under test) is absolute; otherwise the
-/// answer comes from what this machine has actually been measured doing, not
-/// from a constant compiled in from someone else's hardware.
+/// `MOOSIK_GPU=0` is absolute; otherwise the answer comes from what this
+/// machine has actually been measured doing, not from a constant compiled in
+/// from someone else's hardware.
 fn route_to_device(group_n: usize) -> bool {
     if group_n < gpu_min_block() { return false }
     #[cfg(test)]
@@ -829,12 +839,6 @@ fn stats_reset() {
     ] {
         a.store(0, O::Relaxed);
     }
-}
-
-/// Force the threshold, for holding the two routes against each other.
-#[cfg(test)]
-pub fn set_gpu_min_block(v: usize) {
-    GPU_MIN_LIVE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Transforms a batch must contain before the GPU is worth using.
@@ -1127,6 +1131,30 @@ pub fn analyze_with_progress(
     should_continue: &(dyn Fn() -> bool + Sync),
     on_bar_done: &(dyn Fn(usize) + Sync),
 ) -> Vec<Vec<f32>> {
+    analyze_routed(
+        signal, sample_rate, n_bars, min_freq, max_freq, hop, cfg,
+        should_continue, on_bar_done, route_to_device,
+    )
+}
+
+/// [`analyze_with_progress`], with the device-routing decision supplied.
+///
+/// Production passes [`route_to_device`]; tests pass whatever they are actually
+/// asserting about, so that no two tests can steer each other by writing to a
+/// shared threshold.
+#[allow(clippy::too_many_arguments)]
+fn analyze_routed(
+    signal: &[f32],
+    sample_rate: u32,
+    n_bars: usize,
+    min_freq: f32,
+    max_freq: f32,
+    hop: usize,
+    cfg: &AsltConfig,
+    should_continue: &(dyn Fn() -> bool + Sync),
+    on_bar_done: &(dyn Fn(usize) + Sync),
+    route: RouteDecision,
+) -> Vec<Vec<f32>> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1250,7 +1278,7 @@ pub fn analyze_with_progress(
         let group_n = *_key;
         let stride = (group_n / 2).max(1);
         let blocks = signal.len().div_ceil(stride).max(1);
-        let gpu = route_to_device(group_n)
+        let gpu = route(group_n)
             .then(super::gpu::GpuFft::shared)
             .flatten();
         let t_group = std::time::Instant::now();
@@ -2003,6 +2031,35 @@ mod tests {
     /// the edge frames the GPU hands back for the CPU to fill, and the
     /// recombination of members that went down different paths. A mistake in
     /// any of those yields a spectrum, just not the right one.
+    /// The device boundary the GPU/CPU comparison has always used: low enough
+    /// that the bass bars really do take the device branch on a signal this
+    /// short, where the shipped threshold is tuned for real tracks.
+    ///
+    /// Injected rather than stored in a global, so a test running in parallel
+    /// cannot observe or move it.
+    fn eligible_gpu(n: usize) -> bool {
+        n >= 1 << 13
+    }
+    /// Route nothing to the device.
+    fn never_gpu(_n: usize) -> bool {
+        false
+    }
+
+    /// Run an analysis with the route stated outright.
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_via(
+        route: RouteDecision,
+        sig: &[f32],
+        sr: u32,
+        bars: usize,
+        lo: f32,
+        hi: f32,
+        hop: usize,
+        cfg: &AsltConfig,
+    ) -> Vec<Vec<f32>> {
+        analyze_routed(sig, sr, bars, lo, hi, hop, cfg, &|| true, &|_| {}, route)
+    }
+
     #[test]
     fn analyze_agrees_with_and_without_the_gpu() {
         if super::super::gpu::GpuFft::shared().is_none() {
@@ -2025,13 +2082,11 @@ mod tests {
         let bars = 128;
         let cfg = cfg(1.0, 1.2, 4, 0.5);
 
-        // Low enough that the bass bars really do take the GPU branch on a
-        // signal this short; the shipped threshold is tuned for real tracks.
-        set_gpu_min_block(1 << 13);
-        let with = analyze(&sig, sr, bars, lo, hi, hop, &cfg);
-        set_gpu_min_block(usize::MAX - 1);
-        let without = analyze(&sig, sr, bars, lo, hi, hop, &cfg);
-        set_gpu_min_block(GPU_MIN_BLOCK);
+        // Stated per call rather than by moving a shared threshold: the old
+        // version wrote to a process-wide atomic that another test's analysis
+        // could read mid-run.
+        let with = analyze_via(eligible_gpu, &sig, sr, bars, lo, hi, hop, &cfg);
+        let without = analyze_via(never_gpu, &sig, sr, bars, lo, hi, hop, &cfg);
 
         assert_eq!(with.len(), without.len(), "frame counts differ");
         assert!(!with.is_empty());
@@ -2077,8 +2132,14 @@ mod tests {
         assert_eq!(want, got, "the Log scale must be the old code, bit for bit");
 
         // And end to end, since the plan is built from those two numbers.
-        let a = analyze(&sig, sr, n_bars, lo, hi, hop, &cfg);
-        let b = analyze(&sig, sr, n_bars, lo, hi, hop, &cfg);
+        //
+        // Both calls are pinned to the same route. Exact equality is only
+        // meaningful within one route -- GPU and CPU agree to a tolerance, not
+        // bit for bit -- and this used to depend on a global threshold another
+        // test could move between these two lines, which made it fail
+        // intermittently under a parallel suite and pass in isolation.
+        let a = analyze_via(never_gpu, &sig, sr, n_bars, lo, hi, hop, &cfg);
+        let b = analyze_via(never_gpu, &sig, sr, n_bars, lo, hi, hop, &cfg);
         assert_eq!(a, b, "analysis must be deterministic before anything else is claimed");
     }
 

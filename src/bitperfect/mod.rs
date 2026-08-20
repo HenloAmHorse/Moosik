@@ -450,6 +450,82 @@ enum Backend {
     Wasapi(#[allow(dead_code)] wasapi_out::Handle),
 }
 
+/// Why an output stream could not be opened.
+///
+/// The distinction is load-bearing, not cosmetic. Under the current legacy
+/// policy a DSD file whose DoP route fails is decimated to PCM automatically so
+/// it still plays. Whether that should happen at all is a settled product
+/// question — the direction is that processed fallback becomes opt-in and
+/// visibly non-diamond — but it is at least *arguable* when the device cannot
+/// take the DoP carrier. It is not arguable when the request was impossible:
+/// `MOOSIK_BP_FORMAT=16i` cannot carry a DoP word on any device ever made, so
+/// decimating in response obeys a request nobody made and hides an operator's
+/// mistake behind a working-looking fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenError {
+    /// The request contradicts itself — no device could satisfy it.
+    ///
+    /// The DSD router refuses to pick another route on its behalf. The PCM
+    /// bit-perfect route does not yet honour that: it flattens this to a
+    /// `String` and still falls back to normal mode.
+    Config(String),
+    /// A synchronous source failure: opening, parsing, building the reader, or
+    /// seeking it. Every route reads the same file, so trying another one only
+    /// reaches the same failure with a less useful message.
+    ///
+    /// Scope is deliberately narrow. Decode errors that surface *later*, on the
+    /// background decode thread, are logged and turn into natural end-of-track;
+    /// routing those through here would need asynchronous error propagation
+    /// that does not exist yet.
+    Source(String),
+    /// This device could not do it. A different route may still work.
+    Device(String),
+}
+
+impl OpenError {
+    pub fn device(msg: impl Into<String>) -> Self {
+        Self::Device(msg.into())
+    }
+    pub fn config(msg: impl Into<String>) -> Self {
+        Self::Config(msg.into())
+    }
+    pub fn source(msg: impl Into<String>) -> Self {
+        Self::Source(msg.into())
+    }
+
+    /// Whether this failure is the device's, rather than the request's or the
+    /// file's.
+    ///
+    /// A classification, not an authorization: it answers "could another device
+    /// route plausibly help?", not "may the audio be processed?". The DSD
+    /// router currently treats a `true` here as licence to decimate to PCM
+    /// automatically, which is the legacy policy the owner has ruled must
+    /// become opt-in and visibly non-diamond.
+    ///
+    /// **Consulted on the DSD/DoP route only.** `Engine::start_bp` flattens
+    /// this error to a `String`, so on the PCM bit-perfect route every kind —
+    /// including `Config` — still reaches the normal-mode retry. Closing that
+    /// is Phase B, not an emergency correction.
+    pub fn is_device_limitation(&self) -> bool {
+        matches!(self, Self::Device(_))
+    }
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Config(m) | Self::Source(m) | Self::Device(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(m) => write!(f, "configuration error: {m}"),
+            Self::Source(m) => write!(f, "{m}"),
+            Self::Device(m) => write!(f, "{m}"),
+        }
+    }
+}
+
 pub struct BpStream {
     _backend: Backend,
     shared: Arc<Shared>,
@@ -484,20 +560,28 @@ impl BpStream {
         dop: bool,
         sample_buf: SampleBuf,
         stereo_buf: StereoBuf,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, OpenError> {
+        // Resolved here, before a device is enumerated or opened, so a request
+        // that cannot be satisfied by anything fails as a configuration error
+        // rather than as an apparent device limitation.
+        #[cfg(windows)]
+        let order = wasapi_out::resolve_order(src_bits, dop)?;
+
         let shared = Arc::new(Shared::new());
         shared.dop_active.store(dop, Ordering::Relaxed);
         let tap = SpectrumTap::new(channels, sample_buf, stereo_buf);
 
         #[cfg(not(windows))]
         let (handle, format_label, dev_label) = cpal_out::open(
-            device_name, sample_rate, channels, src_bits, dop, Arc::clone(&shared), tap)?;
+            device_name, sample_rate, channels, src_bits, dop, Arc::clone(&shared), tap)
+            .map_err(OpenError::device)?;
         #[cfg(not(windows))]
         let backend = Backend::Cpal(handle);
 
         #[cfg(windows)]
         let (handle, format_label, dev_label) = wasapi_out::open(
-            device_name, sample_rate, channels, src_bits, dop, Arc::clone(&shared), tap)?;
+            device_name, sample_rate, channels, order, dop, Arc::clone(&shared), tap)
+            .map_err(OpenError::device)?;
         #[cfg(windows)]
         let backend = Backend::Wasapi(handle);
 
@@ -988,6 +1072,33 @@ mod tests {
         render_samples(&sh, &mut scratch, &mut t, 2, 64);
         assert!(scratch.is_empty());
         assert_eq!(sh.underruns.load(Ordering::Relaxed), 0);
+    }
+
+    /// The routing layer decides whether to decimate a DSD file to PCM by
+    /// asking this question, so the answer has to be carried, not flattened
+    /// into a string somewhere on the way up.
+    #[test]
+    fn a_configuration_error_is_distinguishable_from_a_device_limitation() {
+        let cfg = OpenError::config("MOOSIK_BP_FORMAT=16i excl cannot carry DoP");
+        let src = OpenError::source("DSD: unsupported container");
+        let dev = OpenError::device("\"DAC\" rejected 352.8 kHz in exclusive mode");
+
+        // "Is this the device's fault?" — the question the DSD router asks
+        // before applying the legacy automatic-fallback policy. Not a claim
+        // about the PCM route, which still flattens this error to a String and
+        // falls back regardless.
+        assert!(!cfg.is_device_limitation());
+        assert!(!src.is_device_limitation(), "every route reads the same file");
+        assert!(dev.is_device_limitation());
+        assert!(matches!(cfg, OpenError::Config(_)));
+        assert!(matches!(src, OpenError::Source(_)));
+
+        // The message survives, and only the configuration case is labelled --
+        // a device limitation is already phrased for the user.
+        assert!(cfg.to_string().starts_with("configuration error: "));
+        assert_eq!(dev.to_string(), dev.message());
+        assert_eq!(src.to_string(), src.message());
+        assert!(cfg.message().contains("cannot carry DoP"));
     }
 
     /// Every dropout observed in the field so far arrived within milliseconds

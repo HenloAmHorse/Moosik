@@ -1,5 +1,85 @@
 # Changelog
 
+## [Unreleased]
+
+## [1.4.2] - 2026-08-21
+
+### Removed
+
+- **EQ "Bake to Cache".** The control never did what it said. It computed an EQ
+  fingerprint, deleted an `_eq…spectrumcache` file that nothing ever wrote, and
+  then ran an ordinary analysis — which recomputes its own cache path without
+  the EQ suffix and applies no EQ at any stage. Neither half of its tooltip was
+  true, and it has been that way since the feature was announced. It is removed
+  rather than left in place while a correct version is built.
+
+  Nothing that worked is lost: real-time EQ on the normal PCM path, the DSD
+  PCM-fallback EQ, presets, the response curve, and the Apply/Both bar overlay
+  are all unchanged, as is EQ bypass on the PCM bit-perfect, native-DSD, and
+  DoP routes.
+
+### Internal
+
+- **The analysis suite could fail intermittently.** Two tests steered each other
+  through a process-wide GPU-routing threshold: one rewrote it while another
+  demanded bit-exact equality between consecutive analyses, so under a parallel
+  run one call went to the device and one to the cores — and those agree to a
+  tolerance, not bit for bit. The routing decision is now passed in rather than
+  read from a mutable global, and the mutable test setter is gone. Production
+  routing behaviour is unchanged.
+
+### Fixed
+
+- **`MOOSIK_BP_FORMAT` could destroy DoP.** The override was applied before the
+  DoP container check, so forcing `16i` truncated the 24-bit DoP word and `32f`
+  re-encoded it as floating point — in both cases the DAC stops seeing DoP
+  markers while the route still reports success. DoP now accepts a forced
+  `24i`, `24i32` or `32i` and refuses `16i`/`32f` before the device is opened,
+  rather than silently substituting a different format.
+
+  Two consequences worth stating outright. An **unrecognised** value (a typo)
+  is now an error as well — it used to be logged and ignored, which handed you a
+  different format than the one you pinned. And a DSD file that fails for a
+  *configuration* reason, or because the file itself will not open or parse, no
+  longer falls back to decimated PCM: only an error currently classified as
+  `Device` — a coarse backend/output-open category — may use that legacy
+  automatic fallback. Processing audio in answer to a mistyped environment
+  variable is not a fallback, it is a wrong answer.
+- **The dropout diagnostic could cause dropouts.** The WASAPI render thread runs
+  at MMCSS "Pro Audio" priority with a hard deadline, and 1.4.1 logged from
+  inside its loop — formatting a string, taking a global mutex, and writing and
+  flushing to disk, including on every change to the dropout count. That loop
+  no longer logs at all; counters are accumulated and reported after the
+  deadline is released. *(The ASIO driver callbacks and the CPAL error callback
+  still log synchronously; that needs a lock-free breadcrumb transport and is
+  not yet done.)*
+- **Session logs could overwrite each other.** File names carried whole seconds
+  only and were opened with truncation, so two instances started in the same
+  second shared one file. Names now include the process id and are created
+  exclusively.
+- **Ten logs meant eleven.** Retention ran before the new file was created, so
+  the documented ten became eleven — and a good log was deleted before finding
+  out whether its replacement could be created. Retention now runs after a
+  successful create, counts the current session, and ignores anything outside
+  Moosik's current and accepted legacy reserved session-log filename schemas.
+
+  Retention remains **per-process**: two copies of Moosik running at once can
+  each prune the other's live log. Doing that safely needs a lock the operating
+  system releases on crash, which is not in this release.
+- **The Log button could point at nothing.** A failed create was discarded while
+  the path was published anyway. Failures are now reported and the disabled
+  button carries the reason.
+- **A failed DoP seek moved the display anyway.** The seek result was discarded,
+  so the spectrum advanced and the position readout settled on a target the
+  decoder never reached. The seek is now applied to the source *before* the
+  device or any engine state is touched, so a rejected target is not committed:
+  the spectrum is not advanced, the seek bar snaps back to the actual elapsed
+  position, and the reason appears as a status message rather than only in the
+  log.
+
+  DoP only. The decimated-PCM DSD fallback still ignores its own seek failure,
+  and normal-mode seeks fail asynchronously in a worker; both remain open.
+
 ## [1.4.1] - 2026-08-17
 
 A build on a second machine misbehaved in four different ways at once, with

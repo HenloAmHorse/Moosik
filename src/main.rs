@@ -862,10 +862,23 @@ impl Engine {
             if !self.dsd_native {
                 match self.start_dop(path, Duration::ZERO) {
                     Ok(()) => self.dsd_mode = true,
+                    // Eligible under the current legacy automatic-fallback
+                    // policy, which is a device limitation only. Decimating to
+                    // PCM in answer to "MOOSIK_BP_FORMAT=16i", or to an
+                    // unreadable file, would silently process the audio instead
+                    // of reporting the real problem.
+                    //
+                    // That the remaining case decimates *automatically* is the
+                    // legacy behaviour, not an endorsement of it: the binding
+                    // direction is that processed fallback becomes opt-in and
+                    // visibly non-diamond. Phase B.
+                    Err(e) if !e.is_device_limitation() => {
+                        return Err(format!("DSD (DoP): {e}"));
+                    }
                     Err(dop_err) => {
                         let reason = match native_err {
-                            Some(n) => format!("{n}; DoP: {dop_err}"),
-                            None => dop_err,
+                            Some(n) => format!("{n}; DoP: {}", dop_err.message()),
+                            None => dop_err.message().to_string(),
                         };
                         self.start_dsd_fallback(path, Duration::ZERO).map_err(|e| {
                             format!("{reason}; PCM fallback also failed: {e}")
@@ -955,13 +968,33 @@ impl Engine {
     /// bit-perfect stream, (re)opening it at the DoP carrier rate if the
     /// device, rate, or channel count changed. `start` seeks within the
     /// track (each DoP PCM frame is 16 DSD samples, so the seek target is
-    /// converted to a PCM-frame offset before the device format is touched).
-    fn start_dop(&mut self, path: &Path, start: Duration) -> Result<(), String> {
-        self.native_close(); // a native-DSD output may hold the device exclusively
-        let mut stream = dsd::dop::open_dop_stream(path).map_err(|e| format!("DSD: {e}"))?;
+    /// converted to a PCM-frame offset and applied before the device format or
+    /// any engine state is touched — a failed seek changes nothing).
+    fn start_dop(&mut self, path: &Path, start: Duration) -> Result<(), bitperfect::OpenError> {
+        // The source is prepared in full — opened, parsed, and seeked — before
+        // anything with side effects is touched. Doing the seek after the
+        // device was (re)opened meant a failure could leave an idle exclusive
+        // stream holding the DAC and `dsd_label`/`last_sample_rate` describing
+        // an attempt that never started.
+        //
+        // A file that will not open, parse or seek is not a device problem: the
+        // decimated-PCM route reads the same bytes and fails the same way.
+        // Scope here is synchronous only — open, parse, reader construction and
+        // the seek. Decode failures arrive later, on the decode thread.
+        let mut stream = dsd::dop::open_dop_stream(path)
+            .map_err(|e| bitperfect::OpenError::source(format!("DSD: {e}")))?;
         let carrier = stream.carrier_rate();
         let channels = stream.info().channels as u16;
-        self.dsd_label = Some(stream.info().rate_label());
+        let label = stream.info().rate_label();
+        if start > Duration::ZERO {
+            let pcm_frame = (start.as_secs_f64() * carrier as f64) as u64;
+            stream.seek_to_pcm_frame(pcm_frame)
+                .map_err(|e| bitperfect::OpenError::source(format!("DSD seek: {e}")))?;
+        }
+
+        // Only now does anything change.
+        self.native_close(); // a native-DSD output may hold the device exclusively
+        self.dsd_label = Some(label);
         self.last_sample_rate = carrier;
 
         let reuse = self.bp.as_ref().is_some_and(|s| {
@@ -978,11 +1011,7 @@ impl Engine {
                 true, // dop
                 self.sample_buf.clone(),
                 self.stereo_buf.clone(),
-            ).map_err(|e| format!("DSD (DoP): {e}"))?);
-        }
-        if start > Duration::ZERO {
-            let pcm_frame = (start.as_secs_f64() * carrier as f64) as u64;
-            let _ = stream.seek_to_pcm_frame(pcm_frame);
+            )?);
         }
         let bp = self.bp.as_ref().unwrap();
         bp.resume();
@@ -1389,16 +1418,21 @@ impl Engine {
     /// Normal mode, fallback path: stop sink, reopen file, consume N samples to
     /// reach `target`.  Handles FLAC, where symphonia 0.5.5 returns `Unseekable`
     /// because rodio's `ReadSeekSource::byte_len()` always returns `None`.
-    fn seek_to(&mut self, path: &Path, target: Duration) {
+    fn seek_to(&mut self, path: &Path, target: Duration) -> Result<(), String> {
         if self.on_bp_stream() {
             let was_paused = if self.dsd_native { self.native_is_paused() }
                              else { self.bp.as_ref().map(|bp| bp.is_paused()).unwrap_or(false) };
             let result = if self.dsd_native { self.start_native(path, target) }
-                         else if self.dsd_mode { self.start_dop(path, target) }
+                         else if self.dsd_mode {
+                             self.start_dop(path, target).map_err(|e| e.to_string())
+                         }
                          else { self.start_bp(path, target) };
+            // Returned rather than logged and swallowed: the callers update
+            // the spectrum and the seek bar, and used to do so even when the
+            // decoder never moved.
             if let Err(e) = result {
                 crate::mlog!("seek: {e}");
-                return;
+                return Err(e);
             }
             if was_paused {
                 if self.dsd_native { self.native_pause(); }
@@ -1408,7 +1442,7 @@ impl Engine {
                 self.started_at = Some(Instant::now());
             }
             self.paused_elapsed = target;
-            return;
+            return Ok(());
         }
 
         let was_paused = self.sink.as_ref().map(|s| s.is_paused()).unwrap_or(false);
@@ -1424,7 +1458,7 @@ impl Engine {
                 if was_paused { self.started_at = None; }
                 else { self.started_at = Some(Instant::now()); }
             }
-            return;
+            return Ok(());
         }
 
         // --- DSD fallback: rebuild in place (byte-addressable, instant) ---
@@ -1442,7 +1476,7 @@ impl Engine {
                     self.started_at = Some(Instant::now());
                 }
             }
-            return;
+            return Ok(());
         }
 
         // --- Slow path: reopen + skip samples, ON A BACKGROUND THREAD ---
@@ -1459,6 +1493,10 @@ impl Engine {
         self.pending_seek = Some(PendingSeek { rx, target, was_paused });
         self.paused_elapsed = target;
         self.started_at = None;
+        // The worker's own failures are asynchronous and still surface as an
+        // unchanged position rather than an error here; that propagation is
+        // tracked separately.
+        Ok(())
     }
 
     /// Spawn the background decode-and-skip worker for a normal-mode seek to
@@ -2336,8 +2374,12 @@ impl MoosikApp {
                 }
                 self.on_track_started(&path);
             }
-            // DSD has no fallback path — a raw DSD bitstream can't play through
-            // rodio's normal decoders, so a DoP failure is a hard error.
+            // DSD handles its own fallbacks inside play_file: native → DoP →
+            // decimated PCM. What it does not have is the *normal-mode* retry
+            // below, which re-opens through rodio's decoders — a raw DSD
+            // bitstream cannot go through those. A DSD failure arriving here
+            // means every permitted route failed, or policy prohibited the
+            // processed fallback, so it is a hard error either way.
             Err(e) if self.bit_perfect && !is_dsd => {
                 // Device rejected the format (or vanished) — drop to normal
                 // mode so playback keeps working, and tell the user why.
@@ -2425,7 +2467,10 @@ impl MoosikApp {
 
         engine.play_file(&path, dur)?;
         if pos > Duration::ZERO {
-            engine.seek_to(&path, pos);
+            // A restart that cannot reach `pos` leaves the stream at zero. The
+            // spectrum and the pause state below must not describe a position
+            // the decoder never took.
+            engine.seek_to(&path, pos)?;
             self.spectrum_window.on_seek(pos.as_secs_f64());
         }
         if was_paused {
@@ -2728,7 +2773,14 @@ impl MoosikApp {
         let path = self.playlist[idx].path.clone();
         if let Some(ref mut engine) = self.engine {
             mlog!("seek    engine.seek_to ({:.0} ms in)", t0.elapsed().as_secs_f64() * 1e3);
-            engine.seek_to(&path, target);
+            // Nothing below runs on failure. Moving the spectrum and the seek
+            // bar regardless is how the UI came to claim a position the decoder
+            // never reached.
+            if let Err(e) = engine.seek_to(&path, target) {
+                mlog!("seek    failed after {:.0} ms: {e}", t0.elapsed().as_secs_f64() * 1e3);
+                self.status_msg = format!("Seek failed: {e}");
+                return;
+            }
         }
         mlog!("seek    spectrum on_seek ({:.0} ms in)", t0.elapsed().as_secs_f64() * 1e3);
         self.spectrum_window.on_seek(target.as_secs_f64());
@@ -4143,11 +4195,26 @@ impl eframe::App for MoosikApp {
                     // needs it is the one someone double-clicked. A bug report
                     // that can attach this file is worth more than any amount
                     // of asking what happened.
-                    if ui.button(RichText::new("🗎 Log").size(13.0))
-                        .on_hover_text(match log::path() {
-                            Some(p) => format!("Open this session's log\n{}", p.display()),
-                            None => "Open the log folder".into(),
-                        })
+                    // Gated on a file actually existing, not on the absence of
+                    // a recorded error — those are only the same thing while
+                    // every failure path remembers to record one.
+                    let log_ok = log::path().is_some();
+                    // Two tooltip paths, not one: egui only shows
+                    // `on_hover_text` on an *enabled* widget, so hanging the
+                    // failure reason there meant the disabled button explained
+                    // nothing at all.
+                    let log_tip = match log::path() {
+                        Some(p) => format!("Open this session's log
+{}", p.display()),
+                        None => "Open the log folder".to_string(),
+                    };
+                    let log_why = match log::error() {
+                        Some(e) => format!("No log file this session — {e}"),
+                        None => "No log file this session".to_string(),
+                    };
+                    if ui.add_enabled(log_ok, egui::Button::new(RichText::new("🗎 Log").size(13.0)))
+                        .on_hover_text(log_tip)
+                        .on_disabled_hover_text(log_why)
                         .clicked()
                     {
                         let dir = log::dir();

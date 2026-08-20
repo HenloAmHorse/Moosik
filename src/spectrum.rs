@@ -5248,27 +5248,6 @@ impl SpectrumWindow {
                                     .on_hover_text("Apply EQ gain to bar heights — bars show the EQ'd spectrum");
                                 ui.selectable_value(&mut self.eq_overlay, EqOverlayMode::Both,        "Both")
                                     .on_hover_text("Draw curve AND apply EQ gain to bars");
-                                ui.separator();
-                                // Bake to cache
-                                let has_path = self.current_path.is_some();
-                                let analyzing = self.analyzer.is_analyzing.load(Ordering::Relaxed);
-                                if ui.add_enabled(has_path && !analyzing,
-                                    egui::Button::new("💾 Bake to Cache"))
-                                    .on_hover_text("Re-analyze with EQ applied and cache result.\nCreates a separate cache file keyed to these EQ settings.")
-                                    .clicked()
-                                    && let Some(ref p) = self.current_path.clone() {
-                                    let eq = self.eq_state.lock().unwrap();
-                                    let fp = eq.fingerprint();
-                                    drop(eq);
-                                    let mut cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
-                                    // Append EQ fingerprint to filename stem
-                                    let stem = cache.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                                    cache.set_file_name(format!("{}_eq{:016x}.spectrumcache", stem, fp));
-                                    let _ = std::fs::remove_file(&cache);
-                                    self.analyzer.pre_frames.clear();
-                                    self.analyzer.start_preprocess(p.clone());
-                                    self.needs_reanalysis = false;
-                                }
                             });
 
                             ui.separator();
