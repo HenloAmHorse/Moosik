@@ -5216,13 +5216,26 @@ impl SpectrumWindow {
                     egui::CollapsingHeader::new("🎛 Parametric EQ")
                         .default_open(true)
                         .show(ui, |ui| {
-                            // Bit-perfect mode notice — EQ is bypassed in audio path
+                            // EQ is bypassed whenever the session is on an
+                            // output device stream. That is a routing fact,
+                            // and it is what `bit_perfect` carries here — the
+                            // app sets it from `on_bp_stream()`, not from the
+                            // toggle.
+                            //
+                            // Whether the route is *exact* is a different
+                            // question with its own answer, and drawing a
+                            // green diamond for the first while claiming the
+                            // second is the defect. This says only what it
+                            // knows.
                             if self.bit_perfect {
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        egui::RichText::new("💎 Bit-perfect mode active — EQ bypassed in audio path")
-                                            .size(12.0)
-                                            .color(txt_ok(ui.visuals().dark_mode)),
+                                        egui::RichText::new(
+                                            "\u{25C7} EQ is bypassed — this track plays on an \
+                                             output device stream with no processing in the path",
+                                        )
+                                        .size(12.0)
+                                        .color(txt_faint(ui.visuals().dark_mode)),
                                     );
                                 });
                                 ui.separator();

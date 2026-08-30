@@ -54,9 +54,73 @@ pub struct DsdInfo {
     pub block_size: u32,
     /// Offset + length of an embedded ID3v2 tag, if the file has one.
     pub id3: Option<(u64, u64)>,
+    /// The audio length the container *declares*, before it is clamped to what
+    /// the file actually holds.
+    ///
+    /// Kept separately so truncation is detectable. `data_len` used to be
+    /// silently `min`-ed against the file size, which turned a truncated file
+    /// into a shorter but apparently valid one that ended with a clean EOF —
+    /// indistinguishable from a track that simply finished.
+    pub declared_data_len: u64,
+    /// Speaker layout as a `dwChannelMask`, when the container names one.
+    ///
+    /// `None` means the file declares a channel *count* but not what the
+    /// channels are. Above stereo that is not enough to claim the samples reach
+    /// the right speakers, so callers withhold payload-exact rather than guess.
+    pub layout: Option<u32>,
 }
 
+/// `dwChannelMask` bits, in the order both WASAPI and symphonia use.
+mod mask {
+    pub const FL: u32 = 0x1;
+    pub const FR: u32 = 0x2;
+    pub const FC: u32 = 0x4;
+    pub const LFE: u32 = 0x8;
+    pub const BL: u32 = 0x10;
+    pub const BR: u32 = 0x20;
+    pub const SL: u32 = 0x200;
+    pub const SR: u32 = 0x400;
+}
+
+/// The speaker layout a DSF `channelType` names.
+///
+/// Values are from the DSF specification's channel-type table. Anything not in
+/// it is left unknown rather than guessed — a wrong mask sends audio to the
+/// wrong speakers, which is worse than declining to describe it.
+fn dsf_layout(channel_type: u32, channels: u32) -> Option<u32> {
+    let m = match channel_type {
+        1 => mask::FC,                                                         // mono
+        2 => mask::FL | mask::FR,                                              // stereo
+        3 => mask::FL | mask::FR | mask::FC,                                   // 3 channels
+        4 => mask::FL | mask::FR | mask::BL | mask::BR,                        // quad
+        5 => mask::FL | mask::FR | mask::FC | mask::LFE,                       // 4 channels
+        6 => mask::FL | mask::FR | mask::FC | mask::BL | mask::BR,             // 5 channels
+        7 => mask::FL | mask::FR | mask::FC | mask::LFE | mask::BL | mask::BR, // 5.1
+        _ => return None,
+    };
+    // A channel type that disagrees with the channel count describes a file
+    // nobody can lay out; say so rather than picking one of the two.
+    (m.count_ones() == channels).then_some(m)
+}
+
+/// The speaker a DSDIFF `CHNL` identifier names.
+fn dff_speaker(id: &[u8; 4]) -> Option<u32> {
+    Some(match id {
+        b"SLFT" | b"MLFT" => mask::FL,
+        b"SRGT" | b"MRGT" => mask::FR,
+        b"C   " => mask::FC,
+        b"LFE " => mask::LFE,
+        b"LS  " => mask::SL,
+        b"RS  " => mask::SR,
+        _ => return None,
+    })
+}
 impl DsdInfo {
+    /// Whether the container declares more audio than the file contains.
+    pub fn is_truncated(&self) -> bool {
+        self.declared_data_len > self.data_len
+    }
+
     pub fn duration(&self) -> Duration {
         Duration::from_secs_f64(self.sample_count as f64 / self.sample_rate as f64)
     }
@@ -143,6 +207,7 @@ pub fn parse_dsf<R: Read + Seek>(r: &mut R) -> Result<DsdInfo, String> {
     if format_id != 0 {
         return Err(format!("unsupported DSF format id {format_id} (only raw DSD)"));
     }
+    let channel_type = u32_le(&fmt[20..24]);
     let channels = u32_le(&fmt[24..28]);
     let sample_rate = u32_le(&fmt[28..32]);
     let bits_per_sample = u32_le(&fmt[32..36]);
@@ -176,9 +241,11 @@ pub fn parse_dsf<R: Read + Seek>(r: &mut R) -> Result<DsdInfo, String> {
     if metadata_ptr > data_offset && metadata_ptr <= file_len {
         data_end = metadata_ptr;
     }
-    let data_len = u64_le(&data_hdr[4..12])
-        .saturating_sub(12)
-        .min(data_end.saturating_sub(data_offset));
+    // Both lengths are kept: what the container says, and what is actually
+    // there. Clamping to the file and discarding the declaration made a
+    // truncated file look like a complete shorter one.
+    let declared_data_len = u64_le(&data_hdr[4..12]).saturating_sub(12);
+    let data_len = declared_data_len.min(data_end.saturating_sub(data_offset));
 
     let id3 = (metadata_ptr > 0 && metadata_ptr < file_len)
         .then(|| (metadata_ptr, file_len - metadata_ptr));
@@ -187,6 +254,8 @@ pub fn parse_dsf<R: Read + Seek>(r: &mut R) -> Result<DsdInfo, String> {
         container: DsdContainer::Dsf,
         sample_rate,
         channels,
+        layout: dsf_layout(channel_type, channels),
+        declared_data_len,
         sample_count,
         data_offset,
         data_len,
@@ -210,6 +279,8 @@ pub fn parse_dff<R: Read + Seek>(r: &mut R) -> Result<DsdInfo, String> {
 
     let mut sample_rate = 0u32;
     let mut channels = 0u32;
+    let mut layout: Option<u32> = None;
+    let mut declared_data_len = 0u64;
     let mut data: Option<(u64, u64)> = None;
     let mut id3: Option<(u64, u64)> = None;
 
@@ -245,6 +316,28 @@ pub fn parse_dff<R: Read + Seek>(r: &mut R) -> Result<DsdInfo, String> {
                                 let mut n = [0u8; 2];
                                 read_exact_at(r, p + 12, &mut n)?;
                                 channels = u16::from_be_bytes(n) as u32;
+                                // The identifiers that follow name the
+                                // speakers. Reading only the count and
+                                // assigning "unspecified" threw away the one
+                                // piece of information that makes a
+                                // multichannel claim checkable.
+                                let mut mask = 0u32;
+                                let mut known = true;
+                                for i in 0..channels as u64 {
+                                    let at = p + 14 + i * 4;
+                                    if at + 4 > prop_end { known = false; break; }
+                                    let mut id = [0u8; 4];
+                                    read_exact_at(r, at, &mut id)?;
+                                    match dff_speaker(&id) {
+                                        Some(bit) if mask & bit == 0 => mask |= bit,
+                                        // An unknown or repeated identifier
+                                        // describes a layout this build cannot
+                                        // place; leave it unknown.
+                                        _ => { known = false; break; }
+                                    }
+                                }
+                                layout = (known && mask.count_ones() == channels)
+                                    .then_some(mask);
                             }
                             b"CMPR" => {
                                 let mut c = [0u8; 4];
@@ -262,7 +355,10 @@ pub fn parse_dff<R: Read + Seek>(r: &mut R) -> Result<DsdInfo, String> {
                     }
                 }
             }
-            b"DSD " => data = Some((body, size.min(file_len.saturating_sub(body)))),
+            b"DSD " => {
+                declared_data_len = size;
+                data = Some((body, size.min(file_len.saturating_sub(body))));
+            }
             b"ID3 " => id3 = Some((body, size.min(file_len.saturating_sub(body)))),
             _ => {}
         }
@@ -276,12 +372,33 @@ pub fn parse_dff<R: Read + Seek>(r: &mut R) -> Result<DsdInfo, String> {
     if sample_rate < DSD64_RATE / 2 {
         return Err(format!("implausible DSD rate {sample_rate} Hz"));
     }
+    // DFF interleaves one byte per channel, so the sound chunk is whole
+    // byte-frames or it is damaged. A remainder is not a rounding question:
+    // those trailing bytes belong to the first channels of a frame whose
+    // remaining channels are missing, and `data_len / channels` pretends the
+    // shortfall was shared out evenly between them — which silently rotates
+    // every channel from that point and reports a length the file does not
+    // have. The same fabrication the DSF block reader was refusing to make.
+    if !declared_data_len.is_multiple_of(channels as u64) {
+        return Err(format!(
+            "DSDIFF sound chunk is {declared_data_len} bytes, which is not a whole number of \
+             {channels}-channel frames"
+        ));
+    }
+    if !data_len.is_multiple_of(channels as u64) {
+        return Err(format!(
+            "DSDIFF sound data is {data_len} bytes, which is not a whole number of \
+             {channels}-channel frames — the file is truncated mid-frame"
+        ));
+    }
     let sample_count = data_len / channels as u64 * 8;
 
     Ok(DsdInfo {
         container: DsdContainer::Dff,
         sample_rate,
         channels,
+        layout,
+        declared_data_len,
         sample_count,
         data_offset,
         data_len,
@@ -446,14 +563,52 @@ impl<R: Read + Seek> DsdReader<R> {
         let row_off = self.next_block * row_bytes;
         if row_off >= self.info.data_len {
             self.block_frames = 0;
+            // Running out of bytes while the container still says there are
+            // frames to come is a truncated file, not the end of a track. It
+            // used to be reported as a clean end of stream, which at a gapless
+            // boundary is indistinguishable from a track that simply finished —
+            // the listener hears the next one start early and nothing anywhere
+            // says why.
+            let delivered = self.next_block * bs;
+            if delivered < self.total_frames() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "the file ends after {delivered} of {} declared frames \
+                         ({} of {} declared audio bytes present)",
+                        self.total_frames(), self.info.data_len,
+                        self.info.declared_data_len),
+                ));
+            }
             return Ok(false);
         }
         self.src.seek(SeekFrom::Start(self.info.data_offset + row_off))?;
         let avail = (self.info.data_len - row_off).min(row_bytes) as usize;
+        // A DSF block row is `channels` consecutive runs of `block_size`
+        // bytes, and a writer always emits whole rows — a short one means the
+        // file was cut off inside it.
+        //
+        // Publishing it anyway fabricated audio. The bytes present belong to
+        // the *first* channels; the rest of the row is zero-filled scratch,
+        // and dividing the byte count by the channel count pretends the
+        // shortfall was shared evenly. On a stereo file that silently truncates
+        // the right channel; on a multichannel one every channel after the cut
+        // plays zeroes presented as the recording's own bits.
+        if avail < row_bytes as usize {
+            self.block_frames = 0;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "the file ends inside a DSF block: {avail} of {row_bytes} bytes of \
+                     block {} are present ({} of {} declared audio bytes)",
+                    self.next_block, self.info.data_len, self.info.declared_data_len,
+                ),
+            ));
+        }
         self.block[..avail].fill(0);
         self.src.read_exact(&mut self.block[..avail])?;
-        // Frames in this row: full block unless the file ends mid-row, and
-        // never past the declared per-channel sample count.
+        // Frames in this row: a whole block, never past the declared
+        // per-channel sample count.
         let row_frames = (avail as u64 / ch).min(bs);
         let frames_before = self.next_block * bs;
         self.block_frames = row_frames.min(self.total_frames().saturating_sub(frames_before)) as usize;
@@ -492,7 +647,11 @@ pub(crate) mod tests {
             }
         }
         let data_chunk_size = audio.len() as u64 + 12;
-        let metadata_ptr = if id3.is_some() { 92 + audio.len() as u64 } else { 0 };
+        let metadata_ptr = if id3.is_some() {
+            92 + audio.len() as u64
+        } else {
+            0
+        };
         let total = 92 + audio.len() as u64 + id3.map_or(0, |b| b.len() as u64);
 
         let mut f = Vec::new();
@@ -520,8 +679,80 @@ pub(crate) mod tests {
         f
     }
 
+    /// A DSF file cut off inside a block row is refused, not padded out.
+    ///
+    /// A block row is `channels` consecutive runs of `block_size` bytes, so
+    /// the bytes present in a short row belong to the *first* channels.
+    /// Dividing the byte count by the channel count pretends the shortfall was
+    /// shared evenly: on a stereo file that truncates the right channel, and on
+    /// a multichannel one every channel past the cut plays zero-filled scratch
+    /// presented as the recording's own bits.
+    #[test]
+    fn a_dsf_cut_off_inside_a_block_row_is_refused() {
+        for channels in [2u32, 6] {
+            let bs = 4096u32;
+            let rows = 2usize;
+            let blocks: Vec<Vec<Vec<u8>>> = (0..rows)
+                .map(|r| {
+                    (0..channels)
+                        .map(|c| vec![0x10 + r as u8 * 16 + c as u8; bs as usize])
+                        .collect()
+                })
+                .collect();
+            let samples = (rows as u64) * bs as u64 * 8;
+            let full = make_dsf(channels, DSD64_RATE, 1, samples, bs, &blocks, None);
+
+            let info = parse_dsf(&mut Cursor::new(full.clone())).unwrap();
+            let row_bytes = bs as usize * channels as usize;
+            // Cut halfway through the *second* row, so the first reads fine.
+            let cut = info.data_offset as usize + row_bytes + row_bytes / 2;
+            let short = full[..cut].to_vec();
+            let mut cut_info = parse_dsf(&mut Cursor::new(short.clone())).unwrap();
+            // The header still declares the whole recording, which is what
+            // makes this a truncation rather than a shorter file.
+            assert!(
+                cut_info.is_truncated(),
+                "{channels}ch: fixture must be truncated"
+            );
+            cut_info.data_len = cut as u64 - cut_info.data_offset;
+
+            let mut r = DsdReader::new(Cursor::new(short), cut_info).unwrap();
+            let mut buf = vec![0u8; row_bytes];
+            let mut first_ok = false;
+            let e = loop {
+                match r.read_frames(&mut buf) {
+                    Ok(0) => panic!(
+                        "{channels}ch: a partial block row must not read as a clean end of file"
+                    ),
+                    Ok(_) => {
+                        first_ok = true;
+                        continue;
+                    }
+                    Err(e) => break e,
+                }
+            };
+            assert!(
+                first_ok,
+                "{channels}ch: the whole first row should still read"
+            );
+            assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof, "{channels}ch");
+            let msg = e.to_string();
+            assert!(
+                msg.contains("inside a DSF block") || msg.contains("declared frames"),
+                "{channels}ch: {msg}"
+            );
+        }
+    }
+
     /// Build a minimal valid DFF file in memory.
-    fn make_dff(channels: u16, sample_rate: u32, cmpr: &[u8; 4], audio: &[u8], id3: Option<&[u8]>) -> Vec<u8> {
+    /// (pub(crate): the bit-perfect decoder fixtures reuse it.)
+    pub(crate) fn make_dff(
+        channels: u16,
+        sample_rate: u32,
+        cmpr: &[u8; 4],
+        audio: &[u8],
+        id3: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut prop = Vec::new();
         prop.extend_from_slice(b"SND ");
         prop.extend_from_slice(b"FS  ");
@@ -573,6 +804,85 @@ pub(crate) mod tests {
         f
     }
 
+    /// A DFF cut short physically, with a header that still says otherwise.
+    ///
+    /// The divisibility check added in Phase F ran on the *declared* chunk
+    /// length, and a file truncated by a failed copy or a full disk has a
+    /// declared length that is still whatever the writer wrote — perfectly
+    /// channel-aligned — while the bytes actually present are not. That is
+    /// the common shape of a damaged file and the one the check did not cover:
+    /// `data_len` is clamped to what the file holds, and dividing *that* by
+    /// the channel count is the same fabrication in a different place.
+    #[test]
+    fn a_dff_cut_between_two_channels_is_refused() {
+        for channels in [2u16, 6] {
+            let ch = channels as usize;
+            // A well-formed file, then bytes removed from the end of it so the
+            // header's declared length survives and the audio does not.
+            let audio = vec![0x69u8; ch * 8];
+            let mut file = make_dff(channels, DSD64_RATE, b"DSD ", &audio, None);
+            file.truncate(file.len() - (ch - 1));
+
+            let err = parse_dff(&mut Cursor::new(&file)).unwrap_err();
+            assert!(
+                err.contains("whole number") || err.contains("truncated"),
+                "{channels}ch: a physical cut between two channels must be refused, got {err}"
+            );
+        }
+    }
+
+    /// And a cut that happens to land on a frame boundary is still short.
+    ///
+    /// The declared length is the other half of the same question: a file
+    /// missing whole frames is missing audio, whatever its alignment, and
+    /// `is_truncated` is what the native routes check before opening a device.
+    #[test]
+    fn a_dff_missing_whole_frames_is_still_truncated() {
+        let ch = 2usize;
+        let audio = vec![0x69u8; ch * 8];
+        let mut file = make_dff(2, DSD64_RATE, b"DSD ", &audio, None);
+        file.truncate(file.len() - ch * 2); // two whole frames gone
+
+        let info = parse_dff(&mut Cursor::new(&file)).expect("still parses");
+        assert!(
+            info.is_truncated(),
+            "the container declares {} bytes and the file holds {}",
+            info.declared_data_len,
+            info.data_len
+        );
+    }
+
+    /// A DFF sound chunk that is not whole byte-frames is refused.
+    ///
+    /// DFF interleaves one byte per channel, so a remainder is not a rounding
+    /// question: those trailing bytes belong to the first channels of a frame
+    /// whose remaining channels are missing. `data_len / channels` divided the
+    /// shortfall out evenly between them, which rotates every channel from
+    /// that point on and reports a length the file does not have — the same
+    /// fabrication the DSF block reader already refuses to make.
+    #[test]
+    fn a_dff_sound_chunk_that_is_not_whole_frames_is_refused() {
+        for channels in [2u16, 6] {
+            let ch = channels as usize;
+            // Two whole frames, then one byte short of a third.
+            let short = vec![0x69u8; ch * 2 + (ch - 1)];
+            let file = make_dff(channels, DSD64_RATE, b"DSD ", &short, None);
+            let err = parse_dff(&mut Cursor::new(&file)).unwrap_err();
+            assert!(
+                err.contains("whole number"),
+                "{channels}ch: expected a partial-frame refusal, got {err}"
+            );
+
+            // The whole-frame version of the same file is accepted, so the
+            // rule is about the remainder and not about the size.
+            let whole = vec![0x69u8; ch * 3];
+            let file = make_dff(channels, DSD64_RATE, b"DSD ", &whole, None);
+            let info = parse_dff(&mut Cursor::new(&file)).unwrap();
+            assert_eq!(info.channels, channels as u32);
+            assert_eq!(info.total_frames(), 3);
+        }
+    }
+
     #[test]
     fn dsf_header_fields() {
         let blocks = vec![vec![vec![0u8; 4], vec![0u8; 4]]];
@@ -605,7 +915,12 @@ pub(crate) mod tests {
 
     #[test]
     fn dsf_rejects_garbage() {
-        assert!(parse_dsf(&mut Cursor::new(b"RIFFxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_vec())).is_err());
+        assert!(
+            parse_dsf(&mut Cursor::new(
+                b"RIFFxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_vec()
+            ))
+            .is_err()
+        );
         // Bad bits-per-sample.
         let blocks = vec![vec![vec![0u8; 4]]];
         let file = make_dsf(1, DSD64_RATE, 4, 32, 4, &blocks, None);
@@ -645,12 +960,115 @@ pub(crate) mod tests {
         assert!(err.contains("compressed"), "{err}");
     }
 
+    /// A file that ends before the audio its header promises is a truncated
+    /// file, not a short track.
+    ///
+    /// The declared length used to be clamped to the file size and then
+    /// forgotten, so the reader ran to the short end and reported a clean end
+    /// of stream. At a gapless boundary that is indistinguishable from a track
+    /// finishing normally: the next one starts early and nothing says why.
+    #[test]
+    fn a_truncated_dsf_is_reported_rather_than_ending_cleanly() {
+        // Two block-rows declared, one present.
+        let blocks = vec![
+            vec![vec![0x01, 0x02, 0x03, 0x04], vec![0x11, 0x12, 0x13, 0x14]],
+            vec![vec![0x05, 0x06, 0x07, 0x08], vec![0x15, 0x16, 0x17, 0x18]],
+        ];
+        let full = make_dsf(2, DSD64_RATE, 1, 128, 4, &blocks, None);
+        let intact = parse_dsf(&mut Cursor::new(&full)).unwrap();
+        assert!(!intact.is_truncated(), "the complete file is not truncated");
+        assert_eq!(intact.declared_data_len, intact.data_len);
+
+        // Chop the last block-row off the file, leaving the header's claim.
+        let cut = full.len() - 8;
+        let short = full[..cut].to_vec();
+        let info = parse_dsf(&mut Cursor::new(&short)).unwrap();
+        assert!(
+            info.is_truncated(),
+            "declared {} bytes, {} present",
+            info.declared_data_len,
+            info.data_len
+        );
+
+        // The reader must say so rather than returning a clean end of stream.
+        let mut reader = DsdReader::new(Cursor::new(&short), info).unwrap();
+        let mut buf = vec![0u8; 64];
+        let mut err = None;
+        for _ in 0..8 {
+            match reader.read_frames(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect("a truncated file must surface a read error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("declared"), "{err}");
+    }
+
+    /// DSF names its speaker layout in the `channelType` field, and a layout
+    /// that contradicts the channel count is left unknown rather than guessed.
+    #[test]
+    fn dsf_channel_types_map_to_real_speaker_layouts() {
+        // (channelType, channels, expected mask)
+        let cases: [(u32, u32, Option<u32>); 8] = [
+            (1, 1, Some(0x4)),                                 // mono: FC
+            (2, 2, Some(0x1 | 0x2)),                           // stereo: FL FR
+            (3, 3, Some(0x1 | 0x2 | 0x4)),                     // FL FR FC
+            (4, 4, Some(0x1 | 0x2 | 0x10 | 0x20)),             // quad: FL FR BL BR
+            (5, 4, Some(0x1 | 0x2 | 0x4 | 0x8)),               // FL FR FC LFE
+            (7, 6, Some(0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20)), // 5.1
+            // A type nobody has defined, and a type that disagrees with the
+            // channel count: both unknown rather than invented.
+            (99, 2, None),
+            (7, 2, None),
+        ];
+        for (ty, ch, want) in cases {
+            assert_eq!(
+                dsf_layout(ty, ch),
+                want,
+                "channelType {ty} with {ch} channels"
+            );
+        }
+    }
+
+    /// DSDIFF names its speakers with four-character identifiers, and an
+    /// unknown or repeated one leaves the layout unknown.
+    #[test]
+    fn dff_channel_identifiers_map_to_real_speakers() {
+        assert_eq!(dff_speaker(b"SLFT"), Some(0x1));
+        assert_eq!(dff_speaker(b"SRGT"), Some(0x2));
+        assert_eq!(dff_speaker(b"MLFT"), Some(0x1));
+        assert_eq!(dff_speaker(b"C   "), Some(0x4));
+        assert_eq!(dff_speaker(b"LFE "), Some(0x8));
+        assert_eq!(dff_speaker(b"LS  "), Some(0x200));
+        assert_eq!(dff_speaker(b"RS  "), Some(0x400));
+        for unknown in [b"XXXX", b"    ", b"LFT ", b"c   "] {
+            assert_eq!(dff_speaker(unknown), None, "{:?}", unknown);
+        }
+    }
+
+    /// A real stereo DSF carries its layout through the parser, so a stereo
+    /// track is describable and a multichannel one without identifiers is not.
+    #[test]
+    fn a_stereo_dsf_reports_its_layout() {
+        let blocks = vec![vec![vec![0x01, 0x02], vec![0x11, 0x12]]];
+        let file = make_dsf(2, DSD64_RATE, 1, 16, 2, &blocks, None);
+        let info = parse_dsf(&mut Cursor::new(&file)).unwrap();
+        // `make_dsf` writes channelType 2 for a stereo file.
+        assert_eq!(info.layout, Some(0x3), "stereo should be FL|FR");
+    }
     #[test]
     fn duration_and_labels() {
         let info = DsdInfo {
             container: DsdContainer::Dsf,
             sample_rate: DSD64_RATE,
             channels: 2,
+            layout: None,
+            declared_data_len: 0,
             sample_count: DSD64_RATE as u64 * 3, // exactly 3 s
             data_offset: 92,
             data_len: 0,
@@ -685,9 +1103,12 @@ pub(crate) mod tests {
         let rev = |b: u8| b.reverse_bits();
         // Interleaved ch0,ch1 per frame, bit-reversed (DSF is LSB-first).
         let expect: Vec<u8> = vec![
-            0x01, 0x11, 0x02, 0x12, 0x03, 0x13, 0x04, 0x14,
-            0x05, 0x15, 0x06, 0x16, 0x07, 0x17, 0x08, 0x18,
-        ].into_iter().map(rev).collect();
+            0x01, 0x11, 0x02, 0x12, 0x03, 0x13, 0x04, 0x14, 0x05, 0x15, 0x06, 0x16, 0x07, 0x17,
+            0x08, 0x18,
+        ]
+        .into_iter()
+        .map(rev)
+        .collect();
         assert_eq!(out, expect);
         assert_eq!(rd.read_frames(&mut out).unwrap(), 0); // EOF
     }
@@ -732,8 +1153,15 @@ pub(crate) mod tests {
         rd.seek_to_frame(5).unwrap(); // into the second block-row
         let mut out = vec![0u8; 4];
         assert_eq!(rd.read_frames(&mut out).unwrap(), 2);
-        assert_eq!(out, vec![0x06u8.reverse_bits(), 0x16u8.reverse_bits(),
-                             0x07u8.reverse_bits(), 0x17u8.reverse_bits()]);
+        assert_eq!(
+            out,
+            vec![
+                0x06u8.reverse_bits(),
+                0x16u8.reverse_bits(),
+                0x07u8.reverse_bits(),
+                0x17u8.reverse_bits()
+            ]
+        );
 
         // DFF byte-exact seek.
         let audio = [0x01u8, 0x11, 0x02, 0x12, 0x03, 0x13];

@@ -2,6 +2,1320 @@
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-08-30
+
+Output-truth repair, on top of 1.4.3.
+
+1.4.3 made the diamond a measurement instead of a preference. This makes the
+*rest* of the player agree with it — the lifecycle, the decoder, the backends —
+and adds an honest answer for Float32 files on integer-only DACs.
+
+The Float32 route is hardware-verified on an SMSL C200 Pro: the DAC rejects
+`32f` in exclusive mode and accepts `32i`, and the file now plays continuously
+through the Q1.31 conversion, labelled amber Processed, with no close/reopen
+loop and no fault. That is one route, one DAC, one file, on Windows.
+Nothing else here has been heard. **The evidence boundary for the rest of this
+release is: automated tests, run on Windows and on Linux, at the seams named in
+the closing section — and nothing else.** No other DAC, no ASIO driver, no ALSA
+hardware, no macOS, and no listening. Several repairs sit *below* that boundary
+because every path to them opens a sound card; the closing section names each
+one and what stands in for a test there.
+
+**Corrections to what an earlier draft of these notes claimed.** Several
+described work as finished that was not, and one described a route that could
+not work. They are kept rather than edited away, because the pattern is the
+point: every one of them was a true sentence about the *shape* of a repair
+standing in for a false one about its effect.
+
+- The Float32 ladder was described as "raw `32f`, then a conversion checked
+  sample by sample, then a rounded conversion". Those last two were not two
+  rungs: both request identical 32-bit integer output, so the first always won
+  the negotiation and the second was unreachable — and the runtime guard then
+  *faulted* any ordinary off-grid file that reached it, which is the common
+  case and exactly the material the route existed to carry. There is one
+  integer rung now, described below.
+- Routing was described as reflecting the active session. It did not: it read
+  three request flags, so with the preference on, a session running on the
+  shared mixer was treated as a device stream.
+- "A durable Q31 verdict cache" was listed as not implemented. It is now.
+- "No Linux or macOS build was attempted — the ALSA repair is reasoned from the
+  types, not compiled" was true when written. The Linux build is now compiled
+  and tested; macOS still is not.
+- Reading the integrity state was described as one coherent read once each
+  field carried a generation stamp. Stamping settles whose evidence a field is
+  and says nothing about when it was read; three stamped loads still describe
+  an instant that never held. Corrected in the entry below, and the read now
+  retries against a count of publications.
+- The value-exactness verdict was described as checked against the audio clock.
+  It was checked against the *folded copy* of that clock, which lags the device
+  by up to a frame — which is the whole window the check exists to close. It
+  reads the live stream now, before and after.
+- The restart was described as one transaction. The transaction was real, and
+  the route still opened at position zero and seeked afterwards, so the
+  listener heard the beginning of the track before the sentence's guarantee had
+  anything to guard.
+- The rollback after a failed device change was described as fixed by reporting
+  its error instead of discarding it. There was no error to report: the
+  rollback re-read state the failed attempt had already set to `Stopped` and
+  returned success without doing anything.
+- The status line was described as owned. Ownership was necessary and not
+  sufficient: the now-playing line stored the whole rendered line as its
+  fingerprint rather than the headline, and the ASIO probe wrote text without
+  an owner at all and inherited whatever was there.
+- "Everything else below is verified by automated tests on Windows and Linux"
+  was too strong in one direction and too vague in the other. Replaced with an
+  explicit evidence boundary above and a list, in the closing section, of what
+  sits below it.
+
+Four words are used everywhere, in code, badge, tooltip, panel and log:
+**payload exact** (the driver got the source's own words), **value exact** (the
+representation changed but no number did), **processed** (something was
+altered), **unverified** (nothing Moosik did altered it, but the platform path
+downstream cannot be proved). Only payload exact is green.
+
+### Fixed
+
+- **Reading the integrity state could describe two tracks at once.** The UI
+  asked whether the audio generation was still the one it had folded and then
+  made three separate calls for the rounding count, the recoverable code and
+  the fatal one. A check placed before three reads cannot be about what happens
+  between them, and the device crosses a gapless boundary at the sample: the
+  set of facts that came back could be an off-grid count from the incoming
+  track beside a dropout from the outgoing one, with nothing anywhere able to
+  notice. There is one call now and every field in it is read by the
+  generation's own stamp; the per-field accessors are deleted rather than left
+  unused, so the pattern cannot be rebuilt out of parts.
+
+  Stamping settled *whose* evidence each field was and nothing about *when*.
+  An earlier draft of this entry called the result one read of one instant; it
+  was three atomic loads that could not name the wrong track and could still
+  describe a moment that never held — a terminal code beside an empty
+  recoverable slot, which reads as a track that died with nothing having gone
+  wrong.
+
+  **The first attempt at a fix was itself wrong, and two of the claims made
+  for it are withdrawn.** It counted publications and bumped the counter
+  *after* each store, so the store was visible before the count moved: a
+  reader could load the count, read a field a writer had already changed, load
+  the count again unchanged, and call that a snapshot. "An unchanged count is
+  a true snapshot" was false, and the exact schedule it fails on is the one it
+  was built for — a dropout and the write failure after it, both stored,
+  neither counted. The second claim, that the last attempt could read the
+  terminal record first "because nothing may be published against a generation
+  after its fatal record", was also false: a decode thread unwinding after a
+  write failure, and both native callbacks, revoke afterwards.
+
+  What is there now is a window rather than a count. Every writer announces
+  that it is *about to* change something before it changes it and announces
+  again when it is done, as two independent counters — not one odd/even
+  counter, because writers do not exclude each other and two overlapping
+  publications leave a single counter even in the middle of the second one. A
+  reader that sees the two equal, reads, and then sees the first unchanged has
+  read across an interval no writer was inside. When it cannot find such an
+  interval it answers from the union of what its attempts saw and marks the
+  answer unsettled, and the one caller that grants a claim on this evidence —
+  the value-exact label — refuses to act on an unsettled read. The same
+  protocol on PCM, ASIO and ALSA: one function all three call, exercised
+  through all three public adapters.
+- **A value-exactness verdict could be applied to the wrong file.** The scan
+  recorded the session generation, which is the UI's counter and does not move
+  at a gapless hand-off until the UI folds one — so a verdict computed for the
+  track that was playing when the scan began could be printed against the track
+  that had since replaced it. It records the audio generation too, and needs
+  both.
+
+  The audio generation it compared against was the folded copy, which lags the
+  device by up to a frame — so an earlier draft's claim that the verdict is
+  checked against the audio clock was true only of a clock that had not caught
+  up yet. It reads the live stream now, before and after the evidence the
+  verdict rests on, so a hand-off during the check is caught rather than
+  straddled. A verdict is a label on the session, not a transient: had it gone
+  on the wrong track it would have stayed there.
+- **A new open showed the previous session's evidence.** `begin_open` left the
+  last track's source and the last session's dropout in place, so "Verifying
+  output…" appeared beside a specific claim about a file that was no longer
+  playing, on a route that did not exist yet. A failure did the same for a route
+  that never opened at all.
+- **A failed reopen said "Verifying output…" for the rest of the session.** A
+  seek that got as far as reopening the output and then failed left the
+  transport in its opening state, because the branch that publishes a stopped
+  state only fires when no handle is held — and the handle the reopen was about
+  to replace was still there. The typed seek reason is published instead.
+- **A dropout was invisible on processed and unverified routes.** The integrity
+  line was shown only when the fidelity was already faulted, which is the one
+  case where the headline mentions it anyway; the routes where the loss was the
+  only record of it were exactly the ones that hid it. A processed route keeps
+  its badge — a dropout does not change what it is doing to the audio — and the
+  loss is in the detail on every live route.
+- **The status line went on saying things that had stopped being true.** It
+  compared badges rather than sentences, so a dropout replaced by the backend
+  write failure that ended the track — two headlines under one `Faulted` badge
+  — was never refreshed. And it kept ownership through a stop, so a stopped
+  track had "Playing: …" put back by the next tick.
+
+  The line has an owner now, and the text and the owner are one value with
+  private fields and three ways in: the now-playing line, which carries the
+  fidelity headline it was rendered from and is the only thing that may be
+  regenerated; a message the listener has just been given, which is nobody's to
+  overwrite; or nobody. Two things that an owner alone did not fix have gone
+  with it. The now-playing line stored the *whole rendered line* as its
+  fingerprint, title included, which the live headline can never equal — so it
+  regenerated on every tick rather than never, the same defect wearing the
+  opposite disguise. And the ASIO PCM probe wrote the text and left the owner
+  alone, so a probe result run during playback inherited the now-playing line's
+  claim and was wiped by the next tick; there is now no way to write the text
+  without saying who it belongs to.
+- **A backend that died while paused was not noticed until Resume.** The
+  completion poll lived inside the playing branch, which is right for advancing
+  a playlist and wrong for noticing a failure: a paused session still holds an
+  exclusive device, and a driver reset while paused left the player sitting on
+  it. Auto-advance is unchanged — a paused track has not ended — but a failure
+  is not an ending.
+- **A restart played the beginning of the track before going where it was
+  asked.** Opening and seeking were two operations: every route opened at zero
+  and the caller seeked afterwards, so a bit-perfect toggle or an output-device
+  change mid-song emitted the opening of the track first — audibly, every time
+  — and if the seek then failed, that opening was all the listener got, from a
+  device the player was still holding.
+
+  An earlier draft called this fixed by making the two halves one transaction.
+  The transaction was real and it released what it took, but the audio at
+  position zero was emitted before anything could undo it, so the sentence
+  described half the repair. The position is an argument to the open now. The
+  PCM and DoP routes hand it to `prepare`, which seeks the container before a
+  device is touched; the native route hands it to its own opener; the decimated
+  fallback starts at the byte offset; and the shared mixer holds the sink
+  paused across the append and the seek, because a `rodio` sink plays the
+  moment a source is appended to it. There is no second half, so there is
+  nothing left that can fail after audio has started.
+- **A paused restart played before it paused.** Pausing is a flag the callback
+  reads; starting the output is what lets the callback run. Every route set the
+  flag *after* the start, or let the caller set it a statement later, so a
+  bit-perfect toggle or a device change made while paused emitted the opening
+  of the track — on an exclusive DAC, the first sound after a silent gap — and
+  then went quiet. Nothing about the final state records the difference: an
+  engine that played for a moment and then paused looks exactly like one that
+  never played, which is why it survived four passes of tests that checked the
+  final state.
+
+  The intent is an argument to the open now, next to the position, and the
+  ordering is one function every route goes through.
+
+  The first attempt at this was worse than it looked. The ordering function was
+  real and correct, but only the exact-output route called it: the DoP route and
+  both native DSD routes still resumed unconditionally on the line before their
+  own starting call, and the test that was said to cover them drove a recorder
+  those three routes never touch — a passing test for a fix three of four routes
+  had not received. All four now come up through the same adapter, and each is
+  tested over the stream type it actually holds, asked at the instant its own
+  output step runs whether its own flag is set.
+
+  The renderers had the other half of it, and installing the pause correctly
+  did not close it. All three read `paused` before they contend for the session
+  slot, so a renderer already past that read could be handed a session the
+  pause installed behind it — and it played that session's first buffer, which
+  on an exclusive device is the sound a paused restart exists to prevent. Each
+  now reads the flag again once it holds the slot: `pause` publishes with
+  `Release` and the installing thread takes the same mutex, so acquiring it is
+  what makes the second read reliable. Nothing is consumed before it, so a
+  paused hand-off takes no frame, moves no position, starts no drain, and puts
+  each transport's own silence on the wire — PCM zero, DoP's marked `0x69`,
+  native DSD idle. A `try_lock` that missed because the UI thread was
+  mid-install is no longer counted as a dropout either; it was, and that turned
+  the hand-off itself into a revoked exactness claim. The schedule is forced in
+  a test on each of the three renderers rather than argued about.
+- **A route that failed to start could become the current track.** The PCM path
+  recorded it before the stream started, so a failed open left the engine naming
+  a file it had never played — which is the record `resume` reopens after a
+  failed seek.
+- **Four callers of the restart each interpreted the result differently.** Some
+  set the play state, some did not, one discarded the error outright, and none
+  agreed about the pause state or the position. There is one outcome and one
+  description of what applying it means. Paused stays paused.
+- **The rollback after a failed device change did nothing at all.** Reporting
+  the rollback's error instead of discarding it — which an earlier draft
+  described as the fix — made no difference, because there was no error to
+  report: the rollback called the ordinary restart, which reads live state, and
+  the attempt it was rolling back had just set that state to `Stopped`. The
+  restart's first statement was therefore `return Ok(())`. The listener was
+  told the previous output had taken the track back. It had never been asked.
+
+  A restart now carries its own request — which track, where in it, whether it
+  was paused — captured before the attempt. The rollback replays that request,
+  so it restores the position and the pause state and not merely the track, and
+  when the previous output will not have it back either, both reasons are
+  reported.
+- **Starting a track released nothing when it failed.** Every other open was a
+  transaction; `play_index` was not, and it had a second copy of the policy
+  ladder besides. A DSD open that failed after the ASIO driver had been loaded
+  published the typed reason and left the driver loaded and the endpoint held
+  by a player that had stopped. Starting, restarting, the three device seeks
+  and the decimated-DSD rebuild now go through one open-attempt transaction:
+  if the body fails, the sink is stopped and dropped, the exact stream
+  released, the native session closed, the scan retired, the current track
+  cleared — a route that never played is not what is playing — and the
+  failure's own typed reason published.
+- **A rebuild that could not happen was reported as a seek that landed.** The
+  decimated-DSD in-place rebuild and the background seek worker both returned
+  `Ok(elapsed)` on failure: the position playback happened to stop at, handed
+  back as though the decoder had moved there. The bar moved, the spectrum
+  followed, and the only sign that nothing was playing was that nothing was
+  playing.
+
+- **A superseded decoder could make itself current.** The rollover minted its
+  generation unconditionally, so a decode thread parked between taking its
+  queued successor and rolling came back after a new track had started,
+  allocated a number *newer* than the replacement session's, and stored it as
+  the decode clock. Every ownership check downstream then compared against that
+  number and passed: its boundary, its end-of-source, its fault and its
+  rounding evidence all reached a session they had nothing to do with. A stop
+  flag cannot close this — it is read before the same window. The rollover is a
+  compare-exchange from the generation the caller believes it owns.
+- **A hand-off could be half-published across a reset.** Publication was one
+  check followed by four separate stores, so starting a new track in the middle
+  of it cleared a queue the publisher then pushed into and zeroed a count the
+  publisher then incremented. The result was a boundary belonging to a dead
+  track sitting in a live session's queue behind a pending count that never
+  came back down — and a pending count that never comes down is a session that
+  can never end cleanly. Claim and stores now happen under one lock that the
+  reset also takes, so a publisher is either wholly published and then wholly
+  cleared, or wholly rejected.
+- **A stale decoder could erase its successor's end-of-source, or its rounding
+  evidence.** Both were a check followed by a store, and a thread parked
+  between the two stored anyway. The end-of-source case left the track that had
+  genuinely finished unable to end — the session sat at almost-complete until
+  the drain's wall clock failed it, and a failure never advances a playlist.
+  The rounding case gave the new track the old one's off-grid count, which is
+  the number its value-exact label is decided by. Both are compare-exchanges
+  conditional on what was read.
+- **The reason a track stopped could be replaced by the dropout before it.**
+  The public fatal accessor fell through to the recoverable record when there
+  was no terminal one, so the UI pushed a dropout into the one first-wins field
+  that holds the reason a session ended — and the backend write failure that
+  actually stopped the track arrived at an occupied slot and was discarded. The
+  listener was told the music stopped because of a dropout. The fatal accessor
+  is fatal only.
+- **A dropout left the diamond up.** With the two records separated, the
+  recoverable one needed somewhere visible to be. A session that dropped out
+  cannot go on describing itself as exact — the DAC played something that was
+  not in the file — so the badge goes amber while the music keeps playing, and
+  a fatal reason arriving later takes the headline with the earlier loss kept
+  in the detail.
+- **A dropout in the incoming track was charged to the one that had just
+  finished.** The render thread crosses a gapless boundary at the sample and
+  the UI finds out on its next frame; integrity was polled before that boundary
+  was folded. The track that ended cleanly was marked as having lost its claim
+  and the track that really dropped out started clean a moment later — both
+  surfaces wrong, in opposite directions. Boundaries are folded first, and the
+  stream also publishes which audio generation its evidence belongs to so that
+  a poll running ahead of the fold skips rather than mis-stamps.
+- **A cached status line went on showing a diamond the session had lost.** The
+  now-playing line embeds the fidelity headline in a stored string; it now
+  records **the headline it was rendered from** — the whole sentence from
+  `Presentation`, not the badge — and is refreshed when that changes. (This
+  entry said "the badge it was built with". Recording the badge is what the
+  first version of the repair did, and it is the thing later work had to
+  undo: a dropout replaced by the write failure that ended the track is two
+  sentences under one `Faulted` badge, and a badge comparison leaves the first
+  one on screen.)
+- **Turning bit-perfect on during an unsupported track threw the setting
+  away.** The restart had no fallback policy — it propagated the error, and the
+  toggle flipped itself back. Starting the same track from the playlist fell
+  back to the mixer and kept the setting, so one question had two answers and
+  the worse one belonged to the path the listener reached by asking. Both go
+  through one reducer now, and it cannot touch the preference because it is not
+  given it: under Automatic or HQ the track falls back for itself, under Strict
+  it stops and says why, and in both cases the next track starts again from the
+  top of the ladder.
+- **A DoP route recorded what it was playing before it knew.** The current
+  track was published at the top of `start_dop` with an unknown source, so a
+  successful open reported nothing about a file it had just parsed and a failed
+  one reported a track that never played — which is the record `resume` reopens
+  after a failed seek. It is published after the stream starts, with the DSD
+  source, and a failed open publishes nothing.
+- **A decimated DSD track rolled over as an identity transform.** The
+  gapless rollover set the transform in the fidelity and not in the processing
+  record, so the one surface whose job is to list what is being done to the
+  audio said nothing was.
+
+- **Two tracks could be handed the same generation number.** Every stamp check
+  in the audio path compares a generation, and a generation was arithmetic: the
+  decode clock advanced by adding one to itself, the playback clock by adding
+  one to whatever it was about to overwrite. With a track queued the decode
+  clock runs ahead, so a seek or a new track — which takes the *playback* clock
+  and adds one — was handed the number the queued decoder was still using. Every
+  check then compared them, found them equal, and let the superseded thread
+  through: its end-of-source became the new track's, its rounding evidence
+  decided the new track's badge, a fault it had parked was raised against a file
+  the listener never asked for, and a boundary it published described a track
+  that was no longer queued behind anything. Generations come from one process
+  allocator now — handed out once, used by one session, never seen again — so a
+  replacement outranks both clocks without anyone comparing them.
+- **A gapless hand-off could be crossed before it existed.** The realtime
+  descriptor the render thread reads was published *before* the metadata
+  describing the track, so the device could cross a boundary whose source,
+  transform and path had not been written down, hand the UI a token for it, and
+  leave the UI popping an empty queue: the token spent, the description gone for
+  the rest of the track. The pending count went up last, so a crossing could
+  arrive before it and give back a boundary that had never been counted — which
+  wrapped to `u64::MAX` and left "a track is still queued" true forever, so the
+  session could never end cleanly again. Publication is ordered now — metadata,
+  count, generation, then the frame that claims it — and the UI never spends a
+  token without metadata to spend it on.
+- **A dead backend stopped being asked how the track ended.** The predicate that
+  routes "how did this end?" to the object holding the session also asked
+  whether that object still worked, so the moment a WASAPI backend died or an
+  ASIO driver requested a reset the engine stopped asking the only thing that
+  knew. Completion fell through to the shared-sink branch, found no sink, and
+  answered "still running": the track never ended, the playlist never advanced,
+  and the exclusive handle stayed open for the life of the process. The failure
+  had been recorded correctly, in a place nobody was reading. Ownership and
+  liveness are separate questions now; liveness decides stream reuse and nothing
+  else.
+- **Native DSD never wrote down what it was playing.** ASIO and ALSA opened a
+  device, played a file, and left the engine's record of the current track
+  holding whatever the last other route had put there — and that record is what
+  `resume` reopens after a failed seek. Both publish the path, the parsed DSD
+  source and the starting position now.
+- **The shared mixer described files by its own internal format.** Any track the
+  exact route had not already prepared was published as 32-bit float at the
+  sink's channel count, because that is what `rodio` converts everything to: a
+  24-bit FLAC the DAC had refused was reported to the listener as a float
+  source. The container is asked instead, and an unreadable one is unknown —
+  which is a real answer with a word for it.
+- **A gapless rollover on the shared mixer could claim the audio was
+  untouched.** It asked the function that decides whether a *device* route
+  preserved the samples, and on the mixer the answer is known in advance: it
+  converts to float and applies the volume control, the equaliser and
+  ReplayGain. A track whose channel layout could not be checked came back
+  Unverified — the badge meaning nothing was altered — of exactly that path, and
+  a DSD file on the decimating fallback came back as an identity transform of a
+  path that had just resampled it. The route travels with the queued track now,
+  decided where it is appended.
+- **Turning bit-perfect on or off mid-track restarted the wrong kind of
+  route.** The choice between the instant restart and the full reopen was made
+  from two global preferences rather than from the track. A PCM file with the
+  toggle off and an ASIO driver configured for DSD took the reopen path — a deep
+  hi-res seek on the UI thread, which is the freeze the shortcut exists to
+  prevent — and a DSD file with the toggle off and no native driver was handed
+  to a decoder that cannot read a DSD container at all, so a track playing a
+  moment earlier failed to restart. One planner answers for both, and it asks
+  about the track.
+- **"Seeking to 3:20…" stayed on screen after the seek landed.** It is there to
+  say the position shown is a request and not a landing, and nothing took it
+  down — so it was still up at the one moment it was false.
+- **Frames were counted before the device had them.** The listener's position —
+  and the elapsed clock, the seek bar and the gapless boundary arithmetic built
+  on it — moved forward when audio left the ring rather than when the device
+  accepted it. An ASIO callback that found a null buffer pointer for one channel
+  wrote a partial frame and still counted the whole one; an ALSA period was
+  counted in full before the first `writei` attempt, including the periods a
+  dying device never took. Both count on acceptance now, and ALSA re-offers
+  whatever a partial write left behind.
+- **A dropout in the last seconds of a track was recorded against nothing.** The
+  drain begins where the session slot is given up, so the ALSA writer has no
+  session to name the track with from that point and was using zero — a number
+  no session holds. An XRUN during a drain, which is exactly where one is most
+  likely, left the route still claiming to be exact. A drain records whose it
+  is.
+- **The reason a track stopped could be hidden by the dropout before it.** The
+  recoverable loss and the terminal reason were pushed to the same first-wins
+  field, loss first because it happened first — so the reason that ended the
+  audio arrived at a slot already taken and was thrown away. A track that
+  dropped out and then had its write rejected said "a dropout" and never said
+  the device had stopped accepting audio. They are two fields: the badge is what
+  ended the track, the loss is in the detail beside it.
+
+- **A track that failed reopened itself, forever.** Every fatal path — a read
+  error, a decode error, a dead backend, a panicked thread, a driver reset —
+  set the same `finished` flag the end of a track sets, because that flag's job
+  was "stop waiting for audio". The auto-advance read it as "the track ended"
+  and started the next one, which under Repeat One is the *same* file. A user's
+  log shows one deterministically failing track opened hundreds of times in a
+  row. Ending and failing are now different states, and only *ending* advances
+  anything; a failure stops once, keeps its reason on screen, and is reopened
+  by nothing but the user.
+- **A track was reported finished while the device was still playing it.** The
+  end of the ring is not the end of the audio: up to a full exclusive buffer
+  was still unplayed, so the next track began over the tail of the last one.
+  Completion now waits for a bounded drain — on the WASAPI/CPAL path and, since
+  they had the same defect, on native ASIO and ALSA too, where the buffer the
+  driver still holds is a DSD bitstream the DAC is locked to.
+- **A shared-mode decode that stopped in the middle advanced the playlist.**
+  `rodio`'s decoder yields `None` for a corrupt frame exactly as it does for
+  the end of a file, so an empty sink could not tell "played out" from "gave
+  up" — and "played out" is what it was taken as. A track that ends well short
+  of its declared length is now a failure, which is the one thing that never
+  advances.
+- **Every visible fact rolled over up to a second early at a gapless
+  boundary.** The generation advanced when the *decoder* crossed, and the
+  decoder runs up to a full ring ahead of the device. The badge, the source and
+  the transform therefore described the incoming track while the outgoing one
+  was still audible. There are two clocks now — one for decoding, one for
+  playback — and everything the listener sees follows the second.
+- **A decode error in the queued track stopped the track that was playing.**
+  Same cause: a fault raised while the decoder was a ring ahead was attributed
+  to the audible track, which then halted partway through for something wrong
+  with a file that had not started. Such a fault now waits until the device
+  reaches the track it belongs to.
+- **Rounding evidence was per stream, not per track.** The incoming track's
+  rounding was counted against the outgoing one — the track still being heard,
+  and the track whose value-exact label the count decides. Each of the two
+  tracks in flight has its own.
+- **A fault and the generation it belonged to were two separate atomics.** A
+  reader could see the new code beside the old generation and discard a live
+  fault, or the old code beside the new generation and report one the current
+  session never had. Each stamped value is one word now. The native backends
+  had no generation at all, so a fault from the track that just ended was still
+  readable against the one that replaced it.
+- **A truncated DSD file opened the device before it was refused.** The feeder
+  caught it, but by then an ASIO engine was running and the DAC was locked to a
+  DSD stream, so the failure arrived as a fault on a route already claiming to
+  be exact. It is refused at the source, before any device is touched.
+- **A DSD seek that failed said nothing.** The DoP fallback arm discarded its
+  error with an `if ... .is_ok()` and no `else`: the player went silent at the
+  old position, which is indistinguishable from a seek that worked into
+  silence. It reports through the same typed channel as every other seek.
+- **The odd-tail rule was judged on the wrong file.** Whether a DSD track ends
+  on a half-full carrier frame was recorded when a DoP session *opened*, so
+  after one gapless hand-off it still described whichever file had opened the
+  stream. It travels with the boundary.
+- **A Q1.31 stream could not carry a second Float32 track.** The reuse check
+  asked whether an integer stream could carry Float32 — true of the source,
+  irrelevant to the question, since nothing is sending it floats. On an
+  integer-only DAC every track boundary in a Float32 playlist therefore forced
+  a full device close and reopen instead of a gapless hand-off.
+- **One off-grid track withheld the value-exact label from every track after
+  it** for the life of the stream, because the rounding latch was per stream
+  rather than per track. It is cleared at each hand-off, along with the
+  generation, the pending scan, and the source, transform and fidelity — which
+  used to roll over only in part, so a new track kept the old one's badge.
+- **A stale positive verdict could outlive the evidence.** A cached
+  value-exact result was checked once, when it arrived; the conversion goes on
+  producing evidence for the whole track. A file rewritten between its scan and
+  its playback now costs a label instead of producing a false one.
+- **A DSF file cut off inside a block row played fabricated audio.** A row is
+  `channels` runs of `block_size` bytes, so the bytes present belong to the
+  first channels; dividing the byte count by the channel count pretended the
+  shortfall was shared evenly. Stereo lost the right channel; multichannel
+  played zero-filled scratch as the recording's own bits. A short row is now
+  refused, and a truncated DSD file is refused before a device is opened rather
+  than discovered mid-track on a route already claiming to be exact.
+- **A failed background seek said nothing.** A device that would not open left
+  the pending seek in place and retried it every frame forever; a container
+  that refused the seek cleared it with no message and no state, so the player
+  stopped mid-track with the old position still on the slider. Seeks now report
+  a typed outcome, and the shared route's state is published only once a sink
+  is actually installed.
+- **The output panel described the processing chain the track started with.**
+  Enabling an EQ band, or switching the EQ off, changed the chain and nothing
+  recomputed the description.
+- **A shared fallback described every track as Float32**, because that is the
+  mixer's internal format. A 24-bit FLAC the DAC had refused was reported to
+  the user as a float source; the format established by decoding is kept and
+  used.
+- **The ASIO callback table was leaked on every open**, and every early return
+  after `createBuffers` released the driver without disposing its buffers —
+  while it still held a pointer to a table about to be freed.
+- **The realtime allocation test warmed its paths before arming the probe**, so
+  a buffer whose reservation did not take grew on its *first* flush and the
+  measurement reported zero. `reserve` takes an amount additional to the
+  current length, not a target capacity, and the tap's request was computed
+  from capacity — a buffer reused across streams was left under-reserved.
+
+- **A stopped player kept its diamond and kept your DAC.** `stop()` ended the
+  session but left the exclusive/native handle open and the state saying
+  `streaming`, so the badge described a device nothing was being sent to and no
+  other application could open it. Stop now releases every handle and clears the
+  claim; the request and the policy survive untouched.
+- **Switching from an exact route to ordinary playback did neither.** The shared
+  path was reached with the WASAPI-exclusive stream still open and its exact
+  state still published — so `rodio` failed in a way that looked like a missing
+  device. Handles are released before shared output opens, and the shared route
+  publishes itself as processed with the live volume, EQ and ReplayGain state.
+- **One unsupported track disabled exact output for the whole session.** A
+  single file the DAC could not take switched the feature off for everything
+  after it, until the user noticed. Fallback is per track now and never touches
+  the preference — the policy reducer that decides it is not given the
+  preference to touch. (The named function in the original text no longer
+  performs the fallback; the sentence described 1.4.2's code and stopped being
+  a description of anything.)
+- **A persisted preference rendered as an achievement at startup.** Loading
+  `enabled = true` set the flag and left the session state alone, so the two
+  disagreed from the first frame. A request now shows as a request.
+- **Arrow-key volume overwrote your saved level on an exact route.** The slider
+  was disabled; the keyboard was not, and wrote `self.volume` before consulting
+  anything. Every input path now shares one predicate, and the value is only
+  written if the engine accepted the change.
+- **Failed seeks moved the display and not the audio.** `format.seek`'s result
+  was discarded, so a container that refused the seek carried on decoding from
+  wherever it was while the UI, spectrum and elapsed time all moved. Seeks are
+  typed failures and the time base follows the position actually reached.
+- **A decoder reset was treated as end of file.** `SymError::ResetRequired`
+  means "rebuild the decoder", not "the track ended" — so tracks stopped
+  wherever a reset happened, silently, still claiming to be exact. Reset and
+  read errors are now typed faults, and a damaged first packet fails the open
+  rather than starting a session that has already lost audio.
+- **Precision was checked once and then assumed.** A clean priming packet could
+  establish a 24-bit plan and a later packet with content in the low eight bits
+  would reach a 24-bit writer intact. Every packet now goes through the same
+  validator — family, rate, channels, layout and effective precision against the
+  plan the device was opened for — and a packet that fails publishes nothing.
+- **Impossible bit depths wrapped into plausible ones.** `bits_per_sample` was
+  cast from `u32` to `u8` before it was checked, so 256 became 0 and 257 became
+  1, and the result then steered the output format.
+- **Truncated DSD files ended cleanly.** The declared audio length was clamped
+  to the file size and forgotten, so a truncated file looked like a complete
+  shorter one — at a gapless boundary, indistinguishable from a track finishing.
+  Both lengths are kept and running short is reported with the counts.
+- **Multichannel DSD claimed a layout it had not read.** DSF `channelType` and
+  DSDIFF `CHNL` identifiers are parsed into real speaker masks; a type that
+  disagrees with the channel count, or an unknown identifier, leaves the layout
+  unknown. Above stereo, an unknown layout withholds the exact claim.
+- **WASAPI validated the channel mask against a default instead of the source.**
+  The default for three channels is FL/FR/FC, so a FL/FR/LFE source was
+  negotiated, accepted and "validated" as FL/FR/FC — LFE content to the centre
+  speaker, with the diamond lit. The source's own mask is requested and checked.
+- **A changed default endpoint was invisible.** The reuse key was built from the
+  open stream and compared back to it, so it could only ever match. The target
+  endpoint is resolved independently before every reuse decision, and identity
+  is the endpoint's stable ID rather than its friendly name.
+- **A dead backend was reused.** A render thread that exited on a write error
+  left the handle looking alive, so the next track was handed a stream with
+  nobody behind it and played silence. Backend death is published separately
+  from session faults and prevents reuse.
+- **ASIO started on whatever was in the driver's buffers.** Both halves are now
+  prefilled with correct DSD idle before `ASIOStart`, without consuming source,
+  and the open waits a bounded 1500 ms for a first callback — `ASE_OK` only
+  means the driver accepted the request. Every buffer pointer is validated; a
+  null used to be skipped in silence, so one channel played nothing.
+- **LSB1 drivers got MSB1 silence.** Audio bytes were reversed for an LSB1
+  driver but padding, lead-in, tail, pause and underrun silence were left at a
+  fixed `0x69`. `0x69` reversed is `0x96`, and they are not the same byte.
+- **Every ASIO callback logged.** `bufferSwitchTimeInfo`, `sampleRateDidChange`
+  and `asioMessage` each formatted a string and took the logging mutex on the
+  thread with the hardest deadline in the process. They publish atomics now, and
+  driver events — rate change, reset, resync, overload, buffer-size change — are
+  handled as faults rather than noted as trivia.
+- **Realtime paths could allocate.** The CPAL callback resized its scratch; the
+  spectrum tap could grow its own batches and both shared analyser buffers from
+  inside a render callback, because it appended everything and trimmed
+  afterwards — which is exactly when a `Vec` grows. Both are now bounded, with
+  an allocation-counted test over the complete render-and-tap chain.
+- **The Linux default-feature build did not compile.** The ALSA session took
+  `rtrb::Consumer<u8>` while the call site passed a `FrameConsumer<u8>`. It now
+  consumes whole byte-frames through the frame ring, like every other backend.
+- **A decode thread that failed to start left a silent session claiming to be
+  exact.** Spawn results were discarded with `.ok()`. Every start returns a
+  `Result`, the session is installed only after a successful spawn, and a guard
+  turns a thread that ends without finishing — including by panic — into a
+  visible fault.
+
+- **The playback clock and the terminal state were two atomics.** Every
+  transition was a check against one followed by a write to the other — which
+  is two transitions with a window between them, and the window is wide enough
+  for the thing it was meant to prevent. Track A's decode thread reads the
+  generation, finds its own, is descheduled, and wakes to write its failure
+  into a word that now belongs to track B; B fails before its first sample,
+  blaming a file it never opened. Installing a generation and ending one are
+  now the same operation on the same word, each a compare-exchange, on the PCM
+  path and on both native backends.
+- **One dropout stopped the playlist.** Integrity and completion were one
+  thing, so a track that dropped out was a track that had failed — and a
+  failure never advances. They are separate: a dropout, a missed callback lock
+  and an off-grid sample cost the badge and nothing else, while a decode error,
+  a dead backend, a session that never primed and a torn output ring end the
+  session. A torn ring is on the fatal side and this list had it on the other:
+  a dropout is a hole and the audio resumes, but a ring holding a non-multiple
+  of the channel count can no longer say which channel its head belongs to, so
+  every sample after it plays on the wrong one for the rest of the track. An ASIO overload has its own code rather than borrowing the
+  survivable one it is not.
+- **A drain that outran the UI thread ended a track that had not started.** The
+  ring empties past a gapless boundary before anyone has popped it, so "the
+  ring is dry" and "there is nothing left to play" are different statements
+  whenever a successor is queued. The last track of a gapless run was reported
+  finished before it began.
+- **The decode guard carried the generation its thread was born in.** A panic
+  three tracks into a gapless run was stamped stale and vanished — the decoder
+  was gone and nothing anywhere said so. It follows the track the loop is on,
+  and a fault for a track that has not started waits for the device rather than
+  stopping the one being heard.
+- **A background seek reported four different failures as one.** A file that
+  could not be opened, bytes that could not be decoded, a thread that would not
+  start and a container that refused all arrived as `None` and were reported as
+  "this file could not be seeked", which for three of them is untrue. The
+  spawn failure was discarded outright with `.ok()`. Each says which it was.
+- **A seek past the end of the audio was reported as a landing.** The worker
+  stopped discarding samples when the decoder ran out and handed it back
+  anyway, sitting at EOF, while the caller published the target it had asked
+  for — the slider moved to a position the file does not contain and the track
+  ended at once. The result carries where the decoder actually is.
+- **A seek that failed left the engine in a half-state.** No sink, the clock
+  frozen, and the slider showing a place nothing was playing from — which to a
+  listener is indistinguishable from a seek that worked into a silent passage.
+  Nothing is committed until the sink exists, and every failure puts the
+  position back where playback was.
+- **A shared-mixer track that stopped short claimed a read error.** `rodio`'s
+  decoder yields `None` for a corrupt frame exactly as it does for the end of a
+  file, so nothing had observed a read error; a truncated file, a decoder
+  giving up and a wrong duration tag are identical from there. The inference is
+  named for what it is, and its rule is a function of values rather than a
+  method on a `Sink`, so it can be tested without an audio device.
+- **Both native drains counted the wrong units.** `ASIOGetBufferSize` answers
+  in 1-bit DSD samples and the callback fills bytes, so the ASIO drain waited
+  for sixteen buffers instead of two. ALSA had it inverted — a period is PCM
+  frames of `bps` bytes each — so on `DSD_U32` it ended after half a period,
+  which on DSD is the DAC losing its lock mid-hand-off. Both count byte-frames
+  now, and both count what the device actually accepted rather than what it was
+  offered.
+- **Neither native drain was bounded in time.** A drain is advanced by
+  callbacks, so a driver that goes quiet mid-drain leaves the track at
+  almost-finished for the life of the process. The wall clock is checked from
+  the UI thread, and an expired drain is a failure — the device did not play
+  what it was holding.
+- **A started ASIO driver had no owner.** Four exits between `ASIOStart` and
+  the host thread returning each had to remember to tear down, and a panic
+  remembered nothing: the driver was never stopped and never released, so the
+  DAC kept running and the device stayed held until the process ended.
+- **A driver reporting a rate change left its stream reusable.** Reset, resync
+  and buffer-size change all refuse reuse; this one did not, so the next track
+  was handed to a device that had already said it was running at a different
+  speed.
+- **A DFF sound chunk that is not whole byte-frames was accepted.** DFF
+  interleaves one byte per channel, so a remainder belongs to the first
+  channels of a frame whose remaining channels are missing —
+  `data_len / channels` divided the shortfall evenly between them, rotating
+  every channel from that point and reporting a length the file does not have.
+  The same fabrication the DSF block reader already refuses.
+
+### Added
+
+- **Strict / Automatic / HQ output policy**, in the 🔈▾ menu and persisted with
+  `serde(default)` so existing settings load unchanged. Strict never transforms
+  and stops with the reason — including refusing to be moved onto the shared
+  mixer, which has a volume stage, an EQ and a resampler in it. Automatic tries
+  the source's own representation first and falls back to the conversion. HQ
+  goes straight to the conversion, because that is what asking for it means.
+  The choice applies per track and never changes your bit-perfect preference.
+- **One Float32 → Q1.31 conversion**, which plays everything. A sample that
+  lands on the Q1.31 lattice converts exactly; one that does not is rounded,
+  deterministically — NaN to zero, clamped at both ends, `f64` multiply,
+  ties-to-even, no dither. It is labelled **Processed** from the moment it
+  opens.
+- **Value-exactness as an observation, not a route.** Many Float32 files are 16-
+  or 24-bit masters exported as floats, and for those the conversion changes
+  representation and not one number. That is a property of the *material*, so
+  it is discovered rather than negotiated for: the label is applied only when a
+  complete decode of the whole track says every sample was representable *and*
+  the running conversion has not had to round one. Either alone is not enough —
+  a scan can be stale, and the conversion has only seen what has played. Never
+  green: signed zero and NaN payloads do not survive a change of
+  representation.
+- **A durable verdict cache**, so a track proved once is not decoded in full
+  again on the next launch. Written atomically through a temporary file and a
+  rename, capped, and pruned least-recently-used. A missing, unreadable,
+  truncated or foreign-schema file is a cold cache, never an error. It stays
+  advisory: every packet is re-checked as it is converted, so a stale entry can
+  cost a label and can never put a rounded sample on the wire unannounced.
+- **A policy-controlled route for 64-bit float sources.** They have no exact
+  representation in any device format that exists. Strict stops and says so;
+  Automatic and HQ play them through the same Q1.31 conversion as Float32.
+  The label names both halves of what happened — "Float64 → Float32 → Q1.31,
+  narrowed then rounded ties-to-even and clamped" — because the narrowing to
+  32-bit float happens in the decoder, before this route sees a sample, and
+  that is where the numbers change. It follows that such a source can never be
+  **value exact**, whatever the scan finds: the scan is looking at numbers that
+  have already been altered. That is now enforced rather than assumed.
+
+  The reason shown alongside it names the source rather than the DAC. It used
+  to say the device had no Float32 exclusive format, which is why a *Float32*
+  source takes this route and is not why this one does: a 64-bit float source
+  would be narrowed on hardware that does not exist yet, and blaming the DAC
+  invited the listener to go looking for one that would fix it.
+
+  Three fixtures cover the route, on synthetic files: one puts a 64-bit float
+  WAV through `prepare` and the decode loop and checks that each sample
+  arrives as the `f32` nearest the original double; one runs the same file
+  through the Q1.31 conversion the processed policies choose and checks the
+  payloads that reached the ring against the two roundings in order, ending
+  cleanly; one covers the ladder and the published fidelity under Strict,
+  Automatic and HQ. The value-exact rule is checked separately, as a
+  function of its four conditions.
+- **An ASIO PCM capability probe**, in the ASIO menu and labelled a diagnostic.
+  It opens a driver, asks what it would do with ordinary PCM — channels, buffer
+  range, rates, sample type — and closes it again. It never creates buffers,
+  never starts the driver and never sets a rate. Moosik does not play PCM over
+  ASIO and this does not change that; it answers the question that has to be
+  settled before a renderer is worth writing.
+- **One authoritative session state** behind every surface, with generations, so
+  a scan or a fault from a superseded session is discarded instead of applied
+  to its successor.
+- **A persistent output panel**: source, transform, carrier, transport and
+  endpoint, negotiated format, and the live processing chain. DSD is reported as
+  DSD with its DoP carrier shown separately, rather than as the 24-bit PCM the
+  carrier happens to be.
+
+### Not implemented, and so not exposed
+
+Stated plainly rather than left to be discovered:
+
+- **PCM/Float-to-DSD "HQ" output.** The gates for it include measured passband
+  ripple and out-of-band noise spectra per preset and rate, and a long-run
+  realtime budget on target hardware. None of that can be produced without the
+  hardware, and shipping a modulator whose behaviour has not been measured
+  would be the thing the gate exists to prevent. There is no setting, no route
+  and no claim.
+- **ASIO PCM playback.** The capability probe above exists; the renderer does
+  not. There is no ASIO PCM setting, no ASIO PCM transport and no ASIO PCM
+  claim anywhere — native ASIO DSD is unaffected.
+- **Carrying an odd DSD tail across a gapless boundary.** A DoP carrier frame
+  holds two DSD bytes per channel, so a file with an odd frame count ends on a
+  half-full frame completed with DSD silence. Pairing the outgoing file's last
+  byte with the incoming file's first would put two recordings inside one
+  carrier frame; instead that boundary is declared non-gapless and re-opens the
+  device. The cost is one track gap on odd-length DSD files.
+- **Hardware validation beyond one acceptance run.** The Float32 route was
+  verified on an SMSL C200 Pro: one `32f` rejection, one `32i` open, continuous
+  playback of the whole track, amber Processed throughout, no reopen loop. That
+  is the complete list of what hardware has confirmed.
+
+  Nothing else here rests on hardware. Specifically, and because each of these
+  is easy to read as more than it is:
+
+  - The **drain bounds** on WASAPI, ASIO and ALSA are derived from buffer and
+    period sizes that no real driver has been observed reporting in this build.
+    The units are now right by construction and by test; whether the resulting
+    wait matches a particular DAC's actual latency is unmeasured.
+  - The **ASIO ownership and teardown order** is proved against a fake function
+    table. That is a contract, not a driver: it shows Moosik calls `stop`,
+    `disposeBuffers` and `release` in that order on every path including a
+    panic, and shows nothing about how any real driver responds.
+  - The **IO-format and rate readback** decide a badge, not audio. A driver
+    that implements neither gets amber Unverified, which is a statement about
+    the absence of evidence.
+  - The **native DSD paths** — DoP carriers, truncation refusal, the odd tail,
+    both containers — are exercised on synthetic files only.
+  - The **failure-halt behaviour** is exercised through production reducers and
+    forced thread schedules. The schedules are real — barriers, and hooks that
+    park a thread *inside* `Shared::transition` and inside `fault_decoding`,
+    rather than a sequential model. Two of them were written first without a
+    hook and passed against the broken code, which is why the hooks exist: a
+    rendezvous on either side of a call does not enter the window the defect
+    lives in. Each of the schedule tests has been run against a mutant of the
+    code it covers and fails against it. The hardware they stand in for is
+    still not present.
+  - The **ASIO process globals** (`ACTIVE`, `ENGAGED`) are written by several
+    tests, and the harness runs tests in parallel. They are serialised through
+    one scoped guard now. Before it, `driver_events_fault_the_session_and_never_log`
+    failed on `ev_rate_changed` about one full-suite run in several hundred —
+    another test's `EngineClaim::drop` had nulled `ACTIVE` between the store
+    and the callback — and passed every time it was run alone. Worse than the
+    flake: a `Fake` lives on the stack of the test that built it, so
+    publishing its address without holding the guard published a pointer
+    another thread could dereference after the frame had gone.
+  - The **shared-mixer shortfall rule** has a three-second tolerance chosen as
+    a judgement about how wrong duration tags usually are. It is not a
+    measurement.
+
+  macOS is still neither built nor tested.
+- **A formatting pass.** `cargo fmt --all -- --check` exits non-zero on this
+  tree and has since before this work began. Running it would rewrite most of
+  the source and bury the changes above in a diff nobody can review, so it is
+  deliberately deferred and recorded here as an outstanding debt rather than
+  quietly satisfied. The count is a number of `Diff in` sections: 1104 at
+  `940e58c`, where 1.4.4 was first prepared, and 1116 before this closing pass
+  began. The final figure is in the release checklist below.
+
+### How the gates were run
+
+Recorded because "the tests pass" is not a claim anyone can check.
+
+**Windows 11**, `rustc 1.94.0 (4a4ef493e 2026-03-02)`,
+`cargo 1.94.0 (85eff7c80 2026-01-15)`, host `x86_64-pc-windows-msvc`,
+`rustup` default toolchain `stable-x86_64-pc-windows-msvc`:
+
+> An earlier draft of this section recorded 1.98.0 for Windows. That was the
+> *container's* compiler, copied across when the two tables were written
+> together; the Windows toolchain on this machine is and was 1.94.0. The
+> numbers below were produced by 1.94.0 whatever the previous text said, and
+> the two platforms are not on the same compiler.
+
+```
+cargo test   --locked --all-features
+cargo test   --locked --no-default-features
+cargo check  --locked --no-default-features
+cargo clippy --locked --all-targets --all-features
+cargo build  --locked --release --all-features
+cargo fmt    --all -- --check
+git diff --check
+```
+
+**Linux**, in a `rust:1-bookworm` container with `libasound2-dev` and
+`libudev-dev` installed — `rustc 1.98.0 (88d9e12ae 2026-08-18)`,
+`cargo 1.98.0 (797e8a9bc 2026-08-05)`, host `x86_64-unknown-linux-gnu`,
+whatever the image happens to ship. The working tree is mounted read-only at
+`/src` and copied to `/work`, so the Windows `target/` is never reachable:
+
+```
+cargo check  --locked --all-targets --all-features
+cargo check  --locked --no-default-features
+cargo clippy --locked --all-targets --all-features
+cargo test   --locked --all-features
+cargo test   --locked --no-default-features
+cargo build  --locked --release --all-features
+```
+
+macOS: neither command was run, because there is no machine to run it on.
+
+**What they reported**, on the commit these notes ship with:
+
+| | Windows | Linux |
+|---|---|---|
+| `test --all-features` | 430 passed, 0 failed, 16 ignored | 407 passed, 0 failed, 16 ignored |
+| `test --no-default-features` | 394 passed, 0 failed, 16 ignored | 389 passed, 0 failed, 16 ignored |
+| `check --no-default-features` | exit 0 | exit 0 |
+| `check --all-targets --all-features` | — | exit 0 |
+| `clippy --all-targets --all-features` | exit 0, 27 warnings | exit 0, 84 warnings |
+| `build --release --all-features` | exit 0 | exit 0 |
+| `fmt --all -- --check` | **non-zero: 1206 sections — waived, not passed** | not run |
+
+`cargo fmt` is a **waiver and not a pass**. It exits non-zero, it has done so
+since 1.4.3, and the debt has grown with the comment volume: 1104 → 1116 →
+1121 → 1150 → 1163 → 1183 → 1190 → 1196 → 1201 → 1206. Running the formatter would
+produce a diff far larger than the work it would be mixed into, and mixing them
+would make both unreviewable.
+
+Both clippy runs were compared against the same command on an unpacked copy of
+the immediately preceding commit, `0582f41`, and both are **identical** —
+Windows 27, Linux 84, the same messages in the same numbers, with none in any
+file this release touched last. The Windows set is also the set at `252032c`,
+where the comparison started.
+
+The two platform figures are not comparable to each other and are not being
+compared: the container ships `rustc 1.98.0` and Windows has 1.94.0, four
+releases of new lints (`chunks_exact_to_as_chunks`, `manual_checked_ops`,
+`identity_op` and others that did not exist in 1.94), plus dead-code warnings
+for the Windows-only backends that Linux does not compile.
+
+> An earlier draft of this paragraph recorded 71 for Linux. That number came
+> from a different grep in the container script — the run loop printed only
+> lines matching `warning: unused`, and the total was taken from a summary
+> line rather than from a count of warnings. Counted the same way on both
+> commits, it is 84 on each.
+
+**Test inventories and why the two platforms differ.** Windows lists 446
+tests and Linux 423, of which 16 are ignored on both and are the same 16.
+The difference is `cfg`, not coverage: 42 tests exist only on Windows
+(`bitperfect::asio_dsd` 35, `bitperfect::wasapi_out` 5, `log` 1, and the native
+ASIO route's pause-ordering test in `main`) and 19 only on Linux
+(`bitperfect::alsa_dsd` 17, `bitperfect::cpal_out` 1, and the ALSA mirror of
+that same test). ASIO is a Windows
+API and ALSA is a Linux one, so each backend's tests compile on one platform and
+not the other; the shared PCM, DoP, decode, fidelity and lifecycle tests run on
+both.
+
+42 − 19 = 23, which is 446 − 423. The `cfg` gates are
+`cfg(all(windows, feature = "asio-dsd"))` and
+`cfg(all(target_os = "linux", feature = "alsa-dsd"))` for the two backend
+suites; `wasapi_out` and `cpal_out` are the two shared-path backends, and the
+`log` test needs Windows file-locking semantics to make a delete fail. The
+all-features/no-default difference is those same backend suites plus the
+`asio-pcm-probe` diagnostics.
+
+**The Linux matrix has caught five defects that Windows could not**, and they
+are recorded because that is the interesting part of running it.
+
+The fifth is this pass's. Three new evidence tests moved a stream into the
+thread that reads it, which does not compile on Linux: `Backend` holds a
+`cpal::Stream`, deliberately neither `Send` nor `Sync`, so a `BpStream` cannot
+cross a thread boundary there. On Windows the WASAPI handle is `Send` and all
+three built and passed — a test that exists on one platform and not the other,
+found only because the whole matrix is run. The stream is now built inside the
+reading thread.
+
+A Linux step also failed twice on this pass for a reason that is not a result:
+`check --all-targets --all-features` could not download a crate from
+`crates.io`, once for `flate2` and once for `bitflags`. Both were re-run on the
+same tree and passed. Recorded rather than quietly dropped.
+
+Three of them belong to one pass. Two ALSA tests were still reading the
+combined fault accessor and calling its answer "the fault" after that accessor
+became fatal-only — the same edit had been made to every Windows-visible test,
+and these two are compiled only on Linux. The third was worse: a test that
+burnt exactly one generation and then asserted the next one shared its parity.
+The allocator is process-wide and the suite runs in parallel, so how many
+numbers another test takes in between is not knowable; the assertion held on
+Windows by scheduling luck and failed on Linux, where more tests are compiled
+and the contention is higher. It now rolls until the condition it is about is
+actually met.
+
+The fourth was the pass before that: `alsa_dsd::null_device_end_to_end`, an
+end-to-end run against the `null` device, reported 92.9 ms of elapsed time on a
+100 ms clip because a change to *when* frames are counted had stopped crediting
+the last, partly-full period of a track.
+
+Each time, the whole matrix was re-run on the corrected tree. An earlier phase had one Linux step fail on a
+`crates.io` download timeout and re-run on the same tree; that is still true of
+the run those notes described.
+
+The 16 ignored tests are ignored on both platforms and are the same 16 in
+every run. Counted from `--ignored --list` rather than from memory, because
+the previous version of this paragraph was wrong in three of its five figures:
+
+| Area | Count | What they need |
+|---|---|---|
+| `lyrics::lrclib`, `lyrics::netease` | 5 | a live lyrics service |
+| `spectrum::aslt`, `spectrum::cache_key`, `spectrum::freq_scale` | 5 | long recordings and survey runs |
+| `spectrum::gpu`, `spectrum::gpu_calib` | 3 | a GPU adapter |
+| `tags` | 2 | a writable music library |
+| `fonts` | 1 | an installed system font |
+
+None of them covers anything in this release.
+
+**The full Windows all-features suite was run 25 consecutive times** in the
+default parallel configuration, on the source tree these notes ship with — the
+only change made after it was to this file. The count per run is the one in the
+table above: 423 passed, 0 failed, 25 times out of 25, with each run's output
+kept and discarded only on a pass — so a failure would have left its log
+behind. An earlier version of this paragraph still said 361, which was the
+count three commits before it; the number was not re-read when the suite grew.
+
+**An earlier attempt at that run was 22 of 25**, and it is recorded because
+discarding it would make the clean one look like the only thing that happened.
+Runs 2, 3 and 4 of that attempt did not report the expected line. Their output
+was not kept — the loop only counted — so *what* failed in them is not known
+and is not being guessed at — **and no cause is inferred for them here.** An
+earlier version of this paragraph offered one, on the strength of a linker
+error seen in the same session; that is a coincidence in time, not evidence
+about those three runs, and it is withdrawn. The loop was re-run on the same
+tree with each run's output kept, so that a repeat would be diagnosable rather
+than merely counted, and it came out 25 of 25 with nothing to diagnose.
+
+That is the honest shape of it: one attempt with three failures that were not
+captured and remain unexplained, and one attempt that was clean and would have
+produced evidence if it had not been.
+
+Twenty-five clean runs is evidence about one hazard and not a general claim.
+Before the ASIO global isolation the failure being chased appeared roughly once
+in several hundred runs; twenty-five runs says that specific hazard is gone. It
+says nothing about interleavings nobody has forced, and no claim is made that
+the concurrent paths here are exhaustively covered. What is covered is what is
+listed below, and nothing else.
+
+**What is not covered.** Some of the repairs here are reasoned from the types
+and the comments beside them, and nothing automated proves them, because every
+path that reaches them opens a sound card first:
+
+* that a PCM or DoP route which fails to start publishes no current track —
+  the ordering is right in the source and the mutation that reverses it fails
+  no test, because no test reaches `start_bp` or `start_dop`;
+* that `Engine::completion` reaches a dead handle, which needs a handle that
+  can die;
+* that the ALSA writer loop credits what `writei` accepted, which needs a
+  device that accepts partially;
+* that each device route inside `play_file_at` opens *at* the target — the
+  argument is threaded through in the source, and what a test can hold is that
+  `open_track` asks for the target and never for zero;
+* that the shared route stays silent until it has seeked — the sink is paused
+  across the append and released after `try_seek`, and constructing a `rodio`
+  sink needs an output device;
+* that the three device branches of `Engine::seek_to` release what they took;
+  the transaction is the same one, but the only failing seek a test can reach
+  without hardware is the decimated-DSD rebuild, which is the one driven;
+* that the two `rodio` routes — the shared mixer and the decimated-DSD rebuild
+  — pause before their own append. They take the flag in the same place for the
+  same reason as the four device routes, but constructing a `rodio` sink needs
+  an output device, so no test executes that code. The four routes that hold a
+  stream of their own are covered: the exact-output and DoP routes over a
+  `BpStream`, and the two native DSD sessions over an `AsioDsdStream` and an
+  `AlsaDsdStream`, each asked at the instant its output step runs whether its
+  own flag is set. That correction is described above; the first attempt at it
+  proved a generic recorder that three of those four routes did not call.
+
+Two further boundaries are worth naming because they are not "no device":
+
+* **The shared stream on the WASAPI-exclusive path is preempted, not
+  released.** That is the intended rule for exclusive mode, and it is now
+  written down beside the flag that records it — but no test exercises it, and
+  nothing here claims every held resource is released on that path.
+* **`App::stop` clearing the status line** is asserted on `StatusLine::clear`,
+  not on the caller. That is the gap the brief names, and it is still a gap:
+  `MoosikApp` cannot be constructed, and a wrapper function would be the same
+  assertion wearing a different name.
+
+And a boundary of a different kind: **`MoosikApp` cannot be constructed in a
+unit test.** It takes an `eframe` creation context and reads the user's own
+configuration and playlists on the way up, so the app methods a listener
+actually triggers — `play_index`, `select_bp_device`, `toggle_bit_perfect`,
+`restart_current_track`, the per-frame tick — are proved at the seams they
+call, not as whole methods. Those seams are production code that the callers
+have no alternative to: `open_track`, `switch_output`, `StatusLine`,
+`restart_effect`, `Engine::open_attempt`, `Engine::abort_open` and
+`Engine::halt`. What is not proved is the wiring between an app method and its
+seam. That wiring is **not** always a single call, and saying it was is how
+two of this release's defects survived a phase: the bit-perfect toggle and the
+output-device selection each contain multi-step orchestration — read a
+setting, restart, decide what the status line says, roll back if it failed —
+and both of them were wrong in the part that is not the call. The two
+decisions that were wrong are now reducers the callers ask, with a source
+check that the callers have not grown a second copy; what remains uncovered is
+the sequencing around them.
+
+They are listed because a release note that says "tested on Windows and Linux"
+without saying what could not be tested is the kind of claim this release
+exists to stop making.
+
+**Every schedule-dependent repair is checked against a mutant of the code it
+covers** — the fix reverted, the test expected to fail, the fix restored. That
+is the only way to tell a forced schedule from a test that would pass against
+anything, and it has caught five tests written for this release that proved
+nothing: two that rendezvoused outside the window a race lives in, one whose
+seek targets could not produce the misalignment it was checking for, one that
+asserted on a field it had just written rather than on the decision that reads
+it, and one that spawned a competing thread without establishing that it had
+been reached, so the interleaving it meant to force was a race it usually won.
+
+The forced schedules, each parking a thread at a named hook inside the window
+its race lives in:
+
+| Hook | What is parked there |
+|---|---|
+| `Transition` | a stale writer inside a terminal transition |
+| `DeferFault` | a decoder between finding its track queued and parking a fault |
+| `Successor` | a real PCM or DoP decode loop, between taking its queued successor and claiming the clock |
+| `BoundaryPublish(0..3)` | a publisher after the claim, and after each of the three stores |
+| `DecodeEof` | a decoder between its liveness check and publishing end-of-source |
+| `OffGrid` | a decoder between its liveness check and publishing rounding evidence |
+| `Evidence(1..2)` | a gapless boundary crossing between two fields of one evidence read |
+| `Evidence(3)` | a dropout and the failure after it, published inside the final ordered attempt at reading evidence |
+| `ResetContend` | a reset immediately before it contends for the publication lock, so a publisher is released on a handshake rather than a sleep |
+
+The mutants, each a rule reverted and its test confirmed to fail: the
+render-owned boundary crossing; the stale drain latch; deferred-fault
+monotonicity; per-session frame accounting; the shared seek resume; the native
+fatal-over-recoverable override; the ASIO drain counting its own final buffer;
+the fidelity ordering; counting frames before the buffers are filled; a drain
+expiring against the live clock; an XRUN attributed to generation zero; both
+integrity records pushed to one slot; an unconditional rollover; a reset
+outside the publication lock; a check-then-store end-of-source; a
+validate-then-store rounding count; the fatal accessor falling back to
+recoverable evidence; a rollover keeping its predecessor's loss; a dropout
+leaving the diamond up; a policy-blind open reducer; and a rollover leaving the
+processing record identity.
+
+Then, for the corrective pass that followed — the publication window, pause
+intent and caller truth — seventeen more, every one caught: removing the begin
+marker, the end marker, the fold, the retry and the quiescence check; bypassing
+the PCM and ASIO public adapters; letting the value-exact caller ignore whether
+its read settled; pausing a route after it has started; dropping the pause
+intent on the way into the openers; telling the fallback rung to play; a seek
+worker that ignores cancellation; both untyped error mappings; a toggle that
+treats a selected track as a playing one; a paused session that does not halt
+on a failure; and a toggle caller that decides for itself instead of asking.
+
+Then, for the evidence, lifecycle and status work in this release: reading
+evidence without retrying when a publication lands between the loads; the final
+attempt reading the recoverable records before the terminal one; that attempt
+answering from the last read rather than the union of what it saw; each of the
+four things an open releases, dropped one at a time — the sink, the exact
+stream, the native session and the scan — plus the typed reason, the cleared
+current track, and the undo itself; the decimated-DSD rebuild reporting a
+failure as a landing; opening at zero instead of at the target; skipping the
+rollback; rolling back to a different position; discarding the rollback's own
+error; a seek landing taking the status line when it had put nothing up; the
+now-playing line storing the rendered line rather than its headline; a message
+written without an owner; and the refresh firing for a player that has
+stopped.
+
+## [1.4.3] - 2026-08-25
+
+Bit-perfect output stops being a preference and starts being a measurement.
+
+The short version: the diamond used to come from the toggle. If you had it
+switched on, it was green — while a DSD file was being decimated to processed
+PCM, while a 24-bit track rode a 16-bit stream, while the volume slider sat at
+80%. This release derives it from what the output path is actually doing, and
+where the answer is "not exactly", it says so and says why.
+
+One boundary, stated once and meant everywhere below: **exact means the sample
+and payload words Moosik hands the Windows audio driver are the source's own
+words.** What the USB link, the driver and the DAC do after that is outside
+anything this process can see. A DAC's rate display, its DSD lock light and its
+temperature are not evidence of anything, and nothing here claims otherwise.
+
+### Fixed
+
+- **A 32-bit integer source lost its lowest eight bits, silently.** The output
+  ring carried `f32`, which has 24 bits of mantissa, so every 32-bit sample was
+  rounded before a device ever saw it — and the diamond stayed green while it
+  happened. The ring now carries a canonical `u32` payload: left-aligned signed
+  integers, or raw `f32` bits, with the meaning fixed by the decoded source
+  family. Packing to a device format is shifts and byte copies, never a float
+  multiply and never a saturating cast.
+
+- **A 24-bit file could negotiate a 16-bit device format and still be called
+  bit-perfect.** Each source width had a five-format fallback order ending in
+  `16i`, so a device offering nothing better truncated eight bits per sample
+  and reported success. There is no longer any fallback candidate that is not
+  exact for the source: 1–16-bit integers may use `16i`, packed `24i`,
+  24-in-32 or `32i`; 17–24-bit may use the three wider ones; 25–32-bit may use
+  `32i` and nothing else; a 32-bit float may use `32f` and nothing else. If no
+  device format can carry the source, the open fails with the reason rather
+  than negotiating something quieter. `MOOSIK_BP_FORMAT` obeys the same matrix
+  — it can pick among the exact formats and can no longer authorise a
+  narrowing one.
+
+- **A 64-bit float source claimed exactness it cannot have.** No available
+  device format carries one without rounding. It now plays through normal
+  output, labelled *Exactness unverified*, with the reason attached.
+
+- **The negotiated format was believed rather than checked.** The stored format
+  came from the candidate that was *offered*. A driver that accepted a request
+  and then described something else was taken at its word, which puts frames of
+  the wrong width on the wire. Rate, channel count, channel mask, block
+  alignment, container bits, valid bits and integer/float subtype are now all
+  read back from the driver's reply and compared; a mismatch rejects the
+  candidate and moves on.
+
+- **Torn frames could rotate every channel for the rest of a track.** The ring
+  was drained a sample at a time until it ran dry, which could stop between a
+  left and a right sample. The leftover then became the *first* channel of the
+  next callback, and every channel stayed shifted until some later odd-sized
+  read happened to shift it back. The ring is now frame-atomic on both sides —
+  whole interleaved frames in, whole frames out, capacity a multiple of the
+  channel count — on the WASAPI PCM, WASAPI DoP and native ASIO DSD paths
+  alike. A short read now leaves a whole frame behind instead of half of one.
+
+- **DoP emitted PCM zeros wherever the decoder had not pre-packed silence.**
+  The marker travelled through the ring, so only silence the *decode* thread
+  knew about in advance — the lead-in and the tail — carried a valid DoP
+  marker. The device prefill, a pause, an underrun, the gap after a seek and
+  the final drain all sent frames of zeros, which a DoP DAC reads as loss of
+  lock. Marker ownership has moved to the render thread: one phase counter for
+  the life of the stream, one marker per complete channel frame, and marked DSD
+  silence generated wherever payload runs out. No all-zero DoP frame can be
+  emitted. A pause now also consumes no source at all, where it used to destroy
+  audio by turning it into silence.
+
+- **The volume slider appeared to work on a path that has no volume.** There is
+  no multiply between the decoder and the device on an exact route, so a slider
+  that moved was reporting a state the audio could not be in. While an exact
+  PCM, DoP or native-DSD route is open the slider is disabled and reads
+  `100% · locked for bit-perfect output`. Your saved volume is untouched and
+  returns the moment normal playback resumes.
+
+- **Reusing an open stream could narrow the next track.** The check was the
+  requested device, the sample rate and the channel count. A 16-bit track
+  followed by a 24-bit track at the same rate reused the 16-bit stream and
+  truncated the second one — and the gapless queue used an even looser test
+  than the reopen path, so the boundary case was the worst case. Reuse now
+  compares the resolved endpoint, the route, the rate, the channel count, the
+  channel layout, the source family and the negotiated container's valid bits;
+  a wider integer container may still carry a narrower integer source, because
+  that packing is exact. Both paths ask the same question, and the decode
+  thread asks it again at the moment of the swap.
+
+- **A read or decode error mid-track looked like the end of the file.** It was
+  logged and then treated as a clean end, so the track simply stopped early and
+  the session still claimed to have carried it exactly. Read errors, decode
+  errors and a source that changes rate, layout or sample family mid-stream are
+  now typed integrity faults.
+
+- **Native ASIO DSD checked one channel and assumed the rest.** The bit order
+  is applied once to the whole interleaved stream, which is only correct if
+  every selected channel wants the same order — and a driver is free to report
+  per-channel types. All selected output channels are now queried, and a mixed
+  configuration is refused before the stream starts rather than played with one
+  channel inverted. `DSD Int8 NER8` is also refused: it is 8-bit data at one
+  sample per byte, an eighth of the data rate this path produces, and it used
+  to be treated as MSB1.
+
+### Changed
+
+- **The diamond has five states, and they say what they are in words.** Colour
+  is never the only signal:
+
+  ```
+  ◇ Bit-perfect off
+  ◇ Bit-perfect requested — no active output stream
+  ◇ Verifying exclusive output…
+  💎 Exact output path · WASAPI Exclusive / DoP / Native DSD
+  ⚠ Not bit-perfect · <reason>
+  ⚠ Exactness unverified · <reason>
+  ✕ Bit-perfect unavailable · <reason>
+  ```
+
+  A stored preference on its own is never green. Neither is a route that is
+  still being negotiated — the window between pressing play and the driver
+  accepting a format is exactly when a claim is least justified, and a stale
+  diamond used to survive it.
+
+- **A persistent output panel that transient messages cannot overwrite.**
+  While something is playing, three lines stay put: the source format, the
+  device and negotiated output format, and what is in the processing path.
+  There used to be one status string that every subsystem wrote to, so the line
+  describing the open device survived until the next tag save wanted to say
+  something.
+
+- **Any integrity fault revokes the claim for the rest of the session.** A
+  dropout or a render callback that could not reach its session in time. A
+  dropout means the DAC played silence that was not in the file; no later good
+  buffer undoes that, and only a new session can claim again. A torn frame, a
+  decode or read error and a backend write failure are listed here in error —
+  they do not revoke a claim, they end the session, and 1.4.4 separated the
+  two.
+
+- **Native DSD is never described as "via DoP".** They are different transports
+  with different ceilings, and the ASIO route exists precisely because it is
+  not DoP.
+
+- **Linux and macOS no longer claim exactness.** cpal asks for the exact
+  format, and on a direct `hw:` device it very likely gets it — but ALSA,
+  PipeWire, Pulse, `dmix` and CoreAudio can each resample or mix on the way to
+  the hardware, and this process cannot see which route it got. The format
+  policy there is now exact-only in the same way as on Windows (no narrowing,
+  no cross-family conversion, `F64` refused), but the route reports
+  *Exactness unverified* rather than green. Native ALSA DSD is treated the same
+  way for this release.
+
+- **Source precision is measured, not guessed.** `prepare` now decodes one
+  packet before returning, so the family comes from the buffer symphonia
+  actually produces rather than from a container hint that some formats do not
+  provide. A declared depth narrower than the decoded storage width — 24-bit
+  FLAC in 32-bit slots — is believed only if the samples honour it; content
+  below the declared point widens the requirement instead. Nothing is lost to
+  the probe: that packet is the first audio into the ring.
+
+### Internal
+
+- **Realtime threads publish faults as a `u8`.** No formatting, no allocation,
+  no logging mutex and no filesystem on a thread holding a hard deadline; a
+  non-realtime poller turns the code into words. The ASIO callback's remaining
+  `mlog!` is gone, and a test reads the source to keep it gone. Another test
+  measures the callback with a counting allocator and requires zero allocations
+  in steady state — and calibrates the probe first, so "zero" means something.
+
+- **New modules.** `bitperfect::format` (canonical payloads, the exactness
+  matrix, the byte writers, DoP marker state), `bitperfect::frame_ring`
+  (the frame-atomic ring), `bitperfect::state` (route, integrity and the reuse
+  predicate). The DoP encoder's marker packer is gone — the marker is not a
+  property of the audio.
+
+### Not covered
+
+Stated so it is not mistaken for coverage:
+
+- **No hardware was validated for this release.** Every claim above is about
+  what this process hands the driver, verified by tests. The DAC end has not
+  been re-checked since 1.4.2, and doing so properly needs capture equipment on
+  the USB link, not a DAC's front panel.
+- **FLAC is not in the decoder fixtures.** The suite builds WAV (16-, 24- and
+  32-bit integer and 32-bit float), DSF and DFF fixtures byte by byte; encoding
+  FLAC would need a dependency this release does not add. The FLAC path is
+  covered only through the shared canonical conversion, not end to end.
+- **Linux and macOS builds are unverified here.** `cpal_out.rs` and the ALSA
+  DSD backend are not compiled on Windows, where this was developed and tested.
+
 ## [1.4.2] - 2026-08-21
 
 ### Removed
