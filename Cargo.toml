@@ -1,6 +1,6 @@
 [package]
 name = "moosik"
-version = "1.4.4"
+version = "1.4.5"
 edition = "2024"
 
 [[bin]]
@@ -28,7 +28,7 @@ asio-dsd = []
 alsa-dsd = ["dep:alsa"]
 
 [dependencies]
-eframe = { version = "0.31", features = ["default"] }
+eframe = { version = "=0.31.1", features = ["default", "moosik_windows_linked_viewport"] }
 egui = "0.31"
 rodio = { version = "0.20", features = ["symphonia-all"] }
 lofty = "0.22"
@@ -88,6 +88,13 @@ raw-window-handle = "0.6"
 # (Feature-gating optional deps per-target isn't expressive enough in Cargo,
 # so the extra windows-sys features ride along unconditionally on Windows —
 # they only add API declarations, not linked code.)
+
+# eframe 0.31.1's minimized-window sleep throttles a visible immediate child
+# viewport whose pass belongs to the minimized parent — the spectrum window.
+# The vendored copy is the exact published archive plus one Windows-only,
+# opt-in policy; see vendor/eframe-0.31.1/PATCH.md.
+[patch.crates-io]
+eframe = { path = "vendor/eframe-0.31.1" }
 
 [profile.release]
 opt-level = 3

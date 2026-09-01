@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [1.4.5] - 2026-09-01
+
+### Fixed
+
+- **The spectrum keeps its frame rate while the player window is minimized
+  (Windows).** eframe sleeps the event loop for 10 ms whenever the window it
+  has just painted is minimized. The spectrum is an immediate viewport, so it
+  is painted inside the player window's pass — minimizing the player throttled
+  a window that was still on screen, from roughly 170 FPS to roughly 80. Moosik
+  now vendors the exact published `eframe 0.31.1` and waives that sleep only
+  while a visible, non-minimized descendant, linked through an unbroken chain
+  of immediate viewports, still depends on the minimized viewport's pass.
+  Anything unknown keeps the sleep. Minimizing the player when no visible,
+  non-minimized immediate descendant remains behaves exactly as before, as does
+  every non-Windows build. The rule is generic, not spectrum-specific: the
+  lyrics, tags and track-info windows are immediate viewports too, and keep
+  their frame rate on the same terms. See `vendor/eframe-0.31.1/PATCH.md`.
+
+  Minimizing only the spectrum while the player stays visible still costs what
+  it did before: an immediate viewport shares its parent's repaints, so the
+  work continues whether or not the child is on screen. That is existing
+  behaviour, not a regression, and it is not addressed here.
+
 ## [1.4.4] - 2026-08-30
 
 Output-truth repair, on top of 1.4.3.
