@@ -1315,12 +1315,45 @@ impl Engine {
     ///
     /// Stopping matters as much as dropping: a sink that is dropped while
     /// still playing goes on until its queue empties.
-    fn release_sink(&mut self) {
+    /// Release the shared sink — and with it, the shared analysis route.
+    ///
+    /// The one authoritative place a shared session ends, because there are
+    /// several paths that end one and every one of them comes through here: a
+    /// stop, a halt, a failed open, a rebuild, and the slow background seek,
+    /// which releases the sink and then spends seconds decoding on a worker
+    /// thread before anything replaces it.
+    ///
+    /// The invalidation cannot be left to the source's own `Drop`. `Sink::stop`
+    /// sets an atomic that the mixer notices asynchronously, so the source may
+    /// outlive this call by a callback or two; its `Drop` then runs on the audio
+    /// thread and takes the buffer lock with `try_lock`, which is allowed to
+    /// miss. Doing it here, synchronously and unconditionally, is what makes a
+    /// seek report "no live PCM" the moment it starts rather than whenever the
+    /// mixer gets round to it.
+    fn release_sink(&mut self) -> bool {
+        let mut released = false;
         if let Some(sink) = self.sink.take() {
             sink.stop();
+            released = true;
         }
         #[cfg(test)]
-        { self.held_sink = None; }
+        {
+            released |= self.held_sink.take().is_some();
+        }
+        // Once, and only when a sink actually existed: an exact or native route
+        // that happens to pass through here is not the shared route, and its
+        // display claim is not this function's to revoke. Written as one call
+        // rather than one per branch so a test that reaches it through the
+        // witness is exercising the same line production reaches.
+        //
+        // Returned so the wider teardowns below can advance the route exactly
+        // once. They used to release the sink — which advanced it — and then
+        // advance it again unconditionally, which is harmless but meant the
+        // count was not the thing it claimed to be.
+        if released {
+            spectrum::invalidate_live_pcm_route(&self.stereo_buf, &self.sample_buf);
+        }
+        released
     }
 
     /// Start `path` on this platform's native-DSD backend.
@@ -1387,7 +1420,19 @@ impl Engine {
             // path so the track is never simply unplayable.
             let native_err = if self.native_dsd_selected() {
                 match self.start_native(path, opening) {
-                    Ok(()) => { self.dsd_native = true; None }
+                    Ok(()) => {
+                        self.dsd_native = true;
+                        // Native DSD attaches no tap of any kind: the bits go
+                        // to the driver as DSD and never become PCM anywhere in
+                        // this process. Published rather than inferred, so the
+                        // spectrum says "no live PCM" instead of drawing
+                        // whatever the previous track happened to leave behind.
+                        spectrum::invalidate_live_pcm_route(
+                            &self.stereo_buf,
+                            &self.sample_buf,
+                        );
+                        None
+                    }
                     Err(e) => {
                         let e = e.to_string();
                         // Always audible in the console — a silent fall-through
@@ -3317,7 +3362,7 @@ fn bp_refresh_processing(&mut self) {
     fn stop(&mut self) {
         self.cancel_seek_worker(); // and tell it to stop, not merely stop listening
         self.pending_seek = None; // abandon any in-flight background seek
-        self.release_sink();
+        let ended_shared_route = self.release_sink();
         // Release, not merely idle: an exclusive stream that stays open holds
         // the endpoint.
         self.release_bp();
@@ -3325,6 +3370,16 @@ fn bp_refresh_processing(&mut self) {
         // A scan outliving the track it was started for is how a verdict for
         // one file reached another.
         self.retire_q31_scan();
+        // Exactly once for the whole teardown. `release_sink` above already
+        // advanced the route if there was a shared sink to release; a
+        // bit-perfect or native route has no sink, so this is where those end.
+        // Said out loud rather than left to a tap's own drop: a drop takes the
+        // buffer lock without blocking and may simply miss it, and a stopped
+        // player showing a live spectrum is exactly the kind of stale truth
+        // this engine spends most of its teardown avoiding.
+        if !ended_shared_route {
+            spectrum::invalidate_live_pcm_route(&self.stereo_buf, &self.sample_buf);
+        }
         self.dsd_mode = false;
         self.dsd_native = false;
         self.dsd_fallback = false;
@@ -3418,13 +3473,23 @@ fn completion(&self) -> bitperfect::Completion {
     fn halt(&mut self, reason: u8) {
         self.cancel_seek_worker();
         self.pending_seek = None;
-        self.release_sink();
+        let ended_shared_route = self.release_sink();
         if let Some(r) = bitperfect::fault::to_reason(reason) {
             self.bp_state.halted(r);
         }
         self.release_bp();
         self.native_close();
         self.retire_q31_scan();
+        // Exactly once for the whole teardown. `release_sink` above already
+        // advanced the route if there was a shared sink to release; a
+        // bit-perfect or native route has no sink, so this is where those end.
+        // Said out loud rather than left to a tap's own drop: a drop takes the
+        // buffer lock without blocking and may simply miss it, and a stopped
+        // player showing a live spectrum is exactly the kind of stale truth
+        // this engine spends most of its teardown avoiding.
+        if !ended_shared_route {
+            spectrum::invalidate_live_pcm_route(&self.stereo_buf, &self.sample_buf);
+        }
         self.dsd_mode = false;
         self.dsd_native = false;
         self.dsd_fallback = false;
@@ -3483,10 +3548,20 @@ fn completion(&self) -> bitperfect::Completion {
     fn abort_open(&mut self, reason: bitperfect::state::FailureReason) {
         self.cancel_seek_worker();
         self.pending_seek = None;
-        self.release_sink();
+        let ended_shared_route = self.release_sink();
         self.release_bp();
         self.native_close();
         self.retire_q31_scan();
+        // Exactly once for the whole teardown. `release_sink` above already
+        // advanced the route if there was a shared sink to release; a
+        // bit-perfect or native route has no sink, so this is where those end.
+        // Said out loud rather than left to a tap's own drop: a drop takes the
+        // buffer lock without blocking and may simply miss it, and a stopped
+        // player showing a live spectrum is exactly the kind of stale truth
+        // this engine spends most of its teardown avoiding.
+        if !ended_shared_route {
+            spectrum::invalidate_live_pcm_route(&self.stereo_buf, &self.sample_buf);
+        }
         self.dsd_mode = false;
         self.dsd_native = false;
         self.dsd_fallback = false;
@@ -12624,6 +12699,371 @@ mod tests {
         assert_eq!(e.bp_state.fidelity, first);
     }
 
+    // -----------------------------------------------------------------------
+    // The stereo lease across route teardown
+    // -----------------------------------------------------------------------
+
+    /// Build an engine whose stereo buffer looks like a live two-channel route.
+    fn engine_with_live_stereo() -> (Engine, spectrum::StereoBuf) {
+        let e = engine();
+        let stereo = e.stereo_buf.clone();
+        spectrum::begin_stereo_stream(&stereo, 2);
+        {
+            let mut g = stereo.lock().unwrap();
+            g.frames.push([0.5, -0.5]);
+        }
+        assert_eq!(
+            spectrum::channels::availability(false, true, stereo.lock().unwrap().channels),
+            spectrum::channels::ChannelAvailability::Available,
+            "setup: the route should look live"
+        );
+        (e, stereo)
+    }
+
+    fn assert_no_live_tap(stereo: &spectrum::StereoBuf, what: &str) {
+        let g = stereo.lock().unwrap();
+        assert_eq!(
+            g.channels,
+            spectrum::channels::NO_LIVE_TAP,
+            "{what} left the display claiming a live tap"
+        );
+        assert!(g.frames.is_empty(), "{what} left stale frames behind");
+        assert_eq!(
+            spectrum::channels::availability(false, true, g.channels),
+            spectrum::channels::ChannelAvailability::NoLiveTap,
+            "{what} must report NoLiveTap"
+        );
+    }
+
+    /// Stopping tears every route down, so nothing is feeding the analyser and
+    /// the display has to say so. A stopped player showing a live left and
+    /// right is the same class of stale truth as a stopped player showing
+    /// "Playing:".
+    #[test]
+    fn stopping_retires_the_stereo_lease() {
+        let (mut e, stereo) = engine_with_live_stereo();
+        e.stop();
+        assert_no_live_tap(&stereo, "stop");
+    }
+
+    #[test]
+    fn halting_retires_the_stereo_lease() {
+        let (mut e, stereo) = engine_with_live_stereo();
+        e.halt(bitperfect::fault::BACKEND_DEAD);
+        assert_no_live_tap(&stereo, "halt");
+    }
+
+    #[test]
+    fn aborting_an_open_retires_the_stereo_lease() {
+        let (mut e, stereo) = engine_with_live_stereo();
+        e.abort_open(bitperfect::state::FailureReason::DeviceUnavailable(
+            "no such device".into(),
+        ));
+        assert_no_live_tap(&stereo, "abort_open");
+    }
+
+    /// A failed open goes through the transaction, which undoes everything it
+    /// took. The lease is part of "everything": a route that never started is
+    /// not feeding the analyser, whatever the previous one left in the buffer.
+    #[test]
+    fn a_failed_open_leaves_no_live_tap() {
+        let (mut e, stereo) = engine_with_live_stereo();
+        e.bp_state.begin_open();
+        let out = open_track(
+            &mut e,
+            Opening::at(Duration::ZERO),
+            false,
+            |eng, _o| {
+                eng.note_current(Path::new("attempted.flac"), None, Duration::ZERO);
+                Err(bitperfect::OpenError::backend("the render thread would not start"))
+            },
+            |_, _| panic!("a backend failure is not a format rejection"),
+        );
+        assert!(
+            matches!(out, RestartOutcome::Stopped(_)),
+            "setup: the open should have failed, got {out:?}"
+        );
+        assert_no_live_tap(&stereo, "a failed open");
+    }
+
+    /// Releasing the shared sink ends the shared analysis route there and then,
+    /// without waiting for the source's own `Drop`.
+    ///
+    /// This is the slow background seek: it releases the sink and then spends
+    /// seconds decoding on a worker before anything replaces it. `Sink::stop`
+    /// only sets an atomic, so the source can outlive the call; its `Drop` runs
+    /// on the audio thread and takes the lock with `try_lock`, which is allowed
+    /// to miss. The test models exactly that by never dropping the source at
+    /// all — if the invalidation were left to `Drop`, the display would keep
+    /// claiming a live stereo tap for the whole of a multi-second seek.
+    #[test]
+    fn releasing_the_shared_sink_reports_no_live_tap_without_waiting_for_drop() {
+        let (mut e, stereo) = engine_with_live_stereo();
+        // A witness stands in for the real sink, which needs a device.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        e.held_sink = Some(Sentinel(std::sync::Arc::clone(&counter)));
+
+        e.release_sink();
+
+        assert_eq!(released(&counter), 1, "setup: the sink should have been released");
+        let g = stereo.lock().unwrap();
+        assert_eq!(
+            g.channels,
+            spectrum::channels::NO_LIVE_TAP,
+            "a released shared sink left the display claiming a live tap"
+        );
+        assert!(g.frames.is_empty(), "the previous route's frames survived");
+        assert_eq!(
+            spectrum::channels::availability(false, true, g.channels),
+            spectrum::channels::ChannelAvailability::NoLiveTap
+        );
+    }
+
+    /// And it ends the *session*, not merely the current owner — so a source
+    /// still draining from the released sink cannot claim afterwards.
+    #[test]
+    fn releasing_the_shared_sink_advances_the_route_epoch() {
+        let (mut e, stereo) = engine_with_live_stereo();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        e.held_sink = Some(Sentinel(std::sync::Arc::clone(&counter)));
+        let before = stereo.lock().unwrap().route_epoch;
+
+        e.release_sink();
+
+        assert_ne!(
+            stereo.lock().unwrap().route_epoch,
+            before,
+            "the shared session did not end, so a late first pull could still claim"
+        );
+    }
+
+    /// Releasing a sink that does not exist is not a shared-route teardown. An
+    /// exact or native route passing through here keeps its display claim.
+    #[test]
+    fn releasing_no_sink_leaves_another_routes_claim_alone() {
+        let (mut e, stereo) = engine_with_live_stereo();
+        let epoch = stereo.lock().unwrap().route_epoch;
+        let owner = stereo.lock().unwrap().generation;
+
+        e.release_sink(); // nothing to release
+
+        let g = stereo.lock().unwrap();
+        assert_eq!(g.route_epoch, epoch);
+        assert_eq!(g.generation, owner);
+        assert_eq!(
+            g.channels, 2,
+            "a bit-perfect route lost its claim to an empty release"
+        );
+    }
+
+    /// A native DSD route that starts successfully publishes "no live PCM".
+    ///
+    /// The route itself cannot be run here — it needs an ASIO driver or an ALSA
+    /// hw: device — so this pins the branch instead: the success arm of
+    /// `start_native` must retire the stereo route, and it must do so *inside*
+    /// the arm rather than unconditionally, or a failed native attempt falling
+    /// back to DoP or decimated PCM would blank the route that then succeeds.
+    ///
+    /// Native DSD is not DoP. DoP is a PCM carrier with a tap that publishes no
+    /// channels; native DSD hands DSD bits straight to the driver and attaches
+    /// no tap at all. They reach the same display state by different routes,
+    /// and both are covered — the DoP half in `bitperfect::tests`.
+    #[test]
+    fn a_successful_native_dsd_start_publishes_no_live_tap() {
+        let src = include_str!("main.rs");
+        let arm = src
+            .split_once("match self.start_native(path, opening) {")
+            .expect("the native start dispatch moved")
+            .1;
+        let ok_arm = arm
+            .split_once("Err(e) => {")
+            .expect("the native start dispatch has no failure arm")
+            .0;
+        assert!(
+            ok_arm.contains("self.dsd_native = true"),
+            "this is not the success arm any more"
+        );
+        assert!(
+            ok_arm.contains("invalidate_live_pcm_route"),
+            "a successful native DSD start no longer publishes NoLiveTap"
+        );
+
+        // And the mechanism it uses does what the arm needs it to.
+        let stereo = spectrum::new_stereo_buf();
+        let mono = spectrum::new_sample_buf();
+        spectrum::begin_stereo_stream(&stereo, 2);
+        {
+            let mut g = stereo.lock().unwrap();
+            g.frames.push([0.5, -0.5]);
+        }
+        spectrum::invalidate_live_pcm_route(&stereo, &mono);
+        let g = stereo.lock().unwrap();
+        assert_eq!(g.channels, spectrum::channels::NO_LIVE_TAP);
+        assert!(g.frames.is_empty(), "the previous track's frames survived");
+        assert_eq!(
+            spectrum::channels::availability(false, true, g.channels),
+            spectrum::channels::ChannelAvailability::NoLiveTap
+        );
+    }
+
+    /// A native attempt that *fails* must not publish anything: the fallback
+    /// route that follows is the one that owns the display.
+    #[test]
+    fn a_failed_native_dsd_start_does_not_publish_no_live_tap() {
+        let src = include_str!("main.rs");
+        let arm = src
+            .split_once("match self.start_native(path, opening) {")
+            .expect("the native start dispatch moved")
+            .1;
+        let (_, after_err) = arm
+            .split_once("Err(e) => {")
+            .expect("the native start dispatch has no failure arm");
+        let err_arm = &after_err[..after_err.find("Some(e)").unwrap_or(after_err.len())];
+        assert!(
+            !err_arm.contains("invalidate_live_pcm_route"),
+            "a failed native start blanks the fallback route that follows it"
+        );
+    }
+
+    /// A teardown advances the route exactly once.
+    ///
+    /// It used to advance twice on the shared route: `release_sink` ended the
+    /// session and then the teardown ended it again. Harmless in effect, but it
+    /// meant the count was not the thing it claimed to be, and a count nobody
+    /// can trust is not a guard.
+    #[test]
+    fn a_shared_teardown_advances_the_route_exactly_once() {
+        for (name, run) in [
+            ("stop", 0u8),
+            ("halt", 1),
+            ("abort_open", 2),
+        ] {
+            let (mut e, stereo) = engine_with_live_stereo();
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            e.held_sink = Some(Sentinel(std::sync::Arc::clone(&counter)));
+            let before = stereo.lock().unwrap().route_epoch;
+
+            match run {
+                0 => e.stop(),
+                1 => e.halt(bitperfect::fault::BACKEND_DEAD),
+                _ => e.abort_open(bitperfect::state::FailureReason::DeviceUnavailable(
+                    "no such device".into(),
+                )),
+            }
+
+            let after = stereo.lock().unwrap().route_epoch;
+            assert_eq!(
+                after.wrapping_sub(before),
+                1,
+                "{name} advanced the route {} times",
+                after.wrapping_sub(before)
+            );
+        }
+    }
+
+    /// And a route with no shared sink — bit-perfect or native — still advances
+    /// it once, because `release_sink` had nothing to do.
+    #[test]
+    fn a_teardown_without_a_sink_still_advances_the_route_once() {
+        for run in 0u8..3 {
+            let (mut e, stereo) = engine_with_live_stereo();
+            let before = stereo.lock().unwrap().route_epoch;
+            match run {
+                0 => e.stop(),
+                1 => e.halt(bitperfect::fault::BACKEND_DEAD),
+                _ => e.abort_open(bitperfect::state::FailureReason::DeviceUnavailable(
+                    "no such device".into(),
+                )),
+            }
+            let after = stereo.lock().unwrap().route_epoch;
+            assert_eq!(after.wrapping_sub(before), 1, "run {run}");
+            assert_eq!(
+                stereo.lock().unwrap().channels,
+                spectrum::channels::NO_LIVE_TAP
+            );
+        }
+    }
+
+    /// Both buffers, on every teardown. The mono one is the series the bars are
+    /// drawn from, and it used to survive all of them.
+    #[test]
+    fn every_engine_teardown_clears_the_mono_buffer_too() {
+        for (name, run) in [("stop", 0u8), ("halt", 1), ("abort_open", 2)] {
+            let (mut e, stereo) = engine_with_live_stereo();
+            e.sample_buf.lock().unwrap().extend_from_slice(&[0.4f32; 256]);
+            assert!(!e.sample_buf.lock().unwrap().is_empty(), "setup");
+            let mono = e.sample_buf.clone();
+
+            match run {
+                0 => e.stop(),
+                1 => e.halt(bitperfect::fault::BACKEND_DEAD),
+                _ => e.abort_open(bitperfect::state::FailureReason::DeviceUnavailable(
+                    "no such device".into(),
+                )),
+            }
+
+            assert!(
+                mono.lock().unwrap().is_empty(),
+                "{name} left the previous track's mono PCM for the bars to draw"
+            );
+            assert!(stereo.lock().unwrap().frames.is_empty(), "{name}: stereo");
+        }
+    }
+
+    /// The slow background seek releases the sink and then decodes for seconds
+    /// on a worker before anything replaces it. That release is the only thing
+    /// ending the shared session in the meantime.
+    ///
+    /// The branch cannot be run here — it needs a decoder and a device — so the
+    /// call is pinned in the source. A behavioural test that reached
+    /// `release_sink` directly would survive the call being deleted from the
+    /// branch, which is exactly the mutant this is for.
+    #[test]
+    fn the_slow_seek_branch_releases_the_sink() {
+        let src = include_str!("main.rs");
+        let branch = src
+            .split_once("// --- Slow path: reopen + skip samples, ON A BACKGROUND THREAD ---")
+            .expect("the slow seek branch moved")
+            .1;
+        let head = branch
+            .split_once("spawn_seek_worker")
+            .expect("the slow seek no longer spawns a worker")
+            .0;
+        assert!(
+            head.contains("self.release_sink()"),
+            "the slow seek stopped releasing the sink, so a multi-second seek \
+             would keep reporting a live spectrum of the old position"
+        );
+    }
+
+    /// Retiring is generation-qualified everywhere it can race, so an owner
+    /// being torn down cannot blank a route that has already taken over.
+    #[test]
+    fn an_old_owner_cannot_revoke_its_successor() {
+        let stereo = spectrum::new_stereo_buf();
+        let old = spectrum::begin_stereo_stream(&stereo, 2);
+        let successor = spectrum::begin_stereo_stream(&stereo, 2);
+        assert_ne!(old, successor);
+
+        assert!(
+            !spectrum::end_stereo_stream_if_generation(&stereo, old),
+            "the old generation was allowed to retire the current lease"
+        );
+        let g = stereo.lock().unwrap();
+        assert_eq!(g.generation, successor);
+        assert_eq!(g.channels, 2);
+        drop(g);
+
+        assert!(
+            spectrum::end_stereo_stream_if_generation(&stereo, successor),
+            "the current owner must be able to retire its own lease"
+        );
+        assert_eq!(
+            stereo.lock().unwrap().channels,
+            spectrum::channels::NO_LIVE_TAP
+        );
+    }
+
     /// The shared sink reports a clean ending and nothing else, because that
     /// is all `rodio` gives us — a shared session that fails does so
     /// synchronously, at the open, where it is already reported.
@@ -12649,8 +13089,8 @@ mod tests {
 
     fn engine() -> Engine {
         Engine::new(
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            spectrum::new_sample_buf(),
+            spectrum::new_stereo_buf(),
         )
         .expect("the engine holds no device until something plays")
     }

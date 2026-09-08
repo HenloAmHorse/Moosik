@@ -2,6 +2,309 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Spectrum smoothing works, and works the same on every monitor.** The
+  smoothing value set old-value retention once per UI tick, so the visible
+  decay depended on the repaint rate — the same setting decayed more than twice
+  as fast at 144 Hz as at 60. In Pre-process mode it was not read at all: every
+  mapping (FlatOverlap, Gaussian, CQT, Superlet) ran a fixed
+  `old × 0.5 + new × 0.5` regardless of what the slider showed or what had been
+  saved. The two modes now carry **two settings**, because they are two
+  quantities:
+
+  - **Live** keeps the behaviour it has always had — retention applied once per
+    accepted analyser tick. An earlier draft of this release normalised it to a
+    reference rate as well; that changed a control which was working, and made
+    the live spectrum roughly three times slower on a fast display. It is back
+    to what v1.4.5 shipped.
+  - **Cached** is retention at a 60 Hz reference, converted for the source
+    interval actually crossed — which is what makes it identical on every
+    machine, since the number of cached rows in a repaint depends on the
+    display.
+
+  60 Hz is the unit the cached number is quoted in, not a rate anything runs at:
+  the animation cap starts at 60 in code but is overwritten from the primary
+  monitor's refresh rate at startup.
+
+  **The cached setting does not inherit your live one.** It could not sensibly:
+  the cached path ignored the old control completely, so no value was ever in
+  effect there and there is no appearance to carry forward. Settings files
+  without the new field take a documented default of 0.125, which reaches 95% of
+  a step in about 24 ms — the same figure the accepted 1.4.5 build produced, and
+  now the same figure at every analysis rate. Inheriting the live default of
+  0.75 would have meant 174 ms, which is seven times slower and is exactly the
+  lag this release was reported for. The tooltip quotes the millisecond figure
+  so no value can be silently slow again.
+
+  **This changes how the pre-processed spectrum looks.** The appearance you
+  have been seeing was fixed at 0.5 whatever the setting said; activating the
+  real value — 0.75 by default, or whatever you had saved — is intentional and
+  will look different. The slider is now the way to get the old feel back.
+
+- **Smoothing at 0 means off.** In Pre-process mode it previously still halved
+  the distance to each new value. Zero now displays the cached row exactly, with
+  no filter state.
+
+- **Every analysed frame now reaches the temporal filter.** Pre-process picked
+  its row with `floor(elapsed × frame_rate)` and did nothing else, so on a 60 Hz
+  display against the 180 fps analysis default two of every three computed rows
+  were never read, while others were smoothed repeatedly. The exact fraction
+  varied with the monitor, which is itself the problem. Rows are now consumed
+  once each, in order.
+
+  To be precise about what that buys: the rows reach the *reducer*, not the
+  screen. The bar display still draws one value per repaint — the most recently
+  crossed row — so at 60 repaints a second you still see 60 states a second.
+  What changed is that the two rows in between now contribute to the smoothing,
+  to the interval the peak marker is taken from, and to the waterfall, instead
+  of being discarded. Nothing needs re-analysing: the frames were always
+  there.
+
+- **Peak hold no longer drops transients.** It read the last displayed value,
+  so a peak living in a row the UI never landed on vanished. It now sees the
+  largest value across the rows a tick crossed.
+
+- **The rolling waterfall keeps every analysed row, and its depth is now a
+  setting.** It advances once per analysis update — one row per cached row
+  consumed in Pre-process, one per accepted analyser tick in Real-time.
+
+  An intermediate revision of this branch capped that at 60 rows a second so the
+  time axis would not depend on `max_fps`. On a ~180 Hz display that made the
+  waterfall scroll three times slower than 1.4.5 and, in Pre-process, discard
+  two of every three analysed rows: the bars showed them, the history did not,
+  and a transient could appear in one and not the other. The cap is gone.
+
+  What replaces it is **Waterfall history**, a slider in the spectrum settings,
+  measured in seconds. The ring is a fixed number of rows, so the span it covers
+  is that count divided by the rate rows arrive at — the same span costs 121
+  rows against a 180 Hz rate and 40 against a 60 Hz one, which is why seconds is
+  the only unit in which the choice means anything. It defaults to 0.67 s, what
+  1.4.5 produced on a ~180 Hz display with its fixed 120-row ring, and persists.
+
+  **In Real-time that duration is nominal.** The rate it is sized against comes
+  from **Max FPS**, which is a ceiling the analyser is asked to respect, not a
+  rate anything has measured — nothing in this release measures the accepted
+  tick rate. When the machine delivers fewer updates a second than Max FPS asks
+  for, the same rows cover more time and the history reaches *further back* than
+  the slider says. The figure beside the slider says "nominal" and quotes the
+  rate as an upper bound, rather than claiming a duration it cannot know.
+
+  In Pre-process it is not nominal: every cached row is consumed, so the cache's
+  own frame rate is a measurement and the span is the span on screen.
+
+  Measuring the achieved rate and resizing to suit would be an adaptive resize,
+  and resampling rows to a fixed rate would be a resampler; both were rejected
+  along with the cap. Saying which number is which is the fix.
+
+  The ring is held between 32 and 2048 rows, and both bounds bind at the edges
+  of the slider: 0.2 s against a 60 Hz rate wants 12 rows and gets 32, which is
+  0.53 s. Where a bound binds, the span the ring actually holds is shown beside
+  the slider in place of the value requested.
+
+  A stall still costs rows. Nothing is synthesised to fill one.
+
+- **The live spectrum buffers cover the largest analysis window.** Stereo
+  history was capped at 8192 frames while the FFT size reaches 32768. Both caps
+  now derive from one constant, checked at compile time.
+
+- **The shared PCM tap no longer allocates on the audio path.** It appended to
+  the analyser buffers and trimmed afterwards, which is when a `Vec` grows. It
+  now reserves at construction and trims before appending, matching the
+  bit-perfect tap.
+
+- **Left/Right worked at all.** The route builds the tap and starts playing,
+  and only then does the app tell the spectrum window what is playing — and
+  that call retired the stereo lease, bumping the generation past the tap that
+  had just been created. Every write it made for the rest of the track was
+  rejected, so the channel views were offered and drew nothing. Ownership now
+  belongs to the route rather than to UI metadata: a tap claims the buffer and
+  gives it back when dropped, the engine retires it after tearing every route
+  down, and the native DSD paths publish "no live PCM" because they attach no
+  tap at all. Every retire a tap performs is qualified by generation, so an
+  owner being torn down cannot blank a route that has already taken over.
+
+- **Shared gapless no longer hands the display to the next track early.**
+  `append_next` gives the mixer the successor up to two seconds before it is
+  audible. Its tap now claims at the first pull — the moment the mixer actually
+  reads it — so the track still playing keeps the display until the rollover,
+  and a queued track the user skips past never claims at all.
+
+- **A second allocation on the audio path.** `stereo_batch` was built with room
+  for half a batch but fills to a whole one before anything flushes it, so it
+  grew on its own first flush. The previous round's capacity assertion could not
+  see this; an allocation-counted test now drives a whole `SpectrumSource`,
+  armed before the first pull.
+
+- **Switching between Real-time and Pre-process is treated as a
+  discontinuity.** The two read unrelated producers, so the cached-frame cursor,
+  the smoothing state and the waterfall are all dropped on a switch. Leaving the
+  cursor in place meant switching away and back replayed however many cached
+  rows the clock had crossed meanwhile, as a burst of history nobody played.
+
+- **The channel controls tell the truth while paused and stopped.** Availability
+  was only recomputed while something was playing, so stopping left Left/Right
+  enabled and frozen on the last live frame, and changing mode or visualisation
+  while paused took effect only on the next play.
+
+### Added
+
+- **Waterfall history depth** — see above. 0.2 s to 8 s, persisted, with the
+  resulting row count and producer rate shown beside the control.
+
+- **A Diff channel view.** Right minus left, per bar, about a centre line:
+  above means the right channel is louder at that frequency, below means the
+  left. Cyan below, magenta above, matching Overlay's colours.
+
+  Its vertical axis is ±20 dB, not the plot's usual 80 — channel differences
+  worth looking at are single figures, and on an 80 dB axis every recording ever
+  made is a flat line. Bars beyond the axis pin rather than compress: 30 dB and
+  60 dB of separation are both simply "hard panned" and there is nothing to tell
+  apart up there. The scale is labelled at both ends of the plot.
+
+  Unlike Split and Overlay it shows a series neither channel view does. Two
+  curves an inch apart look the same whether they differ by half a decibel or
+  six; this is the difference itself, which is the thing to look at when the
+  question is about balance, panning, or a crossfeed network.
+
+  Its arrangement is configurable and persisted: **Horizontal** (frequency
+  across, difference up and down) or **Vertical** (frequency down, difference
+  left and right), **Swap L/R**, and **Flip freq**. None of the three has a
+  correct answer — which channel belongs on which side is convention, which end
+  of the spectrum sits where is the same, and the orientation depends on the
+  shape of the window. The end labels move with the channel swap, so the plot
+  cannot end up saying the opposite of what it draws.
+
+  **The whole plot follows the arrangement, not only the bars.** The first cut
+  rotated the bars and left everything around them alone, so the view drew
+  ordinary spectrum furniture over a plot that was not an ordinary spectrum:
+
+  * a 0…−80 dB gridline set, including a −70 dB line, lying across an axis
+    whose centre is 0 and whose ends are ±20 dB;
+  * the frequency labels along the bottom in both arrangements — so in
+    **Vertical**, where frequency runs down the side, the axis showing decibels
+    was labelled in hertz;
+  * **Flip freq** reversing the bars but not the labels, which left every
+    frequency label naming the bar at the opposite end of the spectrum;
+  * **Swap L/R** repainting a band as it moved, because the colour was taken
+    from the drawn side rather than from which channel was actually louder —
+    the one thing a colour key must never do.
+
+  Diff now draws its own axes: a difference axis in signed decibels about a
+  labelled zero, with each end carrying the channel it belongs to in that
+  channel's colour, and a frequency axis on whichever edge the arrangement left
+  free. Both flips move labels and bars together. Cyan is left and magenta is
+  right in every arrangement.
+
+  Frequency labels — in Diff and in the ordinary plot — are now placed through
+  the current frequency scale rather than a bare logarithm. Under **Log** that
+  is the same mapping and nothing moves; under **ERB**, **Blend** or **Lens**
+  the bars had been warped while the labels stayed where a log axis would have
+  put them, so the plot named the wrong frequencies.
+
+  **The EQ overlay stands down while Diff is on screen**, with a line on the
+  plot saying so. Its curve is gain against frequency in the plot's own
+  coordinates and its nodes are dragged in them; Diff has neither of those axes,
+  so every node would have sat at the wrong frequency and gain. Nothing about
+  the EQ changes — the bands, their gains and the EQ panel are untouched, and
+  the overlay returns with any other view. Rotating the node interaction to suit
+  Diff is deliberately not attempted here.
+
+  A Diff selection that cannot be honoured still falls back to Mix, and the
+  fallback now takes the ordinary axes with it. The axis choice keys off what
+  was actually drawn rather than what was selected.
+
+  **Frequency ticks are placed over the displayed range, not over Nyquist.**
+  Tick positions were computed across `min_freq..Nyquist` while the bars are
+  laid out across `min_freq..max_freq`, so whenever the configured ceiling
+  exceeded Nyquist the two disagreed: at 44.1 kHz with the default 24 kHz
+  ceiling every label sat about 4 % of the plot width to the right of the bar it
+  named, roughly six pixels on a 900 px plot. Nyquist now decides only which
+  ticks are *eligible* — a tick above it names a frequency the signal cannot
+  contain — and the configured range decides where they go. This affects the
+  ordinary Mix axis as well as Diff.
+
+  Ticks below `min_freq` are dropped rather than clamped. Raising the minimum to
+  500 Hz used to pile 50, 100 and 200 Hz onto the left endpoint, three labels
+  stacked on one position, each naming a frequency the axis does not cover.
+
+  **The corner readouts no longer overlap each other.** The momentary LUFS
+  number, the channel legend and the frame rate all sit along the top of the
+  plot, and each was anchored by a different piece of code that assumed the row
+  was empty. It was not: at the window's default width "−23.4 LUFS" ran from the
+  widget's left edge straight through the `L`/`R` legend, which starts one
+  dB-margin further in, and on a narrow window the legend reached the frame rate
+  as well.
+
+  They are now laid out as one strip — LUFS from the left, the frame rate from
+  the right, and the legend in what is left between them, with the widths
+  measured rather than assumed, since "−23.4 LUFS" and "— LUFS" differ by a
+  third and a three-digit frame rate is wider than a two-digit one. Overlay's
+  second legend follows the measured width of the first instead of a fixed
+  offset. When a window is too narrow to fit all three the legend is dropped
+  rather than drawn over a number: a missing legend is recoverable by widening
+  the window, two numbers on top of each other are not readable at all.
+
+  All three now sit **inside** the plot rather than in the dB margin, which
+  leaves that margin to the axis labels a Diff plot draws there.
+
+  The **analysis progress badge** joins the same row. It was anchored to the
+  widget's top-right corner — where the frame rate is — so a re-analysis drew
+  "analysing 47% ~1m 12s" straight over it. It is the widest thing in the row
+  and it comes and goes, so it takes the right end and the frame rate moves left
+  of it while it is showing; the alternative would be a frame rate that jumped
+  sideways whenever an analysis started. Its text is now measured once and used
+  both to reserve the space and to draw, so the number cannot grow past its own
+  slot between the two reads.
+
+  **Axis labels no longer get cut off at the plot edges.** The painter is
+  clipped to the widget rectangle and the plot reaches its top and right sides,
+  so a label anchored on the positive end of a difference axis — which is always
+  on an edge, that being what makes it an endpoint — lost half of itself. Labels
+  are now laid out first and positioned second, nudged inward where they would
+  cross the clip.
+
+- **Left/Right spectrum views.** A Channels selector offers Mix (unchanged, and
+  still the default), Left, Right, Split — two stacked plots on one frequency
+  and dB scale — and Overlay, cyan left over magenta right. Both channels come
+  from real transforms of the live stereo pair; nothing is duplicated or
+  downmixed to fill a plot.
+
+  Left/Right — and Split, Overlay and Diff — need a live two-channel PCM
+  stream, which shared and bit-perfect PCM both provide. **They are Real-time
+  only**, and the toolbar now says so next to the control rather than leaving it
+  to be discovered by hovering a disabled button.
+
+  The spectrum toolbar also wraps instead of clipping. It was one unwrapped row
+  of about a dozen controls in a window that opens at 700 px, so the Channels
+  group — added at the end of it — ran off the right edge and was invisible at
+  the default size. The feature shipped unreachable. Where they are unavailable the control is disabled and says
+  which of these it is: mono material, more than two channels (no downmix is
+  guessed), a DSD file on either DSD route, or Pre-process, whose cache holds
+  one mono row per frame and will need the planned channel-aware cache.
+
+  The two DSD routes reach that state differently and are reported as one:
+  **DoP** transports DSD marker and payload words inside a PCM carrier, so a tap
+  exists but what it carries is not audio; **native DSD** sends raw DSD to the
+  driver over ASIO or ALSA and attaches no tap at all. Neither exposes live PCM
+  to the spectrum. Waterfall, Spectrogram, Octave and Phasescope
+  keep a single series in this release and say so. Peak hold and album-art
+  masking remain Mix-only. Your choice is remembered rather than overwritten
+  when an obstacle appears, and returns when it clears.
+
+  Mix runs no extra transform: selecting it performs no channel FFT at all,
+  which is asserted by a test that counts them. Its *total* cost is not claimed
+  to be unchanged — this release also moved smoothing to source time, so
+  Pre-process now folds in rows it used to discard. Whether that is measurable
+  is an owner hardware question, and item 4 of the Phase S checklist is where
+  it gets answered.
+
+### Changed
+
+- The debug overlay called the analyser tick rate "FFT rate". It now names it
+  as a tick rate and reports cached rows consumed per second beside it, which
+  is the figure the smoothing fix is about.
+
 ## [1.4.5] - 2026-09-01
 
 ### Fixed

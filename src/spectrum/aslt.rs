@@ -1658,10 +1658,16 @@ fn analyze_routed(
 // Cost model
 // ---------------------------------------------------------------------------
 
-/// Rough single-core-equivalent throughput, used only for the very first ETA
-/// before any real bars have finished. Measured at ~7–8 G taps/s across 8 cores
-/// on a release build; deliberately pessimistic so the estimate falls rather
-/// than climbs. Replaced by the observed rate within the first few percent.
+/// Rough whole-machine throughput, used only for the very first ETA before any
+/// real bars have finished. Observed at ~7–8 G taps/s on an eight-core release
+/// build; deliberately pessimistic so the estimate falls rather than climbs,
+/// and replaced by the measured rate within the first few percent.
+///
+/// **This is a rate of modelled work, not of instructions.** A tap is not a
+/// multiply-accumulate the CPU performs — see [`bar_taps_per_frame`] — so
+/// dividing a tap count by this figure gives a time, and dividing it by a
+/// clock speed gives nothing at all. Neither the figure nor the tap count says
+/// how many cores a preset needs.
 pub const TAPS_PER_SEC_HINT: f64 = 5.0e9;
 
 /// Wavelet taps each bar costs *per frame*.
@@ -1670,6 +1676,28 @@ pub const TAPS_PER_SEC_HINT: f64 = 5.0e9;
 /// four orders of magnitude — a 20 Hz bar can be 1000× a 20 kHz one. Counting
 /// completed *bars* would make the progress bar crawl and then leap; weighting
 /// by taps makes it linear, and makes the ETA honest.
+///
+/// # A tap is a unit of cost, not an operation
+///
+/// A tap is one wavelet sample of one member of one superlet: the total kernel
+/// length the analysis has to account for. It is deliberately *not* a count of
+/// arithmetic the machine performs, and quoting it as multiply-accumulates,
+/// FLOPs or a core requirement overstates it by a large and variable factor:
+///
+/// * long kernels never run the direct inner loop at all. [`fft_is_cheaper`]
+///   routes them through overlap-save, which costs on the order of
+///   `L log N` per output rather than `L` per output per tap — and those are
+///   exactly the bass bars that dominate the total, so the discrepancy is
+///   largest where the number is largest.
+/// * the frequency-domain route shares one set of signal blocks across every
+///   kernel of a block size, so a chunk of bars pays for the forward transform
+///   once between them.
+/// * the GPU takes the largest blocks entirely, where the relationship between
+///   a tap and a device instruction is different again.
+///
+/// What the number is good for is what it is used for: comparing one
+/// configuration against another, and turning a measured taps-per-second into
+/// a remaining time. Both are ratios, and the modelling error cancels.
 pub fn bar_taps_per_frame(
     sample_rate: u32,
     n_bars: usize,
@@ -2681,3 +2709,7 @@ mod tests {
     }
 }
 
+// TEMPORARY: mono-derivation study, not part of the product.
+#[cfg(test)]
+#[path = "aslt_mono_study.rs"]
+mod mono_study;

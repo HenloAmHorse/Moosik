@@ -373,7 +373,7 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
 use crate::dsd::dop::DopFileStream;
-use crate::spectrum::{SampleBuf, StereoBuf, DEFAULT_FFT_SIZE};
+use crate::spectrum::{SampleBuf, StereoBuf};
 
 use format::{
     canon_from_f32, canon_from_i16, canon_from_i24, canon_from_i32, canon_from_signed,
@@ -3945,7 +3945,9 @@ impl BpStream {
         shared.plan.store(plan.code(), Ordering::Relaxed);
         // The analyser reads what the ring carries, which after a Q31
         // conversion is integer and not float.
-        let tap = SpectrumTap::new(channels, device_kind, sample_buf, stereo_buf);
+        // `dop` decides whether the analyser is offered channels at all: a DoP
+        // carrier is DSD bits in an integer container, not audio.
+        let tap = SpectrumTap::new(channels, device_kind, dop, sample_buf, stereo_buf);
 
         #[cfg(not(windows))]
         let (handle, output) = cpal_out::open(
@@ -4311,6 +4313,17 @@ struct SpectrumTap {
     frame_sum: f32,
     sample_buf: SampleBuf,
     stereo_buf: StereoBuf,
+    /// Generation this tap holds. A flush that arrives after the buffer has
+    /// been claimed by another stream is dropped rather than mixed into it,
+    /// and the lease is given back on drop only if it is still this one.
+    generation: u64,
+    /// Whether the payload is a DoP carrier rather than PCM.
+    ///
+    /// DoP words are DSD bits wearing a 24-bit integer costume. Read as audio
+    /// they are noise, so this tap publishes no channels at all: the display
+    /// reports that there is no live PCM instead of drawing two spectra of a
+    /// marker pattern.
+    dop: bool,
     batch: Vec<f32>,
     stereo_batch: Vec<[f32; 2]>,
 }
@@ -4318,7 +4331,13 @@ struct SpectrumTap {
 const TAP_BATCH: usize = 512;
 
 impl SpectrumTap {
-    fn new(channels: u16, kind: PcmKind, sample_buf: SampleBuf, stereo_buf: StereoBuf) -> Self {
+    fn new(
+        channels: u16,
+        kind: PcmKind,
+        dop: bool,
+        sample_buf: SampleBuf,
+        stereo_buf: StereoBuf,
+    ) -> Self {
         // Reserve the caps here, on the thread that builds the tap, so no
         // realtime flush ever has to.
         //
@@ -4328,24 +4347,30 @@ impl SpectrumTap {
         // is the ordinary case for a buffer reused across streams: a tap built
         // over a half-sized buffer left it half-sized, and the first flush
         // past the halfway mark grew it — on the render thread.
-        if let Ok(mut v) = sample_buf.lock() {
-            let want = MONO_CAP.saturating_sub(v.len());
-            v.reserve(want);
-            debug_assert!(v.capacity() >= MONO_CAP);
-        }
-        if let Ok(mut v) = stereo_buf.lock() {
-            let want = STEREO_CAP.saturating_sub(v.len());
-            v.reserve(want);
-            debug_assert!(v.capacity() >= STEREO_CAP);
-        }
+        // Both buffers reserved together, on the thread that builds the tap.
+        crate::spectrum::prepare_live_tap(&stereo_buf, &sample_buf);
+        // Claims the buffer, states what the device is actually carrying,
+        // clears the previous stream out of it, and reserves — all here, on the
+        // thread that builds the tap.
+        //
+        // Claimed eagerly, unlike the shared route: an exact stream starts
+        // rendering as soon as it is opened, so there is no window in which
+        // this tap exists without being the live one. It then deliberately
+        // outlives individual tracks, because a bit-perfect gapless hand-off
+        // between compatible tracks keeps the same output stream — and so the
+        // same tap.
+        let published = if dop { crate::spectrum::channels::NO_LIVE_TAP } else { channels };
+        let generation = begin_stereo_stream(&stereo_buf, published);
         Self {
             channels,
             kind,
+            dop,
             ch_idx: 0,
             pending_l: 0.0,
             frame_sum: 0.0,
             sample_buf,
             stereo_buf,
+            generation,
             // One sample may be pushed after the threshold check that would
             // have flushed, so both need room for the check value plus one.
             batch: Vec::with_capacity(TAP_BATCH * 2),
@@ -4370,7 +4395,7 @@ impl SpectrumTap {
                 self.flush();
             }
             let f = canon_to_f32(c, self.kind);
-            if self.channels == 2 {
+            if self.channels == 2 && !self.dop {
                 if self.ch_idx == 0 {
                     self.pending_l = f;
                 } else {
@@ -4386,7 +4411,12 @@ impl SpectrumTap {
             self.frame_sum += f;
             self.ch_idx += 1;
             if self.ch_idx >= ch {
-                self.batch.push(self.frame_sum / ch as f32);
+                // A DoP carrier reaches the mono analyser as noise at full
+                // scale. Nothing routes PCM through a DoP tap, but "nothing
+                // does" is not a property and this costs one condition.
+                if !self.dop {
+                    self.batch.push(self.frame_sum / ch as f32);
+                }
                 self.frame_sum = 0.0;
                 self.ch_idx = 0;
             }
@@ -4403,36 +4433,45 @@ impl SpectrumTap {
     /// length never exceeds the reserved capacity and `extend_from_slice`
     /// cannot reallocate. Extending first and trimming afterwards briefly
     /// exceeded the cap — which is exactly when `Vec` grows.
+    /// Hand the batched frames to the analyser without allocating.
+    ///
+    /// Through the one publication helper both taps use, which validates this
+    /// tap's lease before it writes anything. The mono buffer used to be written
+    /// first and unconditionally — before and independently of the generation
+    /// check that guarded the pairs — so a tap whose stream had been torn down
+    /// went on feeding the Mix for as long as it was fed.
     fn flush(&mut self) {
-        if !self.batch.is_empty()
-            && let Ok(mut v) = self.sample_buf.try_lock()
-        {
-            let room = MONO_CAP.saturating_sub(self.batch.len());
-            if v.len() > room {
-                let d = v.len() - room;
-                v.drain(0..d);
-            }
-            v.extend_from_slice(&self.batch);
-        }
+        crate::spectrum::publish_live_pcm(
+            &self.stereo_buf,
+            &self.sample_buf,
+            self.generation,
+            &self.batch,
+            &self.stereo_batch,
+        );
         self.batch.clear();
-
-        if !self.stereo_batch.is_empty()
-            && let Ok(mut v) = self.stereo_buf.try_lock()
-        {
-            let room = STEREO_CAP.saturating_sub(self.stereo_batch.len());
-            if v.len() > room {
-                let d = v.len() - room;
-                v.drain(0..d);
-            }
-            v.extend_from_slice(&self.stereo_batch);
-        }
         self.stereo_batch.clear();
     }
 }
+/// Give the lease back when the output stream is torn down.
+///
+/// Generation-qualified for the same reason the shared route's is: this tap can
+/// be dropped while a different route has already claimed the display — an
+/// exclusive stream released so an ASIO DSD driver can take the DAC, for
+/// instance — and an unconditional retire would blank a display the new route
+/// is legitimately feeding.
+impl Drop for SpectrumTap {
+    fn drop(&mut self) {
+        crate::spectrum::end_stereo_stream_if_generation(&self.stereo_buf, self.generation);
+    }
+}
+
 /// How much history the analyser keeps. Reserved up front on both shared
 /// buffers so a flush can never grow one.
-const MONO_CAP: usize = DEFAULT_FFT_SIZE * 4;
-const STEREO_CAP: usize = 8192;
+///
+/// Both come from [`crate::spectrum::MAX_ANALYSIS_WINDOW`] now. The stereo cap
+/// was an unrelated 8192, which is a quarter of the largest window the FFT-size
+/// selector offers.
+use crate::spectrum::begin_stereo_stream;
 
 // ---------------------------------------------------------------------------
 // Decode thread
@@ -4990,8 +5029,9 @@ mod tests {
         SpectrumTap::new(
             2,
             PcmKind::Integer { valid_bits: 16 },
+            false, // not DoP: real PCM
             Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(Vec::new())),
+            crate::spectrum::new_stereo_buf(),
         )
     }
 
@@ -5347,10 +5387,11 @@ mod tests {
     #[test]
     fn the_tap_hands_the_analyser_one_mono_sample_per_frame() {
         let mono = Arc::new(Mutex::new(Vec::new()));
-        let stereo = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
         let mut t = SpectrumTap::new(
             2,
             PcmKind::Integer { valid_bits: 32 },
+            false, // not DoP: real PCM
             Arc::clone(&mono),
             Arc::clone(&stereo),
         );
@@ -5372,7 +5413,308 @@ mod tests {
             let want = ((i as i64 + 1) * scale) as i32 as f32 / 2_147_483_648.0;
             assert!((v - want).abs() < 1e-6, "frame {i}: {v} vs {want}");
         }
-        assert_eq!(stereo.lock().unwrap().len(), frames);
+        assert_eq!(stereo.lock().unwrap().frames.len(), frames);
+    }
+
+    /// The bit-perfect tap must hand the analyser `[L, R]` in that order, and
+    /// must publish the device channel count so the display can tell whether
+    /// what it is holding is a stereo pair at all.
+    ///
+    /// The pairing matters because the two channels are pushed from separate
+    /// branches of one loop: a `pending_l` captured on the wrong parity still
+    /// produces a well-formed buffer of pairs, just transposed ones.
+    #[test]
+    fn the_bit_perfect_tap_preserves_left_right_order() {
+        let mono = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
+        let mut t = SpectrumTap::new(
+            2,
+            PcmKind::Integer { valid_bits: 32 },
+            false, // not DoP: real PCM
+            Arc::clone(&mono),
+            Arc::clone(&stereo),
+        );
+        assert_eq!(
+            stereo.lock().unwrap().channels,
+            2,
+            "the tap must publish the device channel count on construction"
+        );
+
+        // Left positive, right negative: a swap is unmissable, and an average
+        // would be zero.
+        let frames = TAP_BATCH;
+        let scale = 1i64 << 20;
+        let mut canon = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            canon.push(canon_from_i32(((i as i64 + 1) * scale) as i32));
+            canon.push(canon_from_i32((-(i as i64 + 1) * scale) as i32));
+        }
+        t.feed_canonical(&canon);
+
+        let got = stereo.lock().unwrap();
+        assert_eq!(got.frames.len(), frames);
+        for (i, &[l, r]) in got.frames.iter().enumerate() {
+            assert!(l > 0.0, "frame {i}: left {l} should be positive");
+            assert!(r < 0.0, "frame {i}: right {r} should be negative");
+            assert!((l + r).abs() < 1e-9, "frame {i}: {l} and {r} are not a pair");
+        }
+    }
+
+    /// The bit-perfect half of the ordering defect: the exact stream is opened
+    /// — which builds and claims the tap — before `MoosikApp` tells the
+    /// spectrum window what is playing. UI metadata arriving afterwards must
+    /// not revoke the claim.
+    #[test]
+    fn a_bit_perfect_start_survives_the_ui_telling_it_what_is_playing() {
+        let mono = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
+        let mut t = SpectrumTap::new(
+            2,
+            PcmKind::Integer { valid_bits: 32 },
+            false, // not DoP: real PCM
+            Arc::clone(&mono),
+            Arc::clone(&stereo),
+        );
+        let live = stereo.lock().unwrap().generation;
+
+        let mut w = crate::spectrum::SpectrumWindow::new();
+        w.stereo_buf = Arc::clone(&stereo);
+        w.on_play(std::path::Path::new("C:/music/track.flac"), 48_000);
+
+        assert_eq!(
+            stereo.lock().unwrap().generation, live,
+            "on_play moved the generation out from under a live exact stream"
+        );
+
+        let scale = 1i64 << 20;
+        let canon: Vec<u32> = (0..TAP_BATCH * 2)
+            .map(|i| canon_from_i32(((i as i64 + 1) * scale) as i32))
+            .collect();
+        t.feed_canonical(&canon);
+        let g = stereo.lock().unwrap();
+        assert_eq!(g.channels, 2);
+        assert!(!g.frames.is_empty(), "the tap could no longer write after on_play");
+    }
+
+    /// A bit-perfect gapless hand-off between compatible tracks keeps the same
+    /// output stream, and therefore the same tap. The UI rollover must not
+    /// invalidate it — there is no new tap coming to re-claim.
+    #[test]
+    fn a_persistent_tap_survives_a_gapless_rollover() {
+        let mono = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
+        let mut t = SpectrumTap::new(
+            2,
+            PcmKind::Integer { valid_bits: 32 },
+            false, // not DoP: real PCM
+            Arc::clone(&mono),
+            Arc::clone(&stereo),
+        );
+        let scale = 1i64 << 20;
+        let canon: Vec<u32> = (0..TAP_BATCH * 2)
+            .map(|i| canon_from_i32(((i as i64 + 1) * scale) as i32))
+            .collect();
+        t.feed_canonical(&canon);
+        let live = stereo.lock().unwrap().generation;
+
+        // Track B begins on the same stream; the app announces it.
+        let mut w = crate::spectrum::SpectrumWindow::new();
+        w.stereo_buf = Arc::clone(&stereo);
+        w.on_play(std::path::Path::new("C:/music/next.flac"), 48_000);
+
+        assert_eq!(
+            stereo.lock().unwrap().generation, live,
+            "the rollover invalidated a tap that is still the live one"
+        );
+
+        // Emptied first, and refilled with a pattern only track B produces, so
+        // "still feeding" cannot be satisfied by track A's leftovers.
+        stereo.lock().unwrap().frames.clear();
+        let b_canon: Vec<u32> = (0..TAP_BATCH)
+            .flat_map(|i| {
+                let v = ((i as i64 + 1) * scale) as i32;
+                [canon_from_i32(-v), canon_from_i32(v)]
+            })
+            .collect();
+        t.feed_canonical(&b_canon);
+
+        let g = stereo.lock().unwrap();
+        assert_eq!(g.channels, 2);
+        assert!(!g.frames.is_empty(), "the persistent tap stopped feeding after rollover");
+        for (i, &[l, r]) in g.frames.iter().enumerate() {
+            assert!(
+                l < 0.0 && r > 0.0,
+                "frame {i}: {l}/{r} is track A's pattern, not the one written after rollover"
+            );
+        }
+    }
+
+    /// A DoP carrier is DSD bits in an integer container. Read as audio it is
+    /// noise, so the tap must publish no channels rather than let the display
+    /// draw two spectra of a marker pattern.
+    /// The invariant, made defensive rather than assumed.
+    ///
+    /// A DoP tap should never be fed in the first place — nothing routes PCM
+    /// through it — but "should never" is not a property, and the cost of
+    /// making it one is a single condition. Both buffers must stay empty: the
+    /// mono one is what the bar display reads, and a spectrum of DoP marker
+    /// words is noise drawn at full scale.
+    #[test]
+    fn a_dop_tap_fed_by_mistake_writes_nothing_anywhere() {
+        let mono = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
+        let mut t = SpectrumTap::new(
+            2,
+            PcmKind::Integer { valid_bits: 24 },
+            true, // DoP carrier
+            Arc::clone(&mono),
+            Arc::clone(&stereo),
+        );
+        // Far more than one batch, so every flush path is reached.
+        let canon: Vec<u32> = (0..TAP_BATCH * 8)
+            .map(|i| canon_from_i32((((i as i64 % 4096) + 1) << 8) as i32))
+            .collect();
+        t.feed_canonical(&canon);
+        t.flush();
+
+        assert!(
+            mono.lock().unwrap().is_empty(),
+            "DoP words reached the mono analyser and would be drawn as audio"
+        );
+        assert!(
+            stereo.lock().unwrap().frames.is_empty(),
+            "DoP words were pushed as stereo pairs"
+        );
+        assert_eq!(
+            stereo.lock().unwrap().channels,
+            crate::spectrum::channels::NO_LIVE_TAP
+        );
+    }
+
+    #[test]
+    fn a_dop_tap_publishes_no_live_pcm() {
+        let mono = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
+        let mut t = SpectrumTap::new(
+            2,
+            PcmKind::Integer { valid_bits: 24 },
+            true, // DoP carrier
+            Arc::clone(&mono),
+            Arc::clone(&stereo),
+        );
+        assert_eq!(
+            stereo.lock().unwrap().channels,
+            crate::spectrum::channels::NO_LIVE_TAP,
+            "a DoP carrier must not be advertised as two analysable channels"
+        );
+
+        let canon: Vec<u32> = (0..TAP_BATCH * 2)
+            .map(|i| canon_from_i32(((i as i64 + 1) << 8) as i32))
+            .collect();
+        t.feed_canonical(&canon);
+
+        let g = stereo.lock().unwrap();
+        assert!(g.frames.is_empty(), "DoP words were pushed as stereo audio");
+        assert_eq!(
+            crate::spectrum::channels::availability(false, true, g.channels),
+            crate::spectrum::channels::ChannelAvailability::NoLiveTap
+        );
+    }
+
+    /// Dropping the output stream gives the lease back, so a torn-down exact
+    /// route does not leave the display looking live.
+    #[test]
+    fn dropping_the_bit_perfect_tap_retires_the_lease() {
+        let mono = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
+        let t = SpectrumTap::new(
+            2,
+            PcmKind::Integer { valid_bits: 32 },
+            false, // not DoP: real PCM
+            Arc::clone(&mono),
+            Arc::clone(&stereo),
+        );
+        assert_eq!(stereo.lock().unwrap().channels, 2);
+        drop(t);
+        assert_eq!(
+            stereo.lock().unwrap().channels,
+            crate::spectrum::channels::NO_LIVE_TAP
+        );
+    }
+
+    /// An exclusive stream released so another route can take the DAC must not
+    /// blank the display that route has already claimed.
+    #[test]
+    fn dropping_a_superseded_bit_perfect_tap_leaves_its_successor_alone() {
+        let mono = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
+        let t = SpectrumTap::new(
+            2,
+            PcmKind::Integer { valid_bits: 32 },
+            false, // not DoP: real PCM
+            Arc::clone(&mono),
+            Arc::clone(&stereo),
+        );
+        // Another route takes over before the old stream is released.
+        let successor = crate::spectrum::begin_stereo_stream(&stereo, 2);
+        drop(t);
+        let g = stereo.lock().unwrap();
+        assert_eq!(g.generation, successor, "the old owner revoked its successor");
+        assert_eq!(g.channels, 2);
+    }
+
+    /// A tap built for a stream that has since been superseded must not write
+    /// into the next one. The generation is what makes that decidable.
+    #[test]
+    fn a_superseded_bit_perfect_tap_cannot_write() {
+        let mono = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
+        let mut t = SpectrumTap::new(
+            2,
+            PcmKind::Integer { valid_bits: 32 },
+            false, // not DoP: real PCM
+            Arc::clone(&mono),
+            Arc::clone(&stereo),
+        );
+        // The next stream claims the buffer before the old tap flushes.
+        crate::spectrum::begin_stereo_stream(&stereo, 2);
+
+        let scale = 1i64 << 20;
+        let canon: Vec<u32> = (0..TAP_BATCH * 2)
+            .map(|i| canon_from_i32(((i as i64 + 1) * scale) as i32))
+            .collect();
+        t.feed_canonical(&canon);
+
+        assert!(
+            stereo.lock().unwrap().frames.is_empty(),
+            "the superseded tap wrote into the new stream"
+        );
+    }
+
+    /// More than two channels must not be pushed as pairs at all — there is no
+    /// left and right to push.
+    #[test]
+    fn a_multichannel_tap_pushes_no_pairs() {
+        let mono = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
+        let mut t = SpectrumTap::new(
+            6,
+            PcmKind::Integer { valid_bits: 32 },
+            false, // not DoP: real PCM
+            Arc::clone(&mono),
+            Arc::clone(&stereo),
+        );
+        let canon: Vec<u32> =
+            (0..TAP_BATCH * 6).map(|_| canon_from_i32(1 << 20)).collect();
+        t.feed_canonical(&canon);
+
+        let got = stereo.lock().unwrap();
+        assert_eq!(got.channels, 6);
+        assert!(got.frames.is_empty(), "6 channels must not produce L/R pairs");
+        assert_eq!(
+            crate::spectrum::channels::availability(false, true, got.channels),
+            crate::spectrum::channels::ChannelAvailability::Multichannel(6),
+        );
     }
 
     /// The complete PCM render path — ring drain, spectrum tap and all —
@@ -5391,10 +5733,11 @@ mod tests {
         const FRAMES: usize = 8192;
 
         let mono = Arc::new(Mutex::new(Vec::new()));
-        let stereo = Arc::new(Mutex::new(Vec::new()));
+        let stereo = crate::spectrum::new_stereo_buf();
         let mut tap = SpectrumTap::new(
             CH as u16,
             PcmKind::Integer { valid_bits: 24 },
+            false, // not DoP: real PCM
             Arc::clone(&mono),
             Arc::clone(&stereo),
         );
@@ -5445,7 +5788,7 @@ mod tests {
 
         // And the analyser really was fed, so this is not zero-by-doing-nothing.
         assert!(!mono.lock().unwrap().is_empty());
-        assert!(!stereo.lock().unwrap().is_empty());
+        assert!(!stereo.lock().unwrap().frames.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -6705,8 +7048,9 @@ mod tests {
         let mut tap = SpectrumTap::new(
             CH as u16,
             PcmKind::Integer { valid_bits: 24 },
+            false, // not DoP: real PCM
             Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(Vec::new())),
+            crate::spectrum::new_stereo_buf(),
         );
         let mut scratch = vec![0u32; 256 * CH];
         let got = render_frames(&sh, &mut scratch, &mut tap, CH as u16, 256);
@@ -7066,8 +7410,9 @@ mod tests {
                 let mut tap = SpectrumTap::new(
                     2,
                     PcmKind::Integer { valid_bits: 24 },
+                    false, // not DoP: real PCM
                     Arc::new(Mutex::new(Vec::new())),
-                    Arc::new(Mutex::new(Vec::new())),
+                    crate::spectrum::new_stereo_buf(),
                 );
                 let mut scratch = vec![0u32; 2048];
                 // Asks for far more than the ring holds: a dropout.
@@ -7362,8 +7707,9 @@ mod tests {
         let mut tap = SpectrumTap::new(
             ch as u16,
             PcmKind::Integer { valid_bits: 24 },
+            false, // not DoP: real PCM
             Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(Vec::new())),
+            crate::spectrum::new_stereo_buf(),
         );
         let mut scratch = vec![0u32; want * ch];
         render_frames(sh, &mut scratch, &mut tap, ch as u16, want)
@@ -8839,8 +9185,9 @@ mod tests {
         let mut tap = SpectrumTap::new(
             2,
             PcmKind::Integer { valid_bits: 32 },
+            false, // not DoP: real PCM
             Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(Vec::new())),
+            crate::spectrum::new_stereo_buf(),
         );
         let mut scratch = vec![0u32; 512 * ch];
         *shared.session.lock().unwrap() = Some(Session {
@@ -8950,8 +9297,9 @@ mod tests {
         let mut tap = SpectrumTap::new(
             2,
             PcmKind::Integer { valid_bits: 24 },
+            false, // not DoP: real PCM
             Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(Vec::new())),
+            crate::spectrum::new_stereo_buf(),
         );
         let mut scratch = vec![0u32; 480 * 2];
 
@@ -9007,8 +9355,9 @@ mod tests {
         let mut tap = SpectrumTap::new(
             2,
             PcmKind::Integer { valid_bits: 24 },
+            false, // not DoP: real PCM
             Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(Vec::new())),
+            crate::spectrum::new_stereo_buf(),
         );
         let mut scratch = vec![0u32; 512 * 2];
 
