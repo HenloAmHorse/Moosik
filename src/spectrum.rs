@@ -6,6 +6,8 @@ pub mod gpu_calib;
 pub mod freq_scale;
 pub mod channels;
 pub mod timing;
+pub mod cache;
+pub mod stereo;
 
 use egui::{Color32, Pos2, Rect, Shape, Stroke};
 use serde::{Deserialize, Serialize};
@@ -1147,10 +1149,22 @@ where
 #[allow(dead_code)]
 pub enum PreMessage {
     Done {
-        frames: Vec<Vec<f32>>,
+        frames: cache::PreFrames,
+        /// Left and right, when they were asked for, the stream had exactly two
+        /// channels, and both passes finished. `None` is the ordinary case and
+        /// never an error: Mix is what the rest of the display reads.
+        ///
+        /// Boxed because it is the one large optional field here, and without
+        /// it `Done` is several times the size of `Error(String)` — a message
+        /// this size is moved through the channel whichever variant it is.
+        stereo: Option<Box<stereo::Stereo>>,
         frame_rate: f64,
         waveform: Vec<f32>,
         analysis: TrackAnalysis,
+        /// Bookkeeping that travels with the result. Boxed, because it is
+        /// eighty bytes that only the completion path reads and `Done` is
+        /// already much larger than the other variants.
+        meta: Box<DoneMeta>,
     },
     Error(String),
     /// The user pressed Abort. Distinct from `Error` so the UI can drop back to
@@ -1181,6 +1195,118 @@ pub struct SpectrumAnalyzer {
     /// and reading only the last of them drops a one-row transient on the
     /// floor — the peak marker exists precisely to catch those.
     pub peak_input: Vec<f32>,
+    /// Left and right for the installed cache, when a sidecar was loaded or an
+    /// analysis produced one.
+    ///
+    /// Not public: it is installed only through `set_pre_frames_with`, together
+    /// with the matrix it belongs to. A pair and a mono matrix from different
+    /// analyses would draw a Mix and a Left that describe different audio, and
+    /// the only way to make that impossible is to refuse to let them be set
+    /// apart from one another.
+    pre_channels: PreChannels,
+    /// The mono cache the installed matrix came from, and the identity a
+    /// sidecar beside it has to agree with — so a lazy read knows both which
+    /// file to look for and what it must prove, without recomputing a key.
+    pre_cache: Option<(PathBuf, stereo::Identity)>,
+    /// Bumped whenever the installed matrix changes. A read that completes
+    /// against a stale generation is dropped rather than installed.
+    pre_generation: u64,
+    /// One long-lived link, not one per request.
+    ///
+    /// Dropping the receiver on every track change would discard stale results
+    /// by making them unsendable — which works, and which also means the
+    /// generation check could never be wrong because it could never run. Keeping
+    /// the link means a late result really does arrive, and really is refused
+    /// on its generation, and a test can watch that happen.
+    /// Bumped whenever demand for the channels goes away. A read carrying an
+    /// older serial is discarded.
+    pre_request_serial: u64,
+    /// The serial of the read that currently owns the reader slot.
+    ///
+    /// **Ownership runs from spawn to consumption, not from spawn to thread
+    /// exit.** A flag meaning "a thread is alive" cannot bound this: a tick
+    /// polls, finds nothing, and then reconciles demand — and if the reader
+    /// publishes and exits between those two steps, the reconcile sees an idle
+    /// slot with a result already sitting in the queue and starts the same read
+    /// a second time. Sending before clearing the flag does not help; the same
+    /// window exists one instruction later.
+    ///
+    /// So a completed-but-unconsumed result still owns the slot. It is released
+    /// in `poll_pre_channels`, where the result is installed or discarded, and
+    /// nowhere else. Exactly one completion is published per spawn — the reader
+    /// guarantees that even if it panics — so the slot cannot be left held.
+    ///
+    /// This is not the same as `pre_request_serial`, which says what is wanted
+    /// *now*. The two differ exactly while a stale read is still finishing, and
+    /// that difference is what tells a stale completion apart from newer demand
+    /// waiting its turn.
+    sidecar_outstanding: Option<u64>,
+    /// Readers entered and left, and the most that were ever alive at once.
+    /// Exists so the bound above is observed rather than asserted from the
+    /// shape of the code.
+    #[cfg(test)]
+    pub reader_stats: Arc<ReaderStats>,
+    /// Set when a read is installed, so the display can show the row under the
+    /// playhead without waiting for playback to advance.
+    channels_arrived: bool,
+    sidecar_link: Option<(
+        std::sync::mpsc::Sender<SidecarLoaded>,
+        std::sync::mpsc::Receiver<SidecarLoaded>,
+    )>,
+    /// Reads that arrived for a matrix, or a request, that is no longer wanted.
+    #[cfg(test)]
+    pub discarded_reads: u64,
+    /// Holds the sidecar reader just before it reports, so a test can decide
+    /// when a read "finishes".
+    ///
+    /// Without it, a small fixture is read faster than the test can change its
+    /// mind, and the late-completion case — the one where a result arrives for
+    /// a view the user has already left — is unreachable. A gate rather than a
+    /// sleep: the test says when, and nothing depends on how fast the machine
+    /// is.
+    #[cfg(test)]
+    pub sidecar_hold: Option<Arc<AtomicBool>>,
+    /// Holds the analysis worker before it starts, so a test can set the abort
+    /// flag while it is parked rather than racing the spawn.
+    #[cfg(test)]
+    pub analysis_hold: Option<Arc<AtomicBool>>,
+    /// Whether *future* analyses should also produce left and right.
+    ///
+    /// A persisted preference about generating data. It is deliberately not the
+    /// same question as whether to load channels that already exist — that one
+    /// is answered by the selected view, and a track analysed in stereo keeps
+    /// its channels whatever this says.
+    pub pre_stereo_enabled: bool,
+    /// An explicit request to analyse channels for one particular track.
+    ///
+    /// A bare flag was not enough, twice over. `start_preprocess` returns early
+    /// on a valid cache, so a flag consulted below that point was never read on
+    /// exactly the tracks the button exists for — the one case is a track with
+    /// a Mix cache and no channels. And a flag with no track attached leaks: the
+    /// next track opened would pick it up and rebuild channels nobody asked for.
+    ///
+    /// Naming the track fixes both. A request is honoured for that path and
+    /// discarded when any other analysis starts.
+    pub pre_stereo_request: Option<PathBuf>,
+    /// Cache directory to use, when it is not the owner's.
+    ///
+    /// Everything that reads, writes or sweeps caches goes through
+    /// [`SpectrumAnalyzer::cache_dir`], which consults this. `~/.moosik/cache`
+    /// is the one directory a test must never touch, and without a seam the
+    /// production entry points could only be tested by not testing them — which
+    /// is how the completion paths came to pass `None` as `keep`, and how three
+    /// integration defects reached review at once.
+    ///
+    /// Per instance, not a global: the suite runs in parallel and each test
+    /// drives its own analyser.
+    #[cfg(test)]
+    pub cache_dir_override: Option<PathBuf>,
+    /// Whether anything on screen is asking for the cached channels this tick.
+    ///
+    /// Set by the window from the selected view, the same way
+    /// `waterfall_enabled` is, so that Mix costs exactly what it did before the
+    /// sidecar existed.
+    pub pre_channels_wanted: bool,
     /// Last pre-processed row consumed, so a row is filtered exactly once and
     /// a repeated tick within the same row is a no-op. `None` means there is no
     /// filter state to continue from and the next tick must snap.
@@ -1294,7 +1420,10 @@ pub struct SpectrumAnalyzer {
     pub pending_analysis: Option<TrackAnalysis>,
 
     // Pre-process
-    pub pre_frames: Vec<Vec<f32>>,
+    /// Shared, because the sidecar reader needs it to check identity and a
+    /// copy would be 87 MiB. Nothing mutates it in place: it is replaced
+    /// wholesale by `set_pre_frames_with` and released by `clear_pre_frames`.
+    pub pre_frames: std::sync::Arc<cache::PreFrames>,
     pub pre_frame_rate: f64,
     pub pre_receiver: Option<std::sync::mpsc::Receiver<PreMessage>>,
     /// True while a background analysis thread is running. Arc so the thread can clear it.
@@ -1331,6 +1460,26 @@ impl SpectrumAnalyzer {
             magnitudes: vec![0.0f32; DEFAULT_BAR_COUNT],
             smoothed: vec![0.0f32; DEFAULT_BAR_COUNT],
             peak_input: vec![0.0f32; DEFAULT_BAR_COUNT],
+            pre_channels: PreChannels::Missing,
+            pre_cache: None,
+            pre_generation: 0,
+            pre_request_serial: 0,
+            sidecar_outstanding: None,
+            #[cfg(test)]
+            reader_stats: Arc::new(ReaderStats::default()),
+            channels_arrived: false,
+            sidecar_link: None,
+            #[cfg(test)]
+            discarded_reads: 0,
+            #[cfg(test)]
+            sidecar_hold: None,
+            #[cfg(test)]
+            analysis_hold: None,
+            pre_stereo_enabled: false,
+            pre_stereo_request: None,
+            #[cfg(test)]
+            cache_dir_override: None,
+            pre_channels_wanted: false,
             last_pre_frame: None,
             waterfall_rows: WATERFALL_ROWS_FALLBACK,
             rows_consumed: 0,
@@ -1366,7 +1515,7 @@ impl SpectrumAnalyzer {
             cache_budget_gb: DEFAULT_CACHE_BUDGET_GB,
             pending_waveform: None,
             pending_analysis: None,
-            pre_frames: Vec::new(),
+            pre_frames: std::sync::Arc::new(cache::PreFrames::default()),
             pre_frame_rate: 60.0,
             pre_receiver: None,
             is_analyzing: Arc::new(AtomicBool::new(false)),
@@ -1679,22 +1828,25 @@ impl SpectrumAnalyzer {
 
     pub fn tick_pre(&mut self, elapsed: f64, dt: f64) {
         // Poll for completed background work
-        let mut ready: Option<(Vec<Vec<f32>>, f64)> = None;
+        let mut ready: Option<Arrived> = None;
         if let Some(ref rx) = self.pre_receiver && let Ok(msg) = rx.try_recv() {
             match msg {
-                PreMessage::Done { frames, frame_rate, waveform, analysis } => {
-                    // The worker has just written a cache file; keep the whole
-                    // directory inside its budget now rather than letting it
-                    // grow unbounded between sessions.
-                    if self.cache_budget_gb > 0.0 {
-                        let budget = (self.cache_budget_gb as f64 * 1e9) as u64;
-                        let (n, freed) = evict_cache_to_budget(budget, None);
-                        if n > 0 {
-                            crate::mlog!("[cache] evicted {n} file(s), freed {:.1} MB",
-                                      freed as f64 / 1e6);
-                        }
-                    }
-                    ready = Some((frames, frame_rate));
+                PreMessage::Done {
+                    frames, stereo, frame_rate, waveform, analysis, meta,
+                } => {
+                    // The worker has just written a cache; keep the directory
+                    // inside its budget now rather than letting it grow between
+                    // sessions — and protect the unit that just finished, or a
+                    // long analysis can be swept away by the sweep it triggered.
+                    self.trim_cache(Some(&meta.cache));
+                    log_work(&meta.work);
+                    ready = Some(Arrived {
+                        frames,
+                        stereo,
+                        frame_rate,
+                        cache: meta.cache.clone(),
+                        identity: meta.identity,
+                    });
                     self.pending_waveform = Some(waveform);
                     self.pending_analysis = Some(analysis);
                 }
@@ -1703,9 +1855,19 @@ impl SpectrumAnalyzer {
                 }
             }
         }
-        if let Some((frames, rate)) = ready {
-            crate::mlog!("[analysis] {} frames received by the display", frames.len());
-            self.set_pre_frames(frames, rate);
+        if let Some(Arrived { frames, stereo, frame_rate: rate, cache, identity }) = ready {
+            crate::mlog!(
+                "[analysis] {} frames received by the display{}",
+                frames.len(),
+                if stereo.is_some() { " (with channels)" } else { "" },
+            );
+            // Freshly analysed channels are already in memory: installing them
+            // as resident avoids reading back a file that was just written.
+            let channels = match stereo {
+                Some(p) => PreChannels::Resident(*p),
+                None => channels_on_disk(&cache),
+            };
+            self.set_pre_frames_with(frames, channels, Some((cache, identity)), rate);
             self.pre_receiver = None;
             // Flag already cleared by the thread's ClearOnDrop guard
         }
@@ -1723,7 +1885,7 @@ impl SpectrumAnalyzer {
             return;
         };
 
-        let n = self.pre_frames[target].len();
+        let n = self.pre_frames.bars();
         // Guard: if bar_count changed mid-stream, resize the derived buffers.
         // A resize discards the filter state along with the old width, so the
         // cursor has to go with it, or the next tick would continue a cascade
@@ -1789,13 +1951,19 @@ impl SpectrumAnalyzer {
     /// smoothing slider at zero has to mean, and what it did not mean while
     /// this path hard-coded 0.5.
     fn apply_pre_frame(&mut self, frame: usize, alpha: f32) {
-        let Some(mags) = self.pre_frames.get(frame) else { return };
+        let Some(mags) = self.pre_frames.row(frame) else { return };
         self.rows_consumed = self.rows_consumed.saturating_add(1);
         let w = &self.eq_weights;
-        for (bar, (sm, m)) in self.smoothed.iter_mut().zip(mags.iter()).enumerate() {
+        // Codes, converted one at a time inside the loop that was already
+        // running. No decoded row is materialised and nothing is allocated:
+        // the display needs `bars` values per frame and this is where they are
+        // needed.
+        let inv = self.pre_frames.inv_max();
+        for (bar, (sm, &code)) in self.smoothed.iter_mut().zip(mags.iter()).enumerate() {
+            let m = code as f32 * inv;
             let v = match w.get(bar) {
                 Some(&db) => (m + db / 80.0).clamp(0.0, 1.0),
-                None => *m,
+                None => m,
             };
             *sm = *sm * alpha + v * (1.0 - alpha);
             // Max across the interval, so a transient living in a row the UI
@@ -1806,6 +1974,61 @@ impl SpectrumAnalyzer {
             }
         }
         self.magnitudes.copy_from_slice(&self.smoothed);
+        self.apply_pre_channels(frame, alpha);
+    }
+
+    /// The same row, the same alpha, the same EQ — for each channel.
+    ///
+    /// Everything about this is deliberately identical to the Mix above except
+    /// where the numbers come from. Diff draws the difference between the two
+    /// channels, so any difference in *treatment* — a different retention, a
+    /// row offset by one, EQ on one and not the other — would appear as a
+    /// difference in the audio that is not there. Following the Mix's row index
+    /// rather than keeping a second cursor is what makes a Split guaranteed to
+    /// show one instant in all three plots.
+    ///
+    /// Mix does not pay for this: `pre_channels_wanted` is false unless a
+    /// channel view is selected, which is the same rule `tick_channels`
+    /// applies in real time.
+    fn apply_pre_channels(&mut self, frame: usize, alpha: f32) {
+        if !self.pre_channels_wanted {
+            return;
+        }
+        let Some(pair) = self.pre_channels.resident() else { return };
+        let Some((left, right)) = pair.row(frame) else { return };
+        // Each channel converts with its own ceiling. They are written by the
+        // same encoder and so always agree today, but a shared `inv` would be a
+        // silent scaling error the day one of them came from somewhere else.
+        let inv_l = pair.left().inv_max();
+        let inv_r = pair.right().inv_max();
+        let w = &self.eq_weights;
+        let n = left.len();
+        if self.smoothed_left.len() != n {
+            self.smoothed_left = vec![0.0; n];
+        }
+        if self.smoothed_right.len() != n {
+            self.smoothed_right = vec![0.0; n];
+        }
+        for (bar, (sm, &code)) in self.smoothed_left.iter_mut().zip(left.iter()).enumerate() {
+            let m = code as f32 * inv_l;
+            let v = match w.get(bar) {
+                Some(&db) => (m + db / 80.0).clamp(0.0, 1.0),
+                None => m,
+            };
+            *sm = *sm * alpha + v * (1.0 - alpha);
+        }
+        for (bar, (sm, &code)) in self.smoothed_right.iter_mut().zip(right.iter()).enumerate() {
+            let m = code as f32 * inv_r;
+            let v = match w.get(bar) {
+                Some(&db) => (m + db / 80.0).clamp(0.0, 1.0),
+                None => m,
+            };
+            *sm = *sm * alpha + v * (1.0 - alpha);
+        }
+        self.bars_left.clear();
+        self.bars_left.extend_from_slice(&self.smoothed_left);
+        self.bars_right.clear();
+        self.bars_right.extend_from_slice(&self.smoothed_right);
     }
 
     /// Snap the pre-process display to `elapsed_secs`, discarding filter state.
@@ -1819,7 +2042,7 @@ impl SpectrumAnalyzer {
         else {
             return;
         };
-        let n = self.pre_frames[target].len();
+        let n = self.pre_frames.bars();
         if self.smoothed.len() != n {
             self.smoothed = vec![0.0; n];
         }
@@ -1885,26 +2108,48 @@ impl SpectrumAnalyzer {
             return;
         }
         let n_bars = self.bar_count;
-        let cache = cache_path_for(
+        let (identity, cache) = cache_key_for(
+            &self.cache_dir(),
             &path, n_bars, self.fft_size, self.pad_factor, self.overlap,
             &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode,
             self.dsd_rate, &self.aslt_cfg, self.pre_fps,
         );
-        if let Some(frames) = load_cache(&cache, n_bars) {
+        // An explicit "analyse channels for this track", and for *this* track:
+        // a request left over from another one is dropped rather than applied
+        // to whatever is being opened now.
+        let explicit = self.pre_stereo_request.take().is_some_and(|p| p == path);
+
+        // Ordinary reuse. An explicit request falls through to the analysis
+        // below even though the Mix cache is valid — the producer keeps that
+        // cache byte for byte and writes only the channels.
+        if !explicit && let Some(frames) = load_cache(&cache, n_bars) {
             let rate = self.sample_rate as f64 / self.pre_hop() as f64;
+            // Looked for, not read, and looked for whatever the preference
+            // says. Whether a sidecar exists is a `stat`; reading and checking
+            // it costs tens of megabytes and a hash of the mono cache, and
+            // neither belongs on this thread or in this moment. The read happens
+            // when a channel view actually asks for it.
+            //
+            // Gating this on the generation preference was a conflation of two
+            // questions: whether future analyses should *produce* channels, and
+            // whether channels this track already has can be *found*. With the
+            // preference off, a track analysed in stereo appeared to have none.
+            let channels = channels_on_disk(&cache);
             // Derive a waveform from cached frames using mean bar magnitude per frame.
             if !frames.is_empty() {
                 let wf_n = 1000usize;
                 let n_frames = frames.len();
+                let inv = frames.inv_max();
                 let raw: Vec<f32> = (0..wf_n).map(|i| {
                     let fi = (i * n_frames / wf_n).min(n_frames - 1);
-                    let sum: f32 = frames[fi].iter().sum();
-                    sum / frames[fi].len().max(1) as f32
+                    let row = frames.row(fi).unwrap_or(&[]);
+                    let sum: f32 = row.iter().map(|&c| c as f32 * inv).sum();
+                    sum / row.len().max(1) as f32
                 }).collect();
                 let peak = raw.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
                 self.pending_waveform = Some(raw.iter().map(|&v| v / peak).collect());
             }
-            self.set_pre_frames(frames, rate);
+            self.set_pre_frames_with(frames, channels, Some((cache, identity)), rate);
             return;
         }
         self.clear_pre_frames();
@@ -1933,6 +2178,10 @@ impl SpectrumAnalyzer {
         let eta         = Arc::clone(&self.eta_secs);
         let flag = Arc::clone(&self.is_analyzing);
         let progress = Arc::clone(&self.analysis_progress);
+        // Either the standing preference, or the explicit request taken above.
+        let want_stereo = self.pre_stereo_enabled | explicit;
+        #[cfg(test)]
+        let analysis_hold = self.analysis_hold.clone();
         let mapping_dbg = format!("{:?}", self.bar_mapping);
         std::thread::spawn(move || {
             struct ClearOnDrop(Arc<AtomicBool>);
@@ -1943,6 +2192,14 @@ impl SpectrumAnalyzer {
                 }
             }
             let _guard = ClearOnDrop(flag);
+            // Parked before any work, so a test can set the abort flag and know
+            // the run has not passed its first check yet.
+            #[cfg(test)]
+            if let Some(h) = analysis_hold {
+                while h.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
             // Logged because a second analysis starting behind the first is
             // invisible from the UI — the progress bar simply appears to restart.
             let t0 = Instant::now();
@@ -1955,6 +2212,7 @@ impl SpectrumAnalyzer {
                 &path, &cache, sr, n_bars, &progress,
                 fft_size, pad_factor, overlap, &window_fn, min_freq, max_freq, &interp_mode, &bar_mapping,
                 dsd_rate, &aslt_cfg, pre_fps, &abort, &eta,
+                if want_stereo { StereoRequest::Joint } else { StereoRequest::MixOnly },
             );
             crate::mlog!(
                 "[analysis] {} after {:.1}s",
@@ -1969,6 +2227,47 @@ impl SpectrumAnalyzer {
         });
     }
 
+    /// Where this analyser's caches live.
+    pub fn cache_dir(&self) -> PathBuf {
+        #[cfg(test)]
+        {
+            if let Some(d) = self.cache_dir_override.clone() {
+                return d;
+            }
+        }
+        default_cache_dir()
+    }
+
+    /// Keep the cache directory inside its budget, sparing `keep`.
+    ///
+    /// `keep` is the analysis that just finished, passed as the path of its
+    /// mono cache; `evict_in_dir` spares that whole unit, sidecar included.
+    /// Both completion paths call this, and both used to pass `None` — so the
+    /// sweep a completed analysis triggered was free to delete that very
+    /// analysis, which is the one file in the directory guaranteed to have been
+    /// read zero times.
+    fn trim_cache(&self, keep: Option<&Path>) {
+        if self.cache_budget_gb <= 0.0 {
+            return;
+        }
+        let budget = (self.cache_budget_gb as f64 * 1e9) as u64;
+        let sweep = evict_in_dir(&self.cache_dir(), budget, keep);
+        if sweep.removed > 0 {
+            crate::mlog!(
+                "[cache] evicted {} file(s), freed {:.1} MB",
+                sweep.removed,
+                sweep.freed as f64 / 1e6,
+            );
+        }
+        if sweep.still_over > 0 {
+            crate::mlog!(
+                "[cache] still {:.1} MB over budget: the protected analysis does \
+                 not fit on its own",
+                sweep.still_over as f64 / 1e6,
+            );
+        }
+    }
+
     /// Adopt a freshly loaded or freshly computed set of cached rows.
     ///
     /// The only supported way to install `pre_frames`, because doing so
@@ -1977,18 +2276,297 @@ impl SpectrumAnalyzer {
     /// analysis. There are three places a cache arrives from — a disk load, the
     /// playing-path worker poll, and the paused-path worker poll — and each one
     /// used to assign the field directly.
-    pub fn set_pre_frames(&mut self, frames: Vec<Vec<f32>>, frame_rate: f64) {
-        self.pre_frames = frames;
+    /// Install a matrix with no channels.
+    ///
+    /// Production always has an answer to the channel question — even if the
+    /// answer is `None` — so it calls `set_pre_frames_with` directly. This is
+    /// the shorthand for the many tests that are about something else.
+    #[cfg(test)]
+    pub fn set_pre_frames(&mut self, frames: cache::PreFrames, frame_rate: f64) {
+        self.set_pre_frames_with(frames, PreChannels::Missing, None, frame_rate);
+    }
+
+    /// Install a matrix together with the channels that belong to it.
+    ///
+    /// One call, so a pair can never be attached to a matrix it did not come
+    /// from — including by the ordinary route of installing a new mono cache
+    /// and forgetting the old channels are still there. `set_pre_frames` is
+    /// this with no channels, which is why it clears them.
+    pub fn set_pre_frames_with(
+        &mut self,
+        frames: cache::PreFrames,
+        channels: PreChannels,
+        cache: Option<(PathBuf, stereo::Identity)>,
+        frame_rate: f64,
+    ) {
+        // Refuse a pair that does not describe this matrix rather than index
+        // into it. Reaching here means a sidecar passed its own checks and then
+        // met a different cache, which is a bug worth a line in the log.
+        let channels = match channels {
+            PreChannels::Resident(p)
+                if p.len() != frames.len() || p.bars() != frames.bars() =>
+            {
+                crate::mlog!(
+                    "[stereo] dropped a pair of {}x{} against a cache of {}x{}",
+                    p.len(), p.bars(), frames.len(), frames.bars(),
+                );
+                PreChannels::Missing
+            }
+            other => other,
+        };
+        self.pre_frames = std::sync::Arc::new(frames);
+        // An install that brings channels with it is an arrival too. A fresh
+        // analysis lands here rather than through the reader, and the flag was
+        // only set on the reader's path — so finishing a stereo analysis while
+        // paused installed the channels and drew nothing until playback
+        // resumed, which is the same defect the reader's path was fixed for.
+        self.channels_arrived = matches!(channels, PreChannels::Resident(_));
+        self.pre_channels = channels;
+        self.pre_cache = cache;
         self.pre_frame_rate = frame_rate;
+        // A read in flight against the previous matrix is now stale. The link
+        // stays open so the result arrives and is refused, rather than
+        // vanishing into a dropped channel.
+        self.pre_generation = self.pre_generation.wrapping_add(1);
+        self.reset_channels();
         self.invalidate_pre_cursor();
         self.pre_revision = self.pre_revision.wrapping_add(1);
     }
 
-    /// Drop the cached rows and the cursor into them together.
+    /// Drop the cached rows, the channels and the cursor into them together.
     pub fn clear_pre_frames(&mut self) {
-        self.pre_frames.clear();
+        // Replaced, not emptied: the reader thread may hold a clone of the old
+        // one, and `Arc::make_mut` would deep-copy 87 MiB in order to clear it.
+        // Dropping this handle releases the allocation as soon as the last
+        // reader lets go.
+        self.pre_frames = std::sync::Arc::new(cache::PreFrames::default());
+        self.pre_channels = PreChannels::Missing;
+        self.pre_cache = None;
+        self.pre_generation = self.pre_generation.wrapping_add(1);
+        self.reset_channels();
         self.invalidate_pre_cursor();
         self.pre_revision = self.pre_revision.wrapping_add(1);
+    }
+
+    /// The installed channels, for tests that need to see what was installed.
+    /// Production reads the field directly, in `apply_pre_channels`.
+    #[cfg(test)]
+    pub fn pre_stereo(&self) -> Option<&stereo::Stereo> {
+        self.pre_channels.resident()
+    }
+
+    /// Where this track's channels are.
+    pub fn pre_channels(&self) -> &PreChannels {
+        &self.pre_channels
+    }
+
+    /// Whether channels can be drawn, or could be if asked for.
+    ///
+    /// This is what gates the channel buttons, so it must be true while a
+    /// sidecar is merely on disk — the load is triggered by selecting a channel
+    /// view, and a disabled button cannot select one.
+    pub fn has_pre_channels(&self) -> bool {
+        self.pre_channels.obtainable()
+    }
+
+    /// Whether channels are actually in memory to draw this frame.
+    pub fn pre_channels_resident(&self) -> bool {
+        self.pre_channels.resident().is_some_and(|p| !p.is_empty())
+    }
+
+    /// Start reading the sidecar, if there is one to read and nothing is
+    /// already reading it.
+    ///
+    /// The read, the identity check and the decode all happen on the worker.
+    /// None of it belongs on the UI thread: a sidecar is tens of megabytes and
+    /// checking it means hashing the mono cache it accompanies.
+    pub fn request_pre_channels(&mut self) {
+        match self.pre_channels {
+            // Nothing has been read yet.
+            PreChannels::OnDisk => {}
+            // Waiting for a slot that has since been released — this is the
+            // tick that gets to start the read the user is actually waiting for.
+            PreChannels::Loading if self.sidecar_outstanding.is_none() => {}
+            _ => return,
+        }
+        let Some((cache_path, id)) = self.pre_cache.clone() else {
+            self.pre_channels = PreChannels::Missing;
+            return;
+        };
+        if self.sidecar_outstanding.is_some() {
+            // A read owns the slot — running, or finished and waiting to be
+            // taken. It is not interrupted, because a read cannot be, but no
+            // second one starts beside it. The state says "loading", which is
+            // true: the read the user is waiting for begins the moment that one
+            // is consumed, and any further view changes in between collapse
+            // into that single one.
+            self.pre_channels = PreChannels::Loading;
+            return;
+        }
+        let generation = self.pre_generation;
+        let serial = self.pre_request_serial;
+        let mono = std::sync::Arc::clone(&self.pre_frames);
+        let tx = self
+            .sidecar_link
+            .get_or_insert_with(std::sync::mpsc::channel)
+            .0
+            .clone();
+        #[cfg(test)]
+        let hold = self.sidecar_hold.clone();
+        #[cfg(test)]
+        let stats = Arc::clone(&self.reader_stats);
+        // The slot is taken here and given back only in `poll_pre_channels`.
+        self.sidecar_outstanding = Some(serial);
+        // Counted here, on the thread that decides to spawn, not inside the
+        // thread: a reader exists from this moment, and a test that ticks and
+        // then reads the count would otherwise be racing the scheduler.
+        #[cfg(test)]
+        stats.enter();
+        self.pre_channels = PreChannels::Loading;
+        std::thread::spawn(move || {
+            // **Exactly one completion per spawn**, however this thread
+            // leaves. The slot is released by consuming a completion, so a
+            // reader that panicked without publishing would hold it shut for
+            // the rest of the session; this publishes a failure instead.
+            struct Retire {
+                tx: std::sync::mpsc::Sender<SidecarLoaded>,
+                generation: u64,
+                serial: u64,
+                published: bool,
+                #[cfg(test)]
+                stats: Arc<ReaderStats>,
+            }
+            impl Retire {
+                fn publish(&mut self, result: Result<stereo::Stereo, String>) {
+                    self.published = true;
+                    let _ = self.tx.send(SidecarLoaded {
+                        generation: self.generation,
+                        serial: self.serial,
+                        result,
+                    });
+                }
+            }
+            impl Drop for Retire {
+                fn drop(&mut self) {
+                    if !self.published {
+                        let _ = self.tx.send(SidecarLoaded {
+                            generation: self.generation,
+                            serial: self.serial,
+                            result: Err("the sidecar reader stopped unexpectedly".into()),
+                        });
+                    }
+                    #[cfg(test)]
+                    self.stats.leave();
+                }
+            }
+            let mut retire = Retire {
+                tx,
+                generation,
+                serial,
+                published: false,
+                #[cfg(test)]
+                stats,
+            };
+            let path = stereo::path_for(&cache_path);
+            // The read, the four identity checks and the decode all happen
+            // here. The mono fingerprint alone is a full pass over 87 MiB.
+            let result = stereo::read(&path, id, &mono, MAX_BAR_COUNT)
+                .map_err(|e| format!("{path_display}: {e}", path_display = path.display()));
+            #[cfg(test)]
+            if let Some(h) = hold {
+                while h.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            retire.publish(result);
+        });
+    }
+
+    /// Give the channel matrices back, keeping the file.
+    ///
+    /// Called when the view returns to Mix or the channels stop being drawn.
+    /// The sidecar stays on disk and the state returns to `OnDisk`, so
+    /// selecting a channel view again reads it rather than re-analysing.
+    pub fn release_pre_channels(&mut self) {
+        match &mut self.pre_channels {
+            PreChannels::Resident(p) => {
+                p.clear();
+                self.pre_channels = PreChannels::OnDisk;
+                self.reset_channels();
+            }
+            // A read is in flight and nothing wants it any more. The serial
+            // bump is what makes the result arrive and be thrown away rather
+            // than reinstalling two matrices behind a Mix the user has just
+            // gone back to.
+            PreChannels::Loading => {
+                self.pre_request_serial = self.pre_request_serial.wrapping_add(1);
+                self.pre_channels = PreChannels::OnDisk;
+                self.reset_channels();
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a read landed since this was last asked, and reset.
+    pub fn take_channels_arrived(&mut self) -> bool {
+        std::mem::take(&mut self.channels_arrived)
+    }
+
+    /// Take a finished read, if it is still the one being waited for.
+    pub fn poll_pre_channels(&mut self) {
+        let Some((_, rx)) = self.sidecar_link.as_ref() else { return };
+        let Ok(msg) = rx.try_recv() else { return };
+        // Taking the completion is what releases the slot. Until this line
+        // runs, the read that produced it still owns the reader — which is why
+        // a tick that polls nothing cannot then start the same read again.
+        if self.sidecar_outstanding == Some(msg.serial) {
+            self.sidecar_outstanding = None;
+        }
+        if msg.serial != self.pre_request_serial {
+            crate::mlog!("[stereo] discarded a read nothing is waiting for any more");
+            #[cfg(test)]
+            {
+                self.discarded_reads += 1;
+            }
+            return;
+        }
+        if msg.generation != self.pre_generation {
+            // A read for a track, or a cache, that is no longer on screen.
+            // Installing it would draw a Left belonging to different audio than
+            // the Mix beside it, which is the whole failure this guards.
+            crate::mlog!(
+                "[stereo] discarded a read from generation {} (now {})",
+                msg.generation, self.pre_generation,
+            );
+            #[cfg(test)]
+            {
+                self.discarded_reads += 1;
+            }
+            return;
+        }
+        match msg.result {
+            Ok(pair) if pair.len() == self.pre_frames.len()
+                && pair.bars() == self.pre_frames.bars() =>
+            {
+                crate::mlog!("[stereo] loaded {} rows", pair.len());
+                self.pre_channels = PreChannels::Resident(pair);
+                self.channels_arrived = true;
+                // The cursor is where it was; the channels simply start being
+                // drawn from the next row.
+                self.invalidate_pre_cursor();
+            }
+            Ok(pair) => {
+                crate::mlog!(
+                    "[stereo] a read returned {}x{} against a cache of {}x{}",
+                    pair.len(), pair.bars(), self.pre_frames.len(), self.pre_frames.bars(),
+                );
+                self.pre_channels = PreChannels::Refused("wrong shape".into());
+            }
+            Err(e) => {
+                crate::mlog!("[stereo] rejected {e}");
+                self.pre_channels = PreChannels::Refused(e);
+            }
+        }
     }
 
     /// Which cached matrix is installed, as a number that changes when it does.
@@ -2119,20 +2697,22 @@ impl SpectrumAnalyzer {
     pub fn try_receive_frames(&mut self) {
         if let Some(ref rx) = self.pre_receiver && let Ok(msg) = rx.try_recv() {
             match msg {
-                PreMessage::Done { frames, frame_rate, waveform, analysis } => {
-                    // The worker has just written a cache file; keep the whole
-                    // directory inside its budget now rather than letting it
-                    // grow unbounded between sessions.
-                    if self.cache_budget_gb > 0.0 {
-                        let budget = (self.cache_budget_gb as f64 * 1e9) as u64;
-                        let (n, freed) = evict_cache_to_budget(budget, None);
-                        if n > 0 {
-                            crate::mlog!("[cache] evicted {n} file(s), freed {:.1} MB",
-                                      freed as f64 / 1e6);
-                        }
-                    }
+                PreMessage::Done {
+                    frames, stereo, frame_rate, waveform, analysis, meta,
+                } => {
+                    self.trim_cache(Some(&meta.cache));
+                    log_work(&meta.work);
                     crate::mlog!("[analysis] {} frames received (paused path)", frames.len());
-                    self.set_pre_frames(frames, frame_rate);
+                    let channels = match stereo {
+                        Some(p) => PreChannels::Resident(*p),
+                        None => channels_on_disk(&meta.cache),
+                    };
+                    self.set_pre_frames_with(
+                        frames,
+                        channels,
+                        Some((meta.cache.clone(), meta.identity)),
+                        frame_rate,
+                    );
                     self.pending_waveform = Some(waveform);
                     self.pending_analysis = Some(analysis);
                 }
@@ -2147,14 +2727,26 @@ impl SpectrumAnalyzer {
 // Cache helpers
 // ---------------------------------------------------------------------------
 
-/// Returns (file_count, total_bytes) for all .spectrumcache files.
+/// Whether a path is something this player wrote into its cache directory.
+///
+/// One predicate rather than an extension test repeated at each site, because
+/// the sidecar arrived after six of those sites existed and a budget that
+/// counts only half of what it writes is not a budget. A sidecar is roughly the
+/// size of the mono cache it accompanies, so missing them would under-report
+/// the directory by about two thirds once stereo is on.
+fn is_cache_file(p: &Path) -> bool {
+    p.extension()
+        .is_some_and(|x| x == "spectrumcache" || x == "stereocache")
+}
+
+/// Returns (file_count, total_bytes) for every cache file, sidecars included.
 fn cache_dir_stats() -> (usize, u64) {
     let dir = home_dir().join(".moosik").join("cache");
     let Ok(entries) = std::fs::read_dir(&dir) else { return (0, 0); };
     let mut count = 0usize;
     let mut bytes = 0u64;
     for e in entries.filter_map(|e| e.ok()) {
-        if e.path().extension().map(|x| x == "spectrumcache").unwrap_or(false) {
+        if is_cache_file(&e.path()) {
             count += 1;
             bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
         }
@@ -2172,6 +2764,11 @@ fn cache_dir_stats() -> (usize, u64) {
 /// hundred FFT-mode ones.
 pub const DEFAULT_CACHE_BUDGET_GB: f32 = 4.0;
 
+/// Where caches live, unless a test says otherwise.
+fn default_cache_dir() -> PathBuf {
+    home_dir().join(".moosik").join("cache")
+}
+
 /// Delete least-recently-used caches until the directory fits `budget_bytes`.
 ///
 /// Returns (files removed, bytes freed). `keep` is spared regardless — it is
@@ -2181,18 +2778,53 @@ pub const DEFAULT_CACHE_BUDGET_GB: f32 = 4.0;
 /// LRU also cleans up after cache-key changes for free: caches whose key format
 /// no longer exists can never be read, so they are never touched, so they are
 /// always first out.
-fn evict_cache_to_budget(budget_bytes: u64, keep: Option<&Path>) -> (usize, u64) {
-    evict_in_dir(&home_dir().join(".moosik").join("cache"), budget_bytes, keep)
+/// What one sweep managed.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct Sweep {
+    removed: usize,
+    freed: u64,
+    /// Bytes still over budget once everything evictable was evicted.
+    ///
+    /// Non-zero means the protected unit alone does not fit. Reporting it is
+    /// the difference between "the budget is met" and "the budget cannot be
+    /// met without deleting the track you are listening to" — and the sweep
+    /// must not claim the first when it did the second.
+    still_over: u64,
 }
 
-fn evict_in_dir(dir: &Path, budget_bytes: u64, keep: Option<&Path>) -> (usize, u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return (0, 0); };
+fn evict_cache_to_budget(budget_bytes: u64, keep: Option<&Path>) -> Sweep {
+    evict_in_dir(&default_cache_dir(), budget_bytes, keep)
+}
 
-    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+/// Delete least-recently-used analyses until the directory fits.
+///
+/// # An analysis is one unit, not one file
+///
+/// A track's cache is now a mono file and, when it has channels, a sidecar
+/// beside it. They are evicted together, and for a reason that is not tidiness:
+/// evicting the mono file while sparing its sidecar leaves a file that nothing
+/// can ever read — a sidecar is checked against the mono cache it accompanies,
+/// so an orphan is unreadable *and* still counted against the budget. That is
+/// strictly worse than removing both.
+///
+/// `keep` spares an analysis, meaning both of its files. It is normally the
+/// track playing now, which is exactly the one a size-based sweep would reach
+/// for: it was written most recently, but LRU sorts by access time, and a
+/// freshly written cache has been read zero times.
+fn evict_in_dir(dir: &Path, budget_bytes: u64, keep: Option<&Path>) -> Sweep {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Sweep::default() };
+
+    // Grouped by stem, which is what pairs a sidecar with its mono cache
+    // without having to parse a cache key.
+    let mut units: std::collections::HashMap<std::ffi::OsString, Vec<(u64, PathBuf)>> =
+        std::collections::HashMap::new();
+    let mut newest: std::collections::HashMap<std::ffi::OsString, std::time::SystemTime> =
+        std::collections::HashMap::new();
     let mut total = 0u64;
     for e in entries.filter_map(|e| e.ok()) {
         let p = e.path();
-        if !p.extension().map(|x| x == "spectrumcache").unwrap_or(false) { continue; }
+        if !is_cache_file(&p) { continue; }
+        let Some(stem) = p.file_stem().map(|s| s.to_os_string()) else { continue };
         let Ok(m) = e.metadata() else { continue };
         // Accessed time is what LRU wants, but it is unreliable — Windows
         // updates it lazily and many Linux mounts disable it outright. Modified
@@ -2200,23 +2832,35 @@ fn evict_in_dir(dir: &Path, budget_bytes: u64, keep: Option<&Path>) -> (usize, u
         // analysis was written, so it evicts oldest-analysed first.
         let when = m.accessed().or_else(|_| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
         total += m.len();
-        files.push((when, m.len(), p));
+        // The unit is as recently used as its most recently used file: playing
+        // a track in Mix touches only the mono file, and that must not make the
+        // pair look stale.
+        let slot = newest.entry(stem.clone()).or_insert(when);
+        if when > *slot { *slot = when; }
+        units.entry(stem).or_default().push((m.len(), p));
     }
-    if total <= budget_bytes { return (0, 0); }
+    if total <= budget_bytes { return Sweep::default(); }
 
-    files.sort_by_key(|(when, _, _)| *when);
+    let spared = keep.and_then(|k| k.file_stem().map(|s| s.to_os_string()));
+    let mut order: Vec<(std::time::SystemTime, std::ffi::OsString)> =
+        newest.into_iter().map(|(stem, when)| (when, stem)).collect();
+    order.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
     let mut removed = 0usize;
     let mut freed = 0u64;
-    for (_, len, p) in files {
+    for (_, stem) in order {
         if total <= budget_bytes { break; }
-        if keep.is_some_and(|k| k == p) { continue; }
-        if std::fs::remove_file(&p).is_ok() {
-            total = total.saturating_sub(len);
-            freed += len;
-            removed += 1;
+        if spared.as_ref() == Some(&stem) { continue; }
+        let Some(files) = units.get(&stem) else { continue };
+        for (len, p) in files {
+            if std::fs::remove_file(p).is_ok() {
+                total = total.saturating_sub(*len);
+                freed += *len;
+                removed += 1;
+            }
         }
     }
-    (removed, freed)
+    Sweep { removed, freed, still_over: total.saturating_sub(budget_bytes) }
 }
 
 fn home_dir() -> PathBuf {
@@ -2226,8 +2870,16 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// The identity a sidecar is checked against, and the file the analysis lives
+/// in, derived together.
+///
+/// **Identity is not the same question as content.** Two different stereo
+/// sources can share a mono mix exactly, so a sidecar that agreed only on the
+/// mono numbers could still belong to other audio. The source hash and the
+/// parameter hash are what tie a sidecar to *this* track at *these* settings.
 #[allow(clippy::too_many_arguments)]
-fn cache_path_for(
+fn cache_key_for(
+    dir: &Path,
     path: &PathBuf,
     n_bars: usize,
     fft_size: usize,
@@ -2241,7 +2893,7 @@ fn cache_path_for(
     dsd_rate: u32,
     aslt_cfg: &aslt::AsltConfig,
     pre_fps: f32,
-) -> PathBuf {
+) -> (stereo::Identity, PathBuf) {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -2311,137 +2963,105 @@ fn cache_path_for(
     } else {
         String::new()
     };
-    home_dir()
-        .join(".moosik")
-        .join("cache")
-        .join(format!(
-            "{:016x}_b{}_f{}_w{}_p{}_o{}_n{}_x{}_m{}_i{}{}{}.spectrumcache",
-            hash, n_bars, fft_id, window_id, pad_id, overlap_k, min_hz, max_hz,
-            mapping_id, interp_id, dsd_part, aslt_part,
-        ))
+    // The settings half of the name, and the identity a sidecar is checked
+    // against, are the same string hashed. They cannot drift apart, because
+    // there is only one of them.
+    let params = format!(
+        "b{}_f{}_w{}_p{}_o{}_n{}_x{}_m{}_i{}{}{}",
+        n_bars, fft_id, window_id, pad_id, overlap_k, min_hz, max_hz,
+        mapping_id, interp_id, dsd_part, aslt_part,
+    );
+    let mut ph = DefaultHasher::new();
+    params.hash(&mut ph);
+    (
+        stereo::Identity { source: hash, params: ph.finish() },
+        dir.join(format!("{hash:016x}_{params}.spectrumcache")),
+    )
 }
 
-// Cache format v2: [magic(4), num_frames(4), num_bars(4), lz4_compressed(u16 LE × n_frames × n_bars)]
-// u16 gives 65 536 levels (>30× a 4K screen height). LZ4 adds ~2–4× compression on top.
-// Old f32 caches (no magic header) are auto-rejected: their first 4 bytes decode as a frame
-// count that won't match CACHE_MAGIC, so they recompute silently.
-const CACHE_MAGIC: u32 = 0x4D535032; // "MSP2"
-
-// Cache format v3: same header, but the payload is delta-coded across frequency
-// and split into byte planes before LZ4.
-//
-// Measured on a real 44 645 × 1024 superlet cache: 78.8 MB as v2, 69.1 MB as v3.
-// That 12 % is close to the whole prize — the low byte of each u16 is 46 MB of
-// uniform quantisation noise, so *no* lossless coder can beat ~77 MB, and even
-// truncating to a depth finer than a 4K pixel (12-bit) only reaches 68 MB. The
-// file is large because 44 645 frames × 1024 bars is a lot of data, not because
-// it is badly packed. Bounding the cache as a whole is the real fix; this is
-// just the part that is free.
-//
-// Neighbouring bars correlate slightly better than consecutive frames, which is
-// why the delta runs across frequency — at 180 fps the frames are so similar
-// that their difference is dominated by the same noise floor.
-const CACHE_MAGIC_V3: u32 = 0x4D535033; // "MSP3"
-
-fn load_cache(cache_path: &PathBuf, n_bars: usize) -> Option<Vec<Vec<f32>>> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(cache_path).ok()?;
-    let mut raw = Vec::new();
-    file.read_to_end(&mut raw).ok()?;
-    if raw.len() < 12 { return None; }
-
-    let magic      = u32::from_le_bytes(raw[0..4].try_into().ok()?);
-    let num_frames = u32::from_le_bytes(raw[4..8].try_into().ok()?) as usize;
-    let num_bars   = u32::from_le_bytes(raw[8..12].try_into().ok()?) as usize;
-
-    let v3 = magic == CACHE_MAGIC_V3;
-    if (!v3 && magic != CACHE_MAGIC) || num_bars != n_bars
-        || num_bars > MAX_BAR_COUNT || num_frames > 500_000
-    {
-        return None;
-    }
-
-    let decompressed = lz4_flex::decompress_size_prepended(&raw[12..]).ok()?;
-
-    // Each value is a u16 → 2 bytes per bar per frame.
-    let count = num_frames.checked_mul(num_bars)?;
-    let expected_bytes = count.checked_mul(2)?;
-    if decompressed.len() < expected_bytes { return None; }
-
-    if !v3 {
-        // v2: plain u16 LE, interleaved.
-        return Some((0..num_frames)
-            .map(|f| {
-                let base = f * num_bars * 2;
-                (0..num_bars).map(|b| {
-                    let off = base + b * 2;
-                    let v = u16::from_le_bytes([decompressed[off], decompressed[off + 1]]);
-                    v as f32 / 65535.0
-                }).collect()
-            })
-            .collect());
-    }
-
-    // v3: high-byte plane, then low-byte plane, each holding a zigzag delta
-    // taken across frequency within a frame.
-    let (hi, lo) = decompressed.split_at(count);
-    let mut frames = Vec::with_capacity(num_frames);
-    for f in 0..num_frames {
-        let base = f * num_bars;
-        let mut row = Vec::with_capacity(num_bars);
-        let mut prev: i32 = 0;
-        for b in 0..num_bars {
-            let z = u16::from_le_bytes([lo[base + b], hi[base + b]]) as u32;
-            let d = ((z >> 1) as i32) ^ -((z & 1) as i32);
-            prev = (prev + d) & 0xFFFF;
-            row.push(prev as f32 / 65535.0);
-        }
-        frames.push(row);
-    }
-    Some(frames)
+/// The cache path for these settings.
+#[allow(clippy::too_many_arguments)]
+fn cache_path_for(
+    dir: &Path,
+    path: &PathBuf,
+    n_bars: usize,
+    fft_size: usize,
+    pad_factor: usize,
+    overlap: f32,
+    window_fn: &WindowFn,
+    min_freq: f32,
+    max_freq: f32,
+    bar_mapping: &BarMappingMode,
+    interp_mode: &InterpolationMode,
+    dsd_rate: u32,
+    aslt_cfg: &aslt::AsltConfig,
+    pre_fps: f32,
+) -> PathBuf {
+    cache_key_for(
+        dir, path, n_bars, fft_size, pad_factor, overlap, window_fn, min_freq, max_freq,
+        bar_mapping, interp_mode, dsd_rate, aslt_cfg, pre_fps,
+    )
+    .1
 }
 
-fn save_cache(cache_path: &PathBuf, frames: &[Vec<f32>]) {
-    use std::io::Write;
-    if let Some(parent) = cache_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let n_bars = frames.first().map(|f| f.len()).unwrap_or(0);
-
-    // Zigzag delta across frequency, then split the two bytes of every value
-    // into separate planes. Interleaved, the noisy low byte sits between every
-    // pair of compressible high bytes and stops LZ4 finding any run at all.
-    let count = frames.len() * n_bars;
-    let mut hi: Vec<u8> = Vec::with_capacity(count);
-    let mut lo: Vec<u8> = Vec::with_capacity(count);
-    for frame in frames {
-        let mut prev: i32 = 0;
-        for &v in frame {
-            let q = (v.clamp(0.0, 1.0) * 65535.0).round() as i32;
-            // Wrap the difference into i16 before zigzagging. The raw difference
-            // spans ±65535 and needs 17 bits; wrapped, it still reconstructs
-            // exactly because the values themselves are 16-bit, and it keeps the
-            // common small steps small — which is the entire point of the delta.
-            let d = (q - prev) as i16 as i32;
-            prev = q;
-            let z = ((d << 1) ^ (d >> 31)) as u32 as u16;
-            let [b0, b1] = z.to_le_bytes();
-            lo.push(b0);
-            hi.push(b1);
+/// Read a cache, or `None` for any reason at all.
+///
+/// v2, v3 and v4 all load; the reason a file was rejected is logged rather than
+/// surfaced, because every reason leads to the same place — recompute.
+fn load_cache(cache_path: &Path, n_bars: usize) -> Option<cache::PreFrames> {
+    match cache::read(cache_path, n_bars, MAX_BAR_COUNT) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            // Absent files are the common case and not worth a line.
+            if cache_path.exists() {
+                crate::mlog!("[cache] rejected {}: {e}", cache_path.display());
+            }
+            None
         }
     }
-    let mut payload = hi;
-    payload.append(&mut lo);
-    let compressed = lz4_flex::compress_prepend_size(&payload);
+}
 
-    let mut header = Vec::with_capacity(12 + compressed.len());
-    header.extend_from_slice(&CACHE_MAGIC_V3.to_le_bytes());
-    header.extend_from_slice(&(frames.len() as u32).to_le_bytes());
-    header.extend_from_slice(&(n_bars as u32).to_le_bytes());
-    header.extend_from_slice(&compressed);
+/// Whether a sidecar exists beside `cache_path`, without reading it.
+///
+/// One `stat`. The whole point of the lazy path is that this is all the UI
+/// thread does: it establishes that channels are *obtainable*, which is what
+/// the buttons need, and nothing more.
+fn channels_on_disk(cache_path: &Path) -> PreChannels {
+    if stereo::path_for(cache_path).exists() {
+        PreChannels::OnDisk
+    } else {
+        PreChannels::Missing
+    }
+}
 
-    if let Ok(mut f) = std::fs::File::create(cache_path) && f.write_all(&header).is_err() {
-        let _ = std::fs::remove_file(cache_path);
+/// Write a cache as v4, replacing any existing file only once the new one is
+/// complete. A failure leaves whatever was there untouched.
+///
+/// `abort` is carried into the write rather than only checked before it. It is
+/// read three times: before the encoding, so a cancelled analysis does not pay
+/// for a v4 encode it will throw away; on entry to the write, with the bytes in
+/// hand and nothing yet on disk; and immediately before the rename, which is
+/// the publication boundary and therefore the commit decision. A cancellation
+/// that arrives after that last check is too late — but one that arrives while
+/// the temporary is being written is not, and the existing cache survives it.
+///
+/// A cancelled save is reported as cancelled, not as a successful publication.
+fn save_cache(cache_path: &Path, frames: &cache::PreFrames, abort: &AtomicBool) {
+    if frames.is_empty() {
+        return;
+    }
+    let cancelled = || abort.load(Ordering::Relaxed);
+    if cancelled() {
+        crate::mlog!("[cache] aborted before encoding {}", cache_path.display());
+        return;
+    }
+    let bytes = frames.to_v4();
+    match cache::write_atomic_cancellable(cache_path, &bytes, &cancelled) {
+        Ok(cache::Written::Published) => {}
+        Ok(cache::Written::Cancelled) => {
+            crate::mlog!("[cache] aborted before publishing {}", cache_path.display());
+        }
+        Err(e) => crate::mlog!("[cache] write failed for {}: {e}", cache_path.display()),
     }
 }
 
@@ -2449,10 +3069,256 @@ fn save_cache(cache_path: &PathBuf, frames: &[Vec<f32>]) {
 // Background pre-processing (uses rodio Decoder directly)
 // ---------------------------------------------------------------------------
 
+/// Report what an analysis dispatched, in the units it dispatched it in.
+///
+/// Never a total: the routes do differently shaped work, and adding a
+/// per-frame count to a per-column one produced a number dominated by
+/// whichever route happened to carry the most bars.
+fn log_work(w: &aslt::WorkCount) {
+    crate::mlog!(
+        "[analysis] work: {} column convolution(s), {} frame response(s),          {} frame transform(s), {} device failure(s)",
+        w.column_convolutions,
+        w.frame_responses,
+        w.frame_transforms,
+        w.device_failures,
+    );
+}
+
+/// Where this track's cached channels are.
+///
+/// "Present" was one bit before, and one bit cannot tell a track that has no
+/// channels from one whose channels are sitting on disk unread. The difference
+/// matters at both ends: the display must not offer Left/Right for a track that
+/// has none, and it must not *withhold* them from a track that does merely
+/// because nothing has read the file yet.
+#[derive(Clone, Default)]
+pub enum PreChannels {
+    /// No sidecar beside this analysis.
+    #[default]
+    Missing,
+    /// A sidecar is on disk and has not been read. Obtainable, not resident.
+    OnDisk,
+    /// A read is in flight. The generation it belongs to lives on the message
+    /// and on `pre_generation`, not here: two copies of the same fact are two
+    /// things to keep in step, and only one of them can be the authority.
+    Loading,
+    /// Read, checked, and usable.
+    Resident(stereo::Stereo),
+    /// A sidecar is there and was refused. Distinct from `Missing` so the
+    /// display can say which, and so a file that will fail again is not retried
+    /// on every tick for the rest of the track.
+    Refused(String),
+}
+
+impl PreChannels {
+    /// Whether channels can be shown, or could be if asked for.
+    ///
+    /// `OnDisk` and `Loading` count. If they did not, the channel buttons would
+    /// be disabled for exactly the tracks whose channels exist — and since
+    /// selecting a channel view is what triggers the load, the load could never
+    /// be requested.
+    pub fn obtainable(&self) -> bool {
+        matches!(self, PreChannels::OnDisk | PreChannels::Loading | PreChannels::Resident(_))
+    }
+
+    pub fn resident(&self) -> Option<&stereo::Stereo> {
+        match self {
+            PreChannels::Resident(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// A short word for the readout, or `None` when there is nothing to say.
+    pub fn note(&self) -> Option<&'static str> {
+        match self {
+            PreChannels::Loading => Some("loading channels…"),
+            PreChannels::Refused(_) => Some("channels unreadable"),
+            _ => None,
+        }
+    }
+}
+
+/// What the sidecar readers did, for the test that bounds them.
+#[cfg(test)]
+#[derive(Default)]
+pub struct ReaderStats {
+    pub started: AtomicUsize,
+    pub finished: AtomicUsize,
+    live: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[cfg(test)]
+impl ReaderStats {
+    fn enter(&self) {
+        self.started.fetch_add(1, Ordering::Relaxed);
+        let live = self.live.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut peak = self.peak.load(Ordering::Relaxed);
+        while live > peak {
+            match self.peak.compare_exchange_weak(
+                peak, live, Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => peak = actual,
+            }
+        }
+    }
+
+    fn leave(&self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+        self.finished.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn peak_live(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+/// A finished sidecar read, on its way back to the display.
+struct SidecarLoaded {
+    /// The cache generation this read was started for. Guards against the
+    /// *matrix* changing underneath it.
+    generation: u64,
+    /// The request this read was started for. Guards against the *demand*
+    /// going away — returning to Mix while a read is in flight leaves a result
+    /// that nothing wants, and installing it would put two matrices back that
+    /// the user has just navigated away from.
+    serial: u64,
+    result: Result<stereo::Stereo, String>,
+}
+
+/// A finished analysis, taken out of the message so it can be installed after
+/// the borrow of the receiver ends.
+struct Arrived {
+    frames: cache::PreFrames,
+    stereo: Option<Box<stereo::Stereo>>,
+    frame_rate: f64,
+    cache: PathBuf,
+    identity: stereo::Identity,
+}
+
+/// Bookkeeping that travels with a finished analysis.
+pub struct DoneMeta {
+    /// What the analysis dispatched. Logged on completion, and the only way a
+    /// test can hold the producer to the two-channel contract against what
+    /// actually ran rather than against a recount of the loop bounds.
+    pub work: aslt::WorkCount,
+    /// The mono cache this analysis wrote.
+    ///
+    /// Carried so the completion path can protect the unit it just produced
+    /// from the budget sweep it is about to trigger, rather than recomputing a
+    /// cache key and hoping it matches.
+    pub cache: PathBuf,
+    /// The identity the sidecar beside it was written with, so a later lazy
+    /// read checks against the same one the writer used.
+    pub identity: stereo::Identity,
+}
+
+/// What a pre-process analysis should produce.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StereoRequest {
+    /// The mix alone. What every analysis did before the sidecar existed.
+    MixOnly,
+    /// The mix derived from left and right, in one joint pass.
+    Joint,
+    /// `Joint`, plus a deliberate third transform of the mean signal whose
+    /// result is thrown away — exactly the violation the work-count contract
+    /// forbids.
+    ///
+    /// Only a test asks for this. It exists so the check that forbids a third
+    /// transform can be shown to fail when there is one: a check nothing can
+    /// fail is not a check.
+    #[cfg(test)]
+    JointWithRedundantMixTransform,
+}
+
+impl StereoRequest {
+    fn wants_channels(self) -> bool {
+        !matches!(self, StereoRequest::MixOnly)
+    }
+
+    fn redundant_mix_transform(self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, StereoRequest::JointWithRedundantMixTransform)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
+/// What one analysis pass produced.
+///
+/// `left` and `right` are empty unless the pass was joint. The mix is always
+/// present and is always what the rest of the display reads.
+struct Passes {
+    mix: Vec<Vec<f32>>,
+    left: Vec<Vec<f32>>,
+    right: Vec<Vec<f32>>,
+    /// What the pass dispatched, in the units of whichever producer ran. See
+    /// [`aslt::WorkCount`].
+    work: aslt::WorkCount,
+}
+
+/// Why one analysis pass did not produce frames.
+///
+/// Deliberately not a `PreMessage`: a pass cannot finish an analysis, only fail
+/// at one, and the two failures mean different things once there is more than
+/// one pass. A cancelled *mono* pass ends the run; a cancelled *channel* pass
+/// leaves a mono cache that is already written and already correct.
+enum PassFailed {
+    Aborted,
+    Failed(String),
+}
+
+/// Left and right, collected alongside mono during the one decode pass.
+///
+/// Exists so the two decoders do not each grow their own copy of the same
+/// bookkeeping, and so the alignment rule has one home: **every frame mono gets,
+/// the pair gets**. A truncated final frame that yields one sample still pushes
+/// a value to both sides, because a pair one row shorter than the mono it is
+/// indexed against is worse than a pair whose last row is duplicated.
+struct Channels {
+    left: Vec<f32>,
+    right: Vec<f32>,
+    wanted: bool,
+}
+
+impl Channels {
+    fn new(wanted: bool, hint: usize) -> Self {
+        let cap = if wanted { hint.max(1) } else { 0 };
+        Self {
+            left: Vec::with_capacity(cap),
+            right: Vec::with_capacity(cap),
+            wanted,
+        }
+    }
+
+    /// `frame` holds up to two samples; `got` is how many the decoder actually
+    /// produced for this frame across all channels.
+    fn push(&mut self, frame: &[f32; 2], got: usize) {
+        if !self.wanted || got == 0 {
+            return;
+        }
+        self.left.push(frame[0]);
+        self.right.push(if got >= 2 { frame[1] } else { frame[0] });
+    }
+
+    fn take(self) -> Option<(Vec<f32>, Vec<f32>)> {
+        if self.wanted && !self.left.is_empty() {
+            Some((self.left, self.right))
+        } else {
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn preprocess_file(
     path: &PathBuf,
-    cache_path: &PathBuf,
+    cache_path: &Path,
     _sample_rate_hint: u32,
     n_bars: usize,
     progress: &Arc<AtomicUsize>,
@@ -2469,12 +3335,32 @@ fn preprocess_file(
     pre_fps: f32,
     abort: &Arc<AtomicBool>,
     eta_secs: &Arc<AtomicUsize>,
+    stereo_request: StereoRequest,
 ) -> PreMessage {
-    // ── Phase 1: decode all mono samples sequentially (0–49 %) ──────────────
+    let want_stereo = stereo_request.wants_channels();
+    let mutant = stereo_request.redundant_mix_transform();
+    // ── Phase 1: decode (0–39 %) ────────────────────────────────────────────
+    //
+    // Mono is the mean of the channels *as a signal*, exactly as it always
+    // was. When channels are wanted and the stream has two, left and right are
+    // kept from the same pass — decoding the file twice to get the numbers this
+    // one already read would be a strange way to spend a minute.
+    //
+    // The mix is *derived* from these two, not analysed a third time — see
+    // Phase 2. What it is not derived from is their magnitudes: |F((L+R)/2)|
+    // keeps the cancellation that (|F(L)|+|F(R)|)/2 has already thrown away,
+    // and the superlet compounds that by taking a geometric mean across orders
+    // afterwards. The combination happens on the complex per-member responses,
+    // where it is still exact.
+    //
+    // A stream that is not two-channel yields no pair. There is no
+    // interpretation of "left and right" for mono or for 5.1 that is a
+    // measurement rather than a guess, and `channels::availability` already
+    // says so for the live path.
     // DSD has no PCM samples to decode — it's low-pass-filtered and decimated
     // to the analysis rate instead (the audible band survives; the ultrasonic
     // modulator noise the analyzer shouldn't show is what the filter removes).
-    let (all_mono, sample_rate) = if crate::dsd::is_dsd_path(path) {
+    let (all_mono, lr, sample_rate) = if crate::dsd::is_dsd_path(path) {
         let mut src = match crate::dsd::decimate::open_pcm_source(path, dsd_rate) {
             Ok(s) => s,
             Err(e) => return PreMessage::Error(e),
@@ -2483,17 +3369,23 @@ fn preprocess_file(
         let ch = src.channels().max(1);
         let total_hint = (src.total_out_samples() / ch as u64) as usize;
         let mut mono: Vec<f32> = Vec::with_capacity(total_hint.max(1));
+        let mut pair = Channels::new(want_stereo && ch == 2, total_hint);
         loop {
             let mut sum = 0.0f32;
             let mut got = 0usize;
+            let mut frame = [0.0f32; 2];
             for _ in 0..ch {
                 match src.next() {
-                    Some(s) => { sum += s; got += 1; }
+                    Some(s) => {
+                        if let Some(slot) = frame.get_mut(got) { *slot = s; }
+                        sum += s; got += 1;
+                    }
                     None    => break,
                 }
             }
             if got == 0 { break; }
             mono.push(sum / got as f32);
+            pair.push(&frame, got);
             if total_hint > 0 {
                 progress.store(
                     (mono.len() * PROG_DECODE_END / total_hint).min(PROG_DECODE_END),
@@ -2501,7 +3393,7 @@ fn preprocess_file(
                 );
             }
         }
-        (mono, sr)
+        (mono, pair.take(), sr)
     } else {
         use rodio::Decoder;
         use std::io::BufReader;
@@ -2524,18 +3416,25 @@ fn preprocess_file(
             .unwrap_or(0);
 
         let mut mono: Vec<f32> = Vec::with_capacity(total_hint.max(1));
+        let mut pair = Channels::new(want_stereo && ch == 2, total_hint);
         let mut raw_iter = decoder;
         loop {
             let mut sum = 0.0f32;
             let mut got = 0usize;
+            let mut frame = [0.0f32; 2];
             for _ in 0..ch {
                 match raw_iter.next() {
-                    Some(s) => { sum += s as f32 / 32_768.0; got += 1; }
+                    Some(s) => {
+                        let v = s as f32 / 32_768.0;
+                        if let Some(slot) = frame.get_mut(got) { *slot = v; }
+                        sum += v; got += 1;
+                    }
                     None    => break,
                 }
             }
             if got == 0 { break; }
             mono.push(sum / got as f32);
+            pair.push(&frame, got);
             if total_hint > 0 {
                 progress.store(
                     (mono.len() * PROG_DECODE_END / total_hint).min(PROG_DECODE_END),
@@ -2543,7 +3442,7 @@ fn preprocess_file(
                 );
             }
         }
-        (mono, sr)
+        (mono, pair.take(), sr)
     };
 
     // The superlet has no analysis window to derive a frame rate from, so its
@@ -2725,7 +3624,39 @@ fn preprocess_file(
         loudness_history,
     };
 
-    // ── Phase 2a: superlet (50–99 %) ─────────────────────────────────────────
+    // ── Phase 2: one analysis, however many channels it has (40–99 %) ────────
+    //
+    // **One pass, not three.** When channels were decoded, left and right are
+    // convolved and the mix is derived from their complex per-member responses
+    // before any magnitude is taken:
+    //
+    // ```text
+    // M_j = (L_j + R_j) / 2
+    // ```
+    //
+    // That is the mix exactly, not an approximation of it — the transform is
+    // linear, so combining the responses is the same as having transformed
+    // `(l + r)/2`, which is the signal a mono run would have been handed. What
+    // it is *not* is the average of two magnitudes: after the magnitude the
+    // phase is gone, and two channels in opposite polarity read as loud when
+    // their sum is silence.
+    //
+    // The cost contract is **two channel convolution sets, not zero extra
+    // work**: the mix still pays for its own magnitudes, aggregation,
+    // quantisation and storage. `aslt::channel_passes` counts the convolutions
+    // so the claim is checked against the real dispatch rather than asserted
+    // from the shape of the code.
+    let run_pass = |input: aslt::Input<'_>,
+                    base: usize,
+                    span: usize|
+     -> Result<Passes, PassFailed> {
+        let joint = input.is_joint();
+        let channels = if joint { 2 } else { 1 };
+        let (signal, right) = match input {
+            aslt::Input::Mono(s) => (s, None),
+            aslt::Input::Joint { left, right } => (left, Some(right)),
+        };
+    // ── Phase 2a: superlet ───────────────────────────────────────────────────
     // Wholly replaces the FFT pipeline — no bins, no window, no bar mapping.
     // The frame layout it produces is identical, so the cache format, the
     // renderer and the waterfall are all untouched.
@@ -2736,8 +3667,11 @@ fn preprocess_file(
         // modes does not shift the bars sideways.
         let a_max = (sample_rate as f32 / 2.0).min(max_freq);
         let per_frame = aslt::bar_taps_per_frame(sample_rate, n_bars, min_freq, a_max, aslt_cfg);
-        let n_frames = aslt::frame_count(all_mono.len(), hop) as f64;
-        let total_taps = (per_frame.iter().sum::<f64>() * n_frames).max(1.0);
+        let n_frames = aslt::frame_count(signal.len(), hop) as f64;
+        // Two channels is twice the convolution, and the estimate has to say so
+        // or a stereo analysis reads as half-finished for its whole second half.
+        let total_taps =
+            (per_frame.iter().sum::<f64>() * n_frames * channels as f64).max(1.0);
 
         let done_taps = AtomicU64::new(0);
         let started = Instant::now();
@@ -2745,19 +3679,22 @@ fn preprocess_file(
         // A mutex rather than atomics because the three move together and this
         // is touched once per finished bar, not per frame.
         let rate_window = std::sync::Mutex::new((0.0f64, 0.0f64, 0.0f64));
-        eta_secs.store((total_taps / aslt::TAPS_PER_SEC_HINT) as usize, Ordering::Relaxed);
+        eta_secs.store(
+            (total_taps / aslt::TAPS_PER_SEC_HINT) as usize,
+            Ordering::Relaxed,
+        );
 
         // Held to the user's core budget. `install` makes that pool current, so
         // every nested `par_iter` inside the transform inherits the limit.
-        let raw = gpu_calib::install(|| aslt::analyze_with_progress(
-            &all_mono, sample_rate, n_bars, min_freq, a_max, hop, aslt_cfg,
+        let raw = gpu_calib::install(|| aslt::analyze_input_with_progress(
+            input, sample_rate, n_bars, min_freq, a_max, hop, aslt_cfg,
             &|| !abort.load(Ordering::Relaxed),
             &|bar| {
-                let cost = per_frame[bar] * n_frames;
+                let cost = per_frame[bar] * n_frames * channels as f64;
                 let done = done_taps.fetch_add(cost as u64, Ordering::Relaxed) as f64 + cost;
                 store_progress_max(
                     progress,
-                    50 + ((done / total_taps).clamp(0.0, 1.0) * 49.0) as usize,
+                    base + ((done / total_taps).clamp(0.0, 1.0) * span as f64) as usize,
                 );
                 // Rate over the last second or so, not since the run started.
                 //
@@ -2792,38 +3729,45 @@ fn preprocess_file(
                 } else {
                     aslt::TAPS_PER_SEC_HINT
                 };
-                eta_secs.store(((total_taps - done) / rate).max(0.0) as usize, Ordering::Relaxed);
+                eta_secs.store(((total_taps - done).max(0.0) / rate) as usize,
+                    Ordering::Relaxed);
             },
         ));
 
-        if abort.load(Ordering::Relaxed) { return PreMessage::Aborted; }
-        if raw.is_empty() {
-            return PreMessage::Error("superlet analysis produced no frames".into());
+        if abort.load(Ordering::Relaxed) { return Err(PassFailed::Aborted); }
+        if raw.mix.is_empty() {
+            return Err(PassFailed::Failed("superlet analysis produced no frames".into()));
         }
 
-        let frames: Vec<Vec<f32>> = raw
-            .into_iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .map(|(bar, &mag)| {
-                        let _ = bar;
-                        let db = (20.0 * (mag * ASLT_DB_REF).log10()).max(-80.0);
-                        ((db + 80.0) / 80.0).clamp(0.0, 1.0)
-                    })
-                    .collect()
-            })
-            .collect();
+        // The same dB mapping for all three, because they are drawn on one
+        // axis and Diff subtracts two of them.
+        let to_db = |rows: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
+            rows.into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|&mag| {
+                            let db = (20.0 * (mag * ASLT_DB_REF).log10()).max(-80.0);
+                            ((db + 80.0) / 80.0).clamp(0.0, 1.0)
+                        })
+                        .collect()
+                })
+                .collect()
+        };
 
-        progress.store(100, Ordering::Relaxed);
-        eta_secs.store(0, Ordering::Relaxed);
-        let frame_rate = sample_rate as f64 / hop as f64;
-        save_cache(cache_path, &frames);
-        return PreMessage::Done { frames, frame_rate, waveform, analysis };
+        store_progress_max(progress, base + span);
+        return Ok(Passes {
+            work: raw.work,
+            mix: to_db(raw.mix),
+            left: to_db(raw.left),
+            right: to_db(raw.right),
+        });
     }
 
-    // ── Phase 2: process frames in parallel with rayon (50–99 %) ─────────────
-    let num_frames = (all_mono.len() - fft_size) / hop + 1;
+    // ── Phase 2b: the FFT pipeline, in parallel with rayon ───────────────────
+    let num_frames = (signal.len() - fft_size) / hop + 1;
+    // Incremented inside `spec`, so it counts calls rather than restating the
+    // loop bounds.
+    let transforms = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let nf   = num_frames.max(1);
 
@@ -2833,28 +3777,80 @@ fn preprocess_file(
     let cqt_q_pp = 1.0 / (2.0_f32.powf(1.0 / bins_per_oct_pp) - 1.0);
 
     use rayon::prelude::*;
-    let frames: Vec<Vec<f32>> = (0..num_frames)
+    let frames_all: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = (0..num_frames)
         .into_par_iter()
         .map(|fi| {
             let start = fi * hop;
-            let slice = &all_mono[start..start + fft_size];
+            // One windowed, zero-padded transform per channel — two for a joint
+            // run, never three.
+            let spec = |sig: &[f32]| -> Vec<Complex<f32>> {
+                transforms.fetch_add(1, Ordering::Relaxed);
+                let slice = &sig[start..start + fft_size];
+                let mut buf: Vec<Complex<f32>> = slice.iter()
+                    .zip(window.iter())
+                    .map(|(s, w)| Complex { re: s * w, im: 0.0 })
+                    .chain(std::iter::repeat_n(
+                        Complex { re: 0.0, im: 0.0 }, padded_size - fft_size))
+                    .collect();
+                fft.process(&mut buf);
+                buf
+            };
 
-            let mut buf: Vec<Complex<f32>> = slice.iter()
-                .zip(window.iter())
-                .map(|(s, w)| Complex { re: s * w, im: 0.0 })
-                .chain(std::iter::repeat_n(Complex { re: 0.0, im: 0.0 }, padded_size - fft_size))
-                .collect();
-            fft.process(&mut buf);
-            let norms: Vec<f32> = buf[..half].iter().map(|c| c.norm()).collect();
+            let a = spec(signal);
+            // The mix is the mean of the *complex bins*, taken before the
+            // magnitude and therefore before the bar mapping — the same
+            // boundary the superlet route combines at, for the same reason.
+            // Averaging the finished bar magnitudes instead would read two
+            // anti-phase channels as loud when their sum is silence.
+            let (mix_norms, left_norms, right_norms) = match right {
+                None => (
+                    a[..half].iter().map(|c| c.norm()).collect::<Vec<f32>>(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                Some(r) => {
+                    let b = spec(r);
+                    if mutant {
+                        // The violation the contract forbids: a third transform,
+                        // of the mean signal, thrown away. Only a test asks for
+                        // it, and it exists so the check can be shown to fail.
+                        transforms.fetch_add(1, Ordering::Relaxed);
+                        let mut m: Vec<Complex<f32>> = signal[start..start + fft_size]
+                            .iter()
+                            .zip(&r[start..start + fft_size])
+                            .zip(window.iter())
+                            .map(|((x, y), w)| Complex { re: 0.5 * (x + y) * w, im: 0.0 })
+                            .chain(std::iter::repeat_n(
+                                Complex { re: 0.0, im: 0.0 }, padded_size - fft_size))
+                            .collect();
+                        fft.process(&mut m);
+                    }
+                    let mix: Vec<f32> = a[..half].iter().zip(b[..half].iter())
+                        .map(|(x, y)| {
+                            let re = 0.5 * (x.re + y.re);
+                            let im = 0.5 * (x.im + y.im);
+                            (re * re + im * im).sqrt()
+                        })
+                        .collect();
+                    (
+                        mix,
+                        a[..half].iter().map(|c| c.norm()).collect(),
+                        b[..half].iter().map(|c| c.norm()).collect(),
+                    )
+                }
+            };
 
-            let bars: Vec<f32> = (0..n_bars)
+            // The same mapping for all three: they share a frequency axis and a
+            // dB scale, and Diff subtracts two of them.
+            let to_bars = |norms: &[f32]| -> Vec<f32> {
+                (0..n_bars)
                 .map(|bar| {
                     let fscale = aslt_cfg.scale;
                     let mag = if *bar_mapping == BarMappingMode::Cqt {
                         let tc  = (bar as f32 + 0.5) / n_bars as f32;
                         let f_c = fscale.freq_at(tc, min_freq, max_freq);
                         let bc  = (f_c * padded_size as f32 / sample_rate as f32).clamp(1.0, half as f32 - 1.0);
-                        cqt_kernel(&norms, bc, cqt_q_pp, half)
+                        cqt_kernel(norms, bc, cqt_q_pp, half)
                     } else {
                         let t0 = bar as f32 / n_bars as f32;
                         let t1 = (bar + 1) as f32 / n_bars as f32;
@@ -2865,7 +3861,7 @@ fn preprocess_file(
                             .max(fbin_lo + 0.001).min(half as f32 - 0.001);
                         if fbin_hi - fbin_lo <= 1.0 {
                             let center = (fbin_lo + fbin_hi) * 0.5;
-                            interp_sub_bin(&norms, center, interp_mode)
+                            interp_sub_bin(norms, center, interp_mode)
                         } else {
                             let b_start = fbin_lo.floor() as usize;
                             let b_end   = (fbin_hi.ceil() as usize).min(half - 1);
@@ -2894,23 +3890,195 @@ fn preprocess_file(
                     let db = 20.0 * (mag / scale).log10().max(-80.0);
                     ((db + 80.0) / 80.0).clamp(0.0, 1.0)
                 })
-                .collect();
+                .collect()
+            };
+
+            let bars = to_bars(&mix_norms);
+            let l = if left_norms.is_empty() { Vec::new() } else { to_bars(&left_norms) };
+            let r = if right_norms.is_empty() { Vec::new() } else { to_bars(&right_norms) };
 
             let c = done.fetch_add(1, Ordering::Relaxed) + 1;
-            progress.store(50 + (c * 49 / nf).min(49), Ordering::Relaxed);
-            bars
+            store_progress_max(progress, base + (c * span / nf).min(span));
+            (bars, l, r)
         })
         .collect();
 
     // The FFT path is fast enough that Abort rarely gets a chance to fire, but
     // it must still honour it rather than write a cache the user cancelled.
-    if abort.load(Ordering::Relaxed) { return PreMessage::Aborted; }
+    if abort.load(Ordering::Relaxed) { return Err(PassFailed::Aborted); }
+    store_progress_max(progress, base + span);
 
-    progress.store(100, Ordering::Relaxed);
+    let mut out = Passes {
+        mix: Vec::with_capacity(num_frames),
+        left: Vec::new(),
+        right: Vec::new(),
+        // Observed, not computed from the frame count: a third transform added
+        // by mistake would still satisfy `num_frames * channels`, which is
+        // exactly the sort of arithmetic that agrees with the bug.
+        work: aslt::WorkCount {
+            frame_transforms: transforms.load(Ordering::Relaxed) as u64,
+            ..Default::default()
+        },
+    };
+    if joint {
+        out.left.reserve(num_frames);
+        out.right.reserve(num_frames);
+    }
+    for (m, l, r) in frames_all {
+        out.mix.push(m);
+        if joint {
+            out.left.push(l);
+            out.right.push(r);
+        }
+    }
+    Ok(out)
+    };
+
+    // ── Phase 3: one analysis, then the files it produces ────────────────
+    //
+    // A joint run has no mono-first ordering to preserve, and it must not
+    // acquire one: adding a separate mono pass so that the mix could be written
+    // before the channels finished would be the third analysis this design
+    // exists to remove. So a cancelled *cold* stereo run leaves no new mono
+    // cache. That is the honest consequence rather than a regression — nothing
+    // partial is published, and a mono cache that was already on disk is
+    // untouched, because a cancelled run writes nothing at all.
+    // The same derivation the cache filename comes from, so a sidecar can
+    // never claim an identity the file it sits beside does not have.
+    // The directory does not enter the identity — it is the path and the
+    // settings — so the cache's own parent is as good a value as any here.
+    let identity = cache_key_for(
+        cache_path.parent().unwrap_or(Path::new(".")),
+        path, n_bars, fft_size, pad_factor, overlap, window_fn, min_freq, max_freq,
+        bar_mapping, interp_mode, dsd_rate, aslt_cfg, pre_fps,
+    )
+    .0;
+    let span = 100 - PROG_LOUDNESS_END - 1;
+    let base = PROG_LOUDNESS_END + 1;
+    let input = match lr.as_ref() {
+        Some((l, r)) => aslt::Input::Joint { left: l, right: r },
+        None => aslt::Input::Mono(&all_mono),
+    };
+    let joint = input.is_joint();
+
+    let got = match run_pass(input, base, span) {
+        Ok(p) => p,
+        Err(PassFailed::Aborted) => return PreMessage::Aborted,
+        Err(PassFailed::Failed(e)) => return PreMessage::Error(e),
+    };
+    // The signals are finished with. Dropped explicitly for the reason
+    // `drop(mix)` is below — a rebinding would hold 40 MiB per minute of audio
+    // per channel through the encode and the write.
+    drop(all_mono);
+    drop(lr);
 
     let frame_rate = sample_rate as f64 / hop as f64;
-    save_cache(cache_path, &frames);
-    PreMessage::Done { frames, frame_rate, waveform, analysis }
+    // Quantise once, here, and let the whole-track `f32` go before anything
+    // else is allocated. The display and the file then hold the identical
+    // values, so a fresh analysis and a reload of it cannot differ.
+    //
+    // `drop`, not shadowing: a rebinding of the same name leaves the old matrix
+    // alive to the end of the scope, so the `f32` would still be resident
+    // through the encode and the write — which is the peak this was meant to
+    // remove.
+    let Passes { mix, left, right, work } = got;
+    let derived = cache::PreFrames::from_analysis(&mix);
+    drop(mix);
+
+    // Adding channels to a track that already has a valid mono cache does not
+    // rewrite that cache.
+    //
+    // Two reasons, and the second is the one that matters. The obvious one is
+    // that rewriting a file with numbers it already holds is wasted work. The
+    // real one is precision: an existing cache may be v2 or v3, which stored 16
+    // bits a cell, and replacing it with a v4 rewrite would quietly coarsen it
+    // to 12 — the user asked for channels, not for a coarser Mix.
+    //
+    // The sidecar is then bound to the cache that is actually on disk, because
+    // that is the matrix it will be checked against every time it is read.
+    let kept = want_stereo
+        .then(|| cache::read(cache_path, n_bars, MAX_BAR_COUNT).ok())
+        .flatten()
+        .filter(|f| f.len() == derived.len() && f.bars() == derived.bars());
+    let compact = match kept {
+        Some(existing) => {
+            crate::mlog!(
+                "[cache] kept the existing mono cache ({} levels a cell) and wrote \
+                 only the channels",
+                existing.max_code() as u32 + 1,
+            );
+            existing
+        }
+        None => {
+            save_cache(cache_path, &derived, abort);
+            derived
+        }
+    };
+
+    // ── Phase 4: the sidecar, beside the cache already on disk ──────────────
+    let stereo = if joint && !left.is_empty() && !right.is_empty() {
+        let l = cache::PreFrames::from_analysis(&left);
+        drop(left);
+        let r = cache::PreFrames::from_analysis(&right);
+        drop(right);
+        let pair = stereo::Stereo::new(l, r);
+        if pair.is_none() {
+            crate::mlog!("[stereo] the two channels disagreed in shape; mono kept");
+        }
+        pair.filter(|p| save_sidecar(cache_path, identity, &compact, p, abort))
+            .map(Box::new)
+    } else {
+        None
+    };
+
+    progress.store(100, Ordering::Relaxed);
+    eta_secs.store(0, Ordering::Relaxed);
+    PreMessage::Done {
+        frames: compact,
+        stereo,
+        frame_rate,
+        waveform,
+        analysis,
+        meta: Box::new(DoneMeta {
+            work,
+            cache: cache_path.to_path_buf(),
+            identity,
+        }),
+    }
+}
+
+/// Write the sidecar for a mono cache that is already on disk.
+///
+/// Returns whether the pair should be shown. A sidecar that could not be
+/// written is not a reason to withhold the channels from *this* session — they
+/// are correct, they are in memory, and the only cost is that the next play of
+/// the track analyses them again. A pair that does not match the mono cache is
+/// a different matter and never reaches here: `Stereo::new` refuses it.
+fn save_sidecar(
+    mono_cache: &Path,
+    id: stereo::Identity,
+    mono: &cache::PreFrames,
+    pair: &stereo::Stereo,
+    abort: &AtomicBool,
+) -> bool {
+    if pair.is_empty() {
+        return false;
+    }
+    let path = stereo::path_for(mono_cache);
+    if abort.load(Ordering::Relaxed) {
+        crate::mlog!("[stereo] aborted before encoding {}", path.display());
+        return true;
+    }
+    let bytes = stereo::encode(id, mono, pair);
+    let cancelled = || abort.load(Ordering::Relaxed);
+    match cache::write_atomic_cancellable(&path, &bytes, &cancelled) {
+        Ok(cache::Written::Published) => {}
+        Ok(cache::Written::Cancelled) => {
+            crate::mlog!("[stereo] aborted before publishing {}", path.display());
+        }
+        Err(e) => crate::mlog!("[stereo] write failed for {}: {e}", path.display()),
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -2981,17 +4149,15 @@ fn matches_standard_nyquist(ceiling_hz: f32) -> Option<u32> {
 
 /// Analyse pre-processed FFT frames and return spectral ceiling + rolloff shape.
 fn compute_spectral_ceiling(
-    frames: &[Vec<f32>], n_bars: usize, min_freq: f32, max_freq: f32,
+    frames: &cache::PreFrames, n_bars: usize, min_freq: f32, max_freq: f32,
     scale: freq_scale::FreqScale,
 ) -> Option<SpectralCeiling> {
     if frames.is_empty() || n_bars == 0 { return None; }
     let noise = 0.15_f32;
-    let mut peak = vec![0.0f32; n_bars];
-    for frame in frames {
-        for (i, &v) in frame.iter().enumerate().take(n_bars) {
-            if v > peak[i] { peak[i] = v; }
-        }
-    }
+    // One pass over the codes, no intermediate rows. The scan itself is
+    // unchanged: still the largest value each bar reaches across the track.
+    let mut peak = frames.peak_per_bar();
+    peak.resize(n_bars, 0.0);
     let highest = peak.iter().enumerate().rev()
         .find(|&(_, &v)| v > noise).map(|(i, _)| i)?;
     let hz = scale.bar_center(highest, n_bars, min_freq, max_freq);
@@ -4314,6 +5480,12 @@ struct SpectrumSettings {
     #[serde(default)] aslt_preset:   Option<aslt::AsltPreset>,
     #[serde(default)] aslt_cfg:      aslt::AsltConfig,
     #[serde(default = "def_pre_fps")] pre_fps: f32,
+    /// Whether a pre-process analysis also produces left and right.
+    ///
+    /// Off by default and `serde(default)` for the same reason: it roughly
+    /// triples the analysis and adds a file about the size of the cache, so it
+    /// is something a user turns on, never something they find already on.
+    #[serde(default)] pre_stereo: bool,
     #[serde(default = "def_cache_budget")] cache_budget_gb: f32,
     #[serde(default)] show_fft:      bool,
     #[serde(default)] show_peak:     bool,
@@ -4510,6 +5682,12 @@ pub struct SpectrumWindow {
     recalibrating: Option<std::sync::mpsc::Receiver<()>>,
     /// True when settings changed and no cache exists for the new combo.
     needs_reanalysis: bool,
+    /// Whether the stereo offer has been declined for the track on screen.
+    ///
+    /// Per track, and reset when the track changes: "not now" is an answer
+    /// about this track, not a permanent preference. The permanent one is the
+    /// checkbox, and it is deliberately a different control.
+    dismissed_stereo_prompt: bool,
     /// Cached (count, bytes) of all .spectrumcache files; refreshed lazily.
     cache_stats: (usize, u64),
     cache_stats_at: Option<Instant>,
@@ -4725,6 +5903,7 @@ impl SpectrumWindow {
             worker_threads: 0,
             recalibrating: None,
             needs_reanalysis: false,
+            dismissed_stereo_prompt: false,
             cache_stats: (0, 0),
             cache_stats_at: None,
             cache_file_set: std::collections::HashSet::new(),
@@ -4908,6 +6087,7 @@ impl SpectrumWindow {
             aslt_preset:   self.analyzer.aslt_preset,
             aslt_cfg:      self.analyzer.aslt_cfg.clone(),
             pre_fps:       self.analyzer.pre_fps,
+            pre_stereo:    self.analyzer.pre_stereo_enabled,
             cache_budget_gb: self.analyzer.cache_budget_gb,
             gpu_mode:       self.gpu_mode,
             worker_threads: self.worker_threads,
@@ -4963,6 +6143,7 @@ impl SpectrumWindow {
             None    => s.aslt_cfg.clone(),
         };
         self.analyzer.pre_fps = s.pre_fps.clamp(24.0, 480.0);
+        self.analyzer.pre_stereo_enabled = s.pre_stereo;
         self.analyzer.cache_budget_gb = s.cache_budget_gb.clamp(0.0, 200.0);
         // These two live in globals the transform reads, so the stored value has
         // to be pushed there as well as mirrored on the window.
@@ -5048,9 +6229,191 @@ impl SpectrumWindow {
         self.bar_mapping != BarMappingMode::Superlet
     }
 
+    /// Three actions, kept apart, and one preference that is not an action.
+    ///
+    /// The distinction the earlier single checkbox lost: **generating channel
+    /// data and loading channel data that already exists are different
+    /// questions.** A track analysed in stereo keeps its channels whatever the
+    /// preference says; the preference only decides what *future* analyses
+    /// produce. Selecting a channel view is what loads them.
+    ///
+    /// So the row offers, when this track has no channels:
+    ///
+    /// * **This track** — analyse channels now, once, changing nothing else;
+    /// * **From now on** — the same, and make it the default for future
+    ///   analyses;
+    /// * **Not now** — say nothing more about it for this track.
+    ///
+    /// Only the second changes a persisted setting, and it says where to change
+    /// it back.
+    fn stereo_intent_ui(&mut self, ui: &mut egui::Ui) {
+        let has_track = self.current_path.is_some();
+        let already = self.analyzer.has_pre_channels();
+        let analysing = self.analyzer.is_analyzing.load(Ordering::Relaxed);
+
+        // The preference. Not an action: ticking it does not analyse anything,
+        // and unticking it does not delete anything.
+        let before = self.analyzer.pre_stereo_enabled;
+        ui.checkbox(&mut self.analyzer.pre_stereo_enabled, "Stereo by default")
+            .on_hover_text(
+                "Whether *future* analyses also produce Left and Right.\n\n\
+                 This is a preference about generating data, not about showing \
+                 it: a track already analysed in stereo keeps its channels \
+                 whichever way this is set, and selecting a channel view is \
+                 what loads them. Turning it off deletes nothing.\n\n\
+                 Change it back here, under Channels in the Pre-process view.",
+            );
+        if self.analyzer.pre_stereo_enabled != before {
+            // A preference change never rewrites or deletes a cache. It only
+            // changes what the next analysis produces.
+            self.status_msg = if self.analyzer.pre_stereo_enabled {
+                "Future analyses will include Left and Right.".into()
+            } else {
+                "Future analyses will be Mix only. Existing channels are kept.".into()
+            };
+        }
+
+        if already || !has_track || self.dismissed_stereo_prompt {
+            return;
+        }
+
+        // What it would cost, from this track's own length and the settings in
+        // force — not a constant, and not a promise.
+        ui.label(
+            egui::RichText::new(format!("· {}", self.stereo_cost_note()))
+                .size(11.0)
+                .color(txt_faint(ui.visuals().dark_mode)),
+        );
+
+        let mut request = false;
+        if ui
+            .add_enabled(!analysing, egui::Button::new("This track").small())
+            .on_hover_text(
+                "Analyse Left and Right for this track only. The preference \
+                 above is not changed.\n\n\
+                 The sidecar holds two more planes beside the Mix's one, so \
+                 this track's cache becomes three planes. What that is in bytes \
+                 depends on the content and on which format the existing Mix \
+                 cache is in.",
+            )
+            .clicked()
+        {
+            request = true;
+        }
+        if ui
+            .add_enabled(!analysing, egui::Button::new("From now on").small())
+            .on_hover_text(
+                "Analyse Left and Right for this track, and for future \
+                 analyses.\n\nThis changes the preference above, where you can \
+                 change it back.",
+            )
+            .clicked()
+        {
+            self.analyzer.pre_stereo_enabled = true;
+            request = true;
+        }
+        if ui
+            .add_enabled(!analysing, egui::Button::new("Not now").small())
+            .on_hover_text("Leave this track as it is. Nothing is changed or deleted.")
+            .clicked()
+        {
+            self.dismissed_stereo_prompt = true;
+        }
+
+        if request && let Some(path) = self.current_path.clone() {
+            // Not dismissed: an analysis that is cancelled or fails leaves the
+            // offer where it was, so it can be asked for again. "Not now" is
+            // the only thing that puts it away, because "not now" is the only
+            // one of these that was a decision about wanting it.
+            self.analyzer.pre_stereo_request = Some(path.clone());
+            self.analyzer.start_preprocess(path);
+        }
+    }
+
+    /// What analysing this track's channels would cost, from its own length.
+    ///
+    /// Two cases, and they are genuinely different work:
+    ///
+    /// * **incremental** — a valid Mix cache is already on disk, and it is kept
+    ///   rather than rewritten, so what is added is the channel analysis and one
+    ///   more file;
+    /// * **cold** — nothing is cached, so the whole analysis runs.
+    ///
+    /// The ratio quoted is from the pass count, not a benchmark. One measured
+    /// track came out at 2.26x a Mix-only analysis of the same track, and that
+    /// is one track on one machine with one preset: it is not a guarantee and is
+    /// not quoted as one.
+    fn stereo_cost_note(&self) -> String {
+        let incremental = self.current_cache_path().is_some_and(|p| p.exists());
+        // The track's own length, from the cache that is already describing it.
+        let secs = (self.analyzer.pre_frame_rate > 0.0)
+            .then(|| self.analyzer.pre_frames.len() as f64 / self.analyzer.pre_frame_rate)
+            .filter(|s| *s > 1.0);
+
+        // From this track's length and the settings in force, not a constant.
+        // The superlet's own cost model, run for two channels; the FFT mappings
+        // are fast enough that a time would be noise.
+        let est = secs.filter(|_| self.bar_mapping == BarMappingMode::Superlet).map(|s| {
+            let sr = self.analyzer.sample_rate.max(1);
+            let taps = aslt::estimated_taps(
+                (s * sr as f64) as usize,
+                sr,
+                self.bar_count,
+                self.min_freq,
+                (sr as f32 / 2.0).min(self.max_freq),
+                self.analyzer.pre_hop(),
+                &self.analyzer.aslt_cfg,
+            );
+            // Two channels of convolution. The mix is derived from them, so
+            // there is no third — but its magnitudes, aggregation and storage
+            // are real work this does not model.
+            fmt_eta((2.0 * taps / aslt::TAPS_PER_SEC_HINT) as usize)
+        });
+
+        let what = if incremental {
+            "This track's Mix is already cached and is kept as it is. Adding \
+             channels analyses them"
+        } else {
+            "Nothing is cached for this track yet, so the whole analysis runs"
+        };
+        // Planes, not a byte ratio. The sidecar adds two planes to the Mix's
+        // one; what that comes to on disk depends on the content and on whether
+        // the existing Mix cache is a 16-bit v2/v3 or a 12-bit v4.
+        match est {
+            Some(t) => format!(
+                "{what} — very roughly {t} here. The sidecar adds two planes to \
+                 the Mix's one, so this track's cache becomes three. An estimate \
+                 from this track's length and these settings; real times vary \
+                 with the machine, and the byte ratio with the content."
+            ),
+            None => format!(
+                "{what}. The sidecar adds two planes to the Mix's one, so this \
+                 track's cache becomes three; the byte ratio depends on the \
+                 content and on the existing cache's format."
+            ),
+        }
+    }
+
+    /// The mono cache the current track and settings map to, if there is one.
+    ///
+    /// Extracted because three places now need it — loading, protecting it from
+    /// a sweep, and asking whether channels exist on disk — and a fourth copy
+    /// of this argument list is a fourth chance to get one of them wrong.
+    fn current_cache_path(&self) -> Option<PathBuf> {
+        let path = self.current_path.as_ref()?;
+        Some(cache_path_for(
+            &self.analyzer.cache_dir(),
+            path, self.bar_count, self.fft_size, self.pad_factor, self.overlap,
+            &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping,
+            &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg,
+            self.analyzer.pre_fps,
+        ))
+    }
+
     fn try_load_or_flag_reanalysis(&mut self) {
         let Some(path) = self.current_path.clone() else { return; };
-        let cache = cache_path_for(
+        let (identity, cache) = cache_key_for(
+            &self.analyzer.cache_dir(),
             &path, self.bar_count, self.fft_size, self.pad_factor, self.overlap,
             &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode,
             self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
@@ -5060,7 +6423,12 @@ impl SpectrumWindow {
             // rate, and using the FFT hop here would drift the spectrum against
             // playback for the whole track.
             let rate = self.analyzer.sample_rate as f64 / self.analyzer.pre_hop() as f64;
-            self.analyzer.set_pre_frames(frames, rate);
+            // Discovery is independent of the generation preference, as in
+            // `start_preprocess`: a sidecar this track already has is found
+            // whether or not future analyses are set to produce them.
+            let channels = channels_on_disk(&cache);
+            self.analyzer
+                .set_pre_frames_with(frames, channels, Some((cache, identity)), rate);
             self.spectral_ceiling = None; // recompute on next tick
             self.spectral_ceiling_attempted = false;
             self.needs_reanalysis = false;
@@ -5198,7 +6566,14 @@ impl SpectrumWindow {
         self.analyzer.rebuild_fft();
         self.auto_fft_size = auto_fft;
 
+        let changed = self.current_path.as_deref() != Some(path);
         self.current_path = Some(path.to_path_buf());
+        if changed {
+            // "Not now" was an answer about the previous track. Carrying it
+            // forward would silence the offer for every track after the first
+            // one it was declined on.
+            self.dismissed_stereo_prompt = false;
+        }
         // Auto-load the last-used (or default) preset for the new track.
         self.auto_load_preset_for(path);
         // A repeat, or a restart from the top, calls this for the file already
@@ -5299,15 +6674,16 @@ impl SpectrumWindow {
         // a "Playing:" line on a stopped player. Changing mode or visualisation
         // while paused has to take effect then, too, not on the next play.
         self.refresh_channel_state();
-        self.refresh_waterfall_depth();
-        // A cache can be installed by a worker at any moment, including while
-        // paused. Checked here rather than where the frames arrive because
-        // there are three places they arrive from and one place that owns the
-        // state they invalidate.
+        // Before the reconciliation below, deliberately. A new cache retires
+        // every drawable the old one produced, and the one-shot snap inside
+        // `reconcile_pre_channels` produces exactly such a drawable — resetting
+        // afterwards would throw away the row it had just drawn and leave a
+        // paused display blank.
         if self.seen_pre_revision != self.analyzer.pre_revision() {
             self.reset_presentation();
         }
-
+        self.reconcile_pre_channels(elapsed_secs);
+        self.refresh_waterfall_depth();
         if !is_playing { return; }
 
         // Throttle FFT runs to max_fps
@@ -5400,9 +6776,18 @@ impl SpectrumWindow {
                 }
             }
             SpectrumMode::PreProcess => {
-                // The v3 cache holds one mono row per frame, so there is nothing
-                // to separate; `refresh_channel_state` has already said so.
-                self.analyzer.reset_channels();
+                // Demand was reconciled before the playback guard, so by here
+                // the request is either in flight, resident, or deliberately
+                // released. Nothing in this branch computes a transform: the
+                // rows were analysed when the cache was written.
+                if !self.analyzer.pre_channels_wanted
+                    || !self.analyzer.pre_channels_resident()
+                {
+                    // No view wants them, or none are in memory yet. Leaving
+                    // the previous values in place would freeze a Left from
+                    // another track or another view.
+                    self.analyzer.reset_channels();
+                }
                 self.analyzer.tick_pre(elapsed_secs, tick_dt);
             }
         }
@@ -5781,13 +7166,54 @@ impl SpectrumWindow {
     /// Cheap enough to run on every tick: one lock on the tap to read a channel
     /// count, and a comparison. It performs no transforms — producing the
     /// spectra is `tick_channels`, which only runs while something is playing.
+    /// Whether anything on screen wants the cached channels right now.
+    ///
+    /// Mode, view and visualisation together — the same three the availability
+    /// rule uses, because demand and availability have to agree about what
+    /// "showing channels" means.
+    fn wants_pre_channels(&self) -> bool {
+        self.mode == SpectrumMode::PreProcess
+            && self.channel_view.needs_channels()
+            && self.style_supports_channels()
+    }
+
+    /// Bring channel residency in line with what is being drawn.
+    ///
+    /// **Before the playback guard, deliberately.** Demand changes while
+    /// paused: selecting Left on a paused track has to start the read, and
+    /// going back to Mix — or leaving Pre-process — has to give the matrices
+    /// back. Neither involves playing anything, and both used to wait for the
+    /// transport to start before they took effect, because this lived in the
+    /// Pre-process branch of the tick below the guard.
+    fn reconcile_pre_channels(&mut self, elapsed_secs: f64) {
+        let want = self.wants_pre_channels();
+        self.analyzer.pre_channels_wanted = want;
+        if want {
+            self.analyzer.request_pre_channels();
+        } else {
+            self.analyzer.release_pre_channels();
+        }
+        // A read that lands while paused still has to reach the screen. This
+        // draws the row under the playhead and nothing else: no transport
+        // moves, and no live transform runs.
+        if self.analyzer.take_channels_arrived() && want {
+            self.analyzer.snap_pre_to(elapsed_secs);
+        }
+    }
+
     fn refresh_channel_state(&mut self) {
         if self.mode != self.last_mode {
             self.on_mode_changed();
         }
+        // Every tick, playing or paused: a read that finished while the
+        // transport was stopped still has to be installed, and one that
+        // finished against a track that has since changed still has to be
+        // thrown away.
+        self.analyzer.poll_pre_channels();
         let tap_channels = self.live_tap_channels();
         let avail = channels::availability(
             self.mode == SpectrumMode::PreProcess,
+            self.analyzer.has_pre_channels(),
             self.style_supports_channels(),
             tap_channels,
         );
@@ -5862,6 +7288,7 @@ impl SpectrumWindow {
 
         let avail = channels::availability(
             self.mode == SpectrumMode::PreProcess,
+            self.analyzer.has_pre_channels(),
             self.style_supports_channels(),
             tap_channels,
         );
@@ -6031,9 +7458,13 @@ impl SpectrumWindow {
                         if view == channels::ChannelView::Mix {
                             ui.selectable_value(&mut self.channel_view, view, view.label())
                                 .on_hover_text(
-                                    "Every channel averaged to one spectrum. \
-                                     The default, and the only view the \
-                                     pre-processed cache can supply.",
+                                    "Every channel averaged to one spectrum, \
+                                     before the transform — which is not the \
+                                     same as averaging the two finished spectra. \
+                                     In a stereo analysis the mix is derived \
+                                     from the two channels' complex responses, \
+                                     at the point where that difference still \
+                                     exists.",
                                 );
                             continue;
                         }
@@ -6077,7 +7508,7 @@ impl SpectrumWindow {
                     // a greyed-out button, which is not a thing anyone does.
                     if let Some(ref why) = ch_reason {
                         let short = match self.channel_availability {
-                            channels::ChannelAvailability::PreProcessMono => "Real-time only",
+                            channels::ChannelAvailability::PreProcessMono => "no channels cached",
                             channels::ChannelAvailability::UnsupportedStyle => "Bars/Line/Filled only",
                             channels::ChannelAvailability::Mono => "mono track",
                             channels::ChannelAvailability::Multichannel(n) => {
@@ -6091,6 +7522,34 @@ impl SpectrumWindow {
                                 .color(txt_faint(ui.visuals().dark_mode)),
                         )
                         .on_hover_text(why.as_str());
+                    }
+                    // Obtainable is not resident. The buttons are live while a
+                    // sidecar is being read, and the plot shows the Mix in the
+                    // meantime — so say which of those is happening, or a
+                    // second or two of apparently ignored clicks looks like a
+                    // bug.
+                    if self.mode == SpectrumMode::PreProcess
+                        && let Some(note) = self.analyzer.pre_channels().note()
+                    {
+                        let label = ui.label(
+                            egui::RichText::new(format!("({note})"))
+                                .size(11.0)
+                                .color(txt_faint(ui.visuals().dark_mode)),
+                        );
+                        if let PreChannels::Refused(why) = self.analyzer.pre_channels() {
+                            label.on_hover_text(format!(
+                                "The channel file beside this track's cache could                                  not be read:
+{why}
+
+The Mix is unaffected.                                  Analysing the track again will rewrite it."
+                            ));
+                        }
+                    }
+                    // Only in Pre-process, and next to the buttons it governs:
+                    // this is where someone who wanted Left/Right and could not
+                    // have it is already looking.
+                    if self.mode == SpectrumMode::PreProcess {
+                        self.stereo_intent_ui(ui);
                     }
                     ui.separator();
                     ui.label("Loudness:");
@@ -6210,6 +7669,7 @@ impl SpectrumWindow {
                                 };
                                 let has_cache = self.current_path.as_ref().map(|p| {
                                     self.cache_file_set.contains(&cache_path_for(
+                                        &self.analyzer.cache_dir(),
                                         p, self.bar_count, sz, self.pad_factor, self.overlap,
                                         &self.window_fn, self.min_freq, self.max_freq,
                                         &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
@@ -6249,6 +7709,7 @@ impl SpectrumWindow {
                                     let name = format!("{:.1} kHz", rate as f32 / 1000.0);
                                     let has = self.current_path.as_ref().map(|p| {
                                         self.cache_file_set.contains(&cache_path_for(
+                                        &self.analyzer.cache_dir(),
                                             p, self.bar_count, self.fft_size, self.pad_factor,
                                             self.overlap, &self.window_fn, self.min_freq, self.max_freq,
                                             &self.bar_mapping, &self.interp_mode, rate,
@@ -6296,6 +7757,7 @@ impl SpectrumWindow {
                             let wf_green = |wf: WindowFn| -> egui::RichText {
                                 let has = self.current_path.as_ref().map(|p| {
                                     self.cache_file_set.contains(&cache_path_for(
+                                        &self.analyzer.cache_dir(),
                                         p, self.bar_count, self.fft_size, self.pad_factor,
                                         self.overlap, &wf, self.min_freq, self.max_freq,
                                         &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
@@ -6336,6 +7798,7 @@ impl SpectrumWindow {
                             let im_green = |im: InterpolationMode| -> egui::RichText {
                                 let has = self.current_path.as_ref().map(|p| {
                                     self.cache_file_set.contains(&cache_path_for(
+                                        &self.analyzer.cache_dir(),
                                         p, self.bar_count, self.fft_size, self.pad_factor,
                                         self.overlap, &self.window_fn, self.min_freq, self.max_freq,
                                         &self.bar_mapping, &im, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
@@ -6386,6 +7849,7 @@ impl SpectrumWindow {
                                 let label_text = if pf == 1 { "1× (off)".to_string() } else { format!("{}×", pf) };
                                 let has_cache = self.current_path.as_ref().map(|p| {
                                     let candidate = cache_path_for(
+                                    &self.analyzer.cache_dir(),
                                         p, self.bar_count, self.fft_size, pf, self.overlap,
                                         &self.window_fn, self.min_freq, self.max_freq,
                                         &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
@@ -6425,6 +7889,7 @@ impl SpectrumWindow {
                             for &(text, val) in &[("50%", 0.5f32), ("75%", 0.75), ("87.5%", 0.875)] {
                                 let has_cache = self.current_path.as_ref().map(|p| {
                                     self.cache_file_set.contains(&cache_path_for(
+                                        &self.analyzer.cache_dir(),
                                         p, self.bar_count, self.fft_size, self.pad_factor, val,
                                         &self.window_fn, self.min_freq, self.max_freq,
                                         &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
@@ -6455,6 +7920,7 @@ impl SpectrumWindow {
                             let bm_green = |bm: BarMappingMode| -> egui::RichText {
                                 let has = self.current_path.as_ref().map(|p| {
                                     self.cache_file_set.contains(&cache_path_for(
+                                        &self.analyzer.cache_dir(),
                                         p, self.bar_count, self.fft_size, self.pad_factor,
                                         self.overlap, &self.window_fn, self.min_freq, self.max_freq,
                                         &bm, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
@@ -6970,7 +8436,7 @@ impl SpectrumWindow {
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🔄 Re-analyze now")).clicked()
                                 && let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
+                                let cache = cache_path_for(&self.analyzer.cache_dir(), p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
                                 let _ = std::fs::remove_file(&cache);
                                 self.analyzer.clear_pre_frames();
                                 self.analyzer.start_preprocess(p.clone());
@@ -6990,9 +8456,12 @@ impl SpectrumWindow {
                     if stale {
                         self.cache_stats = cache_dir_stats();
                         let dir = home_dir().join(".moosik").join("cache");
+                        // Mono files only, deliberately: this set answers
+                        // "is this analysis cached", and the answer is the mono
+                        // cache. A sidecar without one is unreadable anyway.
                         self.cache_file_set = std::fs::read_dir(&dir)
                             .into_iter().flatten().filter_map(|e| e.ok())
-                            .filter(|e| e.path().extension().map(|x| x == "spectrumcache").unwrap_or(false))
+                            .filter(|e| e.path().extension().is_some_and(|x| x == "spectrumcache"))
                             .map(|e| e.path())
                             .collect();
                         self.cache_stats_at = Some(Instant::now());
@@ -7005,7 +8474,7 @@ impl SpectrumWindow {
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🗑 Clear Cache")).clicked()
                                 && let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
+                                let cache = cache_path_for(&self.analyzer.cache_dir(), p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
                                 let existed = cache.exists();
                                 let _ = std::fs::remove_file(&cache);
                                 self.analyzer.clear_pre_frames();
@@ -7020,7 +8489,7 @@ impl SpectrumWindow {
                             if ui.add_enabled(has_path && !analyzing,
                                 egui::Button::new("🔄 Re-analyze")).clicked()
                                 && let Some(ref p) = self.current_path.clone() {
-                                let cache = cache_path_for(p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
+                                let cache = cache_path_for(&self.analyzer.cache_dir(), p, self.bar_count, self.fft_size, self.pad_factor, self.overlap, &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps);
                                 let _ = std::fs::remove_file(&cache);
                                 self.analyzer.clear_pre_frames();
                                 self.analyzer.start_preprocess(p.clone());
@@ -7101,13 +8570,24 @@ impl SpectrumWindow {
                                 .clicked()
                             {
                                 let budget = (self.analyzer.cache_budget_gb as f64 * 1e9) as u64;
-                                let (n, freed) = evict_cache_to_budget(budget, None);
+                                // The track on screen is protected here too. A
+                                // manual trim that deletes what you are
+                                // listening to is a manual trim nobody presses
+                                // twice.
+                                let keep = self.current_cache_path();
+                                let sweep = evict_cache_to_budget(budget, keep.as_deref());
                                 self.cache_stats_at = None;
-                                self.status_msg = if n == 0 {
+                                self.status_msg = if sweep.still_over > 0 {
+                                    format!(
+                                        "Removed {} file(s); still {:.1} MB over — the                                          current track's cache does not fit on its own.",
+                                        sweep.removed,
+                                        sweep.still_over as f64 / 1e6,
+                                    )
+                                } else if sweep.removed == 0 {
                                     "Cache already within budget.".into()
                                 } else {
-                                    format!("Removed {n} cache file(s), freed {:.1} MB",
-                                            freed as f64 / 1e6)
+                                    format!("Removed {} cache file(s), freed {:.1} MB",
+                                            sweep.removed, sweep.freed as f64 / 1e6)
                                 };
                             }
                         });
@@ -7135,8 +8615,11 @@ impl SpectrumWindow {
                                 let dir = home_dir().join(".moosik").join("cache");
                                 if let Ok(entries) = std::fs::read_dir(&dir) {
                                     for e in entries.filter_map(|e| e.ok()) {
+                                        // Sidecars too: leaving them would keep
+                                        // bytes on disk that nothing can read,
+                                        // under a button that says Clear All.
                                         let p = e.path();
-                                        if p.extension().map(|x| x == "spectrumcache").unwrap_or(false) {
+                                        if is_cache_file(&p) {
                                             let _ = std::fs::remove_file(p);
                                         }
                                     }
@@ -8380,7 +9863,7 @@ mod source_time_smoothing_tests {
     /// Distinguishable rows: bar `b` of row `f` is a function of both, so a
     /// swapped, skipped or repeated row shows up as a wrong number rather than
     /// coincidentally matching.
-    fn cache(n_frames: usize) -> Vec<Vec<f32>> {
+    fn cache_rows(n_frames: usize) -> Vec<Vec<f32>> {
         (0..n_frames)
             .map(|f| {
                 (0..BARS)
@@ -8390,10 +9873,17 @@ mod source_time_smoothing_tests {
             .collect()
     }
 
-    fn analyzer(frames: Vec<Vec<f32>>, smoothing: f32, mapping: &BarMappingMode)
+    /// The same rows as the analyser would have produced, quantised
+    /// exactly as a fresh analysis quantises them — so a test sees what
+    /// the display would see, not a precision the cache never had.
+    fn cache(n_frames: usize) -> cache::PreFrames {
+        cache::PreFrames::from_analysis(&cache_rows(n_frames))
+    }
+
+    fn analyzer(frames: cache::PreFrames, smoothing: f32, mapping: &BarMappingMode)
         -> SpectrumAnalyzer
     {
-        let n = frames[0].len();
+        let n = frames.bars();
         let mut a = SpectrumAnalyzer::new(new_sample_buf());
         a.bar_count = n;
         a.magnitudes = vec![0.0; n];
@@ -8426,7 +9916,7 @@ mod source_time_smoothing_tests {
                 tick(&mut a, f as f64 / RATE, 60.0);
             }
             assert_eq!(
-                a.magnitudes, frames[39],
+                a.magnitudes, frames.row_vec(39),
                 "{mapping:?}: smoothing 0 must display the cache row itself"
             );
         }
@@ -8442,7 +9932,7 @@ mod source_time_smoothing_tests {
         for f in 0..20 {
             tick(&mut a, f as f64 / RATE, 60.0);
         }
-        let want: Vec<f32> = frames[19]
+        let want: Vec<f32> = frames.row_vec(19)
             .iter()
             .enumerate()
             .map(|(b, &v)| (v + (b as f32 - 3.5) / 80.0).clamp(0.0, 1.0))
@@ -8548,7 +10038,8 @@ mod source_time_smoothing_tests {
 
         let mut frames = vec![vec![0.1f32; BARS]; 64];
         frames[4] = vec![0.9f32; BARS];
-        w.analyzer.set_pre_frames(frames, RATE);
+        let pre = cache::PreFrames::from_analysis(&frames);
+        w.analyzer.set_pre_frames(pre.clone(), RATE);
 
         // A 60 Hz display against a 180 Hz cache lands on rows 3 and 6, never 4.
         w.last_fft_time = None;
@@ -8556,8 +10047,9 @@ mod source_time_smoothing_tests {
         w.last_fft_time = None;
         w.tick(6.0 / RATE, true);
 
+        // The stored value, not the literal: 0.1 has no exact 12-bit code.
         assert_eq!(
-            w.analyzer.magnitudes[0], 0.1,
+            w.analyzer.magnitudes[0], pre.row_vec(3)[0],
             "the displayed bar should be the latest row, not the peak"
         );
         assert!(
@@ -8576,15 +10068,21 @@ mod source_time_smoothing_tests {
             let mut frames = vec![vec![0.1f32; BARS]; 64];
             // Row 4 is crossed by a 60 Hz tick that lands on rows 3 and 6.
             frames[4] = vec![0.9f32; BARS];
-            let mut a = analyzer(frames, 0.0, mapping);
+            let pre = cache::PreFrames::from_analysis(&frames);
+            let mut a = analyzer(pre.clone(), 0.0, mapping);
             tick(&mut a, 3.0 / RATE, 60.0);
             tick(&mut a, 6.0 / RATE, 60.0);
+            // Against the stored values, not against `0.1` and `0.9`: the
+            // 12-bit grid holds neither exactly, and the property under test
+            // is which row reaches the marker, not what a literal rounds to.
+            let quiet = pre.row_vec(3)[0];
+            let loud = pre.row_vec(4)[0];
             assert_eq!(
-                a.magnitudes[0], 0.1,
+                a.magnitudes[0], quiet,
                 "{mapping:?}: the displayed value is the latest row, not the peak"
             );
             assert_eq!(
-                a.peak_input[0], 0.9,
+                a.peak_input[0], loud,
                 "{mapping:?}: the impulse in row 4 was lost"
             );
         }
@@ -8599,12 +10097,12 @@ mod source_time_smoothing_tests {
         for k in 0..=30 {
             tick(&mut a, k as f64 / 60.0, 60.0);
         }
-        assert!(a.magnitudes != frames[0], "setup: filter should be far from row 0");
+        assert!(a.magnitudes != frames.row_vec(0), "setup: filter should be far from row 0");
         // Loop wrap.
         tick(&mut a, 0.0, 60.0);
         assert_eq!(a.last_pre_frame, Some(0));
         assert_eq!(
-            a.magnitudes, frames[0],
+            a.magnitudes, frames.row_vec(0),
             "a backward jump must snap, not smear from the old position"
         );
     }
@@ -8620,8 +10118,8 @@ mod source_time_smoothing_tests {
         a.invalidate_pre_cursor();
         a.snap_pre_to(400.0 / RATE);
         assert_eq!(a.last_pre_frame, Some(400));
-        assert_eq!(a.magnitudes, frames[400]);
-        assert_eq!(a.peak_input, frames[400]);
+        assert_eq!(a.magnitudes, frames.row_vec(400));
+        assert_eq!(a.peak_input, frames.row_vec(400));
         // And the next ordinary tick continues from there rather than snapping.
         tick(&mut a, 401.0 / RATE, 60.0);
         assert_eq!(a.last_pre_frame, Some(401));
@@ -8642,7 +10140,7 @@ mod source_time_smoothing_tests {
         // The next tick snaps rather than cascading across the join.
         a.smoothing = 0.9;
         tick(&mut a, 60.0 / RATE, 60.0);
-        assert_eq!(a.magnitudes, replacement[60]);
+        assert_eq!(a.magnitudes, replacement.row_vec(60));
     }
 
     /// Track change and stop both go through `reset`.
@@ -8719,6 +10217,7 @@ mod source_time_smoothing_tests {
         let cfg = aslt::AsltPreset::Standard.config();
         let key = |_s: f32| {
             cache_path_for(
+                &default_cache_dir(),
                 &path,
                 1024,
                 8192,
@@ -8939,7 +10438,7 @@ mod channel_spectrum_tests {
             (false, false, 2, ChannelAvailability::UnsupportedStyle),
         ];
         for (pre, style_ok, ch, want) in cases {
-            let got = availability(pre, style_ok, ch);
+            let got = availability(pre, false, style_ok, ch);
             assert_eq!(got, want);
             assert!(!got.is_available());
             assert!(got.reason().is_some());
@@ -9053,7 +10552,7 @@ mod stereo_tap_tests {
             "a mono source must not fabricate stereo frames"
         );
         assert_eq!(
-            channels::availability(false, true, guard.channels),
+            channels::availability(false, false, true, guard.channels),
             channels::ChannelAvailability::Mono
         );
     }
@@ -9070,7 +10569,7 @@ mod stereo_tap_tests {
             g.frames.push([0.5, -0.5]);
         }
         assert_eq!(
-            channels::availability(false, true, stereo.lock().unwrap().channels),
+            channels::availability(false, false, true, stereo.lock().unwrap().channels),
             channels::ChannelAvailability::Available
         );
 
@@ -9080,7 +10579,7 @@ mod stereo_tap_tests {
         assert!(g.frames.is_empty(), "stale frames must not outlive the stream");
         assert_ne!(g.generation, gen_a, "the generation must move on");
         assert_eq!(
-            channels::availability(false, true, g.channels),
+            channels::availability(false, false, true, g.channels),
             channels::ChannelAvailability::NoLiveTap
         );
     }
@@ -9178,7 +10677,7 @@ mod stereo_tap_tests {
             assert!(l > 0.0 && r < 0.0, "frame {i}: {l}/{r} is not a live pair");
         }
         assert_eq!(
-            channels::availability(false, true, g.channels),
+            channels::availability(false, false, true, g.channels),
             channels::ChannelAvailability::Available,
             "Left/Right must still be offered on ordinary playback"
         );
@@ -9578,13 +11077,16 @@ mod channel_adapter_tests {
         feed(&w, 2, &tone(500.0, FFT * 2), &tone(5000.0, FFT * 2));
         w.mode = SpectrumMode::PreProcess;
         w.channel_availability = channels::availability(
-            true, w.style_supports_channels(), channels::NO_LIVE_TAP,
+            true,
+            w.analyzer.has_pre_channels(),
+            w.style_supports_channels(),
+            channels::NO_LIVE_TAP,
         );
         assert_eq!(w.channel_availability, channels::ChannelAvailability::PreProcessMono);
         assert!(
             w.channel_availability
                 .reason()
-                .is_some_and(|r| r.contains("channel-aware cache"))
+                .is_some_and(|r| r.contains("analysed without channels"))
         );
     }
 }
@@ -9604,7 +11106,7 @@ mod mode_and_availability_tests {
     const BARS: usize = 8;
     const FFT: usize = 1024;
 
-    fn cache(n: usize) -> Vec<Vec<f32>> {
+    fn cache_rows(n: usize) -> Vec<Vec<f32>> {
         (0..n)
             .map(|f| {
                 (0..BARS)
@@ -9612,6 +11114,13 @@ mod mode_and_availability_tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// The same rows as the analyser would have produced, quantised
+    /// exactly as a fresh analysis quantises them — so a test sees what
+    /// the display would see, not a precision the cache never had.
+    fn cache(n: usize) -> cache::PreFrames {
+        cache::PreFrames::from_analysis(&cache_rows(n))
     }
 
     fn window() -> SpectrumWindow {
@@ -9728,7 +11237,7 @@ mod mode_and_availability_tests {
         w.analyzer.smoothing = 0.0;
         tick_now(&mut w, 300.0 / RATE, true);
         assert_eq!(
-            w.analyzer.magnitudes, frames[300],
+            w.analyzer.magnitudes, frames.row_vec(300),
             "the first Pre-process tick must show the row the clock points at"
         );
     }
@@ -9820,7 +11329,7 @@ mod mode_and_availability_tests {
         assert!(
             w.channel_availability
                 .reason()
-                .is_some_and(|r| r.contains("channel-aware cache"))
+                .is_some_and(|r| r.contains("analysed without channels"))
         );
     }
 
@@ -10408,7 +11917,7 @@ mod presentation_tests {
         w
     }
 
-    fn cache(n: usize) -> Vec<Vec<f32>> {
+    fn cache_rows(n: usize) -> Vec<Vec<f32>> {
         (0..n)
             .map(|f| {
                 (0..BARS)
@@ -10416,6 +11925,13 @@ mod presentation_tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// The same rows as the analyser would have produced, quantised
+    /// exactly as a fresh analysis quantises them — so a test sees what
+    /// the display would see, not a precision the cache never had.
+    fn cache(n: usize) -> cache::PreFrames {
+        cache::PreFrames::from_analysis(&cache_rows(n))
     }
 
     fn tone(freq: f32, n: usize) -> Vec<f32> {
@@ -10531,7 +12047,7 @@ mod presentation_tests {
             "the reset destroyed the cache that caused it"
         );
         assert_eq!(
-            w.analyzer.magnitudes, frames[300],
+            w.analyzer.magnitudes, frames.row_vec(300),
             "the first cached tick must snap to the row the clock points at"
         );
         assert!(
@@ -10606,12 +12122,28 @@ mod presentation_tests {
         let assigns = src.matches(assign).count();
         let clears = src.matches(clear).count();
         assert_eq!(
-            assigns, 1,
-            "`pre_frames` is assigned {assigns} times; only `set_pre_frames` may"
+            assigns, 2,
+            "`pre_frames` is assigned {assigns} times; the two are \
+             `set_pre_frames_with`, which installs a matrix, and \
+             `clear_pre_frames`, which releases one"
         );
         assert_eq!(
-            clears, 1,
-            "`pre_frames` is cleared {clears} times; only `clear_pre_frames` may"
+            clears, 0,
+            "`pre_frames` is cleared in place {clears} times; it is shared with \
+             the sidecar reader, so it is *replaced* rather than emptied — \
+             clearing through the `Arc` would deep-copy the matrix in order to \
+             empty it"
+        );
+
+        // The channel state has more legitimate writers than the matrix: it is
+        // a state machine and its transitions live in the analyser's own
+        // methods. The count is pinned so a *new* writer, anywhere, has to be a
+        // deliberate act rather than a quiet one.
+        let ch_assign = concat!("self.pre_channels", " = ");
+        let ch_assigns = src.matches(ch_assign).count();
+        assert_eq!(
+            ch_assigns, 10,
+            "`pre_channels` is assigned {ch_assigns} times; the ten are              `set_pre_frames_with` (install), `clear_pre_frames` (release),              `request_pre_channels` (no path, waiting for the reader slot, and              start), `release_pre_channels` (from resident, and from a read in              flight), and `poll_pre_channels` (resident, wrong shape, refused).              An eleventh is a new way for the channels and the matrix they              belong to to disagree"
         );
     }
 }
@@ -10647,7 +12179,7 @@ mod realtime_snap_tests {
             .collect()
     }
 
-    fn cache(n: usize) -> Vec<Vec<f32>> {
+    fn cache_rows(n: usize) -> Vec<Vec<f32>> {
         (0..n)
             .map(|f| {
                 (0..BARS)
@@ -10655,6 +12187,13 @@ mod realtime_snap_tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// The same rows as the analyser would have produced, quantised
+    /// exactly as a fresh analysis quantises them — so a test sees what
+    /// the display would see, not a precision the cache never had.
+    fn cache(n: usize) -> cache::PreFrames {
+        cache::PreFrames::from_analysis(&cache_rows(n))
     }
 
     /// Entering Real-time with heavy smoothing and nonzero prior state: the
@@ -10799,7 +12338,7 @@ mod realtime_snap_tests {
         w.last_fft_time = None;
         w.tick(600.0 / RATE, true);
         assert_eq!(
-            w.analyzer.magnitudes, frames[600],
+            w.analyzer.magnitudes, frames.row_vec(600),
             "the first Pre-process frame faded up instead of snapping"
         );
     }
@@ -10980,6 +12519,7 @@ mod smoothing_settings_tests {
         let cfg = aslt::AsltPreset::Standard.config();
         let key = || {
             cache_path_for(
+                &default_cache_dir(),
                 &path,
                 1024,
                 8192,
@@ -10998,7 +12538,10 @@ mod smoothing_settings_tests {
         let before = key();
 
         let mut w = SpectrumWindow::new();
-        w.analyzer.set_pre_frames(vec![vec![0.5; 8]; 32], 180.0);
+        w.analyzer.set_pre_frames(
+            cache::PreFrames::from_analysis(&vec![vec![0.5f32; 8]; 32]),
+            180.0,
+        );
         w.mode = SpectrumMode::PreProcess;
         w.needs_reanalysis = false;
         for v in [0.0f32, 0.125, 0.75, 0.97] {
@@ -11229,9 +12772,16 @@ mod live_pcm_lease_tests {
         for _ in 0..(BATCH_SIZE * 2 - 2) {
             old.next();
         }
+        // One frame short of a flush, so nothing has been published yet. The
+        // previous version of this line was `!…is_empty() || true`, which
+        // asserted nothing at all and made `clippy --all-targets` fail on a
+        // deny-by-default lint. If this now fails, the batching threshold moved
+        // and the forced schedule below no longer parks the owner where it
+        // means to.
         assert!(
-            !mono.lock().unwrap().is_empty() || true,
-            "setup only: the batch may or may not have flushed yet"
+            mono.lock().unwrap().is_empty(),
+            "setup: {} frames should be one short of a flush",
+            BATCH_SIZE - 1,
         );
 
         // The route ends and a successor takes over while the batch is held.
@@ -11823,7 +13373,10 @@ mod presentation_completeness_tests {
         w.tick(0.0, false);
         fill(&mut w, &ctx);
         w.analyzer
-            .set_pre_frames(vec![vec![0.25; BARS]; 512], RATE);
+            .set_pre_frames(
+                cache::PreFrames::from_analysis(&vec![vec![0.25f32; BARS]; 512]),
+                RATE,
+            );
         w.tick(0.0, false);
         assert_clean(&w, "a cache handoff");
         assert!(!w.analyzer.pre_frames.is_empty(), "the new cache was destroyed");
@@ -11837,6 +13390,198 @@ mod presentation_completeness_tests {
 // ---------------------------------------------------------------------------
 // The corner readouts share one row
 // ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// The pre-process consumer, benchmarked against the storage it replaced
+// ---------------------------------------------------------------------------
+
+/// What a frame actually costs, through the real bounded catch-up path.
+///
+/// The figure this replaces timed a conversion loop over 512 rows, called it a
+/// tick, and turned it into "1.5 % of the frame budget". That number is
+/// withdrawn: the loop it measured is a fraction of what a tick does, and no
+/// tick was ever run.
+///
+/// Here the candidate is driven through `tick_pre` itself — cursor, bounded
+/// catch-up, smoothing, interval peaks and the waterfall ring — over repeated
+/// batches spanning a whole track, so no single favourable interval decides the
+/// answer. Each batch is one row inside the catch-up bound rather than at it —
+/// see `BATCH` — so these are large batches, not quite the largest possible. The storage-and-conversion inner loop is timed separately, in both
+/// the old representation and the new one, on the same data at the same
+/// settings, so the part attributable to storage is visible rather than
+/// implied.
+///
+/// Run:
+///   cargo test --release --locked --all-features preprocess_consumer_bench -- --ignored --nocapture
+#[cfg(test)]
+mod preprocess_consumer_bench {
+    use super::*;
+    use std::time::Instant;
+
+    const BARS: usize = 1024;
+    const FRAMES: usize = 44_645;
+    const RATE: f64 = 180.0;
+    /// Rows a tick crosses, one below the catch-up bound.
+    ///
+    /// Not because the bound itself would be snapped — it would not.
+    /// `timing::plan` snaps when `target - cursor > limit`, so a gap of exactly
+    /// `MAX_CATCHUP_FRAMES` is consumed and **512 is the real maximum**. This
+    /// is 511 because the target comes from `target_frame`, which derives a row
+    /// from a playback time in seconds, and that floating-point round trip can
+    /// put a nominal 512-row gap on 511 or 513. One row inside the bound makes
+    /// every batch a consume without needing the boundary to land exactly.
+    ///
+    /// So these are large batches, not quite the largest possible; a true
+    /// 512-row batch would cost about 0.2 % more than the figures below.
+    const BATCH: usize = timing::MAX_CATCHUP_FRAMES - 1;
+
+    fn rows() -> Vec<Vec<f32>> {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        (0..FRAMES)
+            .map(|f| {
+                let t = f as f32 * 0.0007;
+                (0..BARS)
+                    .map(|b| {
+                        let x = b as f32 / BARS as f32;
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        let n = ((seed >> 40) as f32 / 8_388_608.0) - 1.0;
+                        ((1.0 - x * 0.8) * 0.7 + (t + x * 9.0).sin() * 0.12 + n * 0.001)
+                            .clamp(0.0, 1.0)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn analyzer(pf: cache::PreFrames, smoothing: f32) -> SpectrumAnalyzer {
+        let mut a = SpectrumAnalyzer::new(new_sample_buf());
+        a.bar_count = BARS;
+        a.magnitudes = vec![0.0; BARS];
+        a.smoothed = vec![0.0; BARS];
+        a.peak_input = vec![0.0; BARS];
+        a.pre_smoothing = smoothing;
+        a.bar_mapping = BarMappingMode::Cqt;
+        a.waterfall_enabled = true;
+        a.waterfall_rows = 512;
+        a.set_pre_frames(pf, RATE);
+        a
+    }
+
+    #[test]
+    #[ignore]
+    fn consumer_cost_against_the_previous_storage() {
+        println!("\n  {FRAMES} frames × {BARS} bars, batches of {BATCH} rows, {RATE} fps\n");
+        let src = rows();
+        let pf = cache::PreFrames::from_analysis(&src);
+        let batches = FRAMES / BATCH;
+
+        // ── the whole consumer, through the production path ─────────────────
+        for smoothing in [0.0f32, 0.75] {
+            let mut a = analyzer(pf.clone(), smoothing);
+            // One pass to warm the buffers, then the measured pass.
+            a.tick_pre(0.0, 1.0 / 60.0);
+            let t = Instant::now();
+            let mut crossed = 0usize;
+            for b in 1..=batches {
+                let at = (b * BATCH) as f64 / RATE;
+                a.tick_pre(at, 1.0 / 60.0);
+                crossed += BATCH;
+            }
+            let total = t.elapsed();
+            // Rows the consumer actually processed, not the rows the clock
+            // crossed: a snap discards rather than consuming, and quoting the
+            // clock would divide by work that never happened.
+            let consumed = a.rows_consumed as usize;
+            println!(
+                "  tick_pre, smoothing {smoothing:<4}   {:>8.3} ms per batch, \
+                 {:>7.1} ns per consumed row  ({consumed} consumed of {crossed} crossed, \
+                 {batches} batches)",
+                total.as_secs_f64() * 1e3 / batches as f64,
+                total.as_secs_f64() * 1e9 / consumed.max(1) as f64,
+            );
+            assert!(
+                consumed > batches,
+                "only {consumed} rows were consumed over {batches} batches — the \
+                 catch-up path did not run"
+            );
+        }
+
+        // ── storage and conversion alone, both representations ──────────────
+        // The same arithmetic in both: weighting, the smoothing step, and the
+        // interval peak. Only where the value comes from differs.
+        let weights: Vec<f32> = Vec::new();
+        let alpha = 0.75f32;
+
+        let mut smoothed = vec![0.0f32; BARS];
+        let mut peak = vec![0.0f32; BARS];
+        let t = Instant::now();
+        for mags in src.iter().take(FRAMES) {
+            for (bar, (sm, m)) in smoothed.iter_mut().zip(mags.iter()).enumerate() {
+                let v = match weights.get(bar) {
+                    Some(&db) => (m + db / 80.0).clamp(0.0, 1.0),
+                    None => *m,
+                };
+                *sm = *sm * alpha + v * (1.0 - alpha);
+                let p = &mut peak[bar];
+                if *sm > *p {
+                    *p = *sm;
+                }
+            }
+        }
+        let old = t.elapsed();
+
+        let mut smoothed2 = vec![0.0f32; BARS];
+        let mut peak2 = vec![0.0f32; BARS];
+        let inv = pf.inv_max();
+        let t = Instant::now();
+        for f in 0..FRAMES {
+            let mags = pf.row(f).unwrap();
+            for (bar, (sm, &code)) in smoothed2.iter_mut().zip(mags.iter()).enumerate() {
+                let m = code as f32 * inv;
+                let v = match weights.get(bar) {
+                    Some(&db) => (m + db / 80.0).clamp(0.0, 1.0),
+                    None => m,
+                };
+                *sm = *sm * alpha + v * (1.0 - alpha);
+                let p = &mut peak2[bar];
+                if *sm > *p {
+                    *p = *sm;
+                }
+            }
+        }
+        let new = t.elapsed();
+
+        println!(
+            "\n  storage + conversion only, same arithmetic, same data:\n\
+             \x20   Vec<Vec<f32>>            {:>8.1} ns/row\n\
+             \x20   PreFrames (u16 codes)    {:>8.1} ns/row   ({:+.1}%)",
+            old.as_secs_f64() * 1e9 / FRAMES as f64,
+            new.as_secs_f64() * 1e9 / FRAMES as f64,
+            (new.as_secs_f64() / old.as_secs_f64() - 1.0) * 100.0,
+        );
+
+        // The two smoothed results must agree to within the quantiser, or the
+        // comparison above is between two different computations.
+        let worst = smoothed
+            .iter()
+            .zip(&smoothed2)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!(
+            "  the two agree to {:.6} of full scale (one 12-bit step is {:.6})",
+            worst,
+            1.0 / cache::V4_MAX_CODE as f32
+        );
+        assert!(
+            worst <= 1.0 / cache::V4_MAX_CODE as f32,
+            "the two paths computed different things: {worst}"
+        );
+        println!();
+    }
+}
 
 /// LUFS, the channel legend and the frame rate all live along the top of the
 /// plot. They were anchored independently by three pieces of code that each
@@ -13049,12 +14794,12 @@ mod diff_view_tests {
         assert!(channels::ChannelView::ALL.contains(&channels::ChannelView::Diff));
         // Available with a live stereo tap.
         assert!(
-            channels::availability(false, true, 2).is_available(),
+            channels::availability(false, false, true, 2).is_available(),
             "a stereo tap must offer it"
         );
         // And refused everywhere the others are, for the same reasons.
         for (pre, style_ok, ch) in [(true, true, 2u16), (false, false, 2), (false, true, 1)] {
-            let a = channels::availability(pre, style_ok, ch);
+            let a = channels::availability(pre, false, style_ok, ch);
             assert!(!a.is_available());
             assert_eq!(
                 channels::effective_view(channels::ChannelView::Diff, &a),
@@ -13216,6 +14961,7 @@ mod cache_key_tests {
 
     fn key(bm: &BarMappingMode, cfg: &aslt::AsltConfig, fps: f32) -> String {
         cache_path_for(
+            &default_cache_dir(),
             &PathBuf::from("/music/track.flac"), 1024, 8192, 16, 0.875,
             &WindowFn::Hann, 20.0, 24_000.0, bm, &InterpolationMode::None,
             crate::dsd::decimate::DEFAULT_ANALYSIS_RATE, cfg, fps,
@@ -13457,71 +15203,6 @@ mod cache_key_tests {
         println!("\n  A level coarser than 1.0x a 4K pixel is visible banding; finer is not.");
     }
 
-    /// v3 must survive a round trip to within its own quantisation step, and v2
-    /// files must still load — there are gigabytes of them on real machines.
-    #[test]
-    fn cache_round_trips_and_reads_v2() {
-        let n_bars = 64;
-        let frames: Vec<Vec<f32>> = (0..40)
-            .map(|f| {
-                (0..n_bars)
-                    .map(|b| {
-                        let x = (f as f32 * 0.13 + b as f32 * 0.017).sin() * 0.5 + 0.5;
-                        x.clamp(0.0, 1.0)
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let p = std::env::temp_dir().join("moosik_cache_v3_roundtrip.spectrumcache");
-        let _ = std::fs::remove_file(&p);
-        save_cache(&p, &frames);
-        let back = load_cache(&p, n_bars).expect("v3 failed to load");
-        assert_eq!(back.len(), frames.len());
-        let worst = frames.iter().flatten().zip(back.iter().flatten())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        // One u16 step is 1/65535; rounding can cost half of one either way.
-        assert!(worst <= 1.0 / 65535.0 + 1e-7, "round trip lost {worst}");
-
-        // Hand-build a v2 file and check the reader still accepts it.
-        let mut payload = Vec::new();
-        for row in &frames {
-            for &v in row {
-                payload.extend_from_slice(&(((v * 65535.0).round()) as u16).to_le_bytes());
-            }
-        }
-        let comp = lz4_flex::compress_prepend_size(&payload);
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&CACHE_MAGIC.to_le_bytes());
-        blob.extend_from_slice(&(frames.len() as u32).to_le_bytes());
-        blob.extend_from_slice(&(n_bars as u32).to_le_bytes());
-        blob.extend_from_slice(&comp);
-        let p2 = std::env::temp_dir().join("moosik_cache_v2_compat.spectrumcache");
-        std::fs::write(&p2, &blob).unwrap();
-        let old = load_cache(&p2, n_bars).expect("v2 file no longer loads");
-        let worst_v2 = frames.iter().flatten().zip(old.iter().flatten())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(worst_v2 <= 1.0 / 65535.0 + 1e-7);
-
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(&p2);
-    }
-
-    /// A cache written for a different bar count must be rejected, not
-    /// reinterpreted — the v3 reader indexes two planes and would read garbage.
-    #[test]
-    fn cache_rejects_mismatched_bar_count() {
-        let frames: Vec<Vec<f32>> = (0..8).map(|_| vec![0.5f32; 32]).collect();
-        let p = std::env::temp_dir().join("moosik_cache_bars_mismatch.spectrumcache");
-        let _ = std::fs::remove_file(&p);
-        save_cache(&p, &frames);
-        assert!(load_cache(&p, 64).is_none(), "accepted a 32-bar cache as 64 bars");
-        assert!(load_cache(&p, 32).is_some());
-        let _ = std::fs::remove_file(&p);
-    }
-
     /// Eviction must free enough, take the oldest first, and touch nothing that
     /// is not a cache file.
     #[test]
@@ -13544,7 +15225,7 @@ mod cache_key_tests {
 
         // 5000 bytes against a 3000 budget: drop the two oldest, landing exactly
         // on the limit.
-        let (removed, freed) = evict_in_dir(&dir, 3000, None);
+        let Sweep { removed, freed, .. } = evict_in_dir(&dir, 3000, None);
         assert_eq!(removed, 2, "removed {removed}, expected 2");
         assert_eq!(freed, 2000);
         assert!(!paths[0].exists() && !paths[1].exists(), "oldest not evicted first");
@@ -13552,10 +15233,10 @@ mod cache_key_tests {
         assert!(innocent.exists(), "deleted a file that was not a cache");
 
         // Already under budget: nothing happens.
-        assert_eq!(evict_in_dir(&dir, 10_000, None), (0, 0));
+        assert_eq!(evict_in_dir(&dir, 10_000, None), Sweep::default());
 
         // `keep` is spared even when it is the oldest.
-        let (removed, _) = evict_in_dir(&dir, 1000, Some(&paths[2]));
+        let removed = evict_in_dir(&dir, 1000, Some(&paths[2])).removed;
         assert!(paths[2].exists(), "kept file was evicted anyway");
         assert!(removed >= 1);
 
@@ -13633,7 +15314,7 @@ mod superlet_pipeline_tests {
             &InterpolationMode::None, &BarMappingMode::Superlet,
             crate::dsd::decimate::DEFAULT_ANALYSIS_RATE,
             &aslt::AsltPreset::Fast.config(), fps, abort,
-            &Arc::new(AtomicUsize::new(usize::MAX)),
+            &Arc::new(AtomicUsize::new(usize::MAX)), StereoRequest::MixOnly,
         )
     }
 
@@ -13650,9 +15331,9 @@ mod superlet_pipeline_tests {
         // Frame rate must come from the requested fps, not from window/overlap.
         assert!((frame_rate - 60.0).abs() < 1.0, "frame rate was {frame_rate}");
         assert!(frames.len() > 30, "only {} frames", frames.len());
-        assert!(frames.iter().all(|r| r.len() == n_bars));
+        assert_eq!(frames.bars(), n_bars);
 
-        let mid = &frames[frames.len() / 2];
+        let mid = frames.row_vec(frames.len() / 2);
         let (peak_bar, &peak) = mid.iter().enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
         let peak_hz = aslt::bar_center_freq(peak_bar, n_bars, 200.0, 5000.0);
@@ -13660,7 +15341,11 @@ mod superlet_pipeline_tests {
         assert!(peak > 0.5, "peak only reached {peak} of full scale");
 
         // Everything stays inside the normalised display range.
-        assert!(frames.iter().flatten().all(|&v| (0.0..=1.0).contains(&v)));
+        assert!(
+            (0..frames.len())
+                .flat_map(|f| frames.row_vec(f))
+                .all(|v| (0.0..=1.0).contains(&v))
+        );
         assert!(f.cache.exists(), "cache was not written");
     }
 
@@ -13685,7 +15370,7 @@ mod superlet_pipeline_tests {
             let PreMessage::Done { frames, .. } = run(&f, 64, 60.0, &abort) else {
                 panic!("expected Done");
             };
-            let mid = &frames[frames.len() / 2];
+            let mid = frames.row_vec(frames.len() / 2);
             levels.push(mid.iter().cloned().fold(0.0f32, f32::max));
         }
         // 20 dB out of the 80 dB display range = 0.25 of full scale.
@@ -13701,5 +15386,1890 @@ mod superlet_pipeline_tests {
         let abort = Arc::new(AtomicBool::new(true));
         assert!(matches!(run(&f, 64, 60.0, &abort), PreMessage::Aborted));
         assert!(!f.cache.exists(), "aborted run still wrote a cache");
+    }
+}
+// ---------------------------------------------------------------------------
+// Pre-process stereo: the channels, the sidecar, and what mono is not
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod preprocess_stereo_tests {
+    use super::*;
+
+    const SR: u32 = 44_100;
+    const BARS: usize = 96;
+
+    /// Minimal 16-bit WAV, one or two channels.
+    fn write_wav(path: &Path, chans: &[&[f32]], sr: u32) {
+        let n = chans.iter().map(|c| c.len()).min().unwrap_or(0);
+        let ch = chans.len() as u16;
+        let mut data: Vec<u8> = Vec::with_capacity(n * chans.len() * 2);
+        for i in 0..n {
+            for c in chans {
+                data.extend(((c[i].clamp(-1.0, 1.0) * 32_767.0) as i16).to_le_bytes());
+            }
+        }
+        let block = ch * 2;
+        let mut out = Vec::with_capacity(44 + data.len());
+        out.extend(b"RIFF");
+        out.extend(((36 + data.len()) as u32).to_le_bytes());
+        out.extend(b"WAVEfmt ");
+        out.extend(16u32.to_le_bytes());
+        out.extend(1u16.to_le_bytes()); // PCM
+        out.extend(ch.to_le_bytes());
+        out.extend(sr.to_le_bytes());
+        out.extend((sr * block as u32).to_le_bytes());
+        out.extend(block.to_le_bytes());
+        out.extend(16u16.to_le_bytes());
+        out.extend(b"data");
+        out.extend((data.len() as u32).to_le_bytes());
+        out.extend(data);
+        std::fs::write(path, out).expect("write wav");
+    }
+
+    fn tone(hz: f32, secs: f32) -> Vec<f32> {
+        let n = (secs * SR as f32) as usize;
+        (0..n)
+            .map(|i| 0.8 * (std::f32::consts::TAU * hz * i as f32 / SR as f32).sin())
+            .collect()
+    }
+
+    /// A file, its cache and its sidecar, all removed on drop.
+    struct Fx {
+        wav: PathBuf,
+        cache: PathBuf,
+    }
+
+    impl Fx {
+        fn new(tag: &str, chans: &[&[f32]]) -> Self {
+            let dir = std::env::temp_dir();
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let wav = dir.join(format!("moosik_st_{tag}_{stamp:x}.wav"));
+            let cache = dir.join(format!("moosik_st_{tag}_{stamp:x}.spectrumcache"));
+            write_wav(&wav, chans, SR);
+            Self { wav, cache }
+        }
+
+        fn sidecar(&self) -> PathBuf {
+            stereo::path_for(&self.cache)
+        }
+
+        /// The identity `run` writes with — derived exactly as production does,
+        /// from the same parameters, so a test reads a sidecar the way the
+        /// player would rather than with a value of its own.
+        fn identity(&self) -> stereo::Identity {
+            cache_key_for(
+                &default_cache_dir(),
+                &self.wav, BARS, 2048, 2, 0.5, &WindowFn::Hann, 100.0, 15_000.0,
+                &BarMappingMode::Cqt, &InterpolationMode::Linear,
+                crate::dsd::decimate::DEFAULT_ANALYSIS_RATE,
+                &aslt::AsltPreset::Fast.config(), 60.0,
+            )
+            .0
+        }
+    }
+
+    impl Drop for Fx {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.wav);
+            let _ = std::fs::remove_file(&self.cache);
+            let _ = std::fs::remove_file(self.sidecar());
+        }
+    }
+
+    /// The FFT path, which is fast enough to run three passes in a test.
+    fn run(f: &Fx, want_stereo: bool, abort: &Arc<AtomicBool>) -> PreMessage {
+        run_as(
+            f,
+            if want_stereo { StereoRequest::Joint } else { StereoRequest::MixOnly },
+            abort,
+        )
+    }
+
+    /// The same, with the request stated exactly — including the deliberately
+    /// wrong one the work-count contract exists to reject.
+    fn run_as(f: &Fx, request: StereoRequest, abort: &Arc<AtomicBool>) -> PreMessage {
+        preprocess_file(
+            &f.wav, &f.cache, SR, BARS,
+            &Arc::new(AtomicUsize::new(0)),
+            2048, 2, 0.5, &WindowFn::Hann, 100.0, 15_000.0,
+            &InterpolationMode::Linear, &BarMappingMode::Cqt,
+            crate::dsd::decimate::DEFAULT_ANALYSIS_RATE,
+            &aslt::AsltPreset::Fast.config(), 60.0, abort,
+            &Arc::new(AtomicUsize::new(usize::MAX)), request,
+        )
+    }
+
+    /// What the reader thread does, minus the thread: read and check.
+    ///
+    /// Production reads a sidecar on a worker now, so there is no
+    /// `load_sidecar` to call. This is the same two steps in the same order.
+    fn read_sidecar_as(
+        cache: &Path, id: stereo::Identity, mono: &cache::PreFrames,
+    ) -> Option<stereo::Stereo> {
+        stereo::read(&stereo::path_for(cache), id, mono, MAX_BAR_COUNT).ok()
+    }
+
+    /// The identity these fixtures are written and read with. Real values come
+    /// from the cache key; here they only have to be the same on both sides.
+    const TEST_ID: stereo::Identity = stereo::Identity { source: 0x5EED, params: 0x1234 };
+
+    fn loudest_bar(row: &[f32]) -> usize {
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    }
+
+    /// A row from the middle of the track, where the analysis window is full.
+    fn mid(f: &cache::PreFrames) -> Vec<f32> {
+        f.row_vec(f.len() / 2)
+    }
+
+    /// The FFT bar mappings have the same contract, in their own unit: one
+    /// windowed transform per frame per channel, and never a third for the mix.
+    ///
+    /// Counted inside `spec`, so it observes calls rather than restating
+    /// `num_frames * channels` — which is arithmetic that would agree with the
+    /// bug it is supposed to catch. The mutation at the end proves the check
+    /// can fail.
+    #[test]
+    fn the_fft_producer_transforms_two_channels_and_not_three() {
+        let l = tone(700.0, 1.0);
+        let r = tone(6000.0, 1.0);
+        let f = Fx::new("fftwork", &[&l, &r]);
+        let abort = Arc::new(AtomicBool::new(false));
+
+        let work_of = |request: StereoRequest| -> aslt::WorkCount {
+            match run_as(&f, request, &abort) {
+                PreMessage::Done { meta, .. } => meta.work,
+                other => panic!("expected Done, got {}", match other {
+                    PreMessage::Error(e) => e,
+                    _ => "abort".into(),
+                }),
+            }
+        };
+
+        let mono = work_of(StereoRequest::MixOnly);
+        let joint = work_of(StereoRequest::Joint);
+        let mutant = work_of(StereoRequest::JointWithRedundantMixTransform);
+
+        println!("  mono   {mono:?}");
+        println!("  joint  {joint:?}");
+        println!("  mutant {mutant:?}");
+
+        assert!(mono.frame_transforms > 0, "setup: the FFT route did no transforms");
+        assert_eq!(
+            mono.column_convolutions, 0,
+            "the FFT producer should report no column convolutions"
+        );
+        assert_eq!(
+            joint.frame_transforms,
+            2 * mono.frame_transforms,
+            "a joint FFT analysis performed {} transforms against a mono run's {}; \
+             two channels means {}, and {} would be a third analysis",
+            joint.frame_transforms,
+            mono.frame_transforms,
+            2 * mono.frame_transforms,
+            3 * mono.frame_transforms,
+        );
+        // Teeth: one deliberate extra transform of the mean window, and the
+        // same assertion fails.
+        assert_eq!(
+            mutant.frame_transforms,
+            3 * mono.frame_transforms,
+            "the mutation did not actually add a third transform"
+        );
+        assert_ne!(
+            mutant.frame_transforms,
+            2 * mono.frame_transforms,
+            "a third transform slipped past the count the contract is checked on"
+        );
+    }
+
+    #[test]
+    fn both_channels_are_analysed_and_written_beside_the_cache() {
+        let l = tone(700.0, 1.5);
+        let r = tone(6000.0, 1.5);
+        let f = Fx::new("pair", &[&l, &r]);
+        let abort = Arc::new(AtomicBool::new(false));
+
+        let PreMessage::Done { frames, stereo: pair, .. } = run(&f, true, &abort) else {
+            panic!("expected Done");
+        };
+        let pair = *pair.expect("a two-channel file with stereo on must yield a pair");
+
+        assert!(f.cache.exists(), "the mono cache was not written");
+        assert!(f.sidecar().exists(), "the sidecar was not written");
+        assert_eq!(pair.len(), frames.len(), "the pair must match the cache");
+        assert_eq!(pair.bars(), frames.bars());
+
+        // The channels carry different audio, and carry the right audio.
+        let (lb, rb) = (loudest_bar(&mid(pair.left())), loudest_bar(&mid(pair.right())));
+        assert!(lb < rb, "left {lb} should peak below right {rb}");
+        assert_ne!(mid(pair.left()), mid(pair.right()));
+
+        // And it comes back off disk unchanged.
+        let reloaded = load_cache(&f.cache, BARS).expect("cache did not reload");
+        assert_eq!(reloaded, frames);
+        assert_eq!(
+            read_sidecar_as(&f.cache, f.identity(), &reloaded)
+                .expect("sidecar did not reload"),
+            pair
+        );
+    }
+
+    /// The question this design exists to answer.
+    ///
+    /// Mono is the mean of the channels **as a signal**, and the magnitude of
+    /// that is not the mean of the magnitudes. Two channels in opposite
+    /// polarity are the extreme case: both are loud, their mean is silence, and
+    /// an implementation that averaged the two channel *spectra* would draw a
+    /// loud tone that is not being played.
+    ///
+    /// The Mix is now **derived** from the channels rather than analysed a
+    /// third time — combined as `(L + R)/2` on the complex bins, before any
+    /// magnitude — and this test is what says the derivation is the right one.
+    /// It is not a test that three analyses were run: a correct joint
+    /// implementation passes it with two, and `aslt`'s
+    /// `a_joint_run_does_two_channel_passes_and_not_three` is what holds it to
+    /// two.
+    #[test]
+    fn the_mix_is_not_the_average_of_the_channel_spectra() {
+        let l = tone(2000.0, 1.5);
+        let r: Vec<f32> = l.iter().map(|s| -s).collect();
+        let f = Fx::new("antiphase", &[&l, &r]);
+        let abort = Arc::new(AtomicBool::new(false));
+
+        let PreMessage::Done { frames, stereo: pair, .. } = run(&f, true, &abort) else {
+            panic!("expected Done");
+        };
+        let pair = *pair.expect("expected a pair");
+
+        let m = mid(&frames);
+        let lrow = mid(pair.left());
+        let rrow = mid(pair.right());
+
+        // Both channels hold the same loud tone at the same bar.
+        let bar = loudest_bar(&lrow);
+        assert_eq!(bar, loudest_bar(&rrow), "the two channels differ only in sign");
+        assert!(lrow[bar] > 0.5, "setup: left should be loud, got {}", lrow[bar]);
+        assert!(rrow[bar] > 0.5, "setup: right should be loud, got {}", rrow[bar]);
+
+        // The mean of the two spectra would be just as loud. The Mix is not.
+        let averaged = (lrow[bar] + rrow[bar]) * 0.5;
+        assert!(
+            m[bar] < averaged - 0.3,
+            "the Mix at bar {bar} was {:.3}; averaging the channels would give {:.3}. \
+             If these are close, something is deriving the Mix rather than analysing it.",
+            m[bar], averaged,
+        );
+    }
+
+    #[test]
+    fn a_single_channel_file_yields_no_pair_and_still_caches() {
+        let m = tone(1000.0, 1.0);
+        let f = Fx::new("mono", &[&m]);
+        let abort = Arc::new(AtomicBool::new(false));
+
+        let PreMessage::Done { frames, stereo: pair, .. } = run(&f, true, &abort) else {
+            panic!("expected Done");
+        };
+        assert!(pair.is_none(), "a mono file must not produce a left and right");
+        assert!(!f.sidecar().exists(), "a mono file wrote a sidecar");
+        assert!(f.cache.exists());
+        assert!(!frames.is_empty());
+    }
+
+    #[test]
+    fn without_the_setting_nothing_extra_is_analysed_or_written() {
+        let l = tone(700.0, 1.0);
+        let r = tone(6000.0, 1.0);
+        let f = Fx::new("off", &[&l, &r]);
+        let abort = Arc::new(AtomicBool::new(false));
+
+        let PreMessage::Done { stereo: pair, .. } = run(&f, false, &abort) else {
+            panic!("expected Done");
+        };
+        assert!(pair.is_none());
+        assert!(!f.sidecar().exists(), "a sidecar was written with stereo off");
+        assert!(f.cache.exists());
+    }
+
+    /// Mono has to survive every way the sidecar can go wrong, because Mix is
+    /// what the waterfall, the spectrogram and the octave meters read.
+    #[test]
+    fn mono_survives_an_absent_or_broken_sidecar() {
+        let l = tone(700.0, 1.0);
+        let r = tone(6000.0, 1.0);
+        let f = Fx::new("broken", &[&l, &r]);
+        let abort = Arc::new(AtomicBool::new(false));
+        let PreMessage::Done { frames, .. } = run(&f, true, &abort) else {
+            panic!("expected Done");
+        };
+        let mono_bytes = std::fs::read(&f.cache).unwrap();
+
+        // Absent.
+        std::fs::remove_file(f.sidecar()).unwrap();
+        let back = load_cache(&f.cache, BARS).expect("mono did not load");
+        assert_eq!(back, frames);
+        assert!(read_sidecar_as(&f.cache, f.identity(), &back).is_none());
+
+        // Truncated.
+        std::fs::write(f.sidecar(), vec![0u8; 12]).unwrap();
+        assert!(read_sidecar_as(&f.cache, f.identity(), &back).is_none());
+
+        // Foreign — a mono cache put where a sidecar belongs.
+        std::fs::write(f.sidecar(), &mono_bytes).unwrap();
+        assert!(read_sidecar_as(&f.cache, f.identity(), &back).is_none());
+
+        // Through all of it the mono cache is untouched.
+        assert_eq!(std::fs::read(&f.cache).unwrap(), mono_bytes);
+        assert_eq!(load_cache(&f.cache, BARS).unwrap(), frames);
+    }
+
+    /// The case a filename cannot catch: a sidecar of the right shape from a
+    /// different analysis.
+    #[test]
+    fn a_sidecar_from_another_analysis_is_refused() {
+        let l = tone(700.0, 1.0);
+        let r = tone(6000.0, 1.0);
+        let a = Fx::new("real", &[&l, &r]);
+        let abort = Arc::new(AtomicBool::new(false));
+        let PreMessage::Done { frames, stereo: pair, .. } = run(&a, true, &abort) else {
+            panic!("expected Done");
+        };
+        let pair = *pair.expect("expected a pair");
+
+        // A sidecar built against a *different* mono matrix of the same shape.
+        let other = cache::PreFrames::from_analysis(
+            &(0..frames.len())
+                .map(|i| (0..frames.bars()).map(|b| ((i + b) % 7) as f32 / 7.0).collect())
+                .collect::<Vec<Vec<f32>>>(),
+        );
+        assert_eq!(other.len(), frames.len());
+        assert_eq!(other.bars(), frames.bars());
+        assert_ne!(other, frames, "setup: the two analyses must differ");
+
+        std::fs::write(a.sidecar(), stereo::encode(TEST_ID, &other, &pair)).unwrap();
+        assert!(
+            read_sidecar_as(&a.cache, TEST_ID, &frames).is_none(),
+            "a sidecar from another analysis was accepted"
+        );
+        // And the genuine one still is.
+        std::fs::write(a.sidecar(), stereo::encode(TEST_ID, &frames, &pair)).unwrap();
+        assert_eq!(read_sidecar_as(&a.cache, TEST_ID, &frames), Some(pair));
+    }
+
+    /// A cancelled sidecar write publishes nothing and leaves mono exactly as
+    /// it was — the guarantee that lets the channels be attempted at all.
+    #[test]
+    fn a_cancelled_sidecar_write_leaves_the_mono_cache_untouched() {
+        let dir = std::env::temp_dir().join(format!(
+            "moosik_sidecar_abort_{}_{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mono_path = dir.join("t.spectrumcache");
+
+        let rows: Vec<Vec<f32>> = (0..40)
+            .map(|i| (0..32).map(|b| ((i * b) % 11) as f32 / 11.0).collect())
+            .collect();
+        let mono = cache::PreFrames::from_analysis(&rows);
+        cache::write_atomic(&mono_path, &mono.to_v4()).unwrap();
+        let before = std::fs::read(&mono_path).unwrap();
+
+        let pair = stereo::Stereo::new(mono.clone(), mono.clone()).unwrap();
+        let abort = AtomicBool::new(true);
+        // Still true: the channels are correct and in memory, so this session
+        // shows them. What must not happen is a file.
+        assert!(save_sidecar(&mono_path, TEST_ID, &mono, &pair, &abort));
+        assert!(
+            !stereo::path_for(&mono_path).exists(),
+            "a cancelled write published a sidecar"
+        );
+        assert_eq!(std::fs::read(&mono_path).unwrap(), before);
+
+        // And with no abort it does write one, which reads back.
+        let go = AtomicBool::new(false);
+        assert!(save_sidecar(&mono_path, TEST_ID, &mono, &pair, &go));
+        assert_eq!(
+            stereo::read(&stereo::path_for(&mono_path), TEST_ID, &mono, MAX_BAR_COUNT)
+                .unwrap(),
+            pair
+        );
+        assert_eq!(std::fs::read(&mono_path).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the display side ────────────────────────────────────────────────────
+
+    fn frames_of(seed: u64, n: usize, bars: usize) -> cache::PreFrames {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        cache::PreFrames::from_analysis(
+            &(0..n)
+                .map(|_| {
+                    (0..bars)
+                        .map(|_| {
+                            s ^= s << 13;
+                            s ^= s >> 7;
+                            s ^= s << 17;
+                            (s >> 40) as f32 / 16_777_216.0
+                        })
+                        .collect()
+                })
+                .collect::<Vec<Vec<f32>>>(),
+        )
+    }
+
+    fn analyzer_with_pair(bars: usize) -> (SpectrumAnalyzer, stereo::Stereo) {
+        let mono = frames_of(1, 64, bars);
+        let pair = stereo::Stereo::new(frames_of(2, 64, bars), frames_of(3, 64, bars)).unwrap();
+        let mut a = SpectrumAnalyzer::new(new_sample_buf());
+        a.bar_count = bars;
+        a.magnitudes = vec![0.0; bars];
+        a.smoothed = vec![0.0; bars];
+        a.peak_input = vec![0.0; bars];
+        a.pre_smoothing = 0.0;
+        a.set_pre_frames_with(mono, PreChannels::Resident(pair.clone()), None, 60.0);
+        (a, pair)
+    }
+
+    #[test]
+    fn the_cached_channels_reach_the_display_unsmoothed_on_a_snap() {
+        let (mut a, pair) = analyzer_with_pair(32);
+        a.pre_channels_wanted = true;
+        a.snap_pre_to(10.0 / 60.0);
+
+        assert_eq!(a.bars_left.len(), 32);
+        assert_eq!(a.bars_right.len(), 32);
+        // A snap is alpha 0, so the display is the row itself.
+        assert_eq!(a.bars_left, pair.left().row_vec(10));
+        assert_eq!(a.bars_right, pair.right().row_vec(10));
+        assert_ne!(a.bars_left, a.bars_right);
+        // And the Mix is its own row, not one of these.
+        assert_ne!(a.magnitudes, a.bars_left);
+    }
+
+    /// Mix must cost exactly what it did before the sidecar existed.
+    #[test]
+    fn mix_does_not_pay_for_channels_it_is_not_showing() {
+        let (mut a, _) = analyzer_with_pair(32);
+        a.pre_channels_wanted = false;
+        a.snap_pre_to(10.0 / 60.0);
+        assert!(a.bars_left.is_empty(), "Mix produced a left channel");
+        assert!(a.bars_right.is_empty(), "Mix produced a right channel");
+        assert_eq!(a.magnitudes.len(), 32, "the Mix itself must still be there");
+    }
+
+    /// All three plots show one instant. The channels follow the Mix's cursor
+    /// rather than keeping one of their own.
+    #[test]
+    fn the_channels_follow_the_same_row_as_the_mix() {
+        let (mut a, pair) = analyzer_with_pair(16);
+        a.pre_channels_wanted = true;
+        for row in [0usize, 5, 40, 63] {
+            a.snap_pre_to(row as f64 / 60.0);
+            assert_eq!(a.magnitudes, a.pre_frames.row_vec(row), "mix at row {row}");
+            assert_eq!(a.bars_left, pair.left().row_vec(row), "left at row {row}");
+            assert_eq!(a.bars_right, pair.right().row_vec(row), "right at row {row}");
+        }
+    }
+
+    /// A pair belongs to the matrix it was installed with, and to nothing else.
+    #[test]
+    fn a_pair_cannot_outlive_the_matrix_it_belongs_to() {
+        let (mut a, _) = analyzer_with_pair(32);
+        assert!(a.has_pre_channels());
+
+        // A plain install of a new matrix drops it — this is the ordinary
+        // track-change path, and keeping the old channels would draw a Left
+        // from the previous track under the new Mix.
+        a.set_pre_frames(frames_of(9, 64, 32), 60.0);
+        assert!(!a.has_pre_channels(), "a new cache kept the old channels");
+        assert!(a.pre_stereo().is_none());
+
+        // A pair of the wrong shape is refused rather than indexed into.
+        let wrong = stereo::Stereo::new(frames_of(2, 40, 32), frames_of(3, 40, 32)).unwrap();
+        a.set_pre_frames_with(frames_of(1, 64, 32), PreChannels::Resident(wrong), None, 60.0);
+        assert!(!a.has_pre_channels(), "a mismatched pair was installed");
+
+        // And clearing takes them with it.
+        let (mut b, _) = analyzer_with_pair(32);
+        b.clear_pre_frames();
+        assert!(!b.has_pre_channels());
+        assert!(b.bars_left.is_empty());
+    }
+
+    // ── the budget ──────────────────────────────────────────────────────────
+
+    /// A track's cache is one unit. Evicting the mono file while sparing its
+    /// sidecar would leave bytes on disk that nothing can ever read.
+    #[test]
+    fn eviction_treats_a_cache_and_its_sidecar_as_one_unit() {
+        let dir = std::env::temp_dir().join(format!(
+            "moosik_evict_pairs_{}_{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Three analyses, oldest first, each 1000 bytes of mono and 1000 of
+        // sidecar.
+        let mut mono = Vec::new();
+        for i in 0..3 {
+            let m = dir.join(format!("t{i}.spectrumcache"));
+            std::fs::write(&m, vec![0u8; 1000]).unwrap();
+            std::fs::write(stereo::path_for(&m), vec![0u8; 1000]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            mono.push(m);
+        }
+
+        // Sidecars count: 6000 bytes, not 3000. A budget that saw only the mono
+        // files would think this directory already fitted.
+        let (_, bytes) = {
+            let mut n = 0usize;
+            let mut b = 0u64;
+            for e in std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()) {
+                if is_cache_file(&e.path()) {
+                    n += 1;
+                    b += e.metadata().unwrap().len();
+                }
+            }
+            (n, b)
+        };
+        assert_eq!(bytes, 6000, "the sidecars were not counted");
+
+        // Down to 4000: the oldest analysis goes, both of its files.
+        let Sweep { removed, freed, .. } = evict_in_dir(&dir, 4000, None);
+        assert_eq!(removed, 2, "removed {removed} file(s), expected a whole unit");
+        assert_eq!(freed, 2000);
+        assert!(!mono[0].exists() && !stereo::path_for(&mono[0]).exists());
+        assert!(mono[1].exists() && stereo::path_for(&mono[1]).exists());
+        assert!(mono[2].exists() && stereo::path_for(&mono[2]).exists());
+
+        // `keep` spares an analysis, meaning both of its files, even though it
+        // is now the oldest.
+        let removed = evict_in_dir(&dir, 1, Some(&mono[1])).removed;
+        assert!(mono[1].exists(), "the kept cache was evicted");
+        assert!(
+            stereo::path_for(&mono[1]).exists(),
+            "the kept cache lost its sidecar, which is the same as losing it"
+        );
+        assert!(removed >= 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── intent: generating channels is not the same as showing them ─────────
+
+    // ── the production entry points, not a copy of their arithmetic ─────────
+
+    /// A temporary cache directory and a real stereo file to analyse into it.
+    struct Bench {
+        dir: PathBuf,
+        wav: PathBuf,
+        other: PathBuf,
+    }
+
+    impl Bench {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "moosik_entry_{tag}_{}_{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let wav = root.join("track.wav");
+            write_wav(&wav, &[&tone(700.0, 0.5), &tone(5000.0, 0.5)], SR);
+            let other = root.join("other.wav");
+            write_wav(&other, &[&tone(300.0, 0.5), &tone(2500.0, 0.5)], SR);
+            Self { dir: root.join("cache"), wav, other }
+        }
+    }
+
+    impl Drop for Bench {
+        fn drop(&mut self) {
+            if let Some(root) = self.dir.parent() {
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    /// An analyser wired to a temporary cache directory, configured for an
+    /// analysis fast enough to run inside a test.
+    fn entry_analyzer(b: &Bench) -> SpectrumAnalyzer {
+        let mut a = SpectrumAnalyzer::new(new_sample_buf());
+        a.cache_dir_override = Some(b.dir.clone());
+        a.cache_budget_gb = 0.0; // no sweeping; this test is not about eviction
+        a.sample_rate = SR;
+        a.bar_count = 32;
+        a.fft_size = 2048;
+        a.pad_factor = 2;
+        a.overlap = 0.5;
+        a.bar_mapping = BarMappingMode::Cqt;
+        a.interp_mode = InterpolationMode::Linear;
+        a.min_freq = 100.0;
+        a.max_freq = 15_000.0;
+        a.magnitudes = vec![0.0; 32];
+        a.smoothed = vec![0.0; 32];
+        a.peak_input = vec![0.0; 32];
+        a
+    }
+
+    /// Run the analysis the entry point started, and install the result the way
+    /// the paused path does. A gate on the worker's own flag, not a sleep.
+    fn settle_analysis(a: &mut SpectrumAnalyzer) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while a.is_analyzing.load(Ordering::Relaxed) {
+            assert!(std::time::Instant::now() < deadline, "the analysis never finished");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        a.try_receive_frames();
+    }
+
+    fn cache_of(a: &SpectrumAnalyzer, path: &PathBuf) -> PathBuf {
+        cache_path_for(
+            &a.cache_dir(), path, a.bar_count, a.fft_size, a.pad_factor, a.overlap,
+            &a.window_fn, a.min_freq, a.max_freq, &a.bar_mapping, &a.interp_mode,
+            a.dsd_rate, &a.aslt_cfg, a.pre_fps,
+        )
+    }
+
+    /// The button's own path: set the request, call `start_preprocess`, and the
+    /// producer must analyse channels even though the Mix cache is valid.
+    ///
+    /// This is the case the whole action exists for — a track with a Mix cache
+    /// and no channels — and it was exactly the case `start_preprocess` returned
+    /// from before it ever looked at the request.
+    #[test]
+    fn an_explicit_request_reaches_the_producer_through_a_valid_mix_cache() {
+        let b = Bench::new("explicit");
+        let mut a = entry_analyzer(&b);
+
+        // A Mix-only analysis first, through the entry point.
+        a.start_preprocess(b.wav.clone());
+        settle_analysis(&mut a);
+        let cache = cache_of(&a, &b.wav);
+        assert!(cache.exists(), "the first analysis wrote no cache");
+        assert!(!stereo::path_for(&cache).exists());
+        let mono_bytes = std::fs::read(&cache).unwrap();
+
+        // Opening it again is ordinary reuse: the cache is loaded, nothing is
+        // analysed, and no channels appear from nowhere.
+        a.start_preprocess(b.wav.clone());
+        assert!(!a.is_analyzing.load(Ordering::Relaxed), "reuse started an analysis");
+        assert!(!a.has_pre_channels());
+
+        // Now the action. The preference stays off throughout.
+        assert!(!a.pre_stereo_enabled);
+        a.pre_stereo_request = Some(b.wav.clone());
+        a.start_preprocess(b.wav.clone());
+        assert!(
+            a.is_analyzing.load(Ordering::Relaxed),
+            "an explicit request did not reach the producer"
+        );
+        settle_analysis(&mut a);
+
+        assert!(stereo::path_for(&cache).exists(), "no sidecar was written");
+        assert_eq!(
+            std::fs::read(&cache).unwrap(),
+            mono_bytes,
+            "the existing Mix cache was rewritten"
+        );
+        assert!(a.pre_channels_resident(), "the fresh channels were not installed");
+        assert!(!a.pre_stereo_enabled, "an explicit request changed the preference");
+        assert!(a.pre_stereo_request.is_none(), "the request was not consumed");
+
+        // And the next, unrelated, uncached track does not inherit it.
+        a.start_preprocess(b.other.clone());
+        settle_analysis(&mut a);
+        let other_cache = cache_of(&a, &b.other);
+        assert!(other_cache.exists(), "the second track was not analysed");
+        assert!(
+            !stereo::path_for(&other_cache).exists(),
+            "a request for one track produced channels for another"
+        );
+    }
+
+    /// Channels already on disk are found with the generation preference off.
+    ///
+    /// Both entry points, because both gated discovery on the preference and
+    /// each is reached a different way: `start_preprocess` when a track opens,
+    /// `try_load_or_flag_reanalysis` when a setting changes which cache applies.
+    #[test]
+    fn existing_channels_are_found_with_the_preference_off() {
+        let b = Bench::new("discovery");
+        let mut a = entry_analyzer(&b);
+        a.pre_stereo_enabled = true;
+        a.start_preprocess(b.wav.clone());
+        settle_analysis(&mut a);
+        let cache = cache_of(&a, &b.wav);
+        assert!(stereo::path_for(&cache).exists(), "setup: no sidecar was written");
+
+        // A fresh analyser with the preference off, opening the same track.
+        let mut off = entry_analyzer(&b);
+        off.pre_stereo_enabled = false;
+        off.start_preprocess(b.wav.clone());
+        assert!(!off.is_analyzing.load(Ordering::Relaxed), "reuse started an analysis");
+        assert!(
+            off.has_pre_channels(),
+            "an existing sidecar was invisible with the preference off"
+        );
+        assert!(
+            !off.pre_channels_resident(),
+            "discovery read the file; it should only have looked"
+        );
+
+        // The other entry point: the window's settings-driven reload.
+        let mut w = SpectrumWindow::new();
+        w.analyzer = entry_analyzer(&b);
+        w.analyzer.pre_stereo_enabled = false;
+        w.bar_count = 32;
+        w.fft_size = 2048;
+        w.pad_factor = 2;
+        w.overlap = 0.5;
+        w.bar_mapping = BarMappingMode::Cqt;
+        w.interp_mode = InterpolationMode::Linear;
+        w.min_freq = 100.0;
+        w.max_freq = 15_000.0;
+        w.current_path = Some(b.wav.clone());
+        w.try_load_or_flag_reanalysis();
+        assert!(
+            w.analyzer.has_pre_channels(),
+            "the reload path did not find the sidecar with the preference off"
+        );
+        assert!(!w.analyzer.pre_channels_resident(), "the reload path read the file");
+        assert!(!w.needs_reanalysis, "a found cache should not ask for a re-analysis");
+    }
+
+    /// Adding channels to a track that already has a Mix cache keeps that
+    /// cache, byte for byte, rather than rewriting it.
+    ///
+    /// The reason is precision, not tidiness: an existing cache may be v2 or v3
+    /// at 16 bits a cell, and a v4 rewrite would quietly coarsen it to 12. The
+    /// user asked for channels, not for a coarser Mix.
+    #[test]
+    fn adding_channels_keeps_an_existing_mix_cache_as_it_is() {
+        let l = tone(700.0, 1.2);
+        let r = tone(6000.0, 1.2);
+        let f = Fx::new("incremental", &[&l, &r]);
+        let abort = Arc::new(AtomicBool::new(false));
+
+        // A Mix-only analysis first.
+        let PreMessage::Done { frames: mono_first, .. } = run(&f, false, &abort) else {
+            panic!("expected Done");
+        };
+        assert!(f.cache.exists());
+        let mono_bytes = std::fs::read(&f.cache).unwrap();
+        assert!(!f.sidecar().exists());
+
+        // Now the channels, on the same track and settings.
+        let PreMessage::Done { frames, stereo: pair, .. } = run(&f, true, &abort) else {
+            panic!("expected Done");
+        };
+        let pair = *pair.expect("expected a pair");
+
+        assert_eq!(
+            std::fs::read(&f.cache).unwrap(),
+            mono_bytes,
+            "the existing Mix cache was rewritten"
+        );
+        assert_eq!(frames, mono_first, "the display got a different Mix than the file");
+        assert!(f.sidecar().exists(), "the sidecar was not written");
+
+        // And the sidecar is bound to the cache that is actually on disk, so it
+        // reads back against it.
+        let reloaded = load_cache(&f.cache, BARS).expect("cache did not reload");
+        assert_eq!(
+            read_sidecar_as(&f.cache, f.identity(), &reloaded).expect("sidecar did not reload"),
+            pair
+        );
+    }
+
+    /// A Mix-only re-analysis of a track with no cache still writes one — the
+    /// keep-it rule applies to adding channels, not to every run.
+    #[test]
+    fn a_cold_analysis_still_writes_its_cache() {
+        let m = tone(1000.0, 0.8);
+        let f = Fx::new("cold", &[&m]);
+        let abort = Arc::new(AtomicBool::new(false));
+        assert!(!f.cache.exists());
+        let PreMessage::Done { .. } = run(&f, false, &abort) else { panic!("expected Done") };
+        assert!(f.cache.exists(), "a cold analysis wrote nothing");
+    }
+
+    // ── residency reconciled on the tick, playing or not ────────────────────
+
+    /// A window in Pre-process with a cache and a sidecar already on disk.
+    fn paused_window(b: &Bench) -> SpectrumWindow {
+        let mut w = SpectrumWindow::new();
+        w.analyzer = entry_analyzer(b);
+        w.analyzer.pre_stereo_enabled = true;
+        w.bar_count = 32;
+        w.fft_size = 2048;
+        w.pad_factor = 2;
+        w.overlap = 0.5;
+        w.bar_mapping = BarMappingMode::Cqt;
+        w.interp_mode = InterpolationMode::Linear;
+        w.min_freq = 100.0;
+        w.max_freq = 15_000.0;
+        w.mode = SpectrumMode::PreProcess;
+        w.style = VizStyle::Bars;
+        w.channel_view = channels::ChannelView::Mix;
+        w.current_path = Some(b.wav.clone());
+        w
+    }
+
+    /// Analyse the fixture once, in stereo, so a sidecar exists to be found.
+    fn analysed_bench(tag: &str) -> Bench {
+        let b = Bench::new(tag);
+        let mut a = entry_analyzer(&b);
+        a.pre_stereo_enabled = true;
+        a.start_preprocess(b.wav.clone());
+        settle_analysis(&mut a);
+        assert!(stereo::path_for(&cache_of(&a, &b.wav)).exists(), "setup: no sidecar");
+        b
+    }
+
+    /// Tick until `done`, never playing. A gate on observable state, not a
+    /// sleep with a guess in it.
+    fn tick_until(w: &mut SpectrumWindow, at: f64, what: &str, done: impl Fn(&SpectrumWindow) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            w.tick(at, false);
+            if done(w) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Selecting a channel view while paused loads the channels and draws the
+    /// row under the playhead — without playing anything.
+    ///
+    /// Demand used to be reconciled inside the Pre-process branch of `tick`,
+    /// which sits *below* `if !is_playing { return; }`. A paused user selecting
+    /// Left got nothing at all until they pressed play.
+    #[test]
+    fn selecting_a_channel_view_while_paused_loads_and_draws_it() {
+        let b = analysed_bench("paused_load");
+        let mut w = paused_window(&b);
+        w.analyzer.start_preprocess(b.wav.clone());
+        assert!(w.analyzer.has_pre_channels(), "setup: the sidecar was not found");
+
+        // Mix: nothing is read, however many ticks go by.
+        let at = 10.0 / 60.0;
+        for _ in 0..3 {
+            w.tick(at, false);
+        }
+        assert!(!w.analyzer.pre_channels_resident(), "Mix read the channels");
+        assert!(w.analyzer.bars_left.is_empty());
+
+        // Left, still paused.
+        w.channel_view = channels::ChannelView::Left;
+        tick_until(&mut w, at, "the paused read to land", |w| {
+            w.analyzer.pre_channels_resident()
+        });
+
+        // Drawn at the playhead's row, not left blank until playback advances.
+        assert!(!w.analyzer.bars_left.is_empty(), "the channels landed but were not drawn");
+        assert!(!w.analyzer.bars_right.is_empty());
+        let row = timing::target_frame(
+            at, w.analyzer.pre_frame_rate, w.analyzer.pre_frames.len(),
+        )
+        .expect("a row under the playhead");
+        let pair = w.analyzer.pre_stereo().expect("resident");
+        assert_eq!(w.analyzer.bars_left, pair.left().row_vec(row));
+
+        // Back to Mix: the matrices go back, the file stays.
+        w.channel_view = channels::ChannelView::Mix;
+        w.tick(at, false);
+        assert!(!w.analyzer.pre_channels_resident(), "Mix did not release the channels");
+        assert!(w.analyzer.bars_left.is_empty() && w.analyzer.bars_right.is_empty());
+        assert!(w.analyzer.has_pre_channels(), "releasing memory lost the file");
+
+        // Leaving Pre-process releases too, and does not re-read.
+        w.channel_view = channels::ChannelView::Left;
+        w.tick(at, false);
+        w.mode = SpectrumMode::RealTime;
+        w.tick(at, false);
+        assert!(!w.analyzer.pre_channels_resident(), "leaving Pre-process kept the channels");
+    }
+
+    /// A read that finishes after the view has gone back to Mix is discarded,
+    /// not installed behind it.
+    #[test]
+    fn a_read_completing_after_a_return_to_mix_is_not_installed() {
+        let b = analysed_bench("late");
+        let mut w = paused_window(&b);
+        w.analyzer.start_preprocess(b.wav.clone());
+        let at = 5.0 / 60.0;
+
+        // Hold the reader just before it reports, so "the user changed their
+        // mind while it was in flight" is a decision this test makes rather
+        // than a race it hopes to win: the fixture is small enough that the
+        // worker finishes first every time.
+        let hold = Arc::new(AtomicBool::new(true));
+        w.analyzer.sidecar_hold = Some(Arc::clone(&hold));
+
+        // Ask, then change your mind on the very next tick.
+        w.channel_view = channels::ChannelView::Left;
+        w.tick(at, false);
+        assert!(
+            matches!(w.analyzer.pre_channels(), PreChannels::Loading),
+            "the paused tick did not start a read"
+        );
+        w.channel_view = channels::ChannelView::Mix;
+        w.tick(at, false);
+        assert!(!w.analyzer.pre_channels_resident(), "it was installed before the release");
+
+        // Now let it report.
+        hold.store(false, Ordering::Relaxed);
+
+        // The result still arrives — the link is deliberately kept open — and
+        // is thrown away rather than putting two matrices back behind a Mix the
+        // user has already returned to.
+        tick_until(&mut w, at, "the unwanted read to be discarded", |w| {
+            w.analyzer.discarded_reads > 0
+        });
+        assert!(!w.analyzer.pre_channels_resident(), "an unwanted read was installed");
+        assert!(w.analyzer.bars_left.is_empty());
+        assert!(w.analyzer.has_pre_channels(), "the file is still there to read later");
+
+        // And asking again still works.
+        w.analyzer.sidecar_hold = None;
+        w.channel_view = channels::ChannelView::Left;
+        tick_until(&mut w, at, "the second read", |w| w.analyzer.pre_channels_resident());
+        assert!(!w.analyzer.bars_left.is_empty());
+    }
+
+    /// A visualisation with no per-channel form is not demand, even with a
+    /// channel view selected.
+    #[test]
+    fn an_unsupported_visualisation_does_not_ask_for_channels() {
+        let b = analysed_bench("style");
+        let mut w = paused_window(&b);
+        w.analyzer.start_preprocess(b.wav.clone());
+        w.channel_view = channels::ChannelView::Split;
+        w.style = VizStyle::Waterfall;
+        assert!(!w.style_supports_channels(), "setup: this style should not support them");
+
+        for _ in 0..3 {
+            w.tick(0.0, false);
+        }
+        assert!(
+            matches!(w.analyzer.pre_channels(), PreChannels::OnDisk),
+            "an unsupported visualisation started a read"
+        );
+        assert!(!w.analyzer.pre_channels_resident());
+    }
+
+    // ── the handoff boundary: poll, then reconcile ──────────────────────────
+    //
+    // A tick polls for a result and then reconciles demand. If a reader
+    // publishes and exits *between* those two steps, the reconcile sees an idle
+    // reader with a result already queued — and, before completion ownership,
+    // started the same read a second time. The tests below stage exactly that
+    // interleave rather than hoping to hit it.
+
+    /// Wait until `n` readers have published and are unwinding.
+    fn readers_finished(a: &SpectrumAnalyzer, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while a.reader_stats.finished.load(Ordering::Relaxed) < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {n} reader(s) to publish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A completion published between the poll and the reconcile must not be
+    /// read again.
+    #[test]
+    fn a_completion_arriving_between_poll_and_reconcile_is_not_read_twice() {
+        let b = analysed_bench("handoff");
+        let mut a = entry_analyzer(&b);
+        a.pre_stereo_enabled = true;
+        a.start_preprocess(b.wav.clone());
+        a.pre_channels_wanted = true;
+
+        let hold = Arc::new(AtomicBool::new(true));
+        a.sidecar_hold = Some(Arc::clone(&hold));
+        a.request_pre_channels();
+        assert_eq!(a.reader_stats.started.load(Ordering::Relaxed), 1);
+
+        // The first half of a tick: nothing to take yet.
+        a.poll_pre_channels();
+        assert!(!a.pre_channels_resident());
+
+        // The reader publishes and exits, in the gap.
+        a.sidecar_hold = None;
+        hold.store(false, Ordering::Relaxed);
+        readers_finished(&a, 1);
+
+        // The second half of the same tick. The result is queued and unconsumed,
+        // so the slot is still owned and this must start nothing.
+        a.request_pre_channels();
+        assert_eq!(
+            a.reader_stats.started.load(Ordering::Relaxed),
+            1,
+            "a completion waiting to be taken was read a second time"
+        );
+        assert!(matches!(a.pre_channels(), PreChannels::Loading));
+
+        // The next poll takes it, and that is what frees the slot.
+        a.poll_pre_channels();
+        assert!(a.pre_channels_resident(), "the queued completion was not installed");
+        assert_eq!(a.reader_stats.started.load(Ordering::Relaxed), 1);
+        assert_eq!(a.reader_stats.peak_live(), 1);
+        assert_eq!(a.discarded_reads, 0);
+
+        // Nothing further is read: the pair is resident.
+        a.request_pre_channels();
+        assert_eq!(a.reader_stats.started.load(Ordering::Relaxed), 1);
+    }
+
+    /// A stale completion, then the current request's completion: two reads,
+    /// never three, and the display ends up with the pair that was asked for.
+    #[test]
+    fn a_stale_completion_then_the_current_one_reads_exactly_twice() {
+        let b = analysed_bench("staleorder");
+        let mut w = paused_window(&b);
+        w.analyzer.start_preprocess(b.wav.clone());
+        let at = 7.0 / 60.0;
+
+        let hold = Arc::new(AtomicBool::new(true));
+        w.analyzer.sidecar_hold = Some(Arc::clone(&hold));
+
+        // Ask, so a reader starts and is held.
+        w.channel_view = channels::ChannelView::Left;
+        w.tick(at, false);
+        assert_eq!(w.analyzer.reader_stats.started.load(Ordering::Relaxed), 1);
+
+        // Change your mind, then change it back. The first read is now stale;
+        // the demand waiting behind it is the current one.
+        w.channel_view = channels::ChannelView::Mix;
+        w.tick(at, false);
+        w.channel_view = channels::ChannelView::Left;
+        w.tick(at, false);
+        assert_eq!(
+            w.analyzer.reader_stats.started.load(Ordering::Relaxed),
+            1,
+            "demand waiting for the slot started a reader beside the held one"
+        );
+        assert!(matches!(w.analyzer.pre_channels(), PreChannels::Loading));
+
+        // Let the stale reader publish and exit, in the gap between ticks.
+        w.analyzer.sidecar_hold = None;
+        hold.store(false, Ordering::Relaxed);
+        readers_finished(&w.analyzer, 1);
+
+        // One tick: takes the stale completion, discards it on its serial, and
+        // — the slot now free — starts the read that is actually wanted.
+        w.tick(at, false);
+        assert_eq!(w.analyzer.discarded_reads, 1, "the stale completion was not discarded");
+        assert_eq!(
+            w.analyzer.reader_stats.started.load(Ordering::Relaxed),
+            2,
+            "the current request was not served after the stale one retired"
+        );
+
+        tick_until(&mut w, at, "the current read", |w| w.analyzer.pre_channels_resident());
+        assert_eq!(
+            w.analyzer.reader_stats.started.load(Ordering::Relaxed),
+            2,
+            "a stale completion followed by the wanted read cost three reads"
+        );
+        assert_eq!(w.analyzer.reader_stats.peak_live(), 1);
+        assert_eq!(w.analyzer.discarded_reads, 1);
+
+        // And the display is showing the pair that was asked for.
+        let pair = w.analyzer.pre_stereo().expect("resident");
+        let row = timing::target_frame(at, w.analyzer.pre_frame_rate, w.analyzer.pre_frames.len())
+            .expect("a row under the playhead");
+        assert_eq!(w.analyzer.bars_left, pair.left().row_vec(row));
+        assert_eq!(w.analyzer.bars_right, pair.right().row_vec(row));
+    }
+
+    /// A reader that dies without publishing still gives the slot back.
+    ///
+    /// Ownership runs to consumption, so a reader that vanished silently would
+    /// hold it shut for the session. Exactly one completion is published per
+    /// spawn, and this is the path that guarantees it.
+    #[test]
+    fn a_reader_that_never_publishes_still_releases_the_slot() {
+        let b = analysed_bench("orphan");
+        let mut a = entry_analyzer(&b);
+        a.pre_stereo_enabled = true;
+        a.start_preprocess(b.wav.clone());
+
+        // A sidecar whose file disappears mid-flight: the read fails, and the
+        // failure is a published completion like any other.
+        std::fs::remove_file(stereo::path_for(&cache_of(&a, &b.wav))).unwrap();
+        a.request_pre_channels();
+        assert_eq!(a.reader_stats.started.load(Ordering::Relaxed), 1);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(a.pre_channels(), PreChannels::Refused(_)) {
+            assert!(std::time::Instant::now() < deadline, "the failure never arrived");
+            a.poll_pre_channels();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The slot came back with it: a later request is free to use it.
+        assert_eq!(a.reader_stats.finished.load(Ordering::Relaxed), 1);
+        assert_eq!(a.reader_stats.peak_live(), 1);
+    }
+
+    /// However often the view changes, at most one reader is ever alive.
+    ///
+    /// Discarding a stale result is not cancellation: the reader that produced
+    /// it ran to completion anyway. Before the bound, flicking between Mix and
+    /// Left started a whole-file read and decode each time and they piled up in
+    /// parallel — all but the last of it thrown away.
+    #[test]
+    fn repeated_view_changes_never_run_more_than_one_reader() {
+        let b = analysed_bench("bound");
+        let mut w = paused_window(&b);
+        w.analyzer.start_preprocess(b.wav.clone());
+        let at = 4.0 / 60.0;
+
+        // Hold the first reader so every flick below happens while it is alive.
+        let hold = Arc::new(AtomicBool::new(true));
+        w.analyzer.sidecar_hold = Some(Arc::clone(&hold));
+
+        // One tick with Left starts exactly one reader, and it is held.
+        w.channel_view = channels::ChannelView::Left;
+        w.tick(at, false);
+        assert_eq!(
+            w.analyzer.reader_stats.started.load(Ordering::Relaxed),
+            1,
+            "the first paused tick did not start a read"
+        );
+
+        // Twelve more changes while that reader is held start none.
+        for _ in 0..6 {
+            w.channel_view = channels::ChannelView::Mix;
+            w.tick(at, false);
+            w.channel_view = channels::ChannelView::Left;
+            w.tick(at, false);
+        }
+        assert_eq!(
+            w.analyzer.reader_stats.started.load(Ordering::Relaxed),
+            1,
+            "view changes started a second reader beside the one still running"
+        );
+        assert_eq!(w.analyzer.reader_stats.peak_live(), 1);
+
+        // Let the held reader retire; the demand that is actually current then
+        // gets served.
+        w.analyzer.sidecar_hold = None;
+        hold.store(false, Ordering::Relaxed);
+        tick_until(&mut w, at, "the coalesced read", |w| w.analyzer.pre_channels_resident());
+
+        assert_eq!(w.analyzer.reader_stats.peak_live(), 1, "readers ran in parallel");
+        assert!(
+            w.analyzer.reader_stats.started.load(Ordering::Relaxed) <= 2,
+            "thirteen view changes should collapse into at most two reads, saw {}",
+            w.analyzer.reader_stats.started.load(Ordering::Relaxed),
+        );
+        let pair = w.analyzer.pre_stereo().expect("resident");
+        let row = timing::target_frame(at, w.analyzer.pre_frame_rate, w.analyzer.pre_frames.len())
+            .expect("a row");
+        assert_eq!(w.analyzer.bars_left, pair.left().row_vec(row));
+
+        // Ending on Mix leaves nothing resident, and still only ever one reader.
+        w.channel_view = channels::ChannelView::Mix;
+        w.tick(at, false);
+        assert!(!w.analyzer.pre_channels_resident());
+        assert_eq!(w.analyzer.reader_stats.peak_live(), 1);
+    }
+
+    /// A track change while a reader is held does not leave a second one beside
+    /// it, and the stale result is not installed.
+    #[test]
+    fn a_track_change_while_a_reader_is_held_starts_no_second_reader() {
+        let b = analysed_bench("trackchange");
+        let mut w = paused_window(&b);
+        w.analyzer.start_preprocess(b.wav.clone());
+        let at = 3.0 / 60.0;
+
+        let hold = Arc::new(AtomicBool::new(true));
+        w.analyzer.sidecar_hold = Some(Arc::clone(&hold));
+        w.channel_view = channels::ChannelView::Left;
+        w.tick(at, false);
+        assert_eq!(w.analyzer.reader_stats.started.load(Ordering::Relaxed), 1);
+
+        // The track changes underneath it. The matrix is replaced; the reader
+        // is still holding the old one.
+        //
+        // The new track is analysed without channels, so "nothing resident"
+        // below means the stale pair was refused rather than that the new
+        // track simply has none of its own to confuse it with.
+        w.analyzer.pre_stereo_enabled = false;
+        w.analyzer.start_preprocess(b.other.clone());
+        settle_analysis(&mut w.analyzer);
+        for _ in 0..4 {
+            w.tick(at, false);
+        }
+        assert_eq!(
+            w.analyzer.reader_stats.started.load(Ordering::Relaxed),
+            1,
+            "a track change started a second reader beside the held one"
+        );
+
+        // Let it retire: the result belongs to a matrix that is gone.
+        w.analyzer.sidecar_hold = None;
+        hold.store(false, Ordering::Relaxed);
+        tick_until(&mut w, at, "the stale read to be discarded", |w| {
+            w.analyzer.discarded_reads > 0
+        });
+        assert!(!w.analyzer.pre_channels_resident(), "a stale read was installed");
+        assert_eq!(w.analyzer.reader_stats.peak_live(), 1);
+    }
+
+    /// A stereo analysis that finishes while paused draws its channels.
+    ///
+    /// The arrival flag was only set on the sidecar reader's path, so a fresh
+    /// analysis installed the channels and the display showed nothing until
+    /// playback resumed. The presentation reset also had to move above the snap,
+    /// or the new cache's revision wiped the row that had just been drawn.
+    #[test]
+    fn a_fresh_stereo_analysis_draws_its_channels_while_paused() {
+        let b = Bench::new("freshpaused");
+        let mut w = paused_window(&b);
+        w.channel_view = channels::ChannelView::Left;
+
+        // Through the real completion consumer: the analysis is started by the
+        // entry point and received by the tick.
+        w.analyzer.pre_stereo_request = Some(b.wav.clone());
+        w.analyzer.start_preprocess(b.wav.clone());
+        assert!(w.analyzer.is_analyzing.load(Ordering::Relaxed));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while w.analyzer.is_analyzing.load(Ordering::Relaxed) {
+            assert!(std::time::Instant::now() < deadline, "the analysis never finished");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let at = 6.0 / 60.0;
+        let before = w.analyzer.take_channel_ffts();
+        assert_eq!(before, 0, "setup: nothing should have run a live transform yet");
+
+        // One paused tick takes delivery, installs, and draws.
+        w.tick(at, false);
+        assert!(w.analyzer.pre_channels_resident(), "the fresh channels were not installed");
+        assert!(
+            !w.analyzer.bars_left.is_empty() && !w.analyzer.bars_right.is_empty(),
+            "a fresh analysis finished while paused and drew nothing"
+        );
+
+        let pair = w.analyzer.pre_stereo().expect("resident");
+        let row = timing::target_frame(at, w.analyzer.pre_frame_rate, w.analyzer.pre_frames.len())
+            .expect("a row under the playhead");
+        assert_eq!(w.analyzer.bars_left, pair.left().row_vec(row), "the wrong row was drawn");
+        assert_eq!(w.analyzer.bars_right, pair.right().row_vec(row));
+        assert_eq!(
+            w.analyzer.take_channel_ffts(),
+            0,
+            "a paused arrival ran a live transform"
+        );
+
+        // Mix wants none of it, and does not keep them.
+        w.channel_view = channels::ChannelView::Mix;
+        w.tick(at, false);
+        assert!(!w.analyzer.pre_channels_resident(), "Mix kept the channels");
+        assert!(w.analyzer.bars_left.is_empty());
+        assert_eq!(w.analyzer.take_channel_ffts(), 0);
+    }
+
+    /// An aborted request, and separately a failed one, leave the Mix cache
+    /// alone and the preference alone — and the retry actually works.
+    #[test]
+    fn an_aborted_or_failed_request_leaves_everything_alone_and_retries() {
+        let b = Bench::new("abortretry");
+        let mut a = entry_analyzer(&b);
+
+        // A Mix-only analysis to have something to protect.
+        a.start_preprocess(b.wav.clone());
+        settle_analysis(&mut a);
+        let cache = cache_of(&a, &b.wav);
+        let mono_bytes = std::fs::read(&cache).unwrap();
+        assert!(!stereo::path_for(&cache).exists());
+
+        // Abort, established rather than raced: the worker is parked before it
+        // does anything, and the flag is set while it is parked.
+        let hold = Arc::new(AtomicBool::new(true));
+        a.analysis_hold = Some(Arc::clone(&hold));
+        a.pre_stereo_request = Some(b.wav.clone());
+        a.start_preprocess(b.wav.clone());
+        assert!(a.is_analyzing.load(Ordering::Relaxed), "the request did not start");
+        a.abort_analysis.store(true, Ordering::Relaxed);
+        hold.store(false, Ordering::Relaxed);
+        a.analysis_hold = None;
+        settle_analysis(&mut a);
+
+        assert!(!stereo::path_for(&cache).exists(), "an aborted request wrote a sidecar");
+        assert_eq!(
+            std::fs::read(&cache).unwrap(),
+            mono_bytes,
+            "an aborted request changed the Mix cache"
+        );
+        assert!(!a.pre_stereo_enabled, "an abort changed the preference");
+        assert!(!a.pre_channels_resident());
+
+        // An error, separately: a file too short to analyse.
+        let tiny = b.wav.with_file_name("tiny.wav");
+        write_wav(&tiny, &[&tone(440.0, 0.01), &tone(440.0, 0.01)], SR);
+        a.pre_stereo_request = Some(tiny.clone());
+        a.start_preprocess(tiny.clone());
+        settle_analysis(&mut a);
+        assert!(!cache_of(&a, &tiny).exists(), "a failed analysis wrote a cache");
+        assert!(!a.pre_stereo_enabled, "an error changed the preference");
+        assert_eq!(
+            std::fs::read(&cache).unwrap(),
+            mono_bytes,
+            "an unrelated failure touched this track's cache"
+        );
+
+        // The retry, through the real entry point, and it has to work.
+        a.pre_stereo_request = Some(b.wav.clone());
+        a.start_preprocess(b.wav.clone());
+        assert!(a.is_analyzing.load(Ordering::Relaxed), "the retry did not start");
+        settle_analysis(&mut a);
+
+        assert!(stereo::path_for(&cache).exists(), "the retry wrote no sidecar");
+        assert_eq!(
+            std::fs::read(&cache).unwrap(),
+            mono_bytes,
+            "the retry rewrote the Mix cache it was supposed to keep"
+        );
+        assert!(a.pre_channels_resident(), "the retry installed no channels");
+        let pair = a.pre_stereo().expect("resident").clone();
+        assert_eq!(pair.len(), a.pre_frames.len());
+        assert_ne!(pair.left(), pair.right(), "the two channels are the same");
+        assert!(!a.pre_stereo_enabled, "the retry changed the preference");
+
+        // And what was written reads back against the cache on disk.
+        let reloaded = load_cache(&cache, a.bar_count).expect("cache did not reload");
+        assert_eq!(
+            read_sidecar_as(&cache, cache_identity(&a, &b.wav), &reloaded).expect("sidecar"),
+            pair
+        );
+    }
+
+    fn cache_identity(a: &SpectrumAnalyzer, path: &PathBuf) -> stereo::Identity {
+        cache_key_for(
+            &a.cache_dir(), path, a.bar_count, a.fft_size, a.pad_factor, a.overlap,
+            &a.window_fn, a.min_freq, a.max_freq, &a.bar_mapping, &a.interp_mode,
+            a.dsd_rate, &a.aslt_cfg, a.pre_fps,
+        )
+        .0
+    }
+
+    // ── lazy loading: on disk, loading, resident, missing, refused ──────────
+
+    /// A mono cache and a matching sidecar in a directory of their own.
+    struct OnDisk {
+        dir: PathBuf,
+        cache: PathBuf,
+        mono: cache::PreFrames,
+        pair: stereo::Stereo,
+    }
+
+    impl OnDisk {
+        fn new(tag: &str, frames: usize, bars: usize) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "moosik_lazy_{tag}_{}_{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let cache = dir.join("t.spectrumcache");
+            let mono = frames_of(1, frames, bars);
+            let pair = stereo::Stereo::new(frames_of(2, frames, bars), frames_of(3, frames, bars))
+                .expect("same shape");
+            cache::write_atomic(&cache, &mono.to_v4()).unwrap();
+            cache::write_atomic(
+                &stereo::path_for(&cache),
+                &stereo::encode(TEST_ID, &mono, &pair),
+            )
+            .unwrap();
+            Self { dir, cache, mono, pair }
+        }
+
+        /// Install the matrix the way the disk-load path does: the sidecar is
+        /// seen, not read.
+        fn install(&self, a: &mut SpectrumAnalyzer) {
+            a.set_pre_frames_with(
+                self.mono.clone(),
+                channels_on_disk(&self.cache),
+                Some((self.cache.clone(), TEST_ID)),
+                60.0,
+            );
+        }
+    }
+
+    impl Drop for OnDisk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn analyzer_for(bars: usize) -> SpectrumAnalyzer {
+        let mut a = SpectrumAnalyzer::new(new_sample_buf());
+        a.bar_count = bars;
+        a.magnitudes = vec![0.0; bars];
+        a.smoothed = vec![0.0; bars];
+        a.peak_input = vec![0.0; bars];
+        a.pre_smoothing = 0.0;
+        a.pre_stereo_enabled = true;
+        a
+    }
+
+    /// Poll until `done` or the deadline. The read is on a worker, so a test
+    /// either waits for it or tests something else.
+    fn settle(a: &mut SpectrumAnalyzer, what: &str, done: impl Fn(&SpectrumAnalyzer) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            a.poll_pre_channels();
+            // As the tick does: demand is re-offered every frame, which is what
+            // gets a coalesced request served once the reader slot frees up.
+            a.request_pre_channels();
+            if done(a) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// The sidecar is not read until a channel view asks for it, and the
+    /// matrices go back when the view returns to Mix.
+    #[test]
+    fn channels_are_read_on_demand_and_released_on_mix() {
+        let fx = OnDisk::new("ondemand", 64, 32);
+        let mut a = analyzer_for(32);
+        fx.install(&mut a);
+
+        // Seen, not read — and the buttons must still be usable, or the view
+        // that triggers the read could never be selected.
+        assert!(matches!(a.pre_channels(), PreChannels::OnDisk));
+        assert!(a.has_pre_channels(), "an unread sidecar must keep the buttons live");
+        assert!(!a.pre_channels_resident(), "nothing should have been read yet");
+
+        a.request_pre_channels();
+        assert!(matches!(a.pre_channels(), PreChannels::Loading));
+        assert!(a.has_pre_channels(), "a read in flight must keep the buttons live");
+
+        settle(&mut a, "the read to land", |a| a.pre_channels_resident());
+        assert_eq!(a.pre_stereo(), Some(&fx.pair));
+
+        // And it draws.
+        a.pre_channels_wanted = true;
+        a.snap_pre_to(10.0 / 60.0);
+        assert_eq!(a.bars_left, fx.pair.left().row_vec(10));
+        assert_eq!(a.bars_right, fx.pair.right().row_vec(10));
+
+        // Back to Mix: the matrices go, the file stays, and the state says the
+        // channels are still obtainable.
+        a.release_pre_channels();
+        assert!(matches!(a.pre_channels(), PreChannels::OnDisk));
+        assert!(!a.pre_channels_resident());
+        assert!(a.bars_left.is_empty() && a.bars_right.is_empty());
+        assert!(stereo::path_for(&fx.cache).exists(), "releasing memory deleted the file");
+        assert!(a.has_pre_channels());
+
+        // Asking again reads it again, rather than re-analysing anything.
+        a.request_pre_channels();
+        settle(&mut a, "the second read", |a| a.pre_channels_resident());
+        assert_eq!(a.pre_stereo(), Some(&fx.pair));
+    }
+
+    /// A read that finishes after the matrix it was started for has gone is
+    /// discarded, not installed.
+    #[test]
+    fn a_read_that_lands_after_a_track_change_is_discarded() {
+        let fx = OnDisk::new("stale", 64, 32);
+        let mut a = analyzer_for(32);
+        fx.install(&mut a);
+        a.request_pre_channels();
+
+        // The track changes while the read is in flight. The link stays open,
+        // so the result really does arrive.
+        let other = frames_of(9, 48, 32);
+        a.set_pre_frames_with(other.clone(), PreChannels::Missing, None, 60.0);
+
+        settle(&mut a, "the stale read to be refused", |a| a.discarded_reads > 0);
+        assert_eq!(a.discarded_reads, 1);
+        assert!(!a.pre_channels_resident(), "a stale read was installed");
+        assert!(matches!(a.pre_channels(), PreChannels::Missing));
+        assert_eq!(a.pre_frames.len(), other.len(), "the new matrix was disturbed");
+    }
+
+    /// Rapid view changes: request, release, request, with a read in flight
+    /// throughout. The last state asked for is the one that holds.
+    #[test]
+    fn rapid_view_changes_leave_a_consistent_state() {
+        let fx = OnDisk::new("rapid", 64, 32);
+        let mut a = analyzer_for(32);
+        fx.install(&mut a);
+
+        for _ in 0..5 {
+            a.request_pre_channels();
+            a.release_pre_channels();
+        }
+        // Releasing while `Loading` cancels that request — the result arrives
+        // and is discarded rather than installed behind a Mix — but it never
+        // loses the *file*: the state stays obtainable and asking again reads
+        // it.
+        a.request_pre_channels();
+        settle(&mut a, "the read after churn", |a| a.pre_channels_resident());
+        assert_eq!(a.pre_stereo(), Some(&fx.pair));
+        assert!(
+            a.discarded_reads > 0,
+            "releasing while a read is in flight should cancel it, and five \
+             cycles should have produced at least one result nobody wanted"
+        );
+
+        // Ending on Mix leaves nothing resident and nothing drawn.
+        a.release_pre_channels();
+        a.pre_channels_wanted = false;
+        a.snap_pre_to(5.0 / 60.0);
+        assert!(a.bars_left.is_empty() && a.bars_right.is_empty());
+        assert!(!a.pre_frames.is_empty(), "the Mix must be untouched by any of this");
+    }
+
+    /// An unreadable sidecar is refused once, says why, and is not retried on
+    /// every tick for the rest of the track.
+    #[test]
+    fn an_unreadable_sidecar_is_refused_once_and_the_mix_is_unaffected() {
+        let fx = OnDisk::new("bad", 64, 32);
+        std::fs::write(stereo::path_for(&fx.cache), vec![0u8; 64]).unwrap();
+        let mut a = analyzer_for(32);
+        fx.install(&mut a);
+        assert!(matches!(a.pre_channels(), PreChannels::OnDisk), "a bad file is still a file");
+
+        a.request_pre_channels();
+        settle(&mut a, "the refusal", |a| matches!(a.pre_channels(), PreChannels::Refused(_)));
+
+        let PreChannels::Refused(why) = a.pre_channels() else { panic!("expected a refusal") };
+        assert!(!why.is_empty(), "a refusal must say why");
+        assert!(a.pre_channels().note().is_some(), "and must have something to show");
+        assert!(!a.has_pre_channels(), "a refused sidecar is not obtainable");
+
+        // Asking again does nothing: `request` only acts on `OnDisk`, so a file
+        // that will fail again is not read again on every tick.
+        let before = a.discarded_reads;
+        a.request_pre_channels();
+        assert!(matches!(a.pre_channels(), PreChannels::Refused(_)));
+        assert_eq!(a.discarded_reads, before);
+
+        // The Mix is untouched throughout, which is the point of the sidecar
+        // being a sidecar.
+        a.pre_channels_wanted = true;
+        a.snap_pre_to(10.0 / 60.0);
+        assert_eq!(a.magnitudes, fx.mono.row_vec(10));
+        assert!(a.bars_left.is_empty());
+    }
+
+    /// A track with no sidecar is `Missing`, and never starts a read.
+    #[test]
+    fn a_track_without_channels_never_starts_a_read() {
+        let fx = OnDisk::new("none", 32, 16);
+        std::fs::remove_file(stereo::path_for(&fx.cache)).unwrap();
+        let mut a = analyzer_for(16);
+        fx.install(&mut a);
+
+        assert!(matches!(a.pre_channels(), PreChannels::Missing));
+        assert!(!a.has_pre_channels());
+        a.request_pre_channels();
+        assert!(matches!(a.pre_channels(), PreChannels::Missing), "a read was started anyway");
+    }
+
+    // ── the budget sweep the completion paths trigger ───────────────────────
+
+    /// A directory of cache units, and the analyser that sweeps it.
+    fn staged_cache_dir(tag: &str, units: usize, bytes: usize) -> (PathBuf, Vec<PathBuf>) {
+        let dir = std::env::temp_dir().join(format!(
+            "moosik_completion_{tag}_{}_{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut mono = Vec::new();
+        for i in 0..units {
+            let m = dir.join(format!("old{i}.spectrumcache"));
+            std::fs::write(&m, vec![0u8; bytes]).unwrap();
+            std::fs::write(stereo::path_for(&m), vec![0u8; bytes]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            mono.push(m);
+        }
+        (dir, mono)
+    }
+
+    /// The completed unit is written last, so LRU would reach for it first.
+    fn finish_unit(dir: &Path, bytes: usize) -> PathBuf {
+        let fresh = dir.join("just_finished.spectrumcache");
+        std::fs::write(&fresh, vec![0u8; bytes]).unwrap();
+        std::fs::write(stereo::path_for(&fresh), vec![0u8; bytes]).unwrap();
+        fresh
+    }
+
+    fn done_message(cache: &Path, stereo_pair: bool) -> PreMessage {
+        let rows: Vec<Vec<f32>> = (0..8).map(|i| (0..16).map(|b| ((i + b) % 5) as f32 / 5.0).collect()).collect();
+        let frames = cache::PreFrames::from_analysis(&rows);
+        let pair = stereo_pair.then(|| {
+            Box::new(
+                stereo::Stereo::new(frames.clone(), frames.clone()).expect("same shape"),
+            )
+        });
+        PreMessage::Done {
+            frames,
+            stereo: pair,
+            frame_rate: 60.0,
+            waveform: vec![0.0; 8],
+            analysis: TrackAnalysis {
+                integrated_lufs: -14.0,
+                dr_score: 8,
+                peak_dbfs: -1.0,
+                clip_count: 0,
+                clip_positions: Vec::new(),
+                bpm: 120.0,
+                key_name: "A minor".into(),
+                loudness_history: Vec::new(),
+            },
+            meta: Box::new(DoneMeta {
+                work: aslt::WorkCount::default(),
+                cache: cache.to_path_buf(),
+                identity: TEST_ID,
+            }),
+        }
+    }
+
+    /// Both production completion paths must spare the unit that just finished.
+    ///
+    /// They passed `None` as `keep` for two milestones, so the sweep a finished
+    /// analysis triggered was free to delete that analysis — and it is the one
+    /// file in the directory guaranteed to have been read zero times, which is
+    /// exactly what LRU reaches for first.
+    #[test]
+    fn a_completed_analysis_survives_the_sweep_it_triggers() {
+        for paused in [false, true] {
+            let (dir, old) = staged_cache_dir(if paused { "paused" } else { "playing" }, 3, 1000);
+            let fresh = finish_unit(&dir, 1000);
+
+            let mut a = SpectrumAnalyzer::new(new_sample_buf());
+            a.cache_dir_override = Some(dir.clone());
+            // 8 000 bytes on disk against a 4 000 byte budget.
+            a.cache_budget_gb = 4000.0 / 1e9;
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(done_message(&fresh, true)).unwrap();
+            a.pre_receiver = Some(rx);
+            if paused {
+                a.try_receive_frames();
+            } else {
+                a.tick_pre(0.0, 1.0 / 60.0);
+            }
+
+            assert!(
+                fresh.exists() && stereo::path_for(&fresh).exists(),
+                "paused={paused}: the completed unit was evicted by its own sweep"
+            );
+            assert!(
+                !old[0].exists() && !stereo::path_for(&old[0]).exists(),
+                "paused={paused}: the oldest unit should have gone, as a whole unit"
+            );
+            let left: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| is_cache_file(&e.path()))
+                .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                .sum();
+            assert!(left <= 4000, "paused={paused}: {left} bytes left, over budget");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// When the protected unit alone exceeds the budget, say so rather than
+    /// reporting that the budget was met.
+    #[test]
+    fn a_protected_unit_that_cannot_fit_is_reported_not_hidden() {
+        let (dir, old) = staged_cache_dir("toobig", 2, 1000);
+        let fresh = finish_unit(&dir, 5000);
+
+        let sweep = evict_in_dir(&dir, 4000, Some(&fresh));
+        println!("  {sweep:?}");
+        assert!(fresh.exists() && stereo::path_for(&fresh).exists());
+        assert!(!old[0].exists() && !old[1].exists(), "everything evictable should go");
+        assert_eq!(sweep.removed, 4, "two units, two files each");
+        assert!(
+            sweep.still_over > 0,
+            "the protected unit is 10 000 bytes against a 4 000 budget; the sweep \
+             must not report success"
+        );
+        assert_eq!(sweep.still_over, 10_000 - 4_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An orphan sidecar is unreadable, so it must not be immortal either.
+    #[test]
+    fn an_orphan_sidecar_is_still_evictable() {
+        let dir = std::env::temp_dir().join(format!(
+            "moosik_evict_orphan_{}_{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let orphan = dir.join("gone.stereocache");
+        std::fs::write(&orphan, vec![0u8; 2000]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let live = dir.join("here.spectrumcache");
+        std::fs::write(&live, vec![0u8; 1000]).unwrap();
+
+        let Sweep { removed, freed, .. } = evict_in_dir(&dir, 1500, None);
+        assert_eq!(removed, 1);
+        assert_eq!(freed, 2000);
+        assert!(!orphan.exists(), "an unreadable sidecar survived the budget");
+        assert!(live.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+// ---------------------------------------------------------------------------
+// What a joint analysis costs on real music
+// ---------------------------------------------------------------------------
+
+/// A real stereo track, analysed mono and then jointly, on the routes this
+/// machine actually has.
+///
+/// The claim under test is a cost one: a joint run performs **two** channel
+/// convolution sets rather than three, so it should land near 2x a mono run and
+/// well under the 3x that three independent analyses would cost. Everything
+/// after the convolution — magnitudes, aggregation, dB mapping, quantisation
+/// and two extra matrices to store — is real work the mix still pays for, so 2x
+/// is a floor and not a promise.
+///
+/// Point it at a file:
+///   MOOSIK_BENCH_TRACK="C:/path/to/track.flac" \
+///   cargo test --release --locked --all-features joint_cost_on_a_real_track \
+///     -- --ignored --nocapture
+#[cfg(test)]
+mod joint_cost_bench {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn joint_cost_on_a_real_track() {
+        let Ok(path) = std::env::var("MOOSIK_BENCH_TRACK") else {
+            println!("set MOOSIK_BENCH_TRACK to a stereo file");
+            return;
+        };
+        let track = PathBuf::from(&path);
+        assert!(track.exists(), "no such file: {path}");
+
+        let bars: usize = std::env::var("MOOSIK_BENCH_BARS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+        let fps: f32 = std::env::var("MOOSIK_BENCH_FPS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(180.0);
+        let preset = match std::env::var("MOOSIK_BENCH_PRESET").as_deref() {
+            Ok("standard") => aslt::AsltPreset::Standard,
+            Ok("extreme") => aslt::AsltPreset::Extreme,
+            _ => aslt::AsltPreset::Fast,
+        };
+        let cfg = preset.config();
+
+        let dir = std::env::temp_dir().join(format!("moosik_joint_bench_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let run = |tag: &str, want_stereo: bool| -> (f64, usize, u64) {
+            let cache = dir.join(format!("{tag}.spectrumcache"));
+            let _ = std::fs::remove_file(&cache);
+            let _ = std::fs::remove_file(stereo::path_for(&cache));
+            let abort = Arc::new(AtomicBool::new(false));
+            let t = Instant::now();
+            let got = preprocess_file(
+                &track, &cache, 44_100, bars,
+                &Arc::new(AtomicUsize::new(0)),
+                8192, 4, 0.75, &WindowFn::Hann, 20.0, 20_000.0,
+                &InterpolationMode::None, &BarMappingMode::Superlet,
+                crate::dsd::decimate::DEFAULT_ANALYSIS_RATE,
+                &cfg, fps, &abort,
+                &Arc::new(AtomicUsize::new(usize::MAX)),
+                if want_stereo { StereoRequest::Joint } else { StereoRequest::MixOnly },
+            );
+            let secs = t.elapsed().as_secs_f64();
+            let (frames, bytes) = match &got {
+                PreMessage::Done { frames, stereo, .. } => {
+                    let side = stereo::path_for(&cache);
+                    let mut b = std::fs::metadata(&cache).map(|m| m.len()).unwrap_or(0);
+                    if stereo.is_some() {
+                        b += std::fs::metadata(&side).map(|m| m.len()).unwrap_or(0);
+                    }
+                    assert_eq!(stereo.is_some(), want_stereo, "{tag}: wrong pair state");
+                    (frames.len(), b)
+                }
+                PreMessage::Error(e) => panic!("{tag}: {e}"),
+                PreMessage::Aborted => panic!("{tag}: aborted"),
+            };
+            let _ = std::fs::remove_file(&cache);
+            let _ = std::fs::remove_file(stereo::path_for(&cache));
+            (secs, frames, bytes)
+        };
+
+        println!(
+            "\n  {}\n  {bars} bars @ {fps} fps, {preset:?} preset\n",
+            track.file_name().unwrap_or_default().to_string_lossy(),
+        );
+
+        let (mono_s, frames, mono_b) = run("mono", false);
+        println!("  mono   {mono_s:>8.1} s   {frames} frames   {:.1} MB on disk",
+                 mono_b as f64 / 1e6);
+        let (joint_s, jframes, joint_b) = run("joint", true);
+        println!("  joint  {joint_s:>8.1} s   {jframes} frames   {:.1} MB on disk",
+                 joint_b as f64 / 1e6);
+
+        assert_eq!(frames, jframes, "the two runs produced different frame counts");
+        println!(
+            "\n  time  {:.2}x mono   disk {:.2}x mono\n  \
+             three independent analyses would be about 3.00x.\n",
+            joint_s / mono_s.max(1e-9),
+            joint_b as f64 / mono_b.max(1) as f64,
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -12713,7 +12713,7 @@ mod tests {
             g.frames.push([0.5, -0.5]);
         }
         assert_eq!(
-            spectrum::channels::availability(false, true, stereo.lock().unwrap().channels),
+            spectrum::channels::availability(false, false, true, stereo.lock().unwrap().channels),
             spectrum::channels::ChannelAvailability::Available,
             "setup: the route should look live"
         );
@@ -12729,7 +12729,7 @@ mod tests {
         );
         assert!(g.frames.is_empty(), "{what} left stale frames behind");
         assert_eq!(
-            spectrum::channels::availability(false, true, g.channels),
+            spectrum::channels::availability(false, false, true, g.channels),
             spectrum::channels::ChannelAvailability::NoLiveTap,
             "{what} must report NoLiveTap"
         );
@@ -12814,7 +12814,7 @@ mod tests {
         );
         assert!(g.frames.is_empty(), "the previous route's frames survived");
         assert_eq!(
-            spectrum::channels::availability(false, true, g.channels),
+            spectrum::channels::availability(false, false, true, g.channels),
             spectrum::channels::ChannelAvailability::NoLiveTap
         );
     }
@@ -12901,7 +12901,7 @@ mod tests {
         assert_eq!(g.channels, spectrum::channels::NO_LIVE_TAP);
         assert!(g.frames.is_empty(), "the previous track's frames survived");
         assert_eq!(
-            spectrum::channels::availability(false, true, g.channels),
+            spectrum::channels::availability(false, false, true, g.channels),
             spectrum::channels::ChannelAvailability::NoLiveTap
         );
     }

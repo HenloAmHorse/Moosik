@@ -138,12 +138,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// Reads finished convolution output and writes one magnitude per frame.
+/// Reads finished convolution output and writes one **complex** value per frame.
 ///
 /// Consecutive blocks overlap, so more than one could supply a given frame.
 /// Each frame picks the *last* block that covers it — the same one the CPU
 /// route ends up with, since there it is simply overwritten in block order.
 /// Choosing explicitly makes it deterministic and removes any write race.
+///
+/// # Why complex and not the magnitude
+///
+/// A stereo analysis combines the two channels as `(L + R)/2` *before* the
+/// magnitude — after it, the phase that makes two channels cancel is already
+/// gone. Taking `sqrt` here would put this route alone on the wrong side of
+/// that boundary and force stereo bars off the device. The scaling the
+/// magnitude used to carry is applied to each component instead, so a host that
+/// wants the magnitude takes the norm and gets the same number.
+///
+/// Frames with no valid block are marked with a quiet NaN in `.x` rather than
+/// the old `-1.0`: every real number is now a legal component, so a sentinel
+/// has to be a value that cannot be produced.
 const EXTRACT_SHADER: &str = r#"
 struct Ex {
     n: u32,
@@ -159,7 +172,7 @@ struct Ex {
 // Per kernel: x = taps, y = half-width.
 @group(0) @binding(0) var<storage, read>       prod: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read>       kmeta: array<vec2<u32>>;
-@group(0) @binding(2) var<storage, read_write> mags: array<f32>;
+@group(0) @binding(2) var<storage, read_write> mags: array<vec2<f32>>;
 @group(0) @binding(3) var<uniform>             e: Ex;
 
 @compute @workgroup_size(64)
@@ -174,18 +187,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let half = kmeta[w].y;
 
     // Position of this frame's output in the linear convolution.
+    // A quiet NaN, written by bit pattern so no optimiser can fold it away.
+    let edge = bitcast<f32>(0x7fc00000u);
+
     let m = fi * e.hop + half;
-    if (m < k - 1u || m >= e.n_sig) { mags[t] = -1.0; return; }
+    if (m < k - 1u || m >= e.n_sig) { mags[t] = vec2<f32>(edge, edge); return; }
 
     // Last block whose valid region [base + k - 1, base + n) covers m.
     let b = min((m - (k - 1u)) / e.stride, e.blocks - 1u);
     let base = b * e.stride;
-    if (m < base + k - 1u || m >= base + e.n) { mags[t] = -1.0; return; }
+    if (m < base + k - 1u || m >= base + e.n) { mags[t] = vec2<f32>(edge, edge); return; }
 
     let c = prod[(w * e.blocks + b) * e.n + (m - base)];
     // 2/n: the inverse transform is unscaled, and the wavelet pair carries a
-    // factor of two, exactly as on the CPU route.
-    mags[t] = 2.0 * sqrt(c.x * c.x + c.y * c.y) / f32(e.n);
+    // factor of two, exactly as on the CPU route. `n` is a power of two, so this
+    // scaling is exact and the norm of what is written here is bit-for-bit the
+    // magnitude this shader used to compute itself.
+    let s = 2.0 / f32(e.n);
+    mags[t] = vec2<f32>(c.x * s, c.y * s);
 }
 "#;
 
@@ -470,7 +489,7 @@ impl GpuFft {
     pub fn convolve_with(
         &self, prepared: &GpuSignal, signal_len: usize, hop: usize, frames: usize,
         kernels: &[GpuKernel],
-    ) -> Result<Vec<Vec<f32>>, String> {
+    ) -> Result<Vec<Vec<C32>>, String> {
         if kernels.is_empty() || frames == 0 { return Ok(Vec::new()); }
         let (n, stride, blocks) = (prepared.n, prepared.stride, prepared.blocks);
         let cplx = std::mem::size_of::<C32>() as u64;
@@ -502,7 +521,8 @@ impl GpuFft {
 
             let prod_a = self.storage("prod-a", w as u64 * per_kernel);
             let prod_b = self.storage("prod-b", w as u64 * per_kernel);
-            let outbuf = self.storage("mag", (w * frames * 4) as u64);
+            // Two floats a frame now, not one.
+            let outbuf = self.storage("resp", (w * frames * 8) as u64);
             let meta: Vec<u32> = group.iter()
                 .flat_map(|k| [k.re.len() as u32, k.half as u32])
                 .collect();
@@ -557,11 +577,11 @@ impl GpuFft {
             }
 
             let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("mag-read"), size: (w * frames * 4) as u64,
+                label: Some("resp-read"), size: (w * frames * 8) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            enc.copy_buffer_to_buffer(&outbuf, 0, &staging, 0, (w * frames * 4) as u64);
+            enc.copy_buffer_to_buffer(&outbuf, 0, &staging, 0, (w * frames * 8) as u64);
             self.queue.submit(Some(enc.finish()));
 
             let slice = staging.slice(..);
@@ -571,9 +591,9 @@ impl GpuFft {
             rx.recv().map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
             {
                 let view = slice.get_mapped_range();
-                let mags: &[f32] = bytemuck::cast_slice(&view);
+                let got: &[C32] = bytemuck::cast_slice(&view);
                 for (gi, col) in out[start..end].iter_mut().enumerate() {
-                    *col = mags[gi * frames..(gi + 1) * frames].to_vec();
+                    *col = got[gi * frames..(gi + 1) * frames].to_vec();
                 }
             }
             staging.unmap();
@@ -849,11 +869,14 @@ mod tests {
                 .expect("cpu shared route declined");
             let peak = want.iter().cloned().fold(0.0f32, f32::max).max(1e-12);
             for (fi, (&a, &b)) in got[gi].iter().zip(want.iter()).enumerate() {
-                // -1 marks an edge frame the GPU deliberately leaves to the
-                // caller; those are not part of this comparison.
-                if a < 0.0 { continue; }
+                // A NaN marks an edge frame the device deliberately leaves to
+                // the caller; those are not part of this comparison. The device
+                // returns the complex response now, so the magnitude the CPU
+                // route produces is compared against its norm.
+                if a[0].is_nan() { continue; }
                 let _ = fi;
-                worst = worst.max((a - b).abs() / peak);
+                let mag = (a[0] * a[0] + a[1] * a[1]).sqrt();
+                worst = worst.max((mag - b).abs() / peak);
                 compared += 1;
             }
         }

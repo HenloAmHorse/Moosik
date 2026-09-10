@@ -2,6 +2,122 @@
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-09-11
+
+### Added
+
+- **Left and right in Pre-process.** The channel views — Left, Right, Split,
+  Overlay and Diff — now work from the cache, with no live audio and while
+  paused. They were real-time only, because the cache held one mono row per
+  frame and there is no way to slice a mono row into two.
+
+  A stereo analysis writes a **sidecar** file beside the mono cache holding the
+  two channels: two more compressed planes, so a track analysed in stereo is
+  three planes on disk rather than one. What that is in bytes depends on the
+  content and on which format the existing Mix cache is in.
+
+  It is off by default — *Stereo by default*, under Channels in the Pre-process
+  view. When a track has no channels the panel offers three separate things:
+  analyse them for **this track**, analyse them **from now on** (the only one
+  that changes the setting, and it says where to change it back), or **not now**.
+
+- **The Mix is derived, not analysed a third time.** A stereo analysis convolves
+  left and right and takes the mix as `M = (L + R)/2` on the **complex**
+  per-member responses — before magnitude, before the log floor, and before the
+  superlet's weighted geometric mean. That is the mix exactly, because the
+  transform is linear and `(l + r)/2` is the signal a mono analysis would have
+  been handed.
+
+  It is not the average of two finished spectra, which is a different quantity:
+  two channels in opposite polarity are both loud and sum to silence, and only
+  the complex form knows that. The FFT bar mappings combine at the same
+  boundary, on the complex bins, before the magnitude and therefore before the
+  bar mapping.
+
+  Every route does this — the direct loop, both overlap-save routes, and the
+  GPU, whose extract shader now returns the complex response rather than taking
+  its own magnitude. The derived mix is held against an independently analysed
+  one across in-phase, anti-phase, one-silent-channel, independent, noise,
+  transient, silent and signal-edge cases; the worst difference measured was
+  1.8×10⁻⁶ of full scale, and 3.6×10⁻⁶ between the GPU and the cores.
+
+  **Cost:** two channel convolution sets rather than three analyses. On one
+  track on one machine — a 2.7-minute file at 1024 bars, 180 fps, Fast preset —
+  a joint analysis took 172.5 s against 76.4 s for mix-only, or **2.26×**. That
+  is a single measurement, not a guarantee: it varies with content, settings and
+  machine. Three independent analyses would be about 3× on the pass count, which
+  is an estimate rather than something timed.
+
+### Changed
+
+- **New caches are 12-bit.** The cache format (v4) stores each level as one of
+  4096 steps on the fixed 80 dB axis instead of 65 536, and packs the planes
+  before compressing them. The quantiser step is 80/4095 = 0.0195 dB and the
+  worst rounding error is half that.
+
+  Measured over 11 tracks at the owner's settings, the packed 12-bit form came
+  to 429.9 MB against 608.1 MB for the old format — about 29 %. **That figure
+  comes from the study encoder used to evaluate the scheme, on that corpus, and
+  has not been re-measured end to end with the production encoder.** Synthetic
+  fixtures of this encoder range from −3 % to −32 % depending on how much noise
+  the material carries.
+
+- **Existing caches keep working.** v2 and v3 files still load and keep the full
+  16-bit precision they were written with. Nothing is converted, migrated or
+  deleted, and no cache is rewritten to gain the new format — only a fresh
+  analysis writes v4.
+
+- **Adding channels keeps the Mix cache.** Analysing channels for a track that
+  already has a valid mix cache does not rewrite that cache. Beyond the wasted
+  work, an existing cache may be a 16-bit v2 or v3, and a v4 rewrite would
+  quietly coarsen it to 12 bits — the request was for channels, not for a
+  coarser mix.
+
+- **Channels are loaded on demand.** The sidecar is read when a channel view
+  asks for it, on a worker thread, and the two matrices are released on return
+  to Mix. The file stays, so selecting a channel view again reads it rather than
+  re-analysing. Whether a sidecar *exists* is a single `stat` and is independent
+  of the setting: a track analysed in stereo keeps its channels whatever the
+  preference says.
+
+- **Cache eviction counts sidecars, and evicts a track's files together.** The
+  size budget sees both planes, a mono file and its sidecar are removed as one
+  unit — an orphan sidecar is unreadable and still occupies space — and the
+  analysis that just finished is protected from the sweep it triggers. When the
+  protected files alone exceed the budget, that is reported rather than passed
+  off as success.
+
+### Fixed
+
+- Cancelling an analysis after the encoding began could still publish it. The
+  abort flag is now read again immediately before the rename that publishes a
+  cache, and a cancelled save is reported as cancelled rather than as a
+  successful write.
+- Cache files were sized from a separate `stat` of the path and then read
+  without a ceiling. The file is opened first, its length taken from that
+  handle, and the read is bounded at one byte past the budget.
+- A stereo analysis finishing while paused installed its channels and drew
+  nothing until playback resumed.
+- Selecting a channel view while paused did nothing until playback resumed.
+- Returning to Mix while a sidecar read was in flight could install the result
+  behind it.
+- Changing view repeatedly started a whole-file read each time and they ran in
+  parallel. At most one reader runs; further changes coalesce into one more
+  read, and the completion owns that slot until it is consumed, so a result
+  waiting to be collected is not read again.
+- The "analyse channels for this track" actions did nothing on a track that
+  already had a valid mix cache — the one case they exist for.
+
+### Notes on evidence
+
+- Memory figures in the project's own documentation are **arithmetic from known
+  dimensions**, not measured process peaks.
+- The reader's cleanup guard publishes a failure if the normal path did not run,
+  so the reader slot is always released. This is not a claim that a release
+  build recovers from a panic.
+
+## [1.5.0] - 2026-09-08
+
 ### Fixed
 
 - **Spectrum smoothing works, and works the same on every monitor.** The

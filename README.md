@@ -46,7 +46,10 @@ cargo build --release
 - **Spectrum analyzer** — pre-processed and real-time, seven visualisation
   styles, an adaptive superlet transform that beats an FFT at both ends of the
   spectrum, GPU offload, and per-channel views including a left/right difference
-  plot
+  plot. Channels work from the cache as well as live: a stereo analysis derives
+  the mix from the two channels' complex responses rather than analysing it a
+  third time, and stores them in a sidecar beside the cache
+  ([docs/SPECTRUM.md](docs/SPECTRUM.md))
 - **Parametric EQ** — up to 16 bands, dragged directly on the spectrum, with
   global and per-song presets
 - **Lyrics** — synced `.lrc`, read from the file or looked up online, with a

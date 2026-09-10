@@ -62,6 +62,13 @@ const SUPPORT_SIGMAS: f32 = 4.0;
 /// before the root is taken; in log space there is nothing to underflow.
 const MAG_FLOOR: f32 = 1e-30;
 
+/// The complex value every route produces before anything takes its magnitude.
+///
+/// Named because it is now a boundary rather than a local: a stereo analysis
+/// combines the two channels *here*, before the magnitude, the log floor and
+/// the geometric mean — none of which it could be done after.
+pub type C32 = rustfft::num_complex::Complex<f32>;
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -307,6 +314,24 @@ pub fn fft_crossover_hz(sample_rate: u32, fft_size: usize, grid_q: f32) -> f32 {
 // Morlet kernel
 // ---------------------------------------------------------------------------
 
+/// Magnitudes of a complex column, in place of a second convolution.
+fn norms(c: Vec<C32>) -> Vec<f32> {
+    c.into_iter().map(|c| (c.re * c.re + c.im * c.im).sqrt()).collect()
+}
+
+/// `(l + r) / 2`, per frame — the mix, taken where it is still the mix.
+///
+/// The whole stereo design turns on this being applied to complex responses.
+/// After the magnitude it would be the average of two magnitudes, which is a
+/// different and wrong quantity: two channels in opposite polarity are both
+/// loud and sum to silence, and only the complex form knows that.
+fn mix_complex(l: &[C32], r: &[C32]) -> Vec<C32> {
+    l.iter()
+        .zip(r)
+        .map(|(a, b)| C32 { re: 0.5 * (a.re + b.re), im: 0.5 * (a.im + b.im) })
+        .collect()
+}
+
 /// A complex Morlet, pre-multiplied into real and imaginary tables so the inner
 /// loop is two multiply-accumulates and no trigonometry.
 pub struct Morlet {
@@ -377,12 +402,45 @@ impl Morlet {
     /// Accumulates in f64. A 4.5σ wavelet at 20 Hz spans ~600 k taps, and an f32
     /// accumulator drifts measurably over that many adds.
     fn response(&self, signal: &[f32], centre: isize) -> f32 {
+        let (re, im, div) = self.response_parts(signal, centre);
+        if div <= 0.0 { return 0.0; }
+        (2.0 * (re * re + im * im).sqrt() / div) as f32
+    }
+
+    /// The same response, kept complex.
+    ///
+    /// This is the boundary a stereo analysis combines at. `M_j = (L_j + R_j)/2`
+    /// is only the mix at this point: after the magnitude below, the average of
+    /// two magnitudes has already discarded the phase that makes two channels
+    /// cancel, and no later stage can put it back.
+    ///
+    /// The edge divisor is a property of the wavelet and the frame position, not
+    /// of the signal, so it is identical for both channels — which is why
+    /// averaging before it and averaging after it give the same answer, and why
+    /// the combination is well defined at the signal edges too.
+    fn response_c(&self, signal: &[f32], centre: isize) -> C32 {
+        let (re, im, div) = self.response_parts(signal, centre);
+        if div <= 0.0 { return C32 { re: 0.0, im: 0.0 }; }
+        C32 { re: (2.0 * re / div) as f32, im: (2.0 * im / div) as f32 }
+    }
+
+    /// Raw f64 accumulators and the divisor the edges renormalise by.
+    ///
+    /// Returned unscaled and undivided so that [`Morlet::response`] can apply
+    /// exactly the expression it always did — `2·|acc|/div` — and stay
+    /// bit-identical to the magnitude this transform has produced since 1.4.
+    /// The complex reader scales each component instead. One loop, two readers,
+    /// and no second implementation of the convolution to drift.
+    ///
+    /// `div` is 1.0 in the interior, the surviving envelope sum at the edges,
+    /// and 0.0 when the window misses the signal entirely.
+    fn response_parts(&self, signal: &[f32], centre: isize) -> (f64, f64, f64) {
         let n = signal.len() as isize;
         let base = centre - self.half as isize;
         let end = base + self.re.len() as isize;
         let lo = base.max(0);
         let hi = end.min(n);
-        if hi <= lo { return 0.0; }
+        if hi <= lo { return (0.0, 0.0, 0.0); }
 
         let mut acc_re = 0.0f64;
         let mut acc_im = 0.0f64;
@@ -394,7 +452,7 @@ impl Morlet {
                 acc_re += (s * wr) as f64;
                 acc_im += (s * wi) as f64;
             }
-            return (2.0 * (acc_re * acc_re + acc_im * acc_im).sqrt()) as f32;
+            return (acc_re, acc_im, 1.0);
         }
 
         let mut env_sum = 0.0f64;
@@ -405,8 +463,7 @@ impl Morlet {
             acc_im += (s * self.im[k]) as f64;
             env_sum += self.env[k] as f64;
         }
-        if env_sum <= 0.0 { return 0.0; }
-        (2.0 * (acc_re * acc_re + acc_im * acc_im).sqrt() / env_sum) as f32
+        (acc_re, acc_im, env_sum)
     }
 
     /// Magnitude at every hop-spaced frame, by whichever route is cheaper.
@@ -420,6 +477,70 @@ impl Morlet {
             return v;
         }
         (0..frames).map(|fi| self.response(signal, (fi * hop) as isize)).collect()
+    }
+
+    /// One member's magnitude columns for whatever the run is analysing.
+    ///
+    /// Mono convolves once. **Joint convolves twice, never three times**, and
+    /// derives the mix from the two complex columns before any magnitude is
+    /// taken. The complex columns exist only inside this call, so what a run
+    /// holds at once is bounded by the number of workers rather than by the
+    /// track length times the wavelet count.
+    ///
+    /// The route each channel takes is chosen the same way it always was, and
+    /// the two channels take the same one — a shared block set that is present
+    /// for one and missing for the other would put the pair through different
+    /// arithmetic, and the mix is a difference of two channels.
+    fn member_cols(
+        &self, ch: &Chans, hop: usize, frames: usize, shared: &SharedSet,
+        work: &WorkCells, seams: &Seams,
+    ) -> Cols {
+        let k = self.re.len();
+        let one = |sig: &[f32], blocks: &Blocks| -> Vec<C32> {
+            work.column(1);
+            blocks
+                .get(&fft_block_len(k))
+                .filter(|_| fft_is_cheaper(k, hop))
+                .and_then(|b| self.complex_via_shared(sig, b, hop, frames))
+                .unwrap_or_else(|| self.complex(sig, hop, frames))
+        };
+        match ch.b {
+            None => Cols { mix: norms(one(ch.a, &shared.a)), ..Default::default() },
+            Some(right) => {
+                let l = one(ch.a, &shared.a);
+                let r = one(right, &shared.b);
+                let mix = norms(mix_complex(&l, &r));
+                if let Some(mean) = ch.mean.filter(|_| seams.redundant_mix_transform) {
+                    // The violation this contract exists to forbid: a third
+                    // convolution, of the mean signal. Through an empty block
+                    // set, because the shared transforms belong to *left* and
+                    // reusing them here would convolve the mean signal against
+                    // the wrong signal's blocks and produce a number that means
+                    // nothing.
+                    let redundant = norms(one(mean, &Blocks::new()));
+                    // Consumed and compared: a mean-signal analysis and the
+                    // derived mix are the same quantity, so this both proves
+                    // the extra work happened and re-checks the derivation.
+                    let dev = redundant
+                        .iter()
+                        .zip(&mix)
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0.0f32, f32::max);
+                    work.redundant(dev);
+                }
+                Cols { mix, left: norms(l), right: norms(r) }
+            }
+        }
+    }
+
+    /// [`Morlet::magnitudes`], kept complex, by whichever route is cheaper.
+    fn complex(&self, signal: &[f32], hop: usize, frames: usize) -> Vec<C32> {
+        if fft_is_cheaper(self.re.len(), hop)
+            && let Some(v) = self.complex_via_fft(signal, hop, frames)
+        {
+            return v;
+        }
+        (0..frames).map(|fi| self.response_c(signal, (fi * hop) as isize)).collect()
     }
 
     /// Interior frames by overlap-save FFT convolution; edge frames by the
@@ -460,6 +581,20 @@ impl Morlet {
     fn magnitudes_via_shared(
         &self, signal: &[f32], blocks: &SignalBlocks, hop: usize, frames: usize,
     ) -> Option<Vec<f32>> {
+        Some(norms(self.complex_via_shared(signal, blocks, hop, frames)?))
+    }
+
+    /// The shared-signal route, kept complex. See [`Morlet::response_c`] for why
+    /// the combination has to happen here and not after the magnitude.
+    ///
+    /// The interior scaling `2/n` is an exact power of two, so applying it to
+    /// each component and taking the norm afterwards gives bit-for-bit the
+    /// magnitude this route produced before — the mono path is unchanged. Edge
+    /// frames, which divide by a surviving envelope sum, can differ in the last
+    /// place; they are the few frames whose window hangs off the signal.
+    fn complex_via_shared(
+        &self, signal: &[f32], blocks: &SignalBlocks, hop: usize, frames: usize,
+    ) -> Option<Vec<C32>> {
         use rustfft::num_complex::Complex;
 
         let k = self.re.len();
@@ -484,10 +619,10 @@ impl Morlet {
         }
         ASLT_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n)).process(&mut kernel);
 
-        let mut out = vec![0.0f32; frames];
+        let mut out = vec![C32 { re: 0.0, im: 0.0 }; frames];
         for (fi, slot) in out.iter_mut().enumerate() {
             if fi < first || fi > last {
-                *slot = self.response(signal, (fi * hop) as isize);
+                *slot = self.response_c(signal, (fi * hop) as isize);
             }
         }
 
@@ -511,7 +646,7 @@ impl Morlet {
             if fi_lo <= fi_hi {
                 for (fi, slot) in (fi_lo..=fi_hi).zip(out[fi_lo..=fi_hi].iter_mut()) {
                     let c = buf[fi * hop + half as usize - base];
-                    *slot = 2.0 * scale * (c.re * c.re + c.im * c.im).sqrt();
+                    *slot = C32 { re: 2.0 * scale * c.re, im: 2.0 * scale * c.im };
                 }
             }
         }
@@ -519,6 +654,12 @@ impl Morlet {
     }
 
     fn magnitudes_via_fft(&self, signal: &[f32], hop: usize, frames: usize) -> Option<Vec<f32>> {
+        Some(norms(self.complex_via_fft(signal, hop, frames)?))
+    }
+
+    /// The own-transform overlap-save route, kept complex. As
+    /// [`Morlet::complex_via_shared`].
+    fn complex_via_fft(&self, signal: &[f32], hop: usize, frames: usize) -> Option<Vec<C32>> {
         use rustfft::num_complex::Complex;
 
         let k = self.re.len();
@@ -553,11 +694,11 @@ impl Morlet {
         }
         fwd.process(&mut kernel);
 
-        let mut out = vec![0.0f32; frames];
+        let mut out = vec![C32 { re: 0.0, im: 0.0 }; frames];
         // Edge frames, direct.
         for (fi, slot) in out.iter_mut().enumerate() {
             if fi < first || fi > last {
-                *slot = self.response(signal, (fi * hop) as isize);
+                *slot = self.response_c(signal, (fi * hop) as isize);
             }
         }
 
@@ -589,7 +730,7 @@ impl Morlet {
             if fi_lo <= fi_hi {
                 for (fi, slot) in (fi_lo..=fi_hi).zip(out[fi_lo..=fi_hi].iter_mut()) {
                     let c = buf[fi * hop + half as usize - base];
-                    *slot = 2.0 * scale * (c.re * c.re + c.im * c.im).sqrt();
+                    *slot = C32 { re: 2.0 * scale * c.re, im: 2.0 * scale * c.im };
                 }
             }
             base += step;
@@ -859,6 +1000,13 @@ const GPU_MIN_BATCH: usize = 24;
 /// be built at once, so the group is walked in chunks.
 const GPU_KERNEL_TAP_BUDGET: usize = 48 << 20;
 
+/// Add one member's contribution to a running log-space accumulator.
+fn fold_logs(acc: &mut [f32], col: &[f32], weight: f32) {
+    for (a, m) in acc.iter_mut().zip(col) {
+        *a += weight * m.max(MAG_FLOOR).ln();
+    }
+}
+
 /// Weighted geometric mean of per-wavelet magnitudes — the superlet itself,
 /// applied to columns that may have come from anywhere.
 fn combine_logs(mags: &[Vec<f32>], weights: &[f32], total_weight: f32, frames: usize) -> Vec<f32> {
@@ -974,6 +1122,258 @@ thread_local! {
 // Superlet
 // ---------------------------------------------------------------------------
 
+/// What one run analyses.
+///
+/// The distinction is not "one signal or two". It is **where the mix comes
+/// from**: analysed in its own right, or derived from the two channels at the
+/// only point where deriving it is correct.
+pub enum Input<'a> {
+    /// One signal, analysed as itself.
+    Mono(&'a [f32]),
+    /// A stereo pair. The mix is derived from the two channels' *complex*
+    /// responses, member by member, before any magnitude is taken:
+    ///
+    /// ```text
+    /// M_j = (L_j + R_j) / 2
+    /// ```
+    ///
+    /// This is exactly the mix, not an approximation of it: the transform is
+    /// linear, and `(l + r)/2` is the signal the mono route would have been
+    /// handed. Two convolution sets, not three — and never the average of two
+    /// magnitudes, which is a different quantity that reads two anti-phase
+    /// channels as loud when their sum is silent.
+    Joint { left: &'a [f32], right: &'a [f32] },
+}
+
+impl<'a> Input<'a> {
+    /// The signal every length, frame count and plan is derived from.
+    fn lead(&self) -> &'a [f32] {
+        match *self {
+            Input::Mono(s) => s,
+            Input::Joint { left, .. } => left,
+        }
+    }
+
+    fn chans(&self) -> Chans<'a> {
+        match *self {
+            Input::Mono(s) => Chans { a: s, b: None, mean: None },
+            // Trimmed to the shorter, so a frame index means the same instant
+            // in both channels and the mix is never a combination of two
+            // different moments. The producer already pairs them exactly; this
+            // makes it a property of the type rather than a promise.
+            Input::Joint { left, right } => {
+                let m = left.len().min(right.len());
+                Chans { a: &left[..m], b: Some(&right[..m]), mean: None }
+            }
+        }
+    }
+
+    pub fn is_joint(&self) -> bool {
+        matches!(self, Input::Joint { .. })
+    }
+}
+
+/// The signals a leaf convolves: one, or two that a mix is derived from.
+#[derive(Clone, Copy)]
+struct Chans<'a> {
+    a: &'a [f32],
+    b: Option<&'a [f32]>,
+    /// `(a + b)/2`, materialised **only** when the redundant-mix seam is on.
+    ///
+    /// Production never allocates it. It exists so the deliberate extra
+    /// operation is a real convolution of a real third signal, through the same
+    /// counted boundary as the two real channels — the first version of this
+    /// seam incremented a counter and computed one sample, which made the
+    /// mutation evidence a fabrication.
+    mean: Option<&'a [f32]>,
+}
+
+impl Chans<'_> {
+    fn joint(&self) -> bool { self.b.is_some() }
+}
+
+/// Forward-transformed signal blocks for each channel of the run.
+///
+/// Two maps rather than one of pairs, because a size can legitimately be
+/// present for one channel and absent for the other: the budget is spent
+/// largest-first and the second channel doubles the bill.
+#[derive(Default)]
+struct SharedSet {
+    a: Blocks,
+    b: Blocks,
+}
+
+type Blocks = std::collections::HashMap<usize, std::sync::Arc<SignalBlocks>>;
+
+/// One bar's finished columns. `left`/`right` are empty unless the run was joint.
+#[derive(Clone, Default)]
+struct Cols {
+    mix: Vec<f32>,
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+impl Cols {
+    fn zeroed(frames: usize, joint: bool) -> Self {
+        let side = || if joint { vec![0.0f32; frames] } else { Vec::new() };
+        Cols { mix: vec![0.0f32; frames], left: side(), right: side() }
+    }
+}
+
+/// What a run actually dispatched, in units that are each homogeneous.
+///
+/// **Deliberately not one number.** The routes do differently shaped work — the
+/// direct route evaluates one frame at a time, the transform routes produce a
+/// whole column per call — and summing them gave a total dominated by whichever
+/// route happened to carry the most bars. The earlier single "transform sets"
+/// figure was that sum; it is withdrawn, and nothing here should be quoted as a
+/// count of physical transforms.
+///
+/// The counts are also **attempts, not logical work**. A device dispatch that
+/// fails sends its whole chunk back to the cores, and both the failed attempt
+/// and the recomputation are counted, because the question the counter answers
+/// is what the machine did.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct WorkCount {
+    /// Whole-column convolutions: one per member, per bar, per channel, per
+    /// attempt. Covers the CPU transform routes and each device dispatch.
+    pub column_convolutions: u64,
+    /// Single-frame direct responses: one per member, per frame, per channel.
+    /// The short-kernel bars, and the edge frames a device dispatch leaves for
+    /// the host to fill.
+    pub frame_responses: u64,
+    /// Windowed frame transforms: one per frame, per channel. The FFT bar
+    /// mappings' unit. The superlet routes never produce these, and the FFT
+    /// producer never produces the other two — so each producer's contract is
+    /// checked in its own unit and the sum is never taken.
+    pub frame_transforms: u64,
+    /// Device dispatches that returned an error. Each one costs its chunk a
+    /// recomputation on the cores, so it is reported beside the retries it
+    /// causes rather than hidden inside them.
+    pub device_failures: u64,
+}
+
+impl WorkCount {
+    fn snapshot(c: &WorkCells) -> Self {
+        use std::sync::atomic::Ordering as O;
+        WorkCount {
+            column_convolutions: c.columns.load(O::Relaxed),
+            frame_responses: c.frames.load(O::Relaxed),
+            frame_transforms: 0,
+            device_failures: c.device_failures.load(O::Relaxed),
+        }
+    }
+}
+
+/// The live counters behind [`WorkCount`], owned by one run.
+///
+/// Per invocation, never a static: the suite runs analyses in parallel, and a
+/// process-global counter reported whichever run finished last — which is how
+/// a joint run once measured as doing a *third* of a mono run's work.
+#[derive(Default)]
+struct WorkCells {
+    columns: std::sync::atomic::AtomicU64,
+    frames: std::sync::atomic::AtomicU64,
+    device_failures: std::sync::atomic::AtomicU64,
+    /// Worst deviation between the redundantly computed mean-signal response
+    /// and the mix derived from the two channels, as `f32` bits.
+    ///
+    /// Recorded so the extra operation's *result* is consumed and checked. An
+    /// increment alone proves nothing: it is the same evidence whether a
+    /// convolution ran or a counter was bumped.
+    redundant_dev: std::sync::atomic::AtomicU32,
+    redundant_seen: std::sync::atomic::AtomicBool,
+}
+
+impl WorkCells {
+    fn column(&self, n: u64) {
+        self.columns.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn frame(&self, n: u64) {
+        self.frames.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn device_failure(&self) {
+        self.device_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record the largest deviation seen so far between a redundantly computed
+    /// mix and the derived one.
+    fn redundant(&self, dev: f32) {
+        use std::sync::atomic::Ordering as O;
+        self.redundant_seen.store(true, O::Relaxed);
+        let bits = dev.to_bits();
+        let mut cur = self.redundant_dev.load(O::Relaxed);
+        while dev > f32::from_bits(cur) {
+            match self.redundant_dev.compare_exchange_weak(cur, bits, O::Relaxed, O::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn redundant_result(&self) -> Option<f32> {
+        use std::sync::atomic::Ordering as O;
+        self.redundant_seen
+            .load(O::Relaxed)
+            .then(|| f32::from_bits(self.redundant_dev.load(O::Relaxed)))
+    }
+}
+
+/// Knobs the driver exposes to its own tests.
+///
+/// Not configuration. They exist so a test can put the driver into a state a
+/// real machine reaches rarely and unpredictably — a memory budget too small
+/// for a block size, a device that declines partway through a run — and then
+/// check what the *production* orchestration does about it, rather than
+/// checking a reimplementation of its decision logic.
+#[derive(Clone, Copy)]
+struct Seams<'a> {
+    /// Ceiling on one group's shared signal transforms, in bytes.
+    shared_budget: usize,
+    /// Called once per device dispatch with `(chunk index, channel index)`.
+    /// Returning `true` makes that dispatch fail exactly as a device would.
+    dispatch_fault: Option<&'a (dyn Fn(usize, usize) -> bool + Sync)>,
+    /// Taps to hold at once while staging a chunk of kernels for the device.
+    ///
+    /// A test lowers it to force a group into several chunks, which is the only
+    /// way to reach the case where one chunk is already staged and waiting to
+    /// be assembled when a later dispatch fails.
+    kernel_tap_budget: usize,
+    /// Convolve the mean signal as well, and throw the result away.
+    ///
+    /// A deliberate violation of the two-channel contract, so that the test
+    /// which checks the contract can be shown to fail when it is broken. A
+    /// check nothing can fail is not a check.
+    redundant_mix_transform: bool,
+}
+
+impl Seams<'_> {
+    fn production() -> Self {
+        Seams {
+            shared_budget: SHARED_BLOCKS_MAX_BYTES,
+            kernel_tap_budget: GPU_KERNEL_TAP_BUDGET,
+            dispatch_fault: None,
+            redundant_mix_transform: false,
+        }
+    }
+}
+
+/// Everything one run produced. `left`/`right` are empty for a mono run.
+pub struct Analysed {
+    pub mix: Vec<Vec<f32>>,
+    pub left: Vec<Vec<f32>>,
+    pub right: Vec<Vec<f32>>,
+    /// What the run dispatched. See [`WorkCount`].
+    pub work: WorkCount,
+    /// Worst deviation between the redundant mean-signal analysis and the
+    /// derived mix, when the redundant-mix seam was on. `None` in production
+    /// and in every run that did not ask for it.
+    ///
+    /// The seam's purpose is to make the work-count contract fail; this is how
+    /// a test knows the extra work was *performed* rather than merely counted.
+    pub redundant_mix_deviation: Option<f32>,
+}
+
 /// The wavelet set for one bar, built once and reused across every frame.
 struct Superlet {
     wavelets: Vec<Morlet>,
@@ -1018,6 +1418,84 @@ impl Superlet {
             acc += weight * mag.ln();
         }
         (acc / self.total_weight).exp()
+    }
+
+    /// One frame, for whatever the run is analysing — the direct route's leaf.
+    ///
+    /// The mix is combined per member and per frame, before the floor, the log
+    /// and the mean, exactly as on the transform routes. Doing it once at the
+    /// end of the aggregation would be averaging two geometric means, which is
+    /// neither the mix nor anything else.
+    fn frame(
+        &self, ch: &Chans, centre: isize, work: &WorkCells, seams: &Seams,
+    ) -> (f32, f32, f32) {
+        // Counting is bound to the call, not written beside it: removing a
+        // response removes its count, and no increment can outlive the work it
+        // is supposed to describe.
+        let resp = |w: &Morlet, sig: &[f32]| -> C32 {
+            work.frame(1);
+            w.response_c(sig, centre)
+        };
+        let mut acc = (0.0f32, 0.0f32, 0.0f32);
+        // Only ever accumulated when the redundant-mix seam is on.
+        let mut acc_redundant = 0.0f32;
+        for (w, weight) in self.wavelets.iter().zip(self.weights.iter()) {
+            match ch.b {
+                None => {
+                    work.frame(1);
+                    acc.0 += weight * w.response(ch.a, centre).max(MAG_FLOOR).ln();
+                }
+                Some(right) => {
+                    let l = resp(w, ch.a);
+                    let r = resp(w, right);
+                    let m = C32 { re: 0.5 * (l.re + r.re), im: 0.5 * (l.im + r.im) };
+                    let mag = |c: C32| (c.re * c.re + c.im * c.im).sqrt().max(MAG_FLOOR).ln();
+                    if let Some(mean) = ch.mean.filter(|_| seams.redundant_mix_transform) {
+                        // A real third response, of a real third signal,
+                        // through the same counted boundary as the other two.
+                        acc_redundant += weight * mag(resp(w, mean));
+                    }
+                    acc.0 += weight * mag(m);
+                    acc.1 += weight * mag(l);
+                    acc.2 += weight * mag(r);
+                }
+            }
+        }
+        let inv = 1.0 / self.total_weight;
+        let out = ((acc.0 * inv).exp(), (acc.1 * inv).exp(), (acc.2 * inv).exp());
+        if ch.mean.is_some() && seams.redundant_mix_transform && ch.b.is_some() {
+            // Consumed and checked, so the count cannot be the only evidence.
+            work.redundant(((acc_redundant * inv).exp() - out.0).abs());
+        }
+        out
+    }
+
+    /// Every frame at once, for whatever the run is analysing.
+    ///
+    /// Members are folded in one at a time, so only one member's columns are
+    /// alive at once however many wavelets a bar has — the same bound
+    /// [`Superlet::responses_with`] kept, now over three outputs instead of one.
+    fn columns(
+        &self, ch: &Chans, hop: usize, frames: usize, shared: &SharedSet,
+        work: &WorkCells, seams: &Seams,
+    ) -> Cols {
+        let joint = ch.joint();
+        let mut acc = Cols::zeroed(frames, joint);
+        for (w, weight) in self.wavelets.iter().zip(self.weights.iter()) {
+            let c = w.member_cols(ch, hop, frames, shared, work, seams);
+            fold_logs(&mut acc.mix, &c.mix, *weight);
+            if joint {
+                fold_logs(&mut acc.left, &c.left, *weight);
+                fold_logs(&mut acc.right, &c.right, *weight);
+            }
+        }
+        let inv = 1.0 / self.total_weight;
+        let finish = |v: Vec<f32>| v.into_iter().map(|a| (a * inv).exp()).collect();
+        Cols {
+            mix: finish(acc.mix),
+            left: if joint { finish(acc.left) } else { Vec::new() },
+            right: if joint { finish(acc.right) } else { Vec::new() },
+        }
     }
 
     /// Whether any member is long enough to be worth transforming.
@@ -1132,8 +1610,38 @@ pub fn analyze_with_progress(
     on_bar_done: &(dyn Fn(usize) + Sync),
 ) -> Vec<Vec<f32>> {
     analyze_routed(
-        signal, sample_rate, n_bars, min_freq, max_freq, hop, cfg,
-        should_continue, on_bar_done, route_to_device,
+        Input::Mono(signal), sample_rate, n_bars, min_freq, max_freq, hop, cfg,
+        should_continue, on_bar_done, route_to_device, Seams::production(),
+    )
+    .mix
+}
+
+/// A stereo analysis: left, right, and the mix **derived** from them.
+///
+/// Not three analyses. The two channels are convolved and the mix is taken at
+/// `M_j = (L_j + R_j)/2` on the complex per-member responses, before magnitude,
+/// floor, log and the weighted geometric mean — see [`Input::Joint`]. The result
+/// is the mix, not an approximation of it, because the transform is linear and
+/// `(l + r)/2` is the signal a mono run would have been given.
+///
+/// Every route takes the pair: direct, own-transform overlap-save,
+/// shared-transform, and the device. None of them falls back to analysing a
+/// third signal.
+#[allow(clippy::too_many_arguments)]
+pub fn analyze_input_with_progress(
+    input: Input<'_>,
+    sample_rate: u32,
+    n_bars: usize,
+    min_freq: f32,
+    max_freq: f32,
+    hop: usize,
+    cfg: &AsltConfig,
+    should_continue: &(dyn Fn() -> bool + Sync),
+    on_bar_done: &(dyn Fn(usize) + Sync),
+) -> Analysed {
+    analyze_routed(
+        input, sample_rate, n_bars, min_freq, max_freq,
+        hop, cfg, should_continue, on_bar_done, route_to_device, Seams::production(),
     )
 }
 
@@ -1144,7 +1652,7 @@ pub fn analyze_with_progress(
 /// shared threshold.
 #[allow(clippy::too_many_arguments)]
 fn analyze_routed(
-    signal: &[f32],
+    input: Input<'_>,
     sample_rate: u32,
     n_bars: usize,
     min_freq: f32,
@@ -1154,13 +1662,36 @@ fn analyze_routed(
     should_continue: &(dyn Fn() -> bool + Sync),
     on_bar_done: &(dyn Fn(usize) + Sync),
     route: RouteDecision,
-) -> Vec<Vec<f32>> {
+    seams: Seams<'_>,
+) -> Analysed {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    let empty = || Analysed {
+        mix: Vec::new(),
+        left: Vec::new(),
+        right: Vec::new(),
+        work: WorkCount::default(),
+        redundant_mix_deviation: None,
+    };
+    let mut chans = input.chans();
+    let joint = chans.joint();
+    // Only the seam allocates this, and only a test sets the seam.
+    let mean_signal: Option<Vec<f32>> = (seams.redundant_mix_transform && joint)
+        .then(|| {
+            let b = chans.b.expect("joint");
+            chans.a.iter().zip(b).map(|(x, y)| 0.5 * (x + y)).collect()
+        });
+    chans.mean = mean_signal.as_deref();
+    // Every length, plan and frame count comes from one signal. A joint run has
+    // already been trimmed to the shorter of the two, so the two channels are
+    // the same length by construction and a frame index means the same instant
+    // in both.
+    let signal = chans.a;
     let frames = frame_count(signal.len(), hop);
-    if frames == 0 || n_bars == 0 { return Vec::new(); }
+    if frames == 0 || n_bars == 0 { return empty(); }
     stats_reset();
+    let work = WorkCells::default();
     let t_run = std::time::Instant::now();
 
     let sr = sample_rate as f32;
@@ -1226,9 +1757,9 @@ fn analyze_routed(
         }
     }
 
-    let mut columns: Vec<Option<Vec<f32>>> = vec![None; n_bars];
+    let mut columns: Vec<Option<Cols>> = vec![None; n_bars];
     for bar in above_nyquist {
-        columns[bar] = Some(vec![0.0; frames]);
+        columns[bar] = Some(Cols::zeroed(frames, joint));
         on_bar_done(bar);
     }
 
@@ -1244,7 +1775,13 @@ fn analyze_routed(
     let block_bytes = |_n: usize| {
         // A block set is always ~2 signal-lengths of complex samples, whatever
         // the transform size: bigger blocks mean proportionally fewer of them.
-        2 * signal.len() * std::mem::size_of::<rustfft::num_complex::Complex<f32>>()
+        // A joint run needs one set per channel, so a size costs twice as much
+        // and the same budget holds half as many sizes — which is a slowdown,
+        // not a wrong answer: a size that does not fit falls back to the
+        // per-kernel route for both channels alike.
+        let per_channel =
+            2 * signal.len() * std::mem::size_of::<rustfft::num_complex::Complex<f32>>();
+        if joint { 2 * per_channel } else { per_channel }
     };
 
     for (_key, idxs) in groups.iter().rev() {
@@ -1256,14 +1793,20 @@ fn analyze_routed(
         wanted.sort_unstable_by(|a, b| b.cmp(a)); // largest first
         wanted.dedup();
 
-        let mut shared: std::collections::HashMap<usize, std::sync::Arc<SignalBlocks>> =
-            Default::default();
+        let mut shared = SharedSet::default();
         let mut spent = 0usize;
         for n in wanted {
             let cost = block_bytes(n);
-            if spent + cost > SHARED_BLOCKS_MAX_BYTES { break; }
+            if spent + cost > seams.shared_budget { break; }
             spent += cost;
-            shared.insert(n, std::sync::Arc::new(SignalBlocks::build(signal, n)));
+            // Both channels or neither. A size present for one and missing for
+            // the other would put the pair through different routes, and the
+            // mix is a combination of the two — the routes are equivalent to
+            // within the transform's own tolerance, not bit-identical.
+            shared.a.insert(n, std::sync::Arc::new(SignalBlocks::build(signal, n)));
+            if let Some(right) = chans.b {
+                shared.b.insert(n, std::sync::Arc::new(SignalBlocks::build(right, n)));
+            }
         }
 
         let members: std::collections::HashSet<usize> =
@@ -1314,7 +1857,7 @@ fn analyze_routed(
                     let cost: usize = superlet_cycles(p.q, cfg).into_iter()
                         .map(|c| morlet_taps(p.freq, c, sr) * 3 * 4)
                         .sum();
-                    if end > at && taps + cost > GPU_KERNEL_TAP_BUDGET { break; }
+                    if end > at && taps + cost > seams.kernel_tap_budget { break; }
                     taps += cost;
                     end += 1;
                 }
@@ -1350,20 +1893,30 @@ fn analyze_routed(
         struct Staged {
             sls: Vec<(usize, Superlet)>,
             owner: Vec<(usize, usize)>,
-            cols: Vec<Vec<f32>>,
+            /// One complex column per kernel, per channel. `b` is empty on a
+            /// mono run. The device returns complex now, because the mix has to
+            /// be taken before the magnitude and the shader is one of the four
+            /// places that magnitude used to be taken.
+            cols_a: Vec<Vec<super::gpu::C32>>,
+            cols_b: Vec<Vec<super::gpu::C32>>,
         }
 
         // Turn a finished chunk into finished bars. Pulled out of the loop
         // because it now runs one iteration behind the dispatch that produced
         // it, and once more at the end to drain the last one.
-        let assemble = |p: Staged| -> Vec<(usize, Vec<f32>)> {
+        let assemble = |p: Staged| -> Vec<(usize, Cols)> {
             let t_fill = std::time::Instant::now();
-            let Staged { sls, owner, cols } = p;
-            let mut got: Vec<Vec<Option<Vec<f32>>>> = sls.iter()
-                .map(|(_, sl)| vec![None; sl.wavelets.len()])
-                .collect();
-            for ((ci, wi), col) in owner.iter().zip(cols) {
-                got[*ci][*wi] = Some(col);
+            let Staged { sls, owner, cols_a, cols_b } = p;
+            let blank = || -> Vec<Vec<Option<Vec<super::gpu::C32>>>> {
+                sls.iter().map(|(_, sl)| vec![None; sl.wavelets.len()]).collect()
+            };
+            let mut got_a = blank();
+            let mut got_b = blank();
+            for ((ci, wi), col) in owner.iter().zip(cols_a) {
+                got_a[*ci][*wi] = Some(col);
+            }
+            for ((ci, wi), col) in owner.iter().zip(cols_b) {
+                got_b[*ci][*wi] = Some(col);
             }
             // One work item per *wavelet*, not per bar.
             //
@@ -1377,32 +1930,56 @@ fn analyze_routed(
             let pairs: Vec<(usize, usize)> = sls.iter().enumerate()
                 .flat_map(|(ci, (_, sl))| (0..sl.wavelets.len()).map(move |wi| (ci, wi)))
                 .collect();
-            let mags: Vec<Vec<f32>> = pairs.par_iter()
+            // One channel of one member, wherever it came from.
+            let channel = |w: &Morlet,
+                           dev: &Option<Vec<super::gpu::C32>>,
+                           sig: &[f32],
+                           blocks: &Blocks| -> Vec<C32> {
+                match dev {
+                    // Frames the device marked NaN are edge frames, whose window
+                    // runs past the signal and renormalises over the taps that
+                    // survive — a convolution cannot express that, so they come
+                    // from the direct path exactly as on the CPU route. The
+                    // sentinel is a NaN and not the old `-1.0` because every
+                    // real number is a legal component of a complex response.
+                    // Already counted where it was dispatched. The edge
+                    // frames are not: they are host work the device left
+                    // undone, and they are per-frame, not a column.
+                    Some(col) => col.iter().enumerate()
+                        .map(|(fi, v)| if v[0].is_nan() {
+                            work.frame(1);
+                            w.response_c(sig, (fi * hop) as isize)
+                        } else {
+                            C32 { re: v[0], im: v[1] }
+                        })
+                        .collect(),
+                    // The wavelets the device did not take are the smaller
+                    // members of the same bar, and they get the group's shared
+                    // signal transform exactly as they would on the CPU route —
+                    // calling the bare per-kernel route here instead cost a
+                    // full-signal forward FFT per wavelet.
+                    None => {
+                        work.column(1);
+                        let k = w.taps();
+                        blocks
+                            .get(&fft_block_len(k))
+                            .filter(|_| fft_is_cheaper(k, hop))
+                            .and_then(|b| w.complex_via_shared(sig, b, hop, frames))
+                            .unwrap_or_else(|| w.complex(sig, hop, frames))
+                    }
+                }
+            };
+
+            let mags: Vec<Cols> = pairs.par_iter()
                 .map(|&(ci, wi)| {
                     let w = &sls[ci].1.wavelets[wi];
-                    match &got[ci][wi] {
-                        // Frames the GPU marked -1 are edge frames, whose window
-                        // runs past the signal and renormalises over the taps
-                        // that survive — a convolution cannot express that, so
-                        // they come from the direct path exactly as on the CPU
-                        // route.
-                        Some(col) => col.iter().enumerate()
-                            .map(|(fi, &v)| if v < 0.0 {
-                                w.response(signal, (fi * hop) as isize)
-                            } else { v })
-                            .collect(),
-                        // The wavelets the device did not take are the smaller
-                        // members of the same bar, and they get the group's
-                        // shared signal transform exactly as they would on the
-                        // CPU route — calling the bare `magnitudes` here instead
-                        // cost a full-signal forward FFT per wavelet.
-                        None => {
-                            let k = w.taps();
-                            shared
-                                .get(&fft_block_len(k))
-                                .filter(|_| fft_is_cheaper(k, hop))
-                                .and_then(|b| w.magnitudes_via_shared(signal, b, hop, frames))
-                                .unwrap_or_else(|| w.magnitudes(signal, hop, frames))
+                    let l = channel(w, &got_a[ci][wi], chans.a, &shared.a);
+                    match chans.b {
+                        None => Cols { mix: norms(l), ..Default::default() },
+                        Some(right) => {
+                            let r = channel(w, &got_b[ci][wi], right, &shared.b);
+                            let mix = norms(mix_complex(&l, &r));
+                            Cols { mix, left: norms(l), right: norms(r) }
                         }
                     }
                 })
@@ -1412,9 +1989,16 @@ fn analyze_routed(
             let mut taken = 0usize;
             for (bar, sl) in sls.iter() {
                 let n = sl.wavelets.len();
-                let col = combine_logs(
-                    &mags[taken..taken + n], &sl.weights, sl.total_weight, frames,
-                );
+                let members = &mags[taken..taken + n];
+                let pick = |f: fn(&Cols) -> &Vec<f32>| -> Vec<f32> {
+                    let cols: Vec<Vec<f32>> = members.iter().map(|c| f(c).clone()).collect();
+                    combine_logs(&cols, &sl.weights, sl.total_weight, frames)
+                };
+                let col = Cols {
+                    mix: pick(|c| &c.mix),
+                    left: if joint { pick(|c| &c.left) } else { Vec::new() },
+                    right: if joint { pick(|c| &c.right) } else { Vec::new() },
+                };
                 taken += n;
                 on_bar_done(*bar);
                 out.push((*bar, col));
@@ -1425,20 +2009,25 @@ fn analyze_routed(
         };
 
         let (gpu_cols, cpu_cols) = rayon::join(
-            || -> Vec<(usize, Vec<f32>)> {
+            || -> Vec<(usize, Cols)> {
                 let Some(g) = gpu else { return Vec::new() };
-                let mut out: Vec<(usize, Vec<f32>)> = Vec::new();
+                let mut out: Vec<(usize, Cols)> = Vec::new();
                 // Once for the whole block size, never per chunk — and not at
                 // all until a chunk is actually going to use it. Preparing
                 // eagerly cost an upload and a full-signal transform for every
                 // large group whose chunks then turned out to be too small to
                 // be worth the device, which was most of Extreme's.
-                let mut prepared: Option<super::gpu::GpuSignal> = None;
+                // One per channel. A joint run stages both; the second is
+                // the same size as the first, and if either fails to stage the
+                // chunk falls through to the cores rather than analysing one
+                // channel on the device and the other off it.
+                let mut prepared: Option<(super::gpu::GpuSignal, Option<super::gpu::GpuSignal>)> =
+                    None;
                 // The chunk whose transforms are finished but whose columns are
                 // not yet assembled — always exactly one behind the dispatch.
                 let mut staged: Option<Staged> = None;
 
-                for &(at, end) in &chunks {
+                for (chunk_i, &(at, end)) in chunks.iter().enumerate() {
                     if cancelled.load(Ordering::Relaxed) { break; }
                     if !should_continue() {
                         cancelled.store(true, Ordering::Relaxed);
@@ -1484,7 +2073,14 @@ fn analyze_routed(
 
                     let t_stage = std::time::Instant::now();
                     if prepared.is_none() {
-                        prepared = g.prepare_signal(signal, group_n, stride).ok();
+                        prepared = g.prepare_signal(signal, group_n, stride).ok()
+                            .and_then(|a| match chans.b {
+                                None => Some((a, None)),
+                                Some(right) => g
+                                    .prepare_signal(right, group_n, stride)
+                                    .ok()
+                                    .map(|b| (a, Some(b))),
+                            });
                     }
                     let stage = t_stage.elapsed();
 
@@ -1507,12 +2103,31 @@ fn analyze_routed(
                     let (dispatch, done_prev) = rayon::join(
                         || {
                             let t = std::time::Instant::now();
-                            let r = match &prepared {
-                                Some(p) => {
-                                    g.convolve_with(p, signal.len(), hop, frames, &kernels)
+                            // Two dispatches on a joint run, one per channel,
+                            // over the same kernels. That is the two-convolution
+                            // contract on this route: never a third for the mix.
+                            // Counted here, at the dispatch, and once per
+                            // channel per attempt — not later in assembly,
+                            // where a failed dispatch would never be seen.
+                            let send = |sg: &super::gpu::GpuSignal, ci: usize| {
+                                work.column(kernels.len() as u64);
+                                if seams.dispatch_fault.is_some_and(|f| f(chunk_i, ci)) {
+                                    return Err(format!(
+                                        "injected device failure, chunk {chunk_i} channel {ci}"
+                                    ));
                                 }
+                                g.convolve_with(sg, signal.len(), hop, frames, &kernels)
+                            };
+                            let r = match &prepared {
+                                Some((a, b)) => send(a, 0).and_then(|ca| match b {
+                                    None => Ok((ca, Vec::new())),
+                                    Some(b) => send(b, 1).map(|cb| (ca, cb)),
+                                }),
                                 None => Err("signal could not be staged".into()),
                             };
+                            if r.is_err() {
+                                work.device_failure();
+                            }
                             (r, t.elapsed())
                         },
                         || staged.take().map(&assemble),
@@ -1530,8 +2145,11 @@ fn analyze_routed(
                         // Held over rather than assembled now: assembling here
                         // would put the device straight back to waiting, which
                         // is the thing this is for.
-                        Ok(cols) if cols.len() == n_kernels => {
-                            staged = Some(Staged { sls, owner, cols });
+                        Ok((cols_a, cols_b))
+                            if cols_a.len() == n_kernels
+                                && (!joint || cols_b.len() == n_kernels) =>
+                        {
+                            staged = Some(Staged { sls, owner, cols_a, cols_b });
                         }
                         // A GPU that declines — out of memory, a lost device — is
                         // not a failure. Those bars simply fall through to the
@@ -1562,7 +2180,7 @@ fn analyze_routed(
                 if let Some(p) = staged.take() { out.extend(assemble(p)); }
                 out
             },
-            || -> Vec<(usize, Vec<f32>)> {
+            || -> Vec<(usize, Cols)> {
                 // Everything the device did not take, across every core, while
                 // it works. These are the smaller-kernel bars of the group, so
                 // there are usually many more of them than there are GPU bars.
@@ -1571,7 +2189,7 @@ fn analyze_routed(
                         if cancel_at_bar(bar, &cancelled) { return None; }
                         let p = by_bar[&bar];
                         let sl = Superlet::new(p.freq, p.q, cfg, sr);
-                        let col = sl.responses_with(signal, hop, frames, &shared);
+                        let col = sl.columns(&chans, hop, frames, &shared, &work, &seams);
                         on_bar_done(bar);
                         Some((bar, col))
                     })
@@ -1591,7 +2209,7 @@ fn analyze_routed(
                 if cancel_at_bar(bar, &cancelled) { return; }
                 let p = by_bar[&bar];
                 let sl = Superlet::new(p.freq, p.q, cfg, sr);
-                *slot = Some(sl.responses_with(signal, hop, frames, &shared));
+                *slot = Some(sl.columns(&chans, hop, frames, &shared, &work, &seams));
                 on_bar_done(bar);
             });
 
@@ -1620,7 +2238,8 @@ fn analyze_routed(
                 if cancelled.load(Ordering::Relaxed) { return; }
                 let (f, q) = direct[&bar];
                 let sl = Superlet::new(f, q, cfg, sr);
-                let mut col = Vec::with_capacity(frames);
+                let mut col = Cols::zeroed(0, joint);
+                col.mix.reserve(frames);
                 for fi in 0..frames {
                     if fi % CANCEL_CHECK_FRAMES == 0
                         && (cancelled.load(Ordering::Relaxed) || !should_continue())
@@ -1628,7 +2247,15 @@ fn analyze_routed(
                         cancelled.store(true, Ordering::Relaxed);
                         return;
                     }
-                    col.push(sl.response(signal, (fi * hop) as isize));
+                    // Both channels and the mix from one pass over the members,
+                    // so the direct route pays for two convolutions and not
+                    // three, exactly as the transform routes do.
+                    let (m, l, r) = sl.frame(&chans, (fi * hop) as isize, &work, &seams);
+                    col.mix.push(m);
+                    if joint {
+                        col.left.push(l);
+                        col.right.push(r);
+                    }
                 }
                 *slot = Some(col);
                 on_bar_done(bar);
@@ -1640,18 +2267,27 @@ fn analyze_routed(
     STATS.total_ns.store(t_run.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     if cancelled.load(Ordering::Relaxed) || columns.iter().any(|c| c.is_none()) {
-        return Vec::new();
+        return empty();
     }
 
     // Transpose to frames × bars, the layout the cache and renderer expect.
-    let mut out = vec![vec![0.0f32; n_bars]; frames];
-    for (bar, col) in columns.iter().enumerate() {
-        let col = col.as_ref().expect("checked above");
-        for (fi, &v) in col.iter().enumerate() {
-            out[fi][bar] = v;
+    let transpose = |pick: fn(&Cols) -> &Vec<f32>| -> Vec<Vec<f32>> {
+        let mut out = vec![vec![0.0f32; n_bars]; frames];
+        for (bar, col) in columns.iter().enumerate() {
+            let col = pick(col.as_ref().expect("checked above"));
+            for (fi, &v) in col.iter().enumerate() {
+                out[fi][bar] = v;
+            }
         }
+        out
+    };
+    Analysed {
+        mix: transpose(|c| &c.mix),
+        left: if joint { transpose(|c| &c.left) } else { Vec::new() },
+        right: if joint { transpose(|c| &c.right) } else { Vec::new() },
+        work: WorkCount::snapshot(&work),
+        redundant_mix_deviation: work.redundant_result(),
     }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2085,7 +2721,637 @@ mod tests {
         hop: usize,
         cfg: &AsltConfig,
     ) -> Vec<Vec<f32>> {
-        analyze_routed(sig, sr, bars, lo, hi, hop, cfg, &|| true, &|_| {}, route)
+        analyze_routed(
+            Input::Mono(sig), sr, bars, lo, hi, hop, cfg, &|| true, &|_| {}, route,
+            Seams::production(),
+        )
+        .mix
+    }
+
+    /// The joint form of [`analyze_via`], for the tests that hold the derived
+    /// mix to an independently analysed one.
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_joint_via(
+        route: RouteDecision,
+        left: &[f32],
+        right: &[f32],
+        sr: u32,
+        bars: usize,
+        lo: f32,
+        hi: f32,
+        hop: usize,
+        cfg: &AsltConfig,
+    ) -> Analysed {
+        analyze_joint_seamed(route, Seams::production(), left, right, sr, bars, lo, hi, hop, cfg)
+    }
+
+    /// The joint driver with the seams a test needs to reach a state a real
+    /// machine reaches rarely. Production orchestration throughout — only the
+    /// budget and the device's behaviour are supplied.
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_joint_seamed(
+        route: RouteDecision,
+        seams: Seams<'_>,
+        left: &[f32],
+        right: &[f32],
+        sr: u32,
+        bars: usize,
+        lo: f32,
+        hi: f32,
+        hop: usize,
+        cfg: &AsltConfig,
+    ) -> Analysed {
+        analyze_routed(
+            Input::Joint { left, right }, sr, bars, lo, hi, hop, cfg,
+            &|| true, &|_| {}, route, seams,
+        )
+    }
+
+    // ── The derived mix, against an independently analysed one ──────────────
+    //
+    // The oracle is a *separate mono analysis of the mean signal*, used only as
+    // a test oracle: production never runs it. If the joint path is right, the
+    // mix it derives from two complex response sets equals the mix that
+    // analysing `(l + r)/2` would have produced, to within float error — and
+    // that is the whole claim behind removing the third pass.
+
+    /// Signals whose mixes are interesting for different reasons.
+    fn joint_cases(sr: u32, n: usize) -> Vec<(&'static str, Vec<f32>, Vec<f32>)> {
+        let tau = std::f32::consts::TAU;
+        let t = |i: usize| i as f32 / sr as f32;
+        let tone = |f: f32, a: f32, ph: f32| -> Vec<f32> {
+            (0..n).map(|i| a * (tau * f * t(i) + ph).sin()).collect()
+        };
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut noise = || -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ((seed >> 40) as f32 / 8_388_608.0) - 1.0
+                })
+                .collect()
+        };
+        // A click, so the mix is tested where the signal is not stationary.
+        let transient: Vec<f32> = (0..n)
+            .map(|i| if i == n / 3 { 0.9 } else { 0.0 })
+            .collect();
+        let silent = vec![0.0f32; n];
+
+        vec![
+            ("in phase", tone(220.0, 0.6, 0.0), tone(220.0, 0.6, 0.0)),
+            // The case the whole design turns on: both loud, mix silent.
+            ("anti phase", tone(220.0, 0.6, 0.0), tone(220.0, 0.6, std::f32::consts::PI)),
+            ("one silent", tone(300.0, 0.7, 0.0), silent.clone()),
+            ("independent", tone(180.0, 0.5, 0.0), tone(700.0, 0.5, 1.1)),
+            ("noise", noise(), noise()),
+            ("transient", transient.clone(), tone(500.0, 0.4, 0.0)),
+            // Both channels at the floor: the log floor and the geometric mean
+            // must not turn silence into something.
+            ("silence", silent.clone(), silent),
+        ]
+    }
+
+    /// The mean signal, in f32, exactly as a mono analysis would be handed it.
+    fn mean_of(l: &[f32], r: &[f32]) -> Vec<f32> {
+        l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect()
+    }
+
+    /// Worst difference between two spectrograms, relative to `full_scale`.
+    ///
+    /// The reference is passed in rather than taken from the oracle, because
+    /// the anti-phase case has a numerically silent oracle: both sides compute
+    /// something around 1e-8, and dividing by *that* turns agreement in the
+    /// eighth decimal place into a 1 % relative error. What the comparison is
+    /// actually about is whether the mix is right on the scale of the audio
+    /// being analysed, so that is the scale it is measured on.
+    fn worst_rel_to(got: &[Vec<f32>], want: &[Vec<f32>], full_scale: f32) -> f32 {
+        let peak = full_scale.max(1e-12);
+        got.iter()
+            .flatten()
+            .zip(want.iter().flatten())
+            .map(|(a, b)| (a - b).abs() / peak)
+            .fold(0.0f32, f32::max)
+    }
+
+    fn peak_of(rows: &[Vec<f32>]) -> f32 {
+        rows.iter().flatten().cloned().fold(0.0f32, f32::max)
+    }
+
+    /// The common case: judged against the oracle's own level.
+    fn worst_rel(got: &[Vec<f32>], want: &[Vec<f32>]) -> f32 {
+        worst_rel_to(got, want, peak_of(want))
+    }
+
+    #[test]
+    fn the_derived_mix_matches_an_independently_analysed_one() {
+        let sr = 16_000u32;
+        let n = (2.0 * sr as f32) as usize;
+        let hop = hop_for_fps(sr, 60.0);
+        // A range wide enough that both routes are exercised in one run: the
+        // low bars are long-kernel and go through the transform, the high bars
+        // are short-kernel and go through the direct loop.
+        let (lo, hi) = (30.0f32, 6_000.0);
+        let bars = 96;
+        let cfg = cfg(1.0, 1.2, 4, 0.5);
+
+        for (name, l, r) in joint_cases(sr, n) {
+            let joint = analyze_joint_via(never_gpu, &l, &r, sr, bars, lo, hi, hop, &cfg);
+            let oracle = analyze_via(never_gpu, &mean_of(&l, &r), sr, bars, lo, hi, hop, &cfg);
+
+            assert_eq!(joint.mix.len(), oracle.len(), "{name}: frame count");
+            assert!(!joint.mix.is_empty(), "{name}: nothing produced");
+
+            let ol = analyze_via(never_gpu, &l, sr, bars, lo, hi, hop, &cfg);
+            let or = analyze_via(never_gpu, &r, sr, bars, lo, hi, hop, &cfg);
+            // Full scale for this case is the loudest of the three spectra, so
+            // the anti-phase case — whose oracle is numerically silent — is
+            // judged on the scale of the audio rather than on the scale of its
+            // own rounding error.
+            let fs = peak_of(&oracle).max(peak_of(&ol)).max(peak_of(&or));
+
+            let worst = worst_rel_to(&joint.mix, &oracle, fs);
+            println!("  mix vs oracle, {name:<12} worst {worst:.2e} of full scale {fs:.3}");
+            assert!(
+                worst < 2e-3,
+                "{name}: the derived mix differs from an independent analysis by {worst:.3e}"
+            );
+
+            // And the channels are themselves, not the mix.
+            assert!(worst_rel_to(&joint.left, &ol, fs) < 2e-3, "{name}: left");
+            assert!(worst_rel_to(&joint.right, &or, fs) < 2e-3, "{name}: right");
+        }
+    }
+
+    /// The case an average of magnitudes gets wrong, stated as a number.
+    ///
+    /// Two channels in opposite polarity sum to silence. A joint run must read
+    /// the mix as silent while reading both channels as loud — and it must do
+    /// so *without* a third analysis, which is exactly what the derivation
+    /// buys.
+    #[test]
+    fn anti_phase_channels_mix_to_silence_and_not_to_their_average() {
+        let sr = 16_000u32;
+        let n = (2.0 * sr as f32) as usize;
+        let tau = std::f32::consts::TAU;
+        let l: Vec<f32> = (0..n)
+            .map(|i| 0.7 * (tau * 400.0 * i as f32 / sr as f32).sin())
+            .collect();
+        let r: Vec<f32> = l.iter().map(|s| -s).collect();
+
+        let hop = hop_for_fps(sr, 60.0);
+        let cfg = cfg(1.0, 1.2, 4, 0.5);
+        let got = analyze_joint_via(never_gpu, &l, &r, sr, 64, 100.0, 2_000.0, hop, &cfg);
+
+        let mid = got.mix.len() / 2;
+        let peak = |row: &Vec<f32>| row.iter().cloned().fold(0.0f32, f32::max);
+        let (m, pl, pr) = (peak(&got.mix[mid]), peak(&got.left[mid]), peak(&got.right[mid]));
+        println!("  anti-phase: mix {m:.3e}  left {pl:.3e}  right {pr:.3e}");
+
+        assert!(pl > 0.2, "setup: left should be loud, got {pl:.3e}");
+        assert!(pr > 0.2, "setup: right should be loud, got {pr:.3e}");
+        // The average of the two magnitudes would be `(pl + pr)/2`. The mix is
+        // orders of magnitude below it, because it is the magnitude of the sum.
+        assert!(
+            m < 0.01 * (pl + pr) * 0.5,
+            "the mix read {m:.3e} against an average of {:.3e}; something is \
+             combining magnitudes rather than responses",
+            (pl + pr) * 0.5
+        );
+    }
+
+    /// A mono run's work count, through the same driver.
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_mono_work(
+        sig: &[f32], sr: u32, bars: usize, lo: f32, hi: f32, hop: usize, cfg: &AsltConfig,
+    ) -> WorkCount {
+        analyze_routed(
+            Input::Mono(sig), sr, bars, lo, hi, hop, cfg, &|| true, &|_| {}, never_gpu,
+            Seams::production(),
+        )
+        .work
+    }
+
+    /// The two-channel contract, as a function, so that a test can show it
+    /// rejecting a violation as well as accepting the real thing.
+    ///
+    /// Each unit is compared on its own. Summing them would let an extra
+    /// column convolution hide behind a few hundred thousand frame responses,
+    /// which is what the earlier single total did.
+    fn two_channel_contract(mono: WorkCount, joint: WorkCount) -> Result<(), String> {
+        if joint.device_failures != 0 || mono.device_failures != 0 {
+            return Err(format!(
+                "device failures make physical work counts unequal: mono {}, joint {}",
+                mono.device_failures, joint.device_failures
+            ));
+        }
+        for (what, m, j) in [
+            ("column convolutions", mono.column_convolutions, joint.column_convolutions),
+            ("frame responses", mono.frame_responses, joint.frame_responses),
+            ("frame transforms", mono.frame_transforms, joint.frame_transforms),
+        ] {
+            if m == 0 && j == 0 {
+                continue;
+            }
+            if j != 2 * m {
+                return Err(format!(
+                    "{what}: mono {m}, joint {j} — expected {}, and \
+                     {} would be a third analysis",
+                    2 * m,
+                    3 * m
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Two channels' work for a stereo run, not three — counted where the work
+    /// is dispatched, and in each unit separately.
+    #[test]
+    fn a_joint_run_does_two_channel_passes_and_not_three() {
+        let sr = 16_000u32;
+        let n = (1.0 * sr as f32) as usize;
+        let tau = std::f32::consts::TAU;
+        let l: Vec<f32> = (0..n).map(|i| 0.5 * (tau * 300.0 * i as f32 / sr as f32).sin()).collect();
+        let r: Vec<f32> = (0..n).map(|i| 0.4 * (tau * 900.0 * i as f32 / sr as f32).sin()).collect();
+        let hop = hop_for_fps(sr, 60.0);
+        let cfg = cfg(1.0, 1.2, 4, 0.5);
+        let (lo, hi, bars) = (40.0f32, 5_000.0, 64);
+
+        // Read off the result, not off a process-wide counter: the suite runs
+        // analyses in parallel, and a static reported whichever run finished
+        // last — which is how a joint run once measured as doing a *third* of a
+        // mono run's work.
+        let one = analyze_mono_work(&l, sr, bars, lo, hi, hop, &cfg);
+        let joint = analyze_joint_via(never_gpu, &l, &r, sr, bars, lo, hi, hop, &cfg);
+        let two = joint.work;
+        assert!(!joint.mix.is_empty());
+        assert!(
+            one.column_convolutions > 0 && one.frame_responses > 0,
+            "setup: this configuration should exercise both the transform and \
+             the direct routes, got {one:?}"
+        );
+
+        println!("  mono  {one:?}");
+        println!("  joint {two:?}");
+        two_channel_contract(one, two).unwrap_or_else(|e| panic!("{e}"));
+
+        // And the check has teeth: the same run with one deliberate extra
+        // analysis of the mean signal is rejected.
+        let mutant = analyze_joint_seamed(
+            never_gpu,
+            Seams { redundant_mix_transform: true, ..Seams::production() },
+            &l, &r, sr, bars, lo, hi, hop, &cfg,
+        );
+        println!("  mutant {:?}", mutant.work);
+        let refused = two_channel_contract(one, mutant.work)
+            .expect_err("a third analysis was accepted by the contract check");
+        println!("  contract refuses it: {refused}");
+        assert_eq!(
+            mutant.work.column_convolutions, 3 * one.column_convolutions,
+            "the mutation did not actually add a third column convolution"
+        );
+        assert_eq!(
+            mutant.work.frame_responses, 3 * one.frame_responses,
+            "the mutation did not actually add a third frame response"
+        );
+
+        // The counts are not the only evidence, and deliberately so: an
+        // increment beside a no-op looks exactly like an increment beside a
+        // convolution. The extra work is a real analysis of a real mean signal,
+        // its result is consumed, and it agrees with the derived mix — which is
+        // both proof that it ran and an independent re-check of the derivation.
+        let dev = mutant
+            .redundant_mix_deviation
+            .expect("the redundant analysis produced no result to check");
+        let scale = peak_of(&mutant.mix).max(1e-12);
+        println!("  redundant mean analysis vs derived mix: {dev:.3e} of {scale:.3}");
+        assert!(
+            dev / scale < 2e-3,
+            "the redundant mean-signal analysis disagreed with the derived mix              by {dev:.3e} of {scale:.3}"
+        );
+
+        // And the mutation changes only the work, never the answer.
+        assert_eq!(mutant.mix.len(), joint.mix.len());
+        assert!(worst_rel(&mutant.mix, &joint.mix) < 1e-6, "the mutation changed the mix");
+        assert!(worst_rel(&mutant.left, &joint.left) < 1e-6);
+        assert!(worst_rel(&mutant.right, &joint.right) < 1e-6);
+
+        // A run without the seam records nothing, so the field cannot be a
+        // leftover from some other run.
+        assert!(joint.redundant_mix_deviation.is_none());
+        assert!(analyze_mono_work(&l, sr, bars, lo, hi, hop, &cfg).column_convolutions > 0);
+    }
+
+    /// A block size the budget cannot hold falls back to the per-kernel
+    /// transform, for both channels, and the answer does not change.
+    ///
+    /// This is a driver-level path that no earlier test reached: the shared
+    /// block set is normally built for every size a group needs, and the
+    /// fallback only happens when memory runs out. A budget of zero forces it
+    /// through the real orchestration rather than through a reimplementation of
+    /// the decision.
+    #[test]
+    fn a_budget_too_small_for_shared_blocks_falls_back_for_both_channels() {
+        let sr = 16_000u32;
+        let n = (2.0 * sr as f32) as usize;
+        let tau = std::f32::consts::TAU;
+        let l: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.5 * (tau * 55.0 * t).sin() + 0.3 * (tau * 900.0 * t).sin()
+            })
+            .collect();
+        let r: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.45 * (tau * 55.0 * t + 1.3).sin() + 0.2 * (tau * 2_500.0 * t).sin()
+            })
+            .collect();
+        let hop = hop_for_fps(sr, 60.0);
+        let (lo, hi, bars) = (30.0f32, 6_000.0, 96);
+        let cfg = cfg(1.0, 1.2, 4, 0.5);
+
+        let starved = analyze_joint_seamed(
+            never_gpu,
+            Seams { shared_budget: 0, ..Seams::production() },
+            &l, &r, sr, bars, lo, hi, hop, &cfg,
+        );
+        let normal = analyze_joint_via(never_gpu, &l, &r, sr, bars, lo, hi, hop, &cfg);
+        assert!(!starved.mix.is_empty());
+        assert_eq!(starved.mix.len(), normal.mix.len());
+
+        // The fallback is a different route, not a different answer — and all
+        // three outputs are held to independent analyses, not merely to each
+        // other.
+        let om = analyze_via(never_gpu, &mean_of(&l, &r), sr, bars, lo, hi, hop, &cfg);
+        let ol = analyze_via(never_gpu, &l, sr, bars, lo, hi, hop, &cfg);
+        let or = analyze_via(never_gpu, &r, sr, bars, lo, hi, hop, &cfg);
+        let fs = peak_of(&om).max(peak_of(&ol)).max(peak_of(&or));
+        for (what, got, want) in [
+            ("mix", &starved.mix, &om),
+            ("left", &starved.left, &ol),
+            ("right", &starved.right, &or),
+        ] {
+            let worst = worst_rel_to(got, want, fs);
+            println!("  starved budget, {what:<6} vs oracle: worst {worst:.2e}");
+            assert!(worst < 2e-3, "{what} differs by {worst:.3e} with no shared blocks");
+        }
+
+        // The contract still holds on the fallback route.
+        let mono = analyze_mono_work(&l, sr, bars, lo, hi, hop, &cfg);
+        let starved_mono = analyze_routed(
+            Input::Mono(&l), sr, bars, lo, hi, hop, &cfg, &|| true, &|_| {}, never_gpu,
+            Seams { shared_budget: 0, ..Seams::production() },
+        )
+        .work;
+        println!("  shared {mono:?}");
+        println!("  starved mono {starved_mono:?}, joint {:?}", starved.work);
+        two_channel_contract(starved_mono, starved.work).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// A device that declines mid-run — including left succeeding and right
+    /// failing, with an earlier chunk already staged.
+    ///
+    /// The failure is injected at the production dispatch boundary, so what is
+    /// under test is the real orchestration: whether the already-staged chunk
+    /// is still drained, whether the bars the failed chunk should have produced
+    /// are recovered by the sweep after the join, and whether the result is
+    /// right.
+    #[test]
+    fn a_device_that_declines_midway_still_produces_the_whole_analysis() {
+        if super::super::gpu::GpuFft::shared().is_none() {
+            println!("no GPU adapter — device failure injection not exercised here");
+            return;
+        }
+        let sr = 16_000u32;
+        let n = (4.0 * sr as f32) as usize;
+        let tau = std::f32::consts::TAU;
+        let l: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.5 * (tau * 45.0 * t).sin() + 0.2 * (tau * 900.0 * t).sin()
+            })
+            .collect();
+        let r: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.4 * (tau * 45.0 * t + 0.7).sin() + 0.3 * (tau * 300.0 * t).sin()
+            })
+            .collect();
+        let hop = hop_for_fps(sr, 60.0);
+        let (lo, hi, bars) = (20.0f32, 8_000.0, 128);
+        let cfg = cfg(1.0, 1.2, 4, 0.5);
+
+        // A tap budget small enough to split a group into several chunks. At
+        // the production budget this configuration is one chunk, and a failure
+        // on the first chunk never meets the case worth testing: a chunk
+        // already staged, waiting to be assembled, when a later dispatch fails.
+        let chunked = Seams { kernel_tap_budget: 1 << 20, ..Seams::production() };
+
+        let clean = analyze_joint_seamed(
+            eligible_gpu, chunked, &l, &r, sr, bars, lo, hi, hop, &cfg,
+        );
+        assert!(!clean.mix.is_empty(), "setup: the device run produced nothing");
+
+        // Left succeeds, right fails, and not on the first chunk.
+        let seen = std::sync::Mutex::new(Vec::<(usize, usize)>::new());
+        let fault = |chunk: usize, channel: usize| -> bool {
+            seen.lock().unwrap_or_else(|e| e.into_inner()).push((chunk, channel));
+            chunk >= 1 && channel == 1
+        };
+        let hurt = analyze_joint_seamed(
+            eligible_gpu,
+            Seams { dispatch_fault: Some(&fault), ..chunked },
+            &l, &r, sr, bars, lo, hi, hop, &cfg,
+        );
+
+        let dispatches = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let failures = hurt.work.device_failures;
+        let chunks = dispatches.iter().map(|(c, _)| *c).max().map(|m| m + 1).unwrap_or(0);
+        println!("  dispatches {} over {chunks} chunk(s); device failures {failures}",
+                 dispatches.len());
+        assert!(
+            chunks >= 2,
+            "setup: the budget did not split the group; only {chunks} chunk(s) ran, \
+             so no chunk was ever staged when a failure landed"
+        );
+        assert!(failures > 0, "setup: the injected failure never fired");
+        // Left really did succeed before right failed, on the failing chunk.
+        assert!(
+            dispatches.contains(&(1, 0)) && dispatches.contains(&(1, 1)),
+            "expected both channels dispatched on chunk 1, saw {dispatches:?}"
+        );
+
+        // Whatever the device did, the analysis is complete and correct.
+        assert_eq!(hurt.mix.len(), clean.mix.len(), "frames lost to the failure");
+        assert_eq!(hurt.left.len(), clean.left.len());
+        assert_eq!(hurt.right.len(), clean.right.len());
+        assert_eq!(hurt.mix[0].len(), bars, "bars lost to the failure");
+        for (what, a, b) in [
+            ("mix", &hurt.mix, &clean.mix),
+            ("left", &hurt.left, &clean.left),
+            ("right", &hurt.right, &clean.right),
+        ] {
+            let worst = worst_rel(a, b);
+            println!("  after failure, {what:<6} vs the clean run: worst {worst:.2e}");
+            assert!(worst < 1e-3, "{what} differs by {worst:.3e} after a device failure");
+        }
+
+        // A failed dispatch costs a retry on the cores. That is real physical
+        // work, so the two-channel contract does not hold on raw counts — and
+        // the check says so rather than pretending otherwise.
+        let mono = analyze_mono_work(&l, sr, bars, lo, hi, hop, &cfg);
+        println!("  clean {:?}", clean.work);
+        println!("  hurt  {:?}", hurt.work);
+        assert!(
+            two_channel_contract(mono, hurt.work).is_err(),
+            "a run with retries must not claim an exact 2x physical total"
+        );
+        assert!(
+            hurt.work.column_convolutions > clean.work.column_convolutions,
+            "the retry after a failed dispatch should show as extra column \
+             convolutions: clean {}, hurt {}",
+            clean.work.column_convolutions,
+            hurt.work.column_convolutions,
+        );
+    }
+
+    /// The same, on the device, when there is one.
+    #[test]
+    fn the_derived_mix_matches_on_the_device_too() {
+        if super::super::gpu::GpuFft::shared().is_none() {
+            println!("no GPU adapter — device route not exercised on this machine");
+            return;
+        }
+        let sr = 16_000u32;
+        let n = (4.0 * sr as f32) as usize;
+        let tau = std::f32::consts::TAU;
+        let l: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.5 * (tau * 45.0 * t).sin() + 0.2 * (tau * 900.0 * t).sin()
+            })
+            .collect();
+        let r: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.4 * (tau * 45.0 * t + 0.7).sin() + 0.3 * (tau * 300.0 * t).sin()
+            })
+            .collect();
+        let hop = hop_for_fps(sr, 60.0);
+        let (lo, hi, bars) = (20.0f32, 8_000.0, 128);
+        let cfg = cfg(1.0, 1.2, 4, 0.5);
+
+        let dev = analyze_joint_via(eligible_gpu, &l, &r, sr, bars, lo, hi, hop, &cfg);
+        let cpu = analyze_joint_via(never_gpu, &l, &r, sr, bars, lo, hi, hop, &cfg);
+        assert!(!dev.mix.is_empty());
+
+        for (what, a, b) in [
+            ("mix", &dev.mix, &cpu.mix),
+            ("left", &dev.left, &cpu.left),
+            ("right", &dev.right, &cpu.right),
+        ] {
+            let worst = worst_rel(a, b);
+            println!("  device vs cores, {what:<6} worst relative {worst:.2e}");
+            assert!(worst < 1e-3, "{what}: device and cores differ by {worst:.3e}");
+        }
+
+        // And the device's mix is still the mix, not an average of magnitudes.
+        let oracle = analyze_via(eligible_gpu, &mean_of(&l, &r), sr, bars, lo, hi, hop, &cfg);
+        let worst = worst_rel(&dev.mix, &oracle);
+        println!("  device mix vs oracle: worst relative {worst:.2e}");
+        assert!(worst < 2e-3, "the device's derived mix differs by {worst:.3e}");
+    }
+
+    /// Edge frames — where the envelope is renormalised over the taps that
+    /// survive — combine correctly too. They are the frames where the two
+    /// routes differ most, and where a divisor applied on the wrong side of the
+    /// average would show.
+    #[test]
+    fn the_derived_mix_matches_at_the_signal_edges() {
+        let sr = 8_000u32;
+        let n = (0.5 * sr as f32) as usize;
+        let tau = std::f32::consts::TAU;
+        let l: Vec<f32> = (0..n).map(|i| 0.6 * (tau * 120.0 * i as f32 / sr as f32).sin()).collect();
+        let r: Vec<f32> = (0..n).map(|i| 0.5 * (tau * 120.0 * i as f32 / sr as f32 + 2.0).sin()).collect();
+        let hop = hop_for_fps(sr, 120.0);
+        let cfg = cfg(1.0, 1.2, 4, 0.5);
+        let (lo, hi, bars) = (40.0f32, 2_000.0, 48);
+
+        let joint = analyze_joint_via(never_gpu, &l, &r, sr, bars, lo, hi, hop, &cfg);
+        let oracle = analyze_via(never_gpu, &mean_of(&l, &r), sr, bars, lo, hi, hop, &cfg);
+        let last = joint.mix.len() - 1;
+        for fi in [0usize, 1, last - 1, last] {
+            let peak = oracle[fi].iter().cloned().fold(0.0f32, f32::max).max(1e-12);
+            let worst = joint.mix[fi].iter().zip(&oracle[fi])
+                .map(|(a, b)| (a - b).abs() / peak)
+                .fold(0.0f32, f32::max);
+            assert!(worst < 2e-3, "edge frame {fi} differs by {worst:.3e}");
+        }
+    }
+
+    /// The complex leaves agree with each other, which is what lets the
+    /// magnitude ones be defined as their norms.
+    #[test]
+    fn the_complex_routes_agree_with_each_other() {
+        let sr = 8_000f32;
+        let n = 200_000usize;
+        let tau = std::f32::consts::TAU;
+        let sig: Vec<f32> = (0..n)
+            .map(|i| 0.7 * (tau * 60.0 * i as f32 / sr).sin())
+            .collect();
+        let hop = 64usize;
+        let frames = frame_count(sig.len(), hop);
+        // Long enough to take the transform route, which is the point: the
+        // three routes have to agree, and two of them only exist for kernels
+        // like this one.
+        let m = Morlet::new(60.0, 40.0, sr);
+        assert!(
+            fft_is_cheaper(m.taps(), hop),
+            "setup: a {}-tap kernel should prefer a transform at hop {hop}",
+            m.taps(),
+        );
+        assert!(n > m.taps(), "setup: the signal must be longer than the kernel");
+
+        let direct: Vec<C32> =
+            (0..frames).map(|fi| m.response_c(&sig, (fi * hop) as isize)).collect();
+        let own = m.complex_via_fft(&sig, hop, frames).expect("own-transform route declined");
+        let blocks = SignalBlocks::build(&sig, fft_block_len(m.taps()));
+        let shared = m
+            .complex_via_shared(&sig, &blocks, hop, frames)
+            .expect("shared route declined");
+
+        let peak = direct.iter().map(|c| c.norm()).fold(0.0f32, f32::max).max(1e-12);
+        let worst = |a: &[C32], b: &[C32]| -> f32 {
+            a.iter().zip(b)
+                .map(|(x, y)| ((x.re - y.re).hypot(x.im - y.im)) / peak)
+                .fold(0.0f32, f32::max)
+        };
+        let (w1, w2) = (worst(&own, &direct), worst(&shared, &direct));
+        println!("  complex routes vs direct: own {w1:.2e}, shared {w2:.2e}");
+        assert!(w1 < 1e-4, "own-transform complex differs by {w1:.3e}");
+        assert!(w2 < 1e-4, "shared-transform complex differs by {w2:.3e}");
+
+        // And the magnitude route is exactly `norms` of the complex one — the
+        // same values, bit for bit, because there is only one convolution and
+        // the magnitude is defined as its norm.
+        //
+        // `sqrt(re² + im²)` and not `Complex::norm`, which is `hypot`: hypot is
+        // the more accurate of the two and would have been the better choice in
+        // a new transform, but this one has produced `sqrt(re² + im²)` since
+        // 1.4 and every cached analysis on the owner's disk was written with
+        // it. Changing it here would shift the mono spectrum for no reason
+        // anyone asked for.
+        let mags = m.magnitudes_via_shared(&sig, &blocks, hop, frames).unwrap();
+        for (mg, c) in mags.iter().zip(&shared) {
+            assert_eq!(
+                *mg,
+                (c.re * c.re + c.im * c.im).sqrt(),
+                "the magnitude route is not the norm of the complex one"
+            );
+        }
     }
 
     #[test]
@@ -2709,7 +3975,3 @@ mod tests {
     }
 }
 
-// TEMPORARY: mono-derivation study, not part of the product.
-#[cfg(test)]
-#[path = "aslt_mono_study.rs"]
-mod mono_study;

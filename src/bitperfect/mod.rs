@@ -5616,7 +5616,7 @@ mod tests {
         let g = stereo.lock().unwrap();
         assert!(g.frames.is_empty(), "DoP words were pushed as stereo audio");
         assert_eq!(
-            crate::spectrum::channels::availability(false, true, g.channels),
+            crate::spectrum::channels::availability(false, false, true, g.channels),
             crate::spectrum::channels::ChannelAvailability::NoLiveTap
         );
     }
@@ -5712,7 +5712,7 @@ mod tests {
         assert_eq!(got.channels, 6);
         assert!(got.frames.is_empty(), "6 channels must not produce L/R pairs");
         assert_eq!(
-            crate::spectrum::channels::availability(false, true, got.channels),
+            crate::spectrum::channels::availability(false, false, true, got.channels),
             crate::spectrum::channels::ChannelAvailability::Multichannel(6),
         );
     }

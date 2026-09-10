@@ -20,8 +20,10 @@
 //!   that by different means, so both are stated rather than one standing in
 //!   for the other. Without saying so, the buffers hold whatever the previous
 //!   track left in them;
-//! * pre-process mode, whose v3 cache stores one mono row per frame and cannot
-//!   be made to yield channels however it is sliced.
+//! * pre-process mode for a track whose cache has no stereo sidecar beside it.
+//!   The mono cache stores one row per frame and cannot be made to yield
+//!   channels however it is sliced; the sidecar holds the two that were
+//!   analysed separately, and without it there is nothing to draw.
 //!
 //! Each of those has to say so on screen rather than fall back quietly, so the
 //! decision lives here as a pure function over facts the caller has to supply.
@@ -109,7 +111,8 @@ pub enum ChannelAvailability {
     Multichannel(u16),
     /// Nothing is writing PCM into the tap: native DSD, or no stream at all.
     NoLiveTap,
-    /// Pre-process mode. The cache is mono per row by format.
+    /// Pre-process mode, and this track's cache has no channels beside it —
+    /// either stereo was off when it was analysed, or the track is not stereo.
     PreProcessMono,
     /// The chosen visualisation has no per-channel form in this phase.
     UnsupportedStyle,
@@ -138,8 +141,8 @@ impl ChannelAvailability {
                     .into(),
             ),
             ChannelAvailability::PreProcessMono => Some(
-                "Stereo pre-analysis requires the future channel-aware cache. \
-                 Switch to Real-time for Left/Right."
+                "This track was analysed without channels. Turn on stereo \
+                 pre-analysis and analyse it again, or switch to Real-time."
                     .into(),
             ),
             ChannelAvailability::UnsupportedStyle => Some(
@@ -170,11 +173,25 @@ pub const NO_LIVE_TAP: u16 = 0;
 /// second, deeper obstacle it could not have guessed at.
 pub fn availability(
     preprocess: bool,
+    pre_channels: bool,
     style_supports_channels: bool,
     tap_channels: u16,
 ) -> ChannelAvailability {
     if preprocess {
-        return ChannelAvailability::PreProcessMono;
+        // The live tap says nothing here: what is on screen came from a file,
+        // and whether that file has channels beside it is a property of the
+        // file. This stays ahead of the style check, and the ordering rule
+        // below is why: clearing this obstacle means analysing the track
+        // again, which costs minutes, and being sent to do that only to find
+        // the visualisation could never have shown it is the worst outcome
+        // available.
+        if !pre_channels {
+            return ChannelAvailability::PreProcessMono;
+        }
+        if !style_supports_channels {
+            return ChannelAvailability::UnsupportedStyle;
+        }
+        return ChannelAvailability::Available;
     }
     if !style_supports_channels {
         return ChannelAvailability::UnsupportedStyle;
@@ -616,12 +633,12 @@ mod tests {
 
     #[test]
     fn only_a_two_channel_live_tap_is_available() {
-        assert_eq!(availability(false, true, 2), ChannelAvailability::Available);
+        assert_eq!(availability(false, false, true, 2), ChannelAvailability::Available);
     }
 
     #[test]
     fn mono_offers_mix_alone() {
-        let a = availability(false, true, 1);
+        let a = availability(false, false, true, 1);
         assert_eq!(a, ChannelAvailability::Mono);
         assert!(!a.is_available());
         assert_eq!(effective_view(ChannelView::Split, &a), ChannelView::Mix);
@@ -632,7 +649,7 @@ mod tests {
     #[test]
     fn more_than_two_channels_declines_and_says_how_many() {
         for n in [3u16, 6, 8] {
-            let a = availability(false, true, n);
+            let a = availability(false, false, true, n);
             assert_eq!(a, ChannelAvailability::Multichannel(n));
             assert!(!a.is_available());
             assert!(a.reason().is_some_and(|r| r.contains(&n.to_string())));
@@ -645,26 +662,51 @@ mod tests {
     /// track starts.
     #[test]
     fn no_live_tap_is_distinct_from_mono() {
-        let a = availability(false, true, NO_LIVE_TAP);
+        let a = availability(false, false, true, NO_LIVE_TAP);
         assert_eq!(a, ChannelAvailability::NoLiveTap);
         assert_ne!(a, ChannelAvailability::Mono);
         assert!(a.reason().is_some_and(|r| r.contains("DoP")));
     }
 
-    /// Pre-process is mono by cache format, whatever the file is.
+    /// Pre-process without a sidecar declines, whatever the *file* is: what
+    /// matters is whether channels were analysed, not whether they exist in the
+    /// audio. A live tap reporting two channels must not make a mono cache look
+    /// separable.
     #[test]
-    fn preprocess_declines_even_for_stereo_material() {
-        let a = availability(true, true, 2);
+    fn preprocess_without_channels_declines_even_for_stereo_material() {
+        let a = availability(true, false, true, 2);
         assert_eq!(a, ChannelAvailability::PreProcessMono);
         assert!(!a.is_available());
-        assert!(a
-            .reason()
-            .is_some_and(|r| r.contains("channel-aware cache")));
+        // The reason has to name the remedy: this one costs an analysis, so
+        // "switch to Real-time" alone would be telling half the story.
+        let why = a.reason().expect("a refusal must say why");
+        assert!(why.contains("analysed without channels"), "{why}");
+        assert!(why.contains("stereo pre-analysis"), "{why}");
+    }
+
+    /// And with a sidecar it is available — from the cache, with no live tap at
+    /// all, which is the whole point.
+    #[test]
+    fn preprocess_with_a_sidecar_is_available() {
+        let a = availability(true, true, true, NO_LIVE_TAP);
+        assert_eq!(a, ChannelAvailability::Available);
+        assert!(a.is_available());
+        assert!(a.reason().is_none());
+        assert_eq!(effective_view(ChannelView::Diff, &a), ChannelView::Diff);
+    }
+
+    /// A cached pair the visualisation cannot draw reports the visualisation,
+    /// not the cache — otherwise it would send the user off to analyse a track
+    /// that has already been analysed.
+    #[test]
+    fn a_cached_pair_under_an_unsupported_style_blames_the_style() {
+        let a = availability(true, true, false, NO_LIVE_TAP);
+        assert_eq!(a, ChannelAvailability::UnsupportedStyle);
     }
 
     #[test]
     fn an_unsupported_visualisation_says_so_rather_than_going_blank() {
-        let a = availability(false, false, 2);
+        let a = availability(false, false, false, 2);
         assert_eq!(a, ChannelAvailability::UnsupportedStyle);
         assert_eq!(effective_view(ChannelView::Left, &a), ChannelView::Mix);
     }
@@ -673,10 +715,13 @@ mod tests {
     /// clear one only to meet another they were never told about.
     #[test]
     fn the_reasons_are_ordered_from_most_fundamental() {
-        // Pre-process outranks both style and channel count.
-        assert_eq!(availability(true, false, 1), ChannelAvailability::PreProcessMono);
+        // Pre-process without channels outranks both style and channel count,
+        // because clearing it costs an analysis and clearing the style costs a
+        // click. Being sent to spend minutes on the expensive one and then
+        // meeting the cheap one is the outcome the ordering exists to prevent.
+        assert_eq!(availability(true, false, false, 1), ChannelAvailability::PreProcessMono);
         // Style outranks channel count.
-        assert_eq!(availability(false, false, 1), ChannelAvailability::UnsupportedStyle);
+        assert_eq!(availability(false, false, false, 1), ChannelAvailability::UnsupportedStyle);
     }
 
     #[test]
@@ -703,9 +748,9 @@ mod tests {
     #[test]
     fn the_requested_view_survives_an_obstacle() {
         let want = ChannelView::Overlay;
-        let blocked = availability(false, true, 1);
+        let blocked = availability(false, false, true, 1);
         assert_eq!(effective_view(want, &blocked), ChannelView::Mix);
-        let cleared = availability(false, true, 2);
+        let cleared = availability(false, false, true, 2);
         assert_eq!(effective_view(want, &cleared), ChannelView::Overlay);
     }
 
