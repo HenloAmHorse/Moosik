@@ -49,7 +49,10 @@ cargo build --release
   plot. Channels work from the cache as well as live: a stereo analysis derives
   the mix from the two channels' complex responses rather than analysing it a
   third time, and stores them in a sidecar beside the cache
-  ([docs/SPECTRUM.md](docs/SPECTRUM.md))
+  ([docs/SPECTRUM.md](docs/SPECTRUM.md)). Pre-processing a track is the
+  heaviest thing Moosik does, and recent work has gone into making it cost less
+  CPU and hold less memory while producing exactly the same output — see the
+  changelog for what was measured and what it covers
 - **Parametric EQ** — up to 16 bands, dragged directly on the spectrum, with
   global and per-song presets
 - **Lyrics** — synced `.lrc`, read from the file or looked up online, with a
@@ -70,6 +73,30 @@ the link, and nothing in Moosik has been validated that way.
 
 The four states this distinguishes, and the rules for each, are in
 [docs/BIT_PERFECT.md](docs/BIT_PERFECT.md).
+
+## Planned
+
+Directions, not commitments — none of this is implemented, and nothing below
+describes what the current release does.
+
+| | |
+|---|---|
+| **1.5.3** | Experimental performance work on pre-processing: bounded streaming and shared FFT work, memory pressure, and further exact-output optimisation. Groundwork for separating the visualisation consumer from an analysis consumer. |
+| **1.6.0** | Professional audio-analysis features. Harmonic and pitch analysis, time-frequency inspection and channel-analysis tools are candidate directions. |
+
+Principles that work is meant to hold to:
+
+- Bit identity of *intermediate* results is not required everywhere; identity of
+  what is defined as the reference output is.
+- Optimising the visualisation path means reproducing a defined reference
+  output — including the relevant temporal state and the supported display
+  changes — not looking similar in one screenshot.
+- Planning that adapts to the screen must never quietly weaken the reference
+  analysis.
+- A professional-analysis result must not depend on monitor or window size.
+- Display caches are not assumed to hold everything a future analytical feature
+  needs: reuse work that is compatible, and support re-analysis from the source
+  when it is not.
 
 ## Reading further
 

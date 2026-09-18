@@ -2,6 +2,100 @@
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-09-18
+
+A performance and correctness release for the pre-processor. Every analysis
+setting, every routing decision and every output format is unchanged, and so is
+every byte a pre-process writes: the same track analysed with the same settings
+produces the same cache and the same sidecar as it did in 1.5.1. This release
+adds no analysis mode, changes no quality setting and redesigns nothing in the
+interface.
+
+### Changed
+
+- **Pre-processing does the same work with less of the machine.** The changes
+  are spread over several rounds and are all of the same kind — do the arithmetic
+  that was always going to happen, but stop paying for it twice:
+
+  - one FFT scratch buffer per block loop instead of a fresh allocation on
+    every single block;
+  - the CPU bar sweeps build a compact list of jobs and split it one job to a
+    leaf, so a handful of direct bars can no longer land in one leaf and run on
+    one thread while the rest of the pool idles;
+  - the convolution inner loops copy, multiply and accumulate over windows
+    rather than element by element, and fold the shared route's multiply into
+    one pass;
+  - fewer intermediate copies, fewer repeated checks, and buffers released at
+    the point the analysis has finished with them rather than at the end.
+
+- **A pre-process holds less memory while it runs.** The transpose that turns
+  the analysis into the cache layout now does one plane at a time and takes each
+  column as it consumes it, so a joint run holds four copies of its largest
+  structure at the peak instead of six. The sidecar is laid out once, into the
+  buffer that becomes the file, instead of being concatenated and copied — about
+  2× rather than 3× the size of its own contents. The v4 encoder packs its
+  nibbles during the scan that produces them and compresses straight into the
+  output, and the decoder reads them in place.
+
+  **No format changed and no compression was added.** The cache is v4 exactly as
+  it was in 1.5.1, the sidecar layout is the same layout, and both are written
+  byte for byte identically — that is asserted by tests, not argued.
+
+- **Cancelling a pre-process stops sooner.** Decode and the statistics pass now
+  check for cancellation as they go; before, a cancelled run kept decoding the
+  whole file before noticing. A decoder call that is already blocked still has to
+  return before anything can act — what this bounds is the work after it does.
+
+- **Progress is published when it moves.** The progress value was recomputed and
+  republished for every decoded frame; it is now published when it changes. The
+  values and their pacing are the same.
+
+- **Your GPU calibration will be measured again, and that is expected.** Moosik
+  learns whether the GPU or the cores are faster for each transform size on your
+  machine, and stores that with an identity describing the program that measured
+  it. The CPU side of that comparison changed in this release, so the identity
+  changed with it, and evidence recorded by an earlier build no longer describes
+  this one. It is discarded and re-learned over the next few analyses rather than
+  migrated or trusted.
+
+  **Do not delete the calibration file by hand.** Nothing needs to be reset;
+  routing simply settles again on its own.
+
+### Fixed
+
+- **GPU calibration: identity, ownership and lifecycle.** A group now owns its
+  routing decision for the scope in which it uses it and probing no longer needs
+  the shared lock; publication is ordered by which measurement actually executed
+  rather than by a generation counter; the calibration is keyed to what really
+  ran, and bounded so a machine that cannot settle stops re-probing for ever.
+  Four lifecycle boundaries that could publish, reset or reload out of order are
+  closed.
+
+- **Test isolation.** Two defects in the test suite itself, both found by running
+  the whole suite rather than the tests under examination: cancellation
+  observations were not attributed to the run that produced them, and a test
+  fixture redirected the calibration directory without owning that redirection
+  for its whole lifetime, which could have left a concurrent test resolving
+  against the real user profile. Neither affects the shipped program — the
+  injection point does not exist outside a test build — and both are now covered
+  by regressions that fail if the old behaviour returns.
+
+### Measured, and what the measurement covers
+
+On one machine (Windows, 8 cores, GPU disabled for the comparison), the **last**
+group of these changes — the convolution loops, the assembly and residency work,
+and the cancellation and progress changes — used **4.4 % to 6.6 % less process
+CPU** on three timed tracks, and lowered joint peak working set by 25–60 MB on
+three memory-measured tracks. Output identity was checked separately and more
+widely: 20 fixtures in mono and joint, every comparison bit-identical.
+
+That figure is the last group measured against the state immediately before it.
+It is **not** a figure for 1.5.2 as a whole. The earlier groups in this release
+were measured separately as they landed, against their own baselines, and those
+numbers are not additive — there is no single measured speedup for this release,
+and none is claimed. What it will do on other hardware, other content and other
+settings was not measured.
+
 ## [1.5.1] - 2026-09-11
 
 ### Added

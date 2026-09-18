@@ -157,7 +157,106 @@ impl Default for PeakHoldConfig {
 // the middle one used to look like a hang: decoding reported 0–49, the transform
 // reported 50–99, and the loudness/chroma pass between them reported nothing at
 // all, so the bar sat frozen at exactly 50 % for as long as that pass took.
+
+/// Test-only hooks on the cancellation polls in [`preprocess_file`].
+///
+/// A cancellation test that raises the flag before the run only ever proves the
+/// first poll of the first phase. These let a test raise it from *inside* a
+/// named phase, so the poll that phase owns is the one under test — and let it
+/// count how much work the run does after that, which is the property the polls
+/// exist for.
+///
+/// Modelled on `gpu_calib::inject`, including its `ENV` mutex: these are process
+/// globals, so every schedule takes `ENV` for its whole body or two tests
+/// rewrite one another's hook.
+///
+/// `ENV` is not enough on its own. Plenty of other tests call `preprocess_file`
+/// without taking it, the binary runs tests in parallel, and their polls reach
+/// an installed hook too — the first version of this seam counted them and a
+/// schedule expecting three statistics polls saw thirteen. So every report
+/// carries the identity of its run's abort flag, which is the one thing
+/// `preprocess_file` already threads through all four poll sites, and a
+/// schedule ignores anything that is not its own. That holds across threads,
+/// including the rayon workers the producer's poll runs on — where a thread-id
+/// filter would not have.
+#[cfg(test)]
+pub(crate) mod cancel_seam {
+    use std::sync::Mutex;
+
+    /// Which poll fired. `FftProducerWork` fires only for a frame that got
+    /// *past* the check, so a test can tell visits from work done.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Phase {
+        PcmDecode,
+        DsdDecode,
+        Statistics,
+        FftProducer,
+        FftProducerWork,
+    }
+
+    /// Serialises the tests that install a hook.
+    pub static ENV: Mutex<()> = Mutex::new(());
+
+    /// `(phase, run)`, where `run` identifies the abort flag of the analysis
+    /// that reported — see the note above.
+    type Hook = Box<dyn Fn(Phase, usize) + Send>;
+    static AT_PHASE: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Installs `f`; returns a guard that removes it again, so a panicking test
+    /// cannot leave the hook behind for the next one.
+    pub fn install(f: impl Fn(Phase, usize) + Send + 'static) -> Installed {
+        *AT_PHASE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
+        Installed
+    }
+
+    pub struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            *AT_PHASE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// `run` is the analysis's own abort flag: two analyses in flight at once
+    /// have different ones, and the pointer is stable for as long as the run
+    /// that owns it.
+    pub(crate) fn run_id(abort: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> usize {
+        std::sync::Arc::as_ptr(abort) as usize
+    }
+
+    pub(crate) fn reached(phase: Phase, run: usize) {
+        let g = AT_PHASE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = g.as_ref() {
+            f(phase, run);
+        }
+    }
+}
+
 const PROG_DECODE_END: usize = 39;
+
+/// How often the decode loop looks at the abort flag, in decoded frames.
+///
+/// A power of two, so the test is a mask rather than a division. At 44.1 kHz
+/// this is about 0.37 s of audio. It bounds the work done *after* a decoder
+/// call returns; it cannot interrupt one that is already blocked on I/O, and
+/// nothing here should be read as claiming otherwise.
+const DECODE_CANCEL_FRAMES: usize = 1 << 14;
+
+/// The first decoded frame at which the decode progress value can next change.
+///
+/// The published value is `floor(frames · PROG_DECODE_END / total)`, so it
+/// reaches `pct + 1` at the smallest `frames` satisfying
+/// `frames · PROG_DECODE_END >= (pct + 1) · total`. Computing that once per
+/// step costs one integer comparison per frame instead of a multiply, a divide
+/// and an atomic store — and publishes the same values at the same frames,
+/// which `decode_progress_publishes_the_same_values_at_the_same_frames` holds
+/// it to.
+fn next_decode_publish(pct: usize, total: usize) -> usize {
+    if total == 0 || pct >= PROG_DECODE_END {
+        return usize::MAX;
+    }
+    (((pct + 1) as u64 * total as u64).div_ceil(PROG_DECODE_END as u64)) as usize
+}
 const PROG_LOUDNESS_END: usize = 49;
 
 /// Which stage a raw progress percentage belongs to. Named so a stalled-looking
@@ -3056,6 +3155,10 @@ fn save_cache(cache_path: &Path, frames: &cache::PreFrames, abort: &AtomicBool) 
         return;
     }
     let bytes = frames.to_v4();
+    // Compiles to nothing outside tests. The encode above is what the check
+    // before it exists to skip, and it leaves no trace on disk, so reaching
+    // here is the only way a test can tell a skipped encode from a done one.
+    cache::fault::run(cache::fault::Hook::CacheEncoded);
     match cache::write_atomic_cancellable(cache_path, &bytes, &cancelled) {
         Ok(cache::Written::Published) => {}
         Ok(cache::Written::Cancelled) => {
@@ -3360,7 +3463,7 @@ fn preprocess_file(
     // DSD has no PCM samples to decode — it's low-pass-filtered and decimated
     // to the analysis rate instead (the audible band survives; the ultrasonic
     // modulator noise the analyzer shouldn't show is what the filter removes).
-    let (all_mono, lr, sample_rate) = if crate::dsd::is_dsd_path(path) {
+    let (mut all_mono, lr, sample_rate) = if crate::dsd::is_dsd_path(path) {
         let mut src = match crate::dsd::decimate::open_pcm_source(path, dsd_rate) {
             Ok(s) => s,
             Err(e) => return PreMessage::Error(e),
@@ -3370,6 +3473,7 @@ fn preprocess_file(
         let total_hint = (src.total_out_samples() / ch as u64) as usize;
         let mut mono: Vec<f32> = Vec::with_capacity(total_hint.max(1));
         let mut pair = Channels::new(want_stereo && ch == 2, total_hint);
+        let mut next_publish = if total_hint > 0 { 1usize } else { usize::MAX };
         loop {
             let mut sum = 0.0f32;
             let mut got = 0usize;
@@ -3386,11 +3490,25 @@ fn preprocess_file(
             if got == 0 { break; }
             mono.push(sum / got as f32);
             pair.push(&frame, got);
-            if total_hint > 0 {
-                progress.store(
-                    (mono.len() * PROG_DECODE_END / total_hint).min(PROG_DECODE_END),
-                    Ordering::Relaxed,
-                );
+            // Published when the value changes, at the frame it changes on —
+            // the same sequence an observer saw before, without recomputing it
+            // for every frame that does not move it.
+            if mono.len() >= next_publish {
+                let pct =
+                    (mono.len() * PROG_DECODE_END / total_hint).min(PROG_DECODE_END);
+                progress.store(pct, Ordering::Relaxed);
+                next_publish = next_decode_publish(pct, total_hint);
+            }
+            // A cancelled run stops here rather than decoding a whole track it
+            // is going to throw away. Nested rather than `&&` only so the test
+            // seam sits on the poll and not on every decoded frame; the
+            // condition is the same one.
+            if mono.len() & (DECODE_CANCEL_FRAMES - 1) == 0 {
+                #[cfg(test)]
+                cancel_seam::reached(cancel_seam::Phase::DsdDecode, cancel_seam::run_id(abort));
+                if abort.load(Ordering::Relaxed) {
+                    return PreMessage::Aborted;
+                }
             }
         }
         (mono, pair.take(), sr)
@@ -3417,6 +3535,7 @@ fn preprocess_file(
 
         let mut mono: Vec<f32> = Vec::with_capacity(total_hint.max(1));
         let mut pair = Channels::new(want_stereo && ch == 2, total_hint);
+        let mut next_publish = if total_hint > 0 { 1usize } else { usize::MAX };
         let mut raw_iter = decoder;
         loop {
             let mut sum = 0.0f32;
@@ -3435,11 +3554,25 @@ fn preprocess_file(
             if got == 0 { break; }
             mono.push(sum / got as f32);
             pair.push(&frame, got);
-            if total_hint > 0 {
-                progress.store(
-                    (mono.len() * PROG_DECODE_END / total_hint).min(PROG_DECODE_END),
-                    Ordering::Relaxed,
-                );
+            // Published when the value changes, at the frame it changes on —
+            // the same sequence an observer saw before, without recomputing it
+            // for every frame that does not move it.
+            if mono.len() >= next_publish {
+                let pct =
+                    (mono.len() * PROG_DECODE_END / total_hint).min(PROG_DECODE_END);
+                progress.store(pct, Ordering::Relaxed);
+                next_publish = next_decode_publish(pct, total_hint);
+            }
+            // A cancelled run stops here rather than decoding a whole track it
+            // is going to throw away. Nested rather than `&&` only so the test
+            // seam sits on the poll and not on every decoded frame; the
+            // condition is the same one.
+            if mono.len() & (DECODE_CANCEL_FRAMES - 1) == 0 {
+                #[cfg(test)]
+                cancel_seam::reached(cancel_seam::Phase::PcmDecode, cancel_seam::run_id(abort));
+                if abort.load(Ordering::Relaxed) {
+                    return PreMessage::Aborted;
+                }
             }
         }
         (mono, pair.take(), sr)
@@ -3455,9 +3588,6 @@ fn preprocess_file(
         ((fft_size as f32 * (1.0 - overlap)).round() as usize).max(1)
     };
     let padded_size = fft_size * pad_factor;
-    let window = make_window(fft_size, window_fn);
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(padded_size);
     let half = padded_size / 2;
     let scale = fft_size as f32; // normalize by window length, not padded length
     let log_min = min_freq.log10();
@@ -3518,6 +3648,15 @@ fn preprocess_file(
     let loudness_step = (total_samples / 100).max(1);
     for (idx, &s) in all_mono.iter().enumerate() {
         if idx % loudness_step == 0 && total_samples > 0 {
+            // The same hundred checkpoints the progress bar already used. This
+            // pass is single-threaded over every decoded sample, so on a long
+            // file it is the one place a cancelled run could still spend
+            // seconds with nothing to show for them.
+            #[cfg(test)]
+            cancel_seam::reached(cancel_seam::Phase::Statistics, cancel_seam::run_id(abort));
+            if abort.load(Ordering::Relaxed) {
+                return PreMessage::Aborted;
+            }
             let span = PROG_LOUDNESS_END - PROG_DECODE_END;
             progress.store(
                 PROG_DECODE_END + (idx * span / total_samples).min(span),
@@ -3734,6 +3873,14 @@ fn preprocess_file(
             },
         ));
 
+        // The analysis is over, so whatever it taught the calibration is worth
+        // putting on disk now rather than at the next debounce — which, on a
+        // player that analyses one track and then sits idle, may never come.
+        // Placed before the abort check on purpose: a cancelled analysis still
+        // completed groups, and the attempts they spent are exactly the state a
+        // restart must not re-spend.
+        gpu_calib::flush();
+
         if abort.load(Ordering::Relaxed) { return Err(PassFailed::Aborted); }
         if raw.mix.is_empty() {
             return Err(PassFailed::Failed("superlet analysis produced no frames".into()));
@@ -3741,17 +3888,24 @@ fn preprocess_file(
 
         // The same dB mapping for all three, because they are drawn on one
         // axis and Diff subtracts two of them.
-        let to_db = |rows: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
-            rows.into_iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|&mag| {
-                            let db = (20.0 * (mag * ASLT_DB_REF).log10()).max(-80.0);
-                            ((db + 80.0) / 80.0).clamp(0.0, 1.0)
-                        })
-                        .collect()
-                })
-                .collect()
+        // In place, cell by cell, in the same order and by the same
+        // expression.
+        //
+        // What this saves is allocator traffic, not peak memory: the old form
+        // consumed `rows` with `into_iter`, so each source row was dropped as
+        // its replacement was built and only one row was ever duplicated. It
+        // did allocate a fresh row for every frame — 87 318 of them on a joint
+        // three-minute 96 kHz track — and that is what goes. Measured at
+        // -0.015 s on that track, and no measurable change in peak working set;
+        // an earlier draft of this comment claimed a whole plane and was wrong.
+        let to_db = |mut rows: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
+            for row in rows.iter_mut() {
+                for mag in row.iter_mut() {
+                    let db = (20.0 * (*mag * ASLT_DB_REF).log10()).max(-80.0);
+                    *mag = ((db + 80.0) / 80.0).clamp(0.0, 1.0);
+                }
+            }
+            rows
         };
 
         store_progress_max(progress, base + span);
@@ -3764,6 +3918,15 @@ fn preprocess_file(
     }
 
     // ── Phase 2b: the FFT pipeline, in parallel with rayon ───────────────────
+    //
+    // The window and the padded plan are built here, on the route that uses
+    // them. Built at the top of the function they were built for the superlet
+    // route as well, which has no bins, no window and no bar mapping — a
+    // 65 536-point plan's twiddle tables held for the whole of a run that never
+    // reads them.
+    let window = make_window(fft_size, window_fn);
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(padded_size);
     let num_frames = (signal.len() - fft_size) / hop + 1;
     // Incremented inside `spec`, so it counts calls rather than restating the
     // loop bounds.
@@ -3780,6 +3943,19 @@ fn preprocess_file(
     let frames_all: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = (0..num_frames)
         .into_par_iter()
         .map(|fi| {
+            // Obsolete work stops at a frame boundary. A cancelled run still
+            // returns a value per frame, so the collection order and the frame
+            // indices are untouched, and the abort check after the join is what
+            // still decides the outcome — this only stops paying for frames
+            // whose result has already been discarded.
+            #[cfg(test)]
+            cancel_seam::reached(cancel_seam::Phase::FftProducer, cancel_seam::run_id(abort));
+            if abort.load(Ordering::Relaxed) {
+                return (Vec::new(), Vec::new(), Vec::new());
+            }
+            // Past the check: this frame is going to be paid for.
+            #[cfg(test)]
+            cancel_seam::reached(cancel_seam::Phase::FftProducerWork, cancel_seam::run_id(abort));
             let start = fi * hop;
             // One windowed, zero-padded transform per channel — two for a joint
             // run, never three.
@@ -3955,6 +4131,23 @@ fn preprocess_file(
     .0;
     let span = 100 - PROG_LOUDNESS_END - 1;
     let base = PROG_LOUDNESS_END + 1;
+    // A joint analysis is handed the two channels and derives the mix from
+    // their complex responses; it never reads the mean signal. Every consumer
+    // that did — the loudness, dynamics, clipping, chroma and waveform pass —
+    // has finished by here, so holding it through the transform held memory
+    // across the longest phase in the run for nobody.
+    //
+    // Measured, not inferred from the length: live heap at the end of the
+    // transform groups fell by 118.7 MiB on a 15.5 M-frame 96 kHz track and by
+    // 134.8 MiB on a 17.6 M-frame one. That is about **twice** four bytes a
+    // frame, because the decode buffer grows by doubling and its capacity is
+    // roughly twice what it holds — which is exactly why this is quoted from
+    // the allocator rather than from `len()`.
+    //
+    // A mono run still needs it, and keeps it.
+    if lr.is_some() {
+        all_mono = Vec::new();
+    }
     let input = match lr.as_ref() {
         Some((l, r)) => aslt::Input::Joint { left: l, right: r },
         None => aslt::Input::Mono(&all_mono),
@@ -4070,6 +4263,7 @@ fn save_sidecar(
         return true;
     }
     let bytes = stereo::encode(id, mono, pair);
+    cache::fault::run(cache::fault::Hook::SidecarEncoded);
     let cancelled = || abort.load(Ordering::Relaxed);
     match cache::write_atomic_cancellable(&path, &bytes, &cancelled) {
         Ok(cache::Written::Published) => {}
@@ -15387,6 +15581,583 @@ mod superlet_pipeline_tests {
         assert!(matches!(run(&f, 64, 60.0, &abort), PreMessage::Aborted));
         assert!(!f.cache.exists(), "aborted run still wrote a cache");
     }
+
+    /// A run cancelled before it starts stops **inside the decode**, not after
+    /// it.
+    ///
+    /// Progress is the witness: the decode phase ends at `PROG_DECODE_END`, so
+    /// a run that reached that value decoded the whole file before noticing.
+    /// The fixture is two seconds at 44.1 kHz — 88 200 frames against a
+    /// 16 384-frame poll interval — so the first poll lands at 18 % of the
+    /// file, well below the end of the phase, whatever the decoder's own
+    /// chunking does.
+    #[test]
+    fn an_aborted_run_stops_inside_the_decode() {
+        let f = Fixture::new("abort_early", 1000.0, 2.0, 44_100);
+        let progress = Arc::new(AtomicUsize::new(0));
+        let abort = Arc::new(AtomicBool::new(true));
+        let msg = preprocess_file(
+            &f.wav, &f.cache, 44_100, 64, &progress,
+            8192, 16, 0.875, &WindowFn::Hann, 200.0, 5000.0,
+            &InterpolationMode::None, &BarMappingMode::Superlet,
+            crate::dsd::decimate::DEFAULT_ANALYSIS_RATE,
+            &aslt::AsltPreset::Fast.config(), 60.0, &abort,
+            &Arc::new(AtomicUsize::new(usize::MAX)), StereoRequest::MixOnly,
+        );
+        assert!(matches!(msg, PreMessage::Aborted));
+        let reached = progress.load(Ordering::Relaxed);
+        assert!(reached < PROG_DECODE_END,
+                "progress reached {reached}, so the decode ran to the end of the file");
+        assert!(!f.cache.exists(), "aborted run still wrote a cache");
+    }
+
+
+    // ── cancellation arriving *inside* a phase ─────────────────────────────
+    //
+    // `abort_yields_no_cache` and `an_aborted_run_stops_inside_the_decode` both
+    // start with the flag already up, which only ever exercises the first poll
+    // of the first phase. These raise it from inside each phase through
+    // `cancel_seam`, so the poll that phase owns is the one under test. No
+    // sleeps, no races: the hook runs on the polling thread, immediately before
+    // the load it is arming.
+
+    /// Everything one of these schedules needs, cleaned up on drop.
+    ///
+    /// The calibration environment is `gpu_calib`'s own fixture, not a second
+    /// partial copy of one. The first version of this held only
+    /// `inject::TEST_DIR` across the two assignments, which does not own the
+    /// span between installing a directory and restoring it: a calibration
+    /// fixture starting inside that span replaces this directory, and this
+    /// fixture's drop then restores the `None` it saved — pointing
+    /// `gpu_calib::path()` back at the running user's `~/.moosik` while that
+    /// fixture is still writing and removing through it. Nothing here observed
+    /// that happening; it was reachable, which is enough.
+    ///
+    /// Lock order in this module: `cancel_seam::ENV` first, then
+    /// `gpu_calib::inject::ENV` inside it, never the other way round. No other
+    /// test takes both, and production takes neither.
+    struct Scratch {
+        paths: Vec<PathBuf>,
+        calib: super::gpu_calib::AsltTestEnv,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            Self { paths: Vec::new(), calib: super::gpu_calib::isolated_test_env(tag) }
+        }
+        fn path(&mut self, name: &str) -> PathBuf {
+            let p = std::env::temp_dir().join(name);
+            let _ = std::fs::remove_file(&p);
+            self.paths.push(p.clone());
+            p
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            for p in &self.paths {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    /// A competing calibration fixture cannot replace — or clear — this one's
+    /// directory while it is in use.
+    ///
+    /// The schedule this closes, which the previous `TEST_DIR`-only fixture
+    /// allowed: this fixture installs a directory and saves the previous value
+    /// (`None`); a calibration fixture installs its own; this one drops and
+    /// restores `None`; the calibration test then runs with
+    /// `gpu_calib::path()` resolving under the **real** user profile, where
+    /// `recalibrate` removes a file.
+    ///
+    /// No file operation is performed on the resolved path here. The assertion
+    /// is on the path itself, before any I/O could reach it, and it rejects
+    /// anything outside the temporary directory — so this is safe to run even
+    /// if the semantics it checks are broken, which is exactly the case it has
+    /// to be able to report.
+    #[test]
+    fn a_competing_calibration_fixture_cannot_take_this_ones_directory() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let _env = cancel_seam::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let sc = Scratch::new("isolation");
+        let mine = sc.calib.dir().to_path_buf();
+        let sandbox = std::env::temp_dir();
+
+        let start = super::gpu_calib::path_for_test();
+        assert_eq!(start.parent(), Some(mine.as_path()),
+                   "fixture did not redirect the calibration at all");
+
+        // A rival doing exactly what every other calibration fixture in the
+        // tree does: take the environment, install its own directory.
+        let (announced_tx, announced) = mpsc::channel::<()>();
+        let (installed_tx, installed) = mpsc::channel::<()>();
+        let (release_tx, release) = mpsc::channel::<()>();
+        let rival = std::thread::spawn(move || {
+            announced_tx.send(()).unwrap();
+            let env = super::gpu_calib::isolated_test_env("isolation_rival");
+            let dir = env.dir().to_path_buf();
+            installed_tx.send(()).unwrap();
+            let _ = release.recv();
+            drop(env);
+            dir
+        });
+
+        // It has started, and has had its chance to get in.
+        announced.recv().unwrap();
+        let got_in = installed.recv_timeout(Duration::from_millis(500)).is_ok();
+
+        // The assertion that decides this test. Under the old lifetime the
+        // rival takes `TEST_DIR` uncontended and this is its directory.
+        let now = super::gpu_calib::path_for_test();
+        assert!(now.starts_with(&sandbox),
+                "calibration path escaped the sandbox to {}", now.display());
+        assert_eq!(now.parent(), Some(mine.as_path()),
+                   "a competing fixture took this one's calibration directory \
+                    while it was in use (rival reported installed: {got_in})");
+
+        // And the other direction: this fixture's drop cannot strand the rival
+        // on the real profile, because the rival only starts after it.
+        drop(sc);
+        if !got_in {
+            installed.recv().unwrap();
+        }
+        let theirs = super::gpu_calib::path_for_test();
+        assert!(theirs.starts_with(&sandbox),
+                "after this fixture dropped, the calibration resolved to {}",
+                theirs.display());
+        assert_ne!(theirs.parent(), Some(mine.as_path()),
+                   "the rival inherited this fixture's directory");
+
+        release_tx.send(()).unwrap();
+        let rival_dir = rival.join().unwrap();
+        assert_eq!(theirs.parent(), Some(rival_dir.as_path()));
+    }
+
+    /// Stereo 16-bit WAV, so the channel and sidecar paths can be reached.
+    fn write_wav_stereo(path: &Path, left: &[f32], right: &[f32], sr: u32) {
+        assert_eq!(left.len(), right.len());
+        let mut data: Vec<u8> = Vec::with_capacity(left.len() * 4);
+        for (l, r) in left.iter().zip(right) {
+            data.extend(((l.clamp(-1.0, 1.0) * 32_767.0) as i16).to_le_bytes());
+            data.extend(((r.clamp(-1.0, 1.0) * 32_767.0) as i16).to_le_bytes());
+        }
+        let mut out = Vec::with_capacity(44 + data.len());
+        out.extend(b"RIFF");
+        out.extend(((36 + data.len()) as u32).to_le_bytes());
+        out.extend(b"WAVEfmt ");
+        out.extend(16u32.to_le_bytes());
+        out.extend(1u16.to_le_bytes());
+        out.extend(2u16.to_le_bytes());
+        out.extend(sr.to_le_bytes());
+        out.extend((sr * 4).to_le_bytes());
+        out.extend(4u16.to_le_bytes());
+        out.extend(16u16.to_le_bytes());
+        out.extend(b"data");
+        out.extend((data.len() as u32).to_le_bytes());
+        out.extend(data);
+        std::fs::write(path, out).expect("write stereo wav");
+    }
+
+    /// A DSF long enough to cross the decode poll interval several times.
+    ///
+    /// DSD64 decimates by 16 to the analysis rate, so `rows` blocks of 4096
+    /// bytes a channel give `rows * 4096 * 8 / 16` frames.
+    fn write_dsf(path: &Path, rows: usize) -> usize {
+        const BS: u32 = 4096;
+        let blocks: Vec<Vec<Vec<u8>>> = (0..rows)
+            .map(|r| {
+                (0..2)
+                    .map(|c| vec![if (r + c) % 2 == 0 { 0x69u8 } else { 0x96u8 }; BS as usize])
+                    .collect()
+            })
+            .collect();
+        let bits = (rows as u64) * (BS as u64) * 8;
+        let bytes = crate::dsd::tests::make_dsf(
+            2, crate::dsd::DSD64_RATE, 1, bits, BS, &blocks, None);
+        std::fs::write(path, bytes).expect("write dsf");
+        (bits / 16) as usize
+    }
+
+    /// One production run, with everything a schedule needs to observe it.
+    #[allow(clippy::too_many_arguments)]
+    fn run_watched(
+        track: &Path, cache: &Path, mapping: &BarMappingMode,
+        stereo: StereoRequest, progress: &Arc<AtomicUsize>, abort: &Arc<AtomicBool>,
+    ) -> PreMessage {
+        preprocess_file(
+            &track.to_path_buf(), cache, 44_100, 64, progress,
+            8192, 16, 0.875, &WindowFn::Hann, 200.0, 5000.0,
+            &InterpolationMode::None, mapping,
+            crate::dsd::decimate::DEFAULT_ANALYSIS_RATE,
+            &aslt::AsltPreset::Fast.config(), 60.0, abort,
+            &Arc::new(AtomicUsize::new(usize::MAX)), stereo,
+        )
+    }
+
+    /// Counts every phase report, and raises the flag on the `arm_at`-th report
+    /// of `arm_on`.
+    struct Schedule {
+        arm_at: usize,
+        seen: Arc<Mutex<Vec<cancel_seam::Phase>>>,
+        abort: Arc<AtomicBool>,
+    }
+
+    impl Schedule {
+        fn install(arm_on: cancel_seam::Phase, arm_at: usize) -> (Self, cancel_seam::Installed) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let abort = Arc::new(AtomicBool::new(false));
+            // Only this run's polls count. Other tests run `preprocess_file`
+            // concurrently and reach the same hook.
+            let mine = cancel_seam::run_id(&abort);
+            let (s, a) = (Arc::clone(&seen), Arc::clone(&abort));
+            let guard = cancel_seam::install(move |phase, run| {
+                if run != mine {
+                    return;
+                }
+                let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
+                g.push(phase);
+                if phase == arm_on && g.iter().filter(|p| **p == arm_on).count() == arm_at {
+                    a.store(true, Ordering::Relaxed);
+                }
+            });
+            (Self { arm_at, seen, abort }, guard)
+        }
+
+        fn count(&self, phase: cancel_seam::Phase) -> usize {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner())
+                .iter().filter(|p| **p == phase).count()
+        }
+    }
+
+    /// Cancellation arriving during PCM decoding stops the decode at its poll.
+    #[test]
+    fn cancellation_during_pcm_decoding_stops_at_the_next_poll() {
+        let _env = cancel_seam::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sc = Scratch::new("pcm");
+        let wav = sc.path("moosik_cancel_pcm.wav");
+        let cache = sc.path("moosik_cancel_pcm.spectrumcache");
+        // 5 s at 44.1 kHz is 220 500 frames — thirteen 16 384-frame polls.
+        let n_samples = 220_500usize;
+        let sig: Vec<f32> = (0..n_samples)
+            .map(|i| 0.5 * (std::f32::consts::TAU * 1000.0 * i as f32 / 44_100.0).sin())
+            .collect();
+        write_wav(&wav, &sig, 44_100);
+
+        let (sched, _guard) = Schedule::install(cancel_seam::Phase::PcmDecode, 2);
+        let progress = Arc::new(AtomicUsize::new(0));
+        let msg = run_watched(&wav, &cache, &BarMappingMode::Superlet,
+                              StereoRequest::MixOnly, &progress, &sched.abort);
+
+        assert!(matches!(msg, PreMessage::Aborted), "expected Aborted");
+        // The production path under test actually ran.
+        assert_eq!(sched.count(cancel_seam::Phase::PcmDecode), sched.arm_at,
+                   "the decode kept polling after the flag went up");
+        // Bounded additional work: the statistics pass was never entered.
+        assert_eq!(sched.count(cancel_seam::Phase::Statistics), 0,
+                   "statistics ran after the decode was cancelled");
+        assert!(progress.load(Ordering::Relaxed) < PROG_DECODE_END,
+                "progress reached {} — the decode ran to the end of the file",
+                progress.load(Ordering::Relaxed));
+        assert!(!cache.exists(), "an aborted run published a cache");
+    }
+
+    /// The same for the DSD decoder, which is a different loop.
+    #[test]
+    fn cancellation_during_dsd_decoding_stops_at_the_next_poll() {
+        let _env = cancel_seam::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sc = Scratch::new("dsd");
+        let dsf = sc.path("moosik_cancel_dsd.dsf");
+        let cache = sc.path("moosik_cancel_dsd.spectrumcache");
+        // 24 blocks of 4096 bytes a channel decimate to 49 152 frames — three polls.
+        let frames = write_dsf(&dsf, 24);
+        assert!(frames > 2 * DECODE_CANCEL_FRAMES,
+                "setup: {frames} frames is not enough to reach a second poll");
+        assert!(crate::dsd::is_dsd_path(&dsf), "setup: the fixture is not a DSD path");
+
+        let (sched, _guard) = Schedule::install(cancel_seam::Phase::DsdDecode, 2);
+        let progress = Arc::new(AtomicUsize::new(0));
+        let msg = run_watched(&dsf, &cache, &BarMappingMode::Superlet,
+                              StereoRequest::MixOnly, &progress, &sched.abort);
+
+        assert!(matches!(msg, PreMessage::Aborted), "expected Aborted");
+        assert_eq!(sched.count(cancel_seam::Phase::DsdDecode), sched.arm_at,
+                   "the DSD decode kept polling after the flag went up");
+        assert_eq!(sched.count(cancel_seam::Phase::PcmDecode), 0,
+                   "the PCM decoder ran for a DSD path");
+        assert_eq!(sched.count(cancel_seam::Phase::Statistics), 0,
+                   "statistics ran after the decode was cancelled");
+        assert!(!cache.exists(), "an aborted run published a cache");
+    }
+
+    /// Cancellation arriving during the statistics pass stops before the
+    /// transform, which is the phase it exists to protect.
+    #[test]
+    fn cancellation_during_statistics_stops_before_the_transform() {
+        let _env = cancel_seam::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sc = Scratch::new("stats");
+        let wav = sc.path("moosik_cancel_stats.wav");
+        let cache = sc.path("moosik_cancel_stats.spectrumcache");
+        let n_samples = 220_500usize;
+        let sig: Vec<f32> = (0..n_samples)
+            .map(|i| 0.5 * (std::f32::consts::TAU * 1000.0 * i as f32 / 44_100.0).sin())
+            .collect();
+        write_wav(&wav, &sig, 44_100);
+
+        let (sched, _guard) = Schedule::install(cancel_seam::Phase::Statistics, 3);
+        let progress = Arc::new(AtomicUsize::new(0));
+        let msg = run_watched(&wav, &cache, &BarMappingMode::Superlet,
+                              StereoRequest::MixOnly, &progress, &sched.abort);
+
+        assert!(matches!(msg, PreMessage::Aborted), "expected Aborted");
+        // The decode completed — this is not the decode poll firing again.
+        assert!(sched.count(cancel_seam::Phase::PcmDecode) > 0,
+                "the decode never reached a poll, so this is not a statistics schedule");
+        assert_eq!(sched.count(cancel_seam::Phase::Statistics), sched.arm_at,
+                   "the statistics pass kept polling after the flag went up");
+        let reached = progress.load(Ordering::Relaxed);
+        assert!(reached <= PROG_LOUDNESS_END,
+                "progress reached {reached}, past the end of the statistics phase");
+        assert!(!cache.exists(), "an aborted run published a cache");
+    }
+
+    /// Cancellation arriving inside the parallel FFT producer stops it paying
+    /// for frames whose result is already discarded.
+    #[test]
+    fn cancellation_inside_the_fft_producer_stops_obsolete_frames() {
+        let _env = cancel_seam::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sc = Scratch::new("fft");
+        let wav = sc.path("moosik_cancel_fft.wav");
+        let cache = sc.path("moosik_cancel_fft.spectrumcache");
+        let n_samples = 220_500usize;   // 208 frames at hop 1024
+        let sig: Vec<f32> = (0..n_samples)
+            .map(|i| 0.5 * (std::f32::consts::TAU * 1000.0 * i as f32 / 44_100.0).sin())
+            .collect();
+        write_wav(&wav, &sig, 44_100);
+        let total_frames = (n_samples - 8192) / 1024 + 1;
+
+        let (sched, _guard) = Schedule::install(cancel_seam::Phase::FftProducer, 4);
+        let progress = Arc::new(AtomicUsize::new(0));
+        // Cqt, so the ordinary FFT producer runs rather than the superlet.
+        let msg = run_watched(&wav, &cache, &BarMappingMode::Cqt,
+                              StereoRequest::MixOnly, &progress, &sched.abort);
+
+        assert!(matches!(msg, PreMessage::Aborted), "expected Aborted");
+        let visited = sched.count(cancel_seam::Phase::FftProducer);
+        let worked = sched.count(cancel_seam::Phase::FftProducerWork);
+        assert_eq!(visited, total_frames,
+                   "every frame is still visited; the map is not short-circuited away");
+        assert!(worked < total_frames,
+                "all {total_frames} frames did full work despite cancellation");
+        // Rayon has at most a pool's worth of frames already past the check.
+        assert!(worked <= sched.arm_at + 64,
+                "{worked} frames did full work after cancellation at frame {}",
+                sched.arm_at);
+        assert!(!cache.exists(), "an aborted run published a cache");
+    }
+
+    /// An aborted run leaves an existing Mix cache exactly as it found it, and
+    /// the retry afterwards succeeds and keeps that cache rather than rewriting
+    /// it.
+    #[test]
+    fn an_aborted_retry_preserves_the_existing_mix_cache() {
+        let _env = cancel_seam::ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sc = Scratch::new("retry");
+        let wav = sc.path("moosik_cancel_retry.wav");
+        let cache = sc.path("moosik_cancel_retry.spectrumcache");
+        let side = stereo::path_for(&cache);
+        let _ = std::fs::remove_file(&side);
+        sc.paths.push(side.clone());
+
+        let n = 44_100usize * 2;
+        let left: Vec<f32> = (0..n)
+            .map(|i| 0.5 * (std::f32::consts::TAU * 1000.0 * i as f32 / 44_100.0).sin())
+            .collect();
+        let right: Vec<f32> = (0..n)
+            .map(|i| 0.4 * (std::f32::consts::TAU * 1500.0 * i as f32 / 44_100.0).sin())
+            .collect();
+        write_wav_stereo(&wav, &left, &right, 44_100);
+
+        // 1. a completed mono analysis writes the Mix cache.
+        let quiet = Arc::new(AtomicBool::new(false));
+        let msg = run_watched(&wav, &cache, &BarMappingMode::Superlet,
+                              StereoRequest::MixOnly,
+                              &Arc::new(AtomicUsize::new(0)), &quiet);
+        assert!(matches!(msg, PreMessage::Done { .. }), "the first run did not finish");
+        let original = std::fs::read(&cache).expect("no cache after the first run");
+        assert!(!side.exists(), "a mono run wrote a sidecar");
+
+        // 2. a channels run cancelled in the statistics pass must touch nothing.
+        {
+            let (sched, _guard) = Schedule::install(cancel_seam::Phase::Statistics, 2);
+            let msg = run_watched(&wav, &cache, &BarMappingMode::Superlet,
+                                  StereoRequest::Joint,
+                                  &Arc::new(AtomicUsize::new(0)), &sched.abort);
+            assert!(matches!(msg, PreMessage::Aborted), "expected Aborted");
+            assert_eq!(std::fs::read(&cache).expect("cache vanished"), original,
+                       "an aborted run rewrote the Mix cache it should have left alone");
+            assert!(!side.exists(), "an aborted run published a sidecar");
+        }
+
+        // 3. the retry finishes, keeps the existing Mix bytes, and adds the pair.
+        let msg = run_watched(&wav, &cache, &BarMappingMode::Superlet,
+                              StereoRequest::Joint,
+                              &Arc::new(AtomicUsize::new(0)), &quiet);
+        assert!(matches!(msg, PreMessage::Done { .. }), "the retry did not finish");
+        assert_eq!(std::fs::read(&cache).expect("cache vanished"), original,
+                   "adding channels rewrote the Mix cache");
+        assert!(side.exists(), "the retry did not write the sidecar");
+    }
+
+    /// The published value at a frame, as the replaced per-frame loop computed
+    /// it. The reference for both progress tests.
+    fn old_progress_at(frames: usize, total: usize) -> usize {
+        (frames * PROG_DECODE_END / total).min(PROG_DECODE_END)
+    }
+
+    /// The cheap progress schedule publishes exactly what the per-frame one did.
+    ///
+    /// Not "roughly the same" and not "the same endpoints": the same values, in
+    /// the same order, at the same frame indices. The reference is the loop that
+    /// was replaced, run in full — which is only affordable for short files, so
+    /// this covers the ones where an exhaustive walk is cheap and
+    /// `decode_progress_reaches_every_threshold` covers the rest.
+    #[test]
+    fn decode_progress_publishes_the_same_values_at_the_same_frames() {
+        for total in [0usize, 1, 2, 7, 38, 39, 40, 41, 100, 1_000, 44_100, 200_000] {
+            let n = total.clamp(1, 200_000);
+            assert!(total == 0 || n == total,
+                    "setup: total {total} was clamped to {n}, so the walk is not exhaustive");
+
+            // What the old loop published: a store per frame, most of them the
+            // value that already held.
+            let mut want: Vec<(usize, usize)> = Vec::new();
+            let mut last: Option<usize> = None;
+            if total > 0 {
+                for frames in 1..=n {
+                    let pct = old_progress_at(frames, total);
+                    if last != Some(pct) {
+                        want.push((frames, pct));
+                        last = Some(pct);
+                    }
+                }
+            }
+
+            // What the new schedule publishes.
+            let mut got: Vec<(usize, usize)> = Vec::new();
+            let mut next = if total > 0 { 1usize } else { usize::MAX };
+            for frames in 1..=n {
+                if frames >= next {
+                    let pct = old_progress_at(frames, total);
+                    got.push((frames, pct));
+                    next = next_decode_publish(pct, total);
+                }
+            }
+            assert_eq!(got, want, "total_hint = {total}");
+
+            if total > PROG_DECODE_END {
+                assert_eq!(want.last().map(|v| v.1), Some(PROG_DECODE_END),
+                           "total_hint = {total}: the walk never reached saturation");
+            }
+        }
+    }
+
+    /// Every threshold, on a track long enough that walking it frame by frame
+    /// is not an option.
+    ///
+    /// The earlier version of this test capped the walk at 200 000 frames, so
+    /// its 15.5-million-frame case stopped short of the first change at about
+    /// frame 397 436 and asserted only that nothing had been published — which
+    /// a schedule that published *nothing at all* would also satisfy. This
+    /// walks the thresholds instead of the frames: for every percentage step,
+    /// the frame before the change, the frame of the change and the frame after
+    /// it are checked against the replaced loop, through saturation.
+    #[test]
+    fn decode_progress_reaches_every_threshold() {
+        for total in [400_000usize, 15_500_000, 44_100 * 3_600] {
+            let mut pct = old_progress_at(1, total);
+            assert_eq!(pct, 0, "total_hint = {total}: the first frame is not 0 %");
+            let mut next = next_decode_publish(pct, total);
+            let mut steps = 0usize;
+
+            while next != usize::MAX {
+                assert!(next > 1, "total_hint = {total}: threshold {next} is not ahead of frame 1");
+
+                // One frame short of the threshold the schedule is waiting for,
+                // the replaced loop still published the value that already held.
+                assert_eq!(old_progress_at(next - 1, total), pct,
+                           "total_hint = {total}: the value changed before frame {next}");
+
+                // At the threshold it changes, and the schedule publishes there.
+                let at = old_progress_at(next, total);
+                assert!(at > pct,
+                        "total_hint = {total}: frame {next} was supposed to be a change");
+
+                // And one frame later nothing new has happened yet, unless the
+                // step is a single frame wide.
+                let after = old_progress_at(next + 1, total);
+                assert!(after >= at, "total_hint = {total}: progress went backwards");
+
+                pct = at;
+                next = next_decode_publish(pct, total);
+                steps += 1;
+                assert!(steps <= PROG_DECODE_END + 1,
+                        "total_hint = {total}: more steps than there are values");
+            }
+
+            assert_eq!(pct, PROG_DECODE_END,
+                       "total_hint = {total}: the schedule stopped at {pct}, not at saturation");
+            assert_eq!(steps, PROG_DECODE_END,
+                       "total_hint = {total}: {steps} steps, expected {PROG_DECODE_END}");
+        }
+    }
+
+    /// A duration hint that underestimates: the file has more frames than the
+    /// decoder promised.
+    ///
+    /// `total_duration()` is best-effort, and a stream that reports short is the
+    /// realistic way this schedule meets its saturation clamp in production.
+    /// Past the hint the replaced loop stored `PROG_DECODE_END` over and over;
+    /// the new one has to publish it once and then stop, with no value
+    /// published twice and none skipped.
+    #[test]
+    fn decode_progress_saturates_when_the_duration_hint_is_short() {
+        let hint = 50_000usize;
+        let actual = hint * 3 / 2;          // the file is half as long again
+
+        let mut want: Vec<(usize, usize)> = Vec::new();
+        let mut last: Option<usize> = None;
+        for frames in 1..=actual {
+            let pct = old_progress_at(frames, hint);
+            if last != Some(pct) {
+                want.push((frames, pct));
+                last = Some(pct);
+            }
+        }
+
+        let mut got: Vec<(usize, usize)> = Vec::new();
+        let mut next = 1usize;
+        for frames in 1..=actual {
+            if frames >= next {
+                let pct = old_progress_at(frames, hint);
+                got.push((frames, pct));
+                next = next_decode_publish(pct, hint);
+            }
+        }
+
+        assert_eq!(got, want, "hint {hint}, actual {actual}");
+        assert_eq!(got.last().map(|v| v.1), Some(PROG_DECODE_END),
+                   "the schedule never saturated");
+        assert!(got.last().unwrap().0 <= hint,
+                "saturation was published at frame {}, past the hint itself",
+                got.last().unwrap().0);
+        // Nothing is published across the frames past the hint: the value there
+        // is already the clamp and has already been sent.
+        assert!(got.iter().all(|(f, _)| *f <= hint),
+                "the schedule published again after the hint ran out");
+    }
 }
 // ---------------------------------------------------------------------------
 // Pre-process stereo: the channels, the sidecar, and what mono is not
@@ -15809,6 +16580,343 @@ mod preprocess_stereo_tests {
         assert_eq!(std::fs::read(&mono_path).unwrap(), before);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the save wrappers, end to end ───────────────────────────────────────
+    //
+    // `write_atomic_cancellable` is tested in `cache.rs` against its own
+    // contract. What follows tests the two production wrappers that call it —
+    // `save_cache` and `save_sidecar` — through the real functions and the real
+    // publication path, because a wrapper can hold a correct primitive and
+    // still check the wrong flag, check it in the wrong order, or report a
+    // cancelled save as a successful one.
+    //
+    // # The linearization boundary these tests assert
+    //
+    // Four moments, in the order a save reaches them:
+    //
+    // 1. **Before the encode.** `save_cache` reads `abort` here. Cancellation
+    //    observed now skips the encode entirely — the only thing that is saved
+    //    at this point is the CPU the encode would have cost, since nothing has
+    //    touched the disk either way.
+    // 2. **After the encode, before anything is created.**
+    //    `write_atomic_cancellable` reads it on entry. Nothing is created.
+    // 3. **With a complete temporary on disk, before the rename.** This is the
+    //    commit decision. The temporary is removed and the destination keeps
+    //    exactly its previous bytes, or stays absent.
+    // 4. **After the rename.** Too late, and legitimately so: the rename is one
+    //    step and nothing here pretends to interrupt it.
+    //
+    // **The encode itself is not interruptible, and these tests do not claim it
+    // is.** A cancellation arriving during `to_v4` or `stereo::encode` is
+    // observed at moment 2, after that work has been paid for. The guarantee is
+    // about *publication*, not about promptness.
+
+    /// A scratch directory with nothing else in it, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!(
+                "moosik_save_{tag}_{}_{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            Self(d)
+        }
+        fn cache(&self) -> PathBuf {
+            self.0.join("t.spectrumcache")
+        }
+        /// Every temporary the writer may have left behind.
+        fn temporaries(&self) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(&self.0)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.contains("tmp-"))
+                .collect();
+            v.sort();
+            v
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn small_frames(seed: usize) -> cache::PreFrames {
+        let rows: Vec<Vec<f32>> = (0..40)
+            .map(|i| (0..32).map(|b| ((i * b + seed) % 11) as f32 / 11.0).collect())
+            .collect();
+        cache::PreFrames::from_analysis(&rows)
+    }
+
+    /// What was at `path` before a save, for the two destinations every case
+    /// below is run against: absent, and holding a valid earlier cache.
+    fn existing_destination(s: &Scratch, existing: bool) -> Option<Vec<u8>> {
+        existing.then(|| {
+            let old = small_frames(7).to_v4();
+            cache::write_atomic(&s.cache(), &old).unwrap();
+            old
+        })
+    }
+
+    /// The destination is exactly as it was, and no temporary survives.
+    fn nothing_was_published(s: &Scratch, before: &Option<Vec<u8>>, what: &str) {
+        match before {
+            Some(old) => assert_eq!(
+                &std::fs::read(s.cache()).unwrap(),
+                old,
+                "{what}: the existing cache was modified"
+            ),
+            None => assert!(!s.cache().exists(), "{what}: a cache was published"),
+        }
+        assert!(s.temporaries().is_empty(), "{what}: left {:?}", s.temporaries());
+    }
+
+    /// Moment 1. Cancellation seen before the encode skips the encode, and the
+    /// destination — absent or occupied — is untouched.
+    #[test]
+    fn a_save_cancelled_before_it_starts_does_not_even_encode() {
+        for existing in [false, true] {
+            let s = Scratch::new("pre_encode");
+            let before = existing_destination(&s, existing);
+
+            let encoded = Arc::new(AtomicBool::new(false));
+            let seen = Arc::clone(&encoded);
+            cache::fault::on(cache::fault::Hook::CacheEncoded, move || {
+                seen.store(true, Ordering::Relaxed);
+            });
+
+            save_cache(&s.cache(), &small_frames(1), &AtomicBool::new(true));
+
+            assert!(
+                !encoded.load(Ordering::Relaxed),
+                "existing={existing}: the encode ran despite a cancelled analysis"
+            );
+            nothing_was_published(&s, &before, "pre-encode cancellation");
+            // Never consumed, because the encode it was watching for was
+            // skipped. Left armed, it would fire inside the next iteration.
+            cache::fault::clear();
+        }
+    }
+
+    /// Moment 2. The encode is paid for, then cancellation is observed with
+    /// nothing yet on disk. Nothing is created.
+    #[test]
+    fn a_save_cancelled_after_encoding_creates_nothing() {
+        for existing in [false, true] {
+            let s = Scratch::new("post_encode");
+            let before = existing_destination(&s, existing);
+
+            let abort = Arc::new(AtomicBool::new(false));
+            let flip = Arc::clone(&abort);
+            let reached = Arc::new(AtomicBool::new(false));
+            let mark = Arc::clone(&reached);
+            cache::fault::on(cache::fault::Hook::CacheEncoded, move || {
+                mark.store(true, Ordering::Relaxed);
+                flip.store(true, Ordering::Relaxed);
+            });
+
+            save_cache(&s.cache(), &small_frames(1), &abort);
+
+            assert!(
+                reached.load(Ordering::Relaxed),
+                "setup: the encode never ran, so nothing was cancelled after it"
+            );
+            nothing_was_published(&s, &before, "post-encode cancellation");
+        }
+    }
+
+    /// Moment 3, the commit decision. The temporary is genuinely on disk when
+    /// the flag flips; it is removed, and the destination keeps its bytes.
+    #[test]
+    fn a_save_cancelled_with_its_temporary_written_publishes_nothing() {
+        for existing in [false, true] {
+            let s = Scratch::new("mid_flight");
+            let before = existing_destination(&s, existing);
+
+            let abort = Arc::new(AtomicBool::new(false));
+            let flip = Arc::clone(&abort);
+            let dir = s.0.clone();
+            let saw_temp = Arc::new(AtomicBool::new(false));
+            let mark = Arc::clone(&saw_temp);
+            cache::fault::on(cache::fault::Hook::TempWritten, move || {
+                let temps: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.contains("tmp-"))
+                    .collect();
+                mark.store(!temps.is_empty(), Ordering::Relaxed);
+                flip.store(true, Ordering::Relaxed);
+            });
+
+            save_cache(&s.cache(), &small_frames(1), &abort);
+
+            assert!(
+                saw_temp.load(Ordering::Relaxed),
+                "setup: no temporary was on disk, so the cancellation was not mid-flight"
+            );
+            nothing_was_published(&s, &before, "commit-boundary cancellation");
+        }
+    }
+
+    /// The uncancelled case, against both destinations: a complete, readable
+    /// cache replaces whatever was there, and no temporary survives.
+    #[test]
+    fn an_uncancelled_save_publishes_a_complete_cache() {
+        for existing in [false, true] {
+            let s = Scratch::new("published");
+            let old = existing_destination(&s, existing);
+
+            let frames = small_frames(1);
+            save_cache(&s.cache(), &frames, &AtomicBool::new(false));
+
+            assert_eq!(
+                cache::read(&s.cache(), 32, MAX_BAR_COUNT).expect("the cache did not read back"),
+                frames,
+                "existing={existing}"
+            );
+            if let Some(old) = old {
+                assert_ne!(std::fs::read(s.cache()).unwrap(), old, "the old cache survived");
+            }
+            assert!(s.temporaries().is_empty(), "left {:?}", s.temporaries());
+        }
+    }
+
+    /// A write that fails — short, or refused at the publication step — is not
+    /// a cancellation, and has the same obligations: the destination keeps its
+    /// bytes and no temporary is left behind. A half-written temporary is never
+    /// a published file, which is the whole point of writing a sibling.
+    #[test]
+    fn a_failed_save_leaves_the_destination_and_no_temporary() {
+        for at in [cache::fault::At::MidWrite, cache::fault::At::BeforePublish] {
+            for existing in [false, true] {
+                let s = Scratch::new("failed");
+                let before = existing_destination(&s, existing);
+
+                cache::fault::arm(at);
+                save_cache(&s.cache(), &small_frames(1), &AtomicBool::new(false));
+
+                nothing_was_published(&s, &before, &format!("{at:?}"));
+            }
+        }
+    }
+
+    /// An empty analysis writes nothing at all, and does not remove a cache
+    /// that is already there.
+    #[test]
+    fn an_empty_analysis_does_not_touch_the_destination() {
+        let s = Scratch::new("empty");
+        let before = existing_destination(&s, true);
+        save_cache(&s.cache(), &cache::PreFrames::from_analysis(&[]), &AtomicBool::new(false));
+        nothing_was_published(&s, &before, "empty analysis");
+    }
+
+    /// The sidecar wrapper, at the same three moments. The mono cache beside it
+    /// must survive every one of them, because it is the file the display is
+    /// reading while the sidecar is being written.
+    #[test]
+    fn the_sidecar_wrapper_honours_the_same_boundary() {
+        let cases = ["pre-encode", "post-encode", "commit"];
+        for case in cases {
+            let s = Scratch::new("sidecar");
+            let mono = small_frames(3);
+            cache::write_atomic(&s.cache(), &mono.to_v4()).unwrap();
+            let mono_bytes = std::fs::read(s.cache()).unwrap();
+            let pair = stereo::Stereo::new(mono.clone(), mono.clone()).unwrap();
+
+            let abort = Arc::new(AtomicBool::new(case == "pre-encode"));
+            let encoded = Arc::new(AtomicBool::new(false));
+            let mark = Arc::clone(&encoded);
+            let flip = Arc::clone(&abort);
+            match case {
+                "pre-encode" => cache::fault::on(cache::fault::Hook::SidecarEncoded, move || {
+                    mark.store(true, Ordering::Relaxed);
+                }),
+                "post-encode" => cache::fault::on(cache::fault::Hook::SidecarEncoded, move || {
+                    mark.store(true, Ordering::Relaxed);
+                    flip.store(true, Ordering::Relaxed);
+                }),
+                _ => cache::fault::on(cache::fault::Hook::TempWritten, move || {
+                    mark.store(true, Ordering::Relaxed);
+                    flip.store(true, Ordering::Relaxed);
+                }),
+            }
+
+            // True throughout: the channels are correct and in memory, so this
+            // session shows them whether or not a file was written.
+            assert!(save_sidecar(&s.cache(), TEST_ID, &mono, &pair, &abort), "{case}");
+
+            if case == "pre-encode" {
+                assert!(
+                    !encoded.load(Ordering::Relaxed),
+                    "{case}: the sidecar was encoded despite a cancelled analysis"
+                );
+            } else {
+                assert!(encoded.load(Ordering::Relaxed), "setup: {case} never reached its hook");
+            }
+            assert!(!s.cache().with_extension("stereocache").exists(), "{case}: published");
+            assert!(!stereo::path_for(&s.cache()).exists(), "{case}: a sidecar was published");
+            assert_eq!(std::fs::read(s.cache()).unwrap(), mono_bytes, "{case}: mono changed");
+            assert!(s.temporaries().is_empty(), "{case}: left {:?}", s.temporaries());
+            // The pre-encode case deliberately never reaches its hook, so the
+            // arming survives; the next case would find that one first.
+            cache::fault::clear();
+        }
+    }
+
+    /// The whole point of the guarantee: a cancelled save costs the next
+    /// attempt nothing. The retry goes through the real entry point —
+    /// `preprocess_file`, the only caller of `save_cache` in production — and
+    /// the cache it publishes reads back.
+    ///
+    /// The cancellation is placed at the encode rather than at the start, so
+    /// the analysis itself completes and it is genuinely the *save* that is
+    /// cancelled. That is the case the wrapper exists for: the work is done and
+    /// the user has moved on.
+    #[test]
+    fn a_cancelled_save_leaves_the_next_analysis_free_to_publish() {
+        let f = Fx::new("retry", &[&tone(440.0, 0.6)]);
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let flip = Arc::clone(&abort);
+        cache::fault::on(cache::fault::Hook::CacheEncoded, move || {
+            flip.store(true, Ordering::Relaxed);
+        });
+        let first = run_as(&f, StereoRequest::MixOnly, &abort);
+        assert!(
+            matches!(first, PreMessage::Done { .. }),
+            "setup: the analysis itself should have finished"
+        );
+        assert!(!f.cache.exists(), "a cancelled save published a cache");
+
+        // A new analysis carries a new flag — production replaces the Arc
+        // rather than clearing it — and publishes.
+        let second = run_as(&f, StereoRequest::MixOnly, &Arc::new(AtomicBool::new(false)));
+        let PreMessage::Done { frames, .. } = second else {
+            panic!("the retry did not finish")
+        };
+        assert!(f.cache.exists(), "the retry published nothing");
+        assert_eq!(
+            cache::read(&f.cache, BARS, MAX_BAR_COUNT).expect("the retry's cache did not read"),
+            frames,
+            "the published cache is not what the analysis produced"
+        );
+        assert!(
+            std::fs::read_dir(f.cache.parent().unwrap())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .all(|e| !e.file_name().to_string_lossy().contains("t.spectrumcache.tmp-")),
+            "a temporary survived the pair of runs"
+        );
     }
 
     // ── the display side ────────────────────────────────────────────────────

@@ -319,6 +319,22 @@ fn norms(c: Vec<C32>) -> Vec<f32> {
     c.into_iter().map(|c| (c.re * c.re + c.im * c.im).sqrt()).collect()
 }
 
+/// `|(l + r) / 2|`, per frame — [`mix_complex`] and [`norms`] in one pass.
+///
+/// The same two expressions, applied to the same values in the same order. What
+/// goes is the `Vec<C32>` between them, which on a joint run was one allocation
+/// and one full pass per member per bar and was never read by anything else.
+fn mix_norms(l: &[C32], r: &[C32]) -> Vec<f32> {
+    l.iter()
+        .zip(r)
+        .map(|(a, b)| {
+            let re = 0.5 * (a.re + b.re);
+            let im = 0.5 * (a.im + b.im);
+            (re * re + im * im).sqrt()
+        })
+        .collect()
+}
+
 /// `(l + r) / 2`, per frame — the mix, taken where it is still the mix.
 ///
 /// The whole stereo design turns on this being applied to complex responses.
@@ -447,21 +463,36 @@ impl Morlet {
 
         if base >= 0 && end <= n {
             // Interior: the envelope already sums to 1, so skip that accumulator.
-            for (k, (&wr, &wi)) in self.re.iter().zip(self.im.iter()).enumerate() {
-                let s = signal[(base + k as isize) as usize];
+            //
+            // The window is taken once as a slice rather than indexed per tap.
+            // The taps are visited in the same order and folded by the same two
+            // expressions, so both f64 accumulators are bit-identical; what goes
+            // is a bounds check on every one of the hundreds of thousands of
+            // taps a bass bar carries, which the slice makes unnecessary by
+            // construction — `end - base` is exactly `self.re.len()`.
+            let window = &signal[base as usize..end as usize];
+            for ((&s, &wr), &wi) in window.iter().zip(self.re.iter()).zip(self.im.iter()) {
                 acc_re += (s * wr) as f64;
                 acc_im += (s * wi) as f64;
             }
             return (acc_re, acc_im, 1.0);
         }
 
+        // The surviving taps, as three slices of the same length, for the
+        // reason the interior branch takes one: same order, same expressions,
+        // same sums, without a bounds check per tap.
         let mut env_sum = 0.0f64;
-        for i in lo..hi {
-            let k = (i - base) as usize;
-            let s = signal[i as usize];
-            acc_re += (s * self.re[k]) as f64;
-            acc_im += (s * self.im[k]) as f64;
-            env_sum += self.env[k] as f64;
+        let (k0, k1) = ((lo - base) as usize, (hi - base) as usize);
+        let window = &signal[lo as usize..hi as usize];
+        for (((&s, &wr), &wi), &g) in window
+            .iter()
+            .zip(&self.re[k0..k1])
+            .zip(&self.im[k0..k1])
+            .zip(&self.env[k0..k1])
+        {
+            acc_re += (s * wr) as f64;
+            acc_im += (s * wi) as f64;
+            env_sum += g as f64;
         }
         (acc_re, acc_im, env_sum)
     }
@@ -509,7 +540,7 @@ impl Morlet {
             Some(right) => {
                 let l = one(ch.a, &shared.a);
                 let r = one(right, &shared.b);
-                let mix = norms(mix_complex(&l, &r));
+                let mix = mix_norms(&l, &r);
                 if let Some(mean) = ch.mean.filter(|_| seams.redundant_mix_transform) {
                     // The violation this contract exists to forbid: a third
                     // convolution, of the mean signal. Through an empty block
@@ -628,12 +659,23 @@ impl Morlet {
 
         let scale = 1.0 / n as f32;
         let mut buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; n];
+        // `process` allocates a fresh scratch buffer on every call, which here
+        // is once per block. One buffer serves the whole loop instead: rustfft
+        // documents its contents as garbage between calls, and the identity
+        // tests hold a reused buffer to the bits of a fresh one.
+        let mut scratch = vec![Complex { re: 0.0f32, im: 0.0f32 }; inv.get_inplace_scratch_len()];
         for b in 0..blocks.blocks() {
             let base = b * blocks.stride;
             if base >= n_sig { break; }
-            buf.copy_from_slice(blocks.block(b));
-            for (x, h) in buf.iter_mut().zip(kernel.iter()) { *x *= *h; }
-            inv.process(&mut buf);
+            // One pass over the block, not two. `Complex::mul_assign` is
+            // `*self = *self * rhs`, so a copy followed by `*x *= *h` and a
+            // direct `*x = *s * *h` are the same product of the same two
+            // values; what goes is a whole-block copy and the pass that read it
+            // back.
+            for ((x, s), h) in buf.iter_mut().zip(blocks.block(b)).zip(kernel.iter()) {
+                *x = *s * *h;
+            }
+            inv.process_with_scratch(&mut buf, &mut scratch);
 
             let m_lo = base + k - 1;
             let m_hi = (base + n).min(n_sig);
@@ -704,17 +746,27 @@ impl Morlet {
 
         let scale = 1.0 / n as f32;
         let mut buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; n];
+        // As in `complex_via_shared`: one scratch for every transform in the
+        // loop, sized for whichever direction needs more.
+        let scratch_len = fwd.get_inplace_scratch_len().max(inv.get_inplace_scratch_len());
+        let mut scratch = vec![Complex { re: 0.0f32, im: 0.0f32 }; scratch_len];
         let mut base = 0usize;
         while base < n_sig {
-            for (i, slot) in buf.iter_mut().enumerate() {
-                *slot = Complex {
-                    re: signal.get(base + i).copied().unwrap_or(0.0),
-                    im: 0.0,
-                };
+            // The same values, as one bounded copy and one zero fill rather
+            // than a checked lookup per element. `base < n_sig` holds at the
+            // top of the loop, so `avail` is exactly where the lookup would
+            // start returning `None`, and the tail is exactly the zero padding
+            // overlap-save requires.
+            let avail = (n_sig - base).min(n);
+            for (slot, &x) in buf[..avail].iter_mut().zip(&signal[base..base + avail]) {
+                *slot = Complex { re: x, im: 0.0 };
             }
-            fwd.process(&mut buf);
+            for slot in buf[avail..].iter_mut() {
+                *slot = Complex { re: 0.0, im: 0.0 };
+            }
+            fwd.process_with_scratch(&mut buf, &mut scratch);
             for (b, h) in buf.iter_mut().zip(kernel.iter()) { *b *= *h; }
-            inv.process(&mut buf);
+            inv.process_with_scratch(&mut buf, &mut scratch);
 
             // Linear-convolution outputs y[m] land at buf[m - base] for
             // m in [base + k - 1, base + n).
@@ -790,7 +842,7 @@ fn superlet_cycles(q: f32, cfg: &AsltConfig) -> Vec<f32> {
 /// way — the large blocks are the low-frequency bars whose kernels run to
 /// hundreds of thousands of taps, and those dominate the expensive presets.
 /// Below this the CPU is simply quicker, so it keeps that work.
-const GPU_MIN_BLOCK: usize = 1 << 17;
+pub(super) const GPU_MIN_BLOCK: usize = 1 << 17;
 
 /// Live threshold. **On where a device is available; `MOOSIK_GPU=0` forces it
 /// off.**
@@ -1062,13 +1114,21 @@ impl SignalBlocks {
         let blocks = signal.len().div_ceil(stride).max(1);
         let mut data = vec![Complex { re: 0.0f32, im: 0.0 }; blocks * n];
         let fwd = ASLT_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
+        // One scratch for every block, as in `Morlet::complex_via_shared`.
+        let mut scratch = vec![Complex { re: 0.0f32, im: 0.0 }; fwd.get_inplace_scratch_len()];
         for b in 0..blocks {
             let base = b * stride;
             let dst = &mut data[b * n..(b + 1) * n];
-            for (i, slot) in dst.iter_mut().enumerate() {
-                *slot = Complex { re: signal.get(base + i).copied().unwrap_or(0.0), im: 0.0 };
+            // As in `Morlet::complex_via_fft`: a bounded copy and a zero fill,
+            // the same values a checked lookup per element produced.
+            let avail = signal.len().saturating_sub(base).min(n);
+            for (slot, &x) in dst[..avail].iter_mut().zip(&signal[base..base + avail]) {
+                *slot = Complex { re: x, im: 0.0 };
             }
-            fwd.process(dst);
+            for slot in dst[avail..].iter_mut() {
+                *slot = Complex { re: 0.0, im: 0.0 };
+            }
+            fwd.process_with_scratch(dst, &mut scratch);
         }
         Self { n, stride, data }
     }
@@ -1220,6 +1280,92 @@ impl Cols {
     }
 }
 
+/// How often cancellation is re-checked inside one bar.
+///
+/// The lowest bars run for tens of seconds on their own, so a per-bar check
+/// alone would leave Abort feeling ignored. Module-scope so the test that
+/// exercises the in-bar check reads the production value rather than repeating
+/// it.
+const CANCEL_CHECK_FRAMES: usize = 512;
+
+/// Move finished columns into their slots.
+///
+/// The single place where a worker's result becomes the run's result. A `Cols`
+/// is one to three `Vec<f32>` of `frames` each, so copying here rather than
+/// moving would hold two of every column at once for the length of the loop.
+/// All three sweeps go through this, so the test that checks for a copy checks
+/// the production path rather than a reimplementation of it in the test file.
+fn install_columns(columns: &mut [Option<Cols>], done: impl IntoIterator<Item = (usize, Cols)>) {
+    for (bar, col) in done {
+        columns[bar] = Some(col);
+    }
+}
+
+/// Transpose one plane of finished columns into frames × bars, releasing each
+/// column as it is consumed.
+///
+/// The columns and the output hold the same numbers in a different order, so
+/// the run does not need both. Transposing all three planes with every column
+/// still alive held **six** copies of the largest structure in the run at once
+/// — three bars × frames column planes and three frames × bars row planes. One
+/// plane at a time, taking each column as it is copied, holds four: the two
+/// column planes not yet consumed, the one being consumed, and the output.
+///
+/// `take` and not `clear`: clearing sets the length to zero and keeps the
+/// capacity, which is the entire cost. The taken `Vec` is dropped at the end of
+/// each iteration and its allocation goes back to the allocator there.
+///
+/// A column shorter than `frames` fills the rows it has and leaves the rest at
+/// zero, exactly as before; the run is abandoned before this point if any
+/// column is missing outright.
+fn transpose_plane(
+    columns: &mut [Option<Cols>],
+    frames: usize,
+    n_bars: usize,
+    pick: fn(&mut Cols) -> &mut Vec<f32>,
+) -> Vec<Vec<f32>> {
+    let mut out = vec![vec![0.0f32; n_bars]; frames];
+    for (bar, slot) in columns.iter_mut().enumerate() {
+        let col = std::mem::take(pick(slot.as_mut().expect("every column is present")));
+        for (fi, &v) in col.iter().enumerate() {
+            out[fi][bar] = v;
+        }
+    }
+    out
+}
+
+/// One bar of CPU work, as little as a worker needs to do it.
+///
+/// Deliberately three scalars: the kernels are built inside the worker that
+/// runs the bar, because a superlet's tables are hundreds of kilobytes at the
+/// bottom of the range and building them all up front would hold every bar's
+/// kernels at once to save nothing.
+#[derive(Clone, Copy)]
+struct BarJob {
+    bar: usize,
+    freq: f32,
+    q: f32,
+}
+
+/// The scheduling shape both CPU bar sweeps use.
+///
+/// Rayon sizes a leaf from the *length of the iterator*, halving the split
+/// budget on every job that is not stolen. Sweeping the 1024-slot column array
+/// and filtering inside it therefore produced leaves of ~128 slots whatever the
+/// work in them, and the direct bars — a contiguous handful at the top of the
+/// range — all landed in one leaf, which then ran on whichever thread took it.
+/// Iterating a compact list of jobs instead makes the length the *work* count,
+/// and `with_max_len(1)` sets the splitter's minimum split count to that length
+/// (`LengthSplitter::new`), so a leaf holds one job.
+///
+/// That bounds granularity, and nothing more: it does not promise that six
+/// workers are busy, does not guarantee stealing, and is not a deadline. It only
+/// removes the case where a whole phase is stuck inside one leaf.
+fn bar_jobs(jobs: &[BarJob]) -> impl rayon::iter::IndexedParallelIterator<Item = &BarJob> {
+    use rayon::prelude::*;
+    jobs.par_iter().with_max_len(1)
+}
+
 /// What a run actually dispatched, in units that are each homogeneous.
 ///
 /// **Deliberately not one number.** The routes do differently shaped work — the
@@ -1294,6 +1440,17 @@ impl WorkCells {
     }
     fn device_failure(&self) {
         self.device_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The running total, for a caller that wants a delta.
+    ///
+    /// This counter is cumulative over a whole analysis, so it cannot answer
+    /// "did *this group* fall back?" on its own. A group reads it before and
+    /// after and compares — otherwise every group after the first failure would
+    /// look like a failure too, and one flaky dispatch would invalidate the
+    /// rest of the run.
+    fn device_failures_now(&self) -> u64 {
+        self.device_failures.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Record the largest deviation seen so far between a redundantly computed
@@ -1703,10 +1860,6 @@ fn analyze_routed(
     let grid_at = |bar: usize| cfg.scale.grid_q_at(bar, n_bars, min_freq, max_freq);
     let cancelled = AtomicBool::new(false);
 
-    // How often to re-check cancellation inside one bar. The lowest bars run for
-    // tens of seconds on their own, so a per-bar check alone would leave Abort
-    // feeling ignored.
-    const CANCEL_CHECK_FRAMES: usize = 512;
     // Cancellation granularity on the frequency-domain route is one whole bar,
     // since a transform cannot be stopped part-way. Those bars are the fast ones
     // now, so the wait is short — but the cheap direct route keeps its
@@ -1821,10 +1974,18 @@ fn analyze_routed(
         let group_n = *_key;
         let stride = (group_n / 2).max(1);
         let blocks = signal.len().div_ceil(stride).max(1);
-        let gpu = route(group_n)
+        // One decision belongs to one group. The scope retires it however this
+        // iteration ends — recorded, cancelled, returned early from, or
+        // unwound — so the next group cannot inherit it and record its own time
+        // under this group's block size.
+        let group_scope = super::gpu_calib::begin_group();
+        let wanted_device = route(group_n);
+        let gpu = wanted_device
             .then(super::gpu::GpuFft::shared)
             .flatten();
         let t_group = std::time::Instant::now();
+        // Cumulative over the analysis, so the per-group question is a delta.
+        let failures_before = work.device_failures_now();
 
         let bars: Vec<usize> = idxs.iter().map(|&i| plans[i].bar).collect();
 
@@ -1978,7 +2139,7 @@ fn analyze_routed(
                         None => Cols { mix: norms(l), ..Default::default() },
                         Some(right) => {
                             let r = channel(w, &got_b[ci][wi], right, &shared.b);
-                            let mix = norms(mix_complex(&l, &r));
+                            let mix = mix_norms(&l, &r);
                             Cols { mix, left: norms(l), right: norms(r) }
                         }
                     }
@@ -2007,6 +2168,11 @@ fn analyze_routed(
                 t_fill.elapsed().as_nanos() as u64, Ordering::Relaxed);
             out
         };
+
+        // From here the exploration has really happened: a cancellation after
+        // this point spends the attempt rather than refunding it, which is what
+        // stops repeated start-and-cancel from buying unlimited exploration.
+        group_scope.work_started();
 
         let (gpu_cols, cpu_cols) = rayon::join(
             || -> Vec<(usize, Cols)> {
@@ -2197,47 +2363,78 @@ fn analyze_routed(
             },
         );
 
-        for (bar, col) in gpu_cols.into_iter().chain(cpu_cols) {
-            columns[bar] = Some(col);
-        }
+        install_columns(&mut columns, gpu_cols.into_iter().chain(cpu_cols));
 
         // Normally empty: only a device that declined mid-run leaves anything
         // here, and then this is the identical computation on the cores.
-        columns.par_iter_mut().enumerate()
-            .filter(|(bar, slot)| members.contains(bar) && slot.is_none())
-            .for_each(|(bar, slot)| {
-                if cancel_at_bar(bar, &cancelled) { return; }
+        //
+        // The jobs are built *after* the results above are installed, so the
+        // condition is the same one the old sweep applied per slot: a bar of
+        // this group whose column is still missing.
+        let missing: Vec<BarJob> = (0..n_bars)
+            .filter(|bar| members.contains(bar) && columns[*bar].is_none())
+            .map(|bar| {
                 let p = by_bar[&bar];
-                let sl = Superlet::new(p.freq, p.q, cfg, sr);
-                *slot = Some(sl.columns(&chans, hop, frames, &shared, &work, &seams));
-                on_bar_done(bar);
-            });
+                BarJob { bar, freq: p.freq, q: p.q }
+            })
+            .collect();
+        if !missing.is_empty() {
+            let recovered: Vec<(usize, Cols)> = bar_jobs(&missing)
+                .filter_map(|job| {
+                    if cancel_at_bar(job.bar, &cancelled) { return None; }
+                    let sl = Superlet::new(job.freq, job.q, cfg, sr);
+                    let col = sl.columns(&chans, hop, frames, &shared, &work, &seams);
+                    on_bar_done(job.bar);
+                    Some((job.bar, col))
+                })
+                .collect();
+            install_columns(&mut columns, recovered);
+        }
 
-        // What this group cost, and which route paid it. Units are bars ×
-        // frames so a 20 s track and a 5 minute one are comparable. A cancelled
-        // group is not a measurement of anything and is dropped.
+        // What this group cost, and which route actually paid it. Units are
+        // bars × frames so a 20 s track and a 5 minute one are comparable. A
+        // cancelled group is not a measurement of anything and is dropped —
+        // dropping the decision returns the exploration attempt it reserved.
+        //
+        // `gpu.is_some()` is not the outcome. It says a device was *selected*;
+        // the recovery sweep above runs declined bars on the cores, and a group
+        // that went both ways is a mixture whose wall time belongs to neither
+        // route. Charging it to the device is how a flaky card teaches this
+        // machine that the route it never cleanly ran is the better one.
         if !cancelled.load(Ordering::Relaxed) {
+            let outcome = match (wanted_device, gpu.is_some()) {
+                (false, _) => super::gpu_calib::Outcome::Cores,
+                // Asked and got nothing: the cores did the work, but only after
+                // paying for a staging attempt a genuine cores route never pays.
+                (true, false) => super::gpu_calib::Outcome::Unavailable,
+                (true, true) if work.device_failures_now() > failures_before => {
+                    super::gpu_calib::Outcome::PartialFallback
+                }
+                (true, true) => super::gpu_calib::Outcome::Device,
+            };
             super::gpu_calib::record(
-                group_n,
                 (bars.len() * frames) as f64,
                 t_group.elapsed().as_secs_f64(),
-                gpu.is_some(),
+                outcome,
             );
         }
+        // Explicit, rather than left to the end of the iteration: a cancelled
+        // group skips the `record` above entirely, and this is the path that
+        // retires its decision instead of leaving it for the next group.
+        drop(group_scope);
     }
 
     // The short-kernel bars, which never touch a transform. They keep the
     // finer-grained cancellation checks: one of these really can run for tens of
     // seconds, where a frequency-domain bar cannot be stopped part-way anyway.
     if !cancelled.load(Ordering::Relaxed) {
-        let direct: std::collections::HashMap<usize, (f32, f32)> =
-            direct_bars.iter().map(|&(b, f, q)| (b, (f, q))).collect();
-        columns.par_iter_mut().enumerate()
-            .filter(|(bar, _)| direct.contains_key(bar))
-            .for_each(|(bar, slot)| {
-                if cancelled.load(Ordering::Relaxed) { return; }
-                let (f, q) = direct[&bar];
-                let sl = Superlet::new(f, q, cfg, sr);
+        let jobs: Vec<BarJob> = direct_bars.iter()
+            .map(|&(bar, freq, q)| BarJob { bar, freq, q })
+            .collect();
+        let done: Vec<(usize, Cols)> = bar_jobs(&jobs)
+            .filter_map(|job| {
+                if cancelled.load(Ordering::Relaxed) { return None; }
+                let sl = Superlet::new(job.freq, job.q, cfg, sr);
                 let mut col = Cols::zeroed(0, joint);
                 col.mix.reserve(frames);
                 for fi in 0..frames {
@@ -2245,7 +2442,9 @@ fn analyze_routed(
                         && (cancelled.load(Ordering::Relaxed) || !should_continue())
                     {
                         cancelled.store(true, Ordering::Relaxed);
-                        return;
+                        // The bar is abandoned, so its slot stays empty and the
+                        // run ends with nothing, exactly as before.
+                        return None;
                     }
                     // Both channels and the mix from one pass over the members,
                     // so the direct route pays for two convolutions and not
@@ -2257,9 +2456,12 @@ fn analyze_routed(
                         col.right.push(r);
                     }
                 }
-                *slot = Some(col);
-                on_bar_done(bar);
-            });
+                on_bar_done(job.bar);
+                Some((job.bar, col))
+            })
+            .collect();
+        // Moved, not copied: each finished column goes straight into its slot.
+        install_columns(&mut columns, done);
     }
 
     // Recorded before the cancellation check so an aborted run still reports
@@ -2271,20 +2473,20 @@ fn analyze_routed(
     }
 
     // Transpose to frames × bars, the layout the cache and renderer expect.
-    let transpose = |pick: fn(&Cols) -> &Vec<f32>| -> Vec<Vec<f32>> {
-        let mut out = vec![vec![0.0f32; n_bars]; frames];
-        for (bar, col) in columns.iter().enumerate() {
-            let col = pick(col.as_ref().expect("checked above"));
-            for (fi, &v) in col.iter().enumerate() {
-                out[fi][bar] = v;
-            }
-        }
-        out
-    };
+    // One plane at a time, so the columns are released as they are consumed
+    // rather than all being held until the last output is finished.
+    let mix = transpose_plane(&mut columns, frames, n_bars, |c| &mut c.mix);
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    if joint {
+        left = transpose_plane(&mut columns, frames, n_bars, |c| &mut c.left);
+        right = transpose_plane(&mut columns, frames, n_bars, |c| &mut c.right);
+    }
+    drop(columns);
     Analysed {
-        mix: transpose(|c| &c.mix),
-        left: if joint { transpose(|c| &c.left) } else { Vec::new() },
-        right: if joint { transpose(|c| &c.right) } else { Vec::new() },
+        mix,
+        left,
+        right,
         work: WorkCount::snapshot(&work),
         redundant_mix_deviation: work.redundant_result(),
     }
@@ -3119,6 +3321,79 @@ mod tests {
     /// is still drained, whether the bars the failed chunk should have produced
     /// are recovered by the sweep after the join, and whether the result is
     /// right.
+    /// The group loop's routing decisions belong to their groups.
+    ///
+    /// This is the call site, not the mechanism: `gpu_calib`'s own suite covers
+    /// what a scope does, and nothing covered the loop that opens one. A mutant
+    /// that replaces `drop(group_scope)` with `mem::forget` survived the whole
+    /// calibration suite, because every one of those tests opens its own scope.
+    ///
+    /// An analysis that has returned must leave nothing parked on the thread.
+    /// Anything left there is a decision the next group would consume, and its
+    /// time would be filed under this analysis's block size.
+    #[test]
+    fn an_analysis_leaves_no_routing_decision_parked() {
+        // The fixture has to produce a group at or above the routing floor
+        // (2^17), or `use_device` declines every size, nothing is ever parked,
+        // and the test would pass by vacuum. `fft_block_len(k)` is
+        // `(2k).next_power_of_two()`, so a 2^17 group needs a kernel of
+        // 32 769..=65 536 taps — which means a window of roughly 0.7 s at
+        // 48 kHz, and a signal comfortably longer than that.
+        // 256 bars is the smallest count whose grid q produces a 2^17 group at
+        // these bounds; 128 tops out at 2^16. The block size follows from the
+        // grid's own q, which scales with the bar count — the window cap only
+        // ever shortens a kernel, so widening the window does not help.
+        let (sr, bars, lo, hi) = (48_000u32, 256usize, 40.0f32, 18_000.0f32);
+        let n = (sr as f32 * 4.0) as usize;
+        let sig: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.0023).sin() * 0.7 + (i as f32 * 0.019).sin() * 0.3)
+            .collect();
+        let cfg = AsltConfig { max_window_s: 0.9, ..AsltPreset::Fast.config() };
+        let hop = hop_for_fps(sr, 120.0);
+
+        // The route must go through the calibration, or nothing is ever
+        // parked and this test cannot fail. `route_to_device` short-circuits to
+        // `true` in a test build without consulting `use_device`, so a test
+        // that used it would pass under any mutation of the scope discipline —
+        // which is exactly what the first version of this test did.
+        fn route_via_calibration(n: usize) -> bool {
+            super::super::gpu_calib::use_device(n)
+        }
+
+        let _env = super::super::gpu_calib::aslt_test_env("scope_discipline");
+
+        // The check has to happen **on the pool thread**. `install` runs its
+        // closure on a rayon worker and the parked decision is thread-local, so
+        // asking from the test thread always sees an empty slot and the
+        // assertion would hold under any mutation of the scope discipline.
+        let (produced, clean) = super::super::gpu_calib::install(|| {
+            let out = analyze_via(route_via_calibration, &sig, sr, bars, lo, hi, hop, &cfg);
+            let clean = super::super::gpu_calib::pending_is_empty();
+            (out, clean)
+        });
+        assert!(!produced.is_empty(), "setup: the analysis produced nothing");
+        assert!(
+            _env.saw_a_decision(),
+            "setup: no group ever took a routing decision, so nothing could leak"
+        );
+        assert!(clean, "a completed analysis left a routing decision parked on the thread");
+
+        // And one cancelled part-way, which is the case that skips `record`
+        // entirely and is the one that actually leaks: the group loop breaks at
+        // the top of the *next* iteration, so no later `begin_group` ever runs
+        // to clear what the abandoned group left.
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        let clean = super::super::gpu_calib::install(|| {
+            let _ = analyze_routed(
+                Input::Mono(&sig), sr, bars, lo, hi, hop, &cfg,
+                &|| seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2,
+                &|_| {}, route_via_calibration, Seams::production(),
+            );
+            super::super::gpu_calib::pending_is_empty()
+        });
+        assert!(clean, "a cancelled analysis left a routing decision parked on the thread");
+    }
+
     #[test]
     fn a_device_that_declines_midway_still_produces_the_whole_analysis() {
         if super::super::gpu::GpuFft::shared().is_none() {
@@ -3352,6 +3627,997 @@ mod tests {
                 "the magnitude route is not the norm of the complex one"
             );
         }
+    }
+
+    // ── Reused transform scratch ────────────────────────────────────────────
+    //
+    // The three block loops hand one scratch buffer to every transform instead
+    // of letting `process` allocate a fresh one per call. The `reference_*`
+    // functions are those loops as they were before, `process` and all, so
+    // these tests compare against the original form rather than against
+    // themselves. Equality is `to_bits` on both components: a float `==` would
+    // accept -0.0 for 0.0 and reject a NaN that both forms produced.
+
+    /// A kernel of exactly `k` taps with deterministic, uneven values, so a
+    /// test can pick its block size directly. Not a wavelet: these tests are
+    /// about bits, not about spectra.
+    fn synthetic_morlet(k: usize, seed: u64) -> Morlet {
+        assert!(k % 2 == 1, "setup: a kernel table has an odd number of taps");
+        let mut next = noise_source(seed);
+        let re = (0..k).map(|_| next()).collect();
+        let im = (0..k).map(|_| next()).collect();
+        let raw: Vec<f32> = (0..k).map(|_| next().abs() + 0.01).collect();
+        let total: f32 = raw.iter().sum();
+        Morlet { re, im, env: raw.iter().map(|v| v / total).collect(), half: k / 2 }
+    }
+
+    fn noise_source(seed: u64) -> impl FnMut() -> f32 {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        move || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 40) as f32 / 8_388_608.0) - 1.0
+        }
+    }
+
+    fn noise(len: usize, seed: u64) -> Vec<f32> {
+        let mut next = noise_source(seed);
+        (0..len).map(|_| next()).collect()
+    }
+
+    /// The fused mix magnitude against the two calls it replaced, bit for bit.
+    ///
+    /// Covers the shapes the fold can meet: ordinary signal, channels equal,
+    /// channels in exact antiphase (where the mix is zero and the sign of the
+    /// zero matters), one channel silent, and values small enough that the
+    /// squares underflow.
+    #[test]
+    fn the_fused_mix_magnitude_matches_the_two_step_form_bit_for_bit() {
+        let mut next = noise_source(0xA5A5);
+        let cases: Vec<(&str, Vec<C32>, Vec<C32>)> = {
+            let base: Vec<C32> = (0..4096)
+                .map(|_| C32 { re: next(), im: next() })
+                .collect();
+            let tiny: Vec<C32> = base.iter()
+                .map(|c| C32 { re: c.re * 1e-30, im: c.im * 1e-30 })
+                .collect();
+            let zero = vec![C32 { re: 0.0, im: 0.0 }; base.len()];
+            let anti: Vec<C32> = base.iter()
+                .map(|c| C32 { re: -c.re, im: -c.im })
+                .collect();
+            let other: Vec<C32> = (0..base.len())
+                .map(|_| C32 { re: next(), im: next() })
+                .collect();
+            vec![
+                ("independent", base.clone(), other),
+                ("identical", base.clone(), base.clone()),
+                ("exact antiphase", base.clone(), anti),
+                ("one channel silent", base.clone(), zero),
+                ("underflowing squares", tiny.clone(), tiny),
+            ]
+        };
+        for (what, l, r) in cases {
+            let got = mix_norms(&l, &r);
+            let want = norms(mix_complex(&l, &r));
+            assert_eq!(got.len(), want.len(), "{what}: lengths differ");
+            if let Some(i) = got.iter().zip(&want).position(|(a, b)| a.to_bits() != b.to_bits()) {
+                panic!("{what}: first difference at {i}: {} against {}", got[i], want[i]);
+            }
+        }
+    }
+
+    fn assert_same_bits(what: &str, got: &[C32], want: &[C32]) {
+        assert_eq!(got.len(), want.len(), "{what}: lengths differ");
+        if let Some(i) = got.iter().zip(want).position(|(a, b)| {
+            a.re.to_bits() != b.re.to_bits() || a.im.to_bits() != b.im.to_bits()
+        }) {
+            panic!("{what}: first difference at {i} of {}: {:?} vs {:?}", got.len(), got[i], want[i]);
+        }
+    }
+
+    /// [`SignalBlocks::build`] before the scratch was reused.
+    fn reference_signal_blocks(signal: &[f32], n: usize) -> SignalBlocks {
+        use rustfft::num_complex::Complex;
+        let stride = (n / 2).max(1);
+        let blocks = signal.len().div_ceil(stride).max(1);
+        let mut data = vec![Complex { re: 0.0f32, im: 0.0 }; blocks * n];
+        let fwd = ASLT_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
+        for b in 0..blocks {
+            let base = b * stride;
+            let dst = &mut data[b * n..(b + 1) * n];
+            for (i, slot) in dst.iter_mut().enumerate() {
+                *slot = Complex { re: signal.get(base + i).copied().unwrap_or(0.0), im: 0.0 };
+            }
+            fwd.process(dst);
+        }
+        SignalBlocks { n, stride, data }
+    }
+
+    /// [`Morlet::complex_via_shared`] before the scratch was reused.
+    fn reference_complex_via_shared(
+        m: &Morlet, signal: &[f32], blocks: &SignalBlocks, hop: usize, frames: usize,
+    ) -> Option<Vec<C32>> {
+        use rustfft::num_complex::Complex;
+
+        let k = m.re.len();
+        let n_sig = signal.len();
+        let half = m.half as isize;
+        let n = blocks.n;
+        if n_sig <= k || hop == 0 || frames == 0 || n <= k { return None; }
+        if blocks.stride > n - k + 1 { return None; }
+
+        let first = (half as usize).div_ceil(hop);
+        let last_pos = (n_sig as isize) - 1 - half;
+        if last_pos < 0 { return None; }
+        let last = ((last_pos as usize) / hop).min(frames.saturating_sub(1));
+        if first > last { return None; }
+
+        let inv = ASLT_PLANNER.with(|p| p.borrow_mut().plan_fft_inverse(n));
+
+        let mut kernel = vec![Complex { re: 0.0f32, im: 0.0f32 }; n];
+        for (slot, i) in kernel.iter_mut().zip((0..k).rev()) {
+            *slot = Complex { re: m.re[i], im: m.im[i] };
+        }
+        ASLT_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n)).process(&mut kernel);
+
+        let mut out = vec![C32 { re: 0.0, im: 0.0 }; frames];
+        for (fi, slot) in out.iter_mut().enumerate() {
+            if fi < first || fi > last {
+                *slot = m.response_c(signal, (fi * hop) as isize);
+            }
+        }
+
+        let scale = 1.0 / n as f32;
+        let mut buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; n];
+        for b in 0..blocks.blocks() {
+            let base = b * blocks.stride;
+            if base >= n_sig { break; }
+            buf.copy_from_slice(blocks.block(b));
+            for (x, h) in buf.iter_mut().zip(kernel.iter()) { *x *= *h; }
+            inv.process(&mut buf);
+
+            let m_lo = base + k - 1;
+            let m_hi = (base + n).min(n_sig);
+            let fi_lo = ((m_lo as isize - half).max(0) as usize).div_ceil(hop).max(first);
+            let fi_hi = if (m_hi as isize) - 1 - half < 0 {
+                0
+            } else {
+                ((((m_hi as isize) - 1 - half) as usize) / hop).min(last)
+            };
+            if fi_lo <= fi_hi {
+                for (fi, slot) in (fi_lo..=fi_hi).zip(out[fi_lo..=fi_hi].iter_mut()) {
+                    let c = buf[fi * hop + half as usize - base];
+                    *slot = C32 { re: 2.0 * scale * c.re, im: 2.0 * scale * c.im };
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// [`Morlet::complex_via_fft`] before the scratch was reused.
+    fn reference_complex_via_fft(
+        m: &Morlet, signal: &[f32], hop: usize, frames: usize,
+    ) -> Option<Vec<C32>> {
+        use rustfft::num_complex::Complex;
+
+        let k = m.re.len();
+        let n_sig = signal.len();
+        let half = m.half as isize;
+        if n_sig <= k || hop == 0 || frames == 0 { return None; }
+
+        let n = fft_block_len(k);
+        if n <= k { return None; }
+        let step = n - k + 1;
+
+        let first = (half as usize).div_ceil(hop);
+        let last_pos = (n_sig as isize) - 1 - half;
+        if last_pos < 0 { return None; }
+        let last = ((last_pos as usize) / hop).min(frames.saturating_sub(1));
+        if first > last { return None; }
+
+        let (fwd, inv) = ASLT_PLANNER.with(|p| {
+            let mut p = p.borrow_mut();
+            (p.plan_fft_forward(n), p.plan_fft_inverse(n))
+        });
+
+        let mut kernel = vec![Complex { re: 0.0f32, im: 0.0f32 }; n];
+        for (slot, i) in kernel.iter_mut().zip((0..k).rev()) {
+            *slot = Complex { re: m.re[i], im: m.im[i] };
+        }
+        fwd.process(&mut kernel);
+
+        let mut out = vec![C32 { re: 0.0, im: 0.0 }; frames];
+        for (fi, slot) in out.iter_mut().enumerate() {
+            if fi < first || fi > last {
+                *slot = m.response_c(signal, (fi * hop) as isize);
+            }
+        }
+
+        let scale = 1.0 / n as f32;
+        let mut buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; n];
+        let mut base = 0usize;
+        while base < n_sig {
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = Complex {
+                    re: signal.get(base + i).copied().unwrap_or(0.0),
+                    im: 0.0,
+                };
+            }
+            fwd.process(&mut buf);
+            for (b, h) in buf.iter_mut().zip(kernel.iter()) { *b *= *h; }
+            inv.process(&mut buf);
+
+            let m_lo = base + k - 1;
+            let m_hi = (base + n).min(n_sig);
+            let fi_lo = ((m_lo as isize - half).max(0) as usize).div_ceil(hop).max(first);
+            let fi_hi = if (m_hi as isize) - 1 - half < 0 {
+                0
+            } else {
+                ((((m_hi as isize) - 1 - half) as usize) / hop).min(last)
+            };
+            if fi_lo <= fi_hi {
+                for (fi, slot) in (fi_lo..=fi_hi).zip(out[fi_lo..=fi_hi].iter_mut()) {
+                    let c = buf[fi * hop + half as usize - base];
+                    *slot = C32 { re: 2.0 * scale * c.re, im: 2.0 * scale * c.im };
+                }
+            }
+            base += step;
+        }
+        Some(out)
+    }
+
+    /// The direct loops against the form they replaced, bit for bit.
+    ///
+    /// `response_parts` used to index the signal once per tap; it now takes the
+    /// window as a slice and zips it. The claim is that nothing but a bounds
+    /// check went, so the two forms are held to identical `f64` accumulators
+    /// over every shape the window can take against a signal — wholly inside
+    /// it, hanging off either end, covering the whole of it at once, and
+    /// missing it entirely. The shapes are *counted*, so a centre list that
+    /// quietly stopped reaching one of them fails the test rather than
+    /// narrowing it.
+    #[test]
+    fn the_direct_window_matches_the_indexed_form_bit_for_bit() {
+        /// `Morlet::response_parts` before the window was taken as a slice.
+        fn reference(m: &Morlet, signal: &[f32], centre: isize) -> (f64, f64, f64) {
+            let n = signal.len() as isize;
+            let base = centre - m.half as isize;
+            let end = base + m.re.len() as isize;
+            let lo = base.max(0);
+            let hi = end.min(n);
+            if hi <= lo { return (0.0, 0.0, 0.0); }
+
+            let mut acc_re = 0.0f64;
+            let mut acc_im = 0.0f64;
+
+            if base >= 0 && end <= n {
+                for (k, (&wr, &wi)) in m.re.iter().zip(m.im.iter()).enumerate() {
+                    let s = signal[(base + k as isize) as usize];
+                    acc_re += (s * wr) as f64;
+                    acc_im += (s * wi) as f64;
+                }
+                return (acc_re, acc_im, 1.0);
+            }
+
+            let mut env_sum = 0.0f64;
+            for i in lo..hi {
+                let k = (i - base) as usize;
+                let s = signal[i as usize];
+                acc_re += (s * m.re[k]) as f64;
+                acc_im += (s * m.im[k]) as f64;
+                env_sum += m.env[k] as f64;
+            }
+            (acc_re, acc_im, env_sum)
+        }
+
+        let (mut interior, mut left, mut right, mut spanning, mut missed) = (0, 0, 0, 0, 0);
+
+        for (k, seed) in [(65usize, 1u64), (1025, 2), (4097, 3)] {
+            let m = synthetic_morlet(k, seed);
+            let half = m.half as isize;
+            // One signal longer than the kernel and one shorter, so the window
+            // can also hang off both ends of the same signal.
+            for len in [k * 3 + 7, k / 2] {
+                let sig = noise(len, seed * 31 + len as u64);
+                let n = len as isize;
+                let mut centres = vec![-half - 1, -half, -half + 1, -1, 0, 1, half - 1, half, half + 1];
+                centres.extend([n - half - 1, n - half, n - half + 1, n - 1, n, n + half]);
+                centres.extend([n / 3, n / 2, n / 2 + 1]);
+
+                for c in centres {
+                    let got = m.response_parts(&sig, c);
+                    let want = reference(&m, &sig, c);
+                    let bits = |t: (f64, f64, f64)| (t.0.to_bits(), t.1.to_bits(), t.2.to_bits());
+                    assert_eq!(bits(got), bits(want),
+                               "k={k} len={len} centre={c}: {got:?} against {want:?}");
+
+                    // And through the reader that scales and divides them, so
+                    // the magnitude a bar actually stores is covered too.
+                    let (re, im, div) = want;
+                    let want_mag = if div <= 0.0 {
+                        0.0f32
+                    } else {
+                        (2.0 * (re * re + im * im).sqrt() / div) as f32
+                    };
+                    assert_eq!(m.response(&sig, c).to_bits(), want_mag.to_bits(),
+                               "k={k} len={len} centre={c}: magnitude");
+
+                    let base = c - half;
+                    let end = base + k as isize;
+                    if end <= 0 || base >= n { missed += 1 }
+                    else if base >= 0 && end <= n { interior += 1 }
+                    else if base < 0 && end > n { spanning += 1 }
+                    else if base < 0 { left += 1 }
+                    else { right += 1 }
+                }
+            }
+        }
+
+        for (what, seen) in [("interior", interior), ("left edge", left),
+                             ("right edge", right), ("spanning both ends", spanning),
+                             ("missing the signal", missed)] {
+            assert!(seen > 0, "setup: no {what} case was exercised");
+        }
+    }
+
+    /// The premise the loops rely on: a scratch buffer holding someone else's
+    /// numbers — here NaN and huge values, then whatever a previous transform
+    /// left — gives the same bits as the fresh zeroed one `process` allocates.
+    #[test]
+    fn transform_scratch_contents_never_reach_the_result() {
+        use rustfft::num_complex::Complex;
+        for log2 in [13u32, 15, 17, 19, FFT_MAX_LOG2] {
+            let n = 1usize << log2;
+            let input: Vec<Complex<f32>> = noise(2 * n, u64::from(log2))
+                .chunks_exact(2)
+                .map(|c| Complex { re: c[0], im: c[1] })
+                .collect();
+            let (fwd, inv) = ASLT_PLANNER.with(|p| {
+                let mut p = p.borrow_mut();
+                (p.plan_fft_forward(n), p.plan_fft_inverse(n))
+            });
+            for (dir, plan) in [("forward", &fwd), ("inverse", &inv)] {
+                let len = plan.get_inplace_scratch_len();
+                assert!(len > 0, "2^{log2} {dir}: no scratch needed, so this proves nothing");
+                let mut want = input.clone();
+                plan.process(&mut want);
+
+                let garbage = [f32::NAN, 1.0e30, -7.5, f32::INFINITY];
+                let mut scratch: Vec<Complex<f32>> = (0..len)
+                    .map(|i| Complex { re: garbage[i % 4], im: garbage[(i + 1) % 4] })
+                    .collect();
+                for pass in ["planted garbage", "a previous transform's leftovers"] {
+                    let mut got = input.clone();
+                    plan.process_with_scratch(&mut got, &mut scratch);
+                    assert_same_bits(&format!("2^{log2} {dir}, scratch holding {pass}"), &got, &want);
+                }
+            }
+        }
+    }
+
+    /// Each loop against its original form, bit for bit.
+    ///
+    /// The three `reference_*` helpers are deliberately *stale*: they hold the
+    /// shape each loop had before it was optimised, which is the only thing
+    /// that makes this a check rather than a tautology. They currently cover
+    /// three changes — the reused transform scratch, the block fill written as
+    /// a bounded copy instead of a checked lookup per element
+    /// (`SignalBlocks::build` and `complex_via_fft`), and the shared route
+    /// multiplying the block in as it reads it instead of copying it first.
+    /// Do not update them to match the production loops.
+    ///
+    /// Coverage is a selection, not every size the planner can reach: five
+    /// transform lengths (2^13, 2^15, 2^17, 2^19, 2^21 — the smallest a kernel
+    /// plans and `FFT_MAX_LOG2`, with three in between), each with a signal
+    /// shorter than one block, exactly one block and an odd tail at 2^13–2^17,
+    /// and the odd tail alone at 2^19 and 2^21 where a debug transform is slow.
+    /// A second channel and the joint mix are covered at 2^13–2^17.
+    #[test]
+    fn reused_scratch_loops_match_the_process_form_bit_for_bit() {
+        // Short, complete and odd-tail signals at the smaller sizes, both
+        // channels; the odd tail alone at the two largest, where a debug
+        // transform is slow.
+        let full = [13u32, 15, 17];
+        for log2 in [13u32, 15, 17, 19, FFT_MAX_LOG2] {
+            let n = 1usize << log2;
+            let k = n / 2 - 1;
+            let m = synthetic_morlet(k, u64::from(log2));
+            assert_eq!(fft_block_len(k), n, "setup: {k} taps must plan a 2^{log2} transform");
+            let hop = n / 8;
+            let odd_tail = n + n / 3 + 1;
+            let lengths: &[(&str, usize)] = if full.contains(&log2) {
+                &[("shorter than a block", k + k / 2), ("one block", n), ("odd tail", odd_tail)]
+            } else {
+                &[("odd tail", odd_tail)]
+            };
+            let channels: &[u64] = if full.contains(&log2) { &[1, 2] } else { &[1] };
+            for &(shape, len) in lengths {
+                let frames = frame_count(len, hop);
+                let mut cols = Vec::new();
+                for &ch in channels {
+                    let what = |route: &str| format!("2^{log2}, {shape} ({len}), channel {ch}, {route}");
+                    let sig = noise(len, u64::from(log2) * 10 + ch);
+
+                    let blocks = SignalBlocks::build(&sig, n);
+                    let ref_blocks = reference_signal_blocks(&sig, n);
+                    assert_eq!((blocks.n, blocks.stride), (ref_blocks.n, ref_blocks.stride));
+                    assert_same_bits(&what("signal blocks"), &blocks.data, &ref_blocks.data);
+
+                    let shared = m.complex_via_shared(&sig, &blocks, hop, frames)
+                        .unwrap_or_else(|| panic!("{}: declined", what("shared route")));
+                    let want_shared = reference_complex_via_shared(&m, &sig, &ref_blocks, hop, frames)
+                        .expect("reference shared route declined");
+                    assert_same_bits(&what("shared route"), &shared, &want_shared);
+
+                    let own = m.complex_via_fft(&sig, hop, frames)
+                        .unwrap_or_else(|| panic!("{}: declined", what("own-transform route")));
+                    let want_own = reference_complex_via_fft(&m, &sig, hop, frames)
+                        .expect("reference own-transform route declined");
+                    assert_same_bits(&what("own-transform route"), &own, &want_own);
+
+                    cols.push([shared, want_shared, own, want_own]);
+                }
+                // The joint producer mixes the two channels' complex columns
+                // before anything nonlinear, so the mix has to match too.
+                if let [l, r] = &cols[..] {
+                    assert_same_bits(&format!("2^{log2}, {shape}, shared mix"),
+                                     &mix_complex(&l[0], &r[0]), &mix_complex(&l[1], &r[1]));
+                    assert_same_bits(&format!("2^{log2}, {shape}, own-transform mix"),
+                                     &mix_complex(&l[2], &r[2]), &mix_complex(&l[3], &r[3]));
+                }
+            }
+        }
+    }
+
+    /// Allocations made on this thread while `f` runs.
+    fn allocations_in(f: impl FnOnce()) -> u64 {
+        let before = crate::alloc_probe::arm();
+        f();
+        crate::alloc_probe::disarm(before)
+    }
+
+    /// The fixture for the allocation tests: one transform size, and two
+    /// signals four times apart in length, so the loop runs four times as many
+    /// transforms on the second. Plans for the size are built on this thread
+    /// before anything is counted.
+    struct ScratchFixture {
+        m: Morlet,
+        n: usize,
+        hop: usize,
+        short: Vec<f32>,
+        long: Vec<f32>,
+    }
+
+    impl ScratchFixture {
+        fn new() -> Self {
+            let n = 1usize << 13;
+            let (fwd, inv) = ASLT_PLANNER.with(|p| {
+                let mut p = p.borrow_mut();
+                (p.plan_fft_forward(n), p.plan_fft_inverse(n))
+            });
+            assert!(
+                fwd.get_inplace_scratch_len() > 0 && inv.get_inplace_scratch_len() > 0,
+                "setup: a transform that needs no scratch allocates none either way",
+            );
+            Self {
+                m: synthetic_morlet(n / 2 - 1, 7),
+                n,
+                hop: n / 8,
+                short: noise(3 * n + 1, 8),
+                long: noise(12 * n + 1, 8),
+            }
+        }
+    }
+
+    /// `SignalBlocks::build` makes the same allocations whatever the length.
+    #[test]
+    fn building_signal_blocks_does_not_allocate_per_transform() {
+        let fx = ScratchFixture::new();
+        // Warm: one untimed call of each form on this thread.
+        std::hint::black_box(SignalBlocks::build(&fx.short, fx.n));
+        std::hint::black_box(reference_signal_blocks(&fx.short, fx.n));
+
+        let count = |sig: &[f32], reference: bool| allocations_in(|| {
+            std::hint::black_box(if reference {
+                reference_signal_blocks(sig, fx.n)
+            } else {
+                SignalBlocks::build(sig, fx.n)
+            });
+        });
+        let (r_short, r_long) = (count(&fx.short, true), count(&fx.long, true));
+        assert!(
+            r_long > r_short,
+            "setup: the longer signal must run more transforms \
+             ({r_short} vs {r_long} allocations in the original form)",
+        );
+        let (short, long) = (count(&fx.short, false), count(&fx.long, false));
+        assert_eq!(
+            short, long,
+            "SignalBlocks::build allocates per transform: {short} allocations for the short \
+             signal, {long} for one four times longer",
+        );
+    }
+
+    /// The shared-route block loop makes the same allocations whatever the
+    /// length.
+    #[test]
+    fn the_shared_route_does_not_allocate_per_transform() {
+        let fx = ScratchFixture::new();
+        let (bs, bl) = (SignalBlocks::build(&fx.short, fx.n), SignalBlocks::build(&fx.long, fx.n));
+        let (fs, fl) = (frame_count(fx.short.len(), fx.hop), frame_count(fx.long.len(), fx.hop));
+        assert!(bl.blocks() > bs.blocks(), "setup: blocks {} vs {}", bs.blocks(), bl.blocks());
+        fx.m.complex_via_shared(&fx.short, &bs, fx.hop, fs).expect("shared route declined");
+        reference_complex_via_shared(&fx.m, &fx.short, &bs, fx.hop, fs).expect("reference declined");
+
+        let count = |sig: &[f32], blocks: &SignalBlocks, frames: usize, reference: bool| {
+            allocations_in(|| {
+                let out = if reference {
+                    reference_complex_via_shared(&fx.m, sig, blocks, fx.hop, frames)
+                } else {
+                    fx.m.complex_via_shared(sig, blocks, fx.hop, frames)
+                };
+                assert!(std::hint::black_box(out).is_some(), "the shared route declined");
+            })
+        };
+        let (r_short, r_long) = (count(&fx.short, &bs, fs, true), count(&fx.long, &bl, fl, true));
+        assert!(
+            r_long > r_short,
+            "setup: the longer signal must run more transforms \
+             ({r_short} vs {r_long} allocations in the original form)",
+        );
+        let (short, long) = (count(&fx.short, &bs, fs, false), count(&fx.long, &bl, fl, false));
+        assert_eq!(
+            short, long,
+            "the shared route allocates per transform: {short} allocations over {} blocks, \
+             {long} over {}",
+            bs.blocks(), bl.blocks(),
+        );
+    }
+
+    /// The own-transform block loop makes the same allocations whatever the
+    /// length — both its transforms, forward and inverse.
+    #[test]
+    fn the_own_transform_route_does_not_allocate_per_transform() {
+        let fx = ScratchFixture::new();
+        let (fs, fl) = (frame_count(fx.short.len(), fx.hop), frame_count(fx.long.len(), fx.hop));
+        fx.m.complex_via_fft(&fx.short, fx.hop, fs).expect("own-transform route declined");
+        reference_complex_via_fft(&fx.m, &fx.short, fx.hop, fs).expect("reference declined");
+
+        let count = |sig: &[f32], frames: usize, reference: bool| {
+            allocations_in(|| {
+                let out = if reference {
+                    reference_complex_via_fft(&fx.m, sig, fx.hop, frames)
+                } else {
+                    fx.m.complex_via_fft(sig, fx.hop, frames)
+                };
+                assert!(std::hint::black_box(out).is_some(), "the own-transform route declined");
+            })
+        };
+        let (r_short, r_long) = (count(&fx.short, fs, true), count(&fx.long, fl, true));
+        assert!(
+            r_long > r_short,
+            "setup: the longer signal must run more transforms \
+             ({r_short} vs {r_long} allocations in the original form)",
+        );
+        let (short, long) = (count(&fx.short, fs, false), count(&fx.long, fl, false));
+        assert_eq!(
+            short, long,
+            "the own-transform route allocates per transform: {short} allocations for the \
+             short signal, {long} for one four times longer",
+        );
+    }
+
+    // ── Bounded bar-job scheduling (candidate G) ────────────────────────────
+
+    fn bar_job_list(len: usize) -> Vec<BarJob> {
+        (0..len).map(|bar| BarJob { bar, freq: 100.0 + bar as f32, q: 8.0 }).collect()
+    }
+
+    /// The production scheduling helper must hand a worker one job at a time.
+    ///
+    /// `fold` is how rayon exposes leaf boundaries: one accumulator per leaf. A
+    /// single-worker pool removes stealing, so what remains is the splitter's own
+    /// decision — exactly what `with_max_len(1)` constrains. Without that bound
+    /// the same 64 jobs come back in fewer, larger leaves and this fails.
+    #[test]
+    fn the_bar_job_helper_splits_to_one_job_per_leaf() {
+        use rayon::prelude::*;
+        let jobs = bar_job_list(64);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("pool");
+        let leaves: Vec<Vec<usize>> = pool.install(|| {
+            bar_jobs(&jobs)
+                .fold(Vec::new, |mut acc: Vec<usize>, job| {
+                    acc.push(job.bar);
+                    acc
+                })
+                .collect()
+        });
+        let sizes: Vec<usize> = leaves.iter().map(Vec::len).collect();
+        println!("  {} leaves over {} jobs; sizes {sizes:?}", leaves.len(), jobs.len());
+        assert_eq!(sizes.iter().sum::<usize>(), jobs.len(), "jobs went missing");
+        assert!(
+            sizes.iter().all(|&s| s == 1),
+            "a leaf held more than one job, so one worker can still take the whole phase: {sizes:?}",
+        );
+        let mut seen: Vec<usize> = leaves.into_iter().flatten().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..jobs.len()).collect::<Vec<_>>(), "jobs duplicated or reordered away");
+    }
+
+    /// `install_columns` moves a finished column into its slot; it does not copy.
+    ///
+    /// **What this proves and what it does not.** It proves that for each of the
+    /// three production sweeps' shared installation step, the heap allocation a
+    /// worker filled is the allocation the slot holds afterwards — same pointer,
+    /// so no deep copy was made. It is **not** a peak-memory measurement: it says
+    /// nothing about how much memory the phase holds, and a run's peak is set by
+    /// the columns and the transpose, not by this loop.
+    ///
+    /// It guards the production helper, not a copy of it. Replacing the move in
+    /// `install_columns` with a clone fails this test; doing the same to an
+    /// installation loop written out inside the test would not, which is why the
+    /// helper exists.
+    #[test]
+    fn finished_columns_are_moved_into_their_slots() {
+        use rayon::prelude::*;
+        let jobs = bar_job_list(8);
+        let built: Vec<(usize, Cols)> = bar_jobs(&jobs)
+            .map(|job| {
+                let mut col = Cols::zeroed(0, true);
+                col.mix.extend((0..32).map(|i| i as f32));
+                col.left.extend((0..32).map(|i| -(i as f32)));
+                col.right.extend((0..32).map(|i| 2.0 * i as f32));
+                (job.bar, col)
+            })
+            .collect();
+        // Every plane, not only the mix: a joint column carries three.
+        let ptrs: Vec<(usize, [*const f32; 3])> = built
+            .iter()
+            .map(|(bar, c)| (*bar, [c.mix.as_ptr(), c.left.as_ptr(), c.right.as_ptr()]))
+            .collect();
+        let values: Vec<(usize, Vec<f32>)> =
+            built.iter().map(|(bar, c)| (*bar, c.mix.clone())).collect();
+
+        let mut columns: Vec<Option<Cols>> = vec![None; jobs.len()];
+        install_columns(&mut columns, built);
+
+        for (bar, want) in ptrs {
+            let c = columns[bar].as_ref().expect("installed");
+            for (plane, (got, want)) in
+                ["mix", "left", "right"].iter().zip([c.mix.as_ptr(), c.left.as_ptr(), c.right.as_ptr()].iter().zip(want.iter()))
+            {
+                assert_eq!(got, want, "bar {bar}'s {plane} plane was copied instead of moved");
+            }
+        }
+        // And the move did not disturb the contents or the indexing.
+        for (bar, want) in values {
+            assert_eq!(columns[bar].as_ref().expect("installed").mix, want, "bar {bar} content");
+        }
+    }
+
+    /// The transpose reorders faithfully and hands each column's memory back.
+    ///
+    /// Two separate claims. **Order:** `out[frame][bar]` is `columns[bar][frame]`
+    /// for every cell, mono and joint, including a joint run's three planes and
+    /// the awkward case of a column shorter than the frame count. **Release:**
+    /// after a plane is transposed, every column of that plane has capacity
+    /// zero — the allocation was returned, not merely emptied. `clear()` in
+    /// place of `take` passes the first claim and fails the second, which is
+    /// the whole point of the change.
+    ///
+    /// This bounds what is *live*, by construction, rather than measuring a
+    /// process peak; the memory measurements are in the round's report.
+    #[test]
+    fn the_transpose_releases_each_column_as_it_consumes_it() {
+        let (n_bars, frames) = (5usize, 7usize);
+        let cell = |plane: usize, bar: usize, fi: usize| {
+            (plane * 1_000 + bar * 100 + fi) as f32 + 0.5
+        };
+
+        let mut columns: Vec<Option<Cols>> = (0..n_bars)
+            .map(|bar| {
+                let mut c = Cols::zeroed(0, true);
+                for fi in 0..frames {
+                    c.mix.push(cell(0, bar, fi));
+                    c.left.push(cell(1, bar, fi));
+                    c.right.push(cell(2, bar, fi));
+                }
+                Some(c)
+            })
+            .collect();
+
+        let mix = transpose_plane(&mut columns, frames, n_bars, |c| &mut c.mix);
+        // The mix columns are gone; the other two planes are untouched.
+        for (bar, slot) in columns.iter().enumerate() {
+            let c = slot.as_ref().expect("slot");
+            assert_eq!(c.mix.capacity(), 0, "bar {bar}: the mix column was emptied, not released");
+            assert_eq!(c.left.len(), frames, "bar {bar}: the left column was disturbed");
+            assert_eq!(c.right.len(), frames, "bar {bar}: the right column was disturbed");
+        }
+        let left = transpose_plane(&mut columns, frames, n_bars, |c| &mut c.left);
+        let right = transpose_plane(&mut columns, frames, n_bars, |c| &mut c.right);
+        for (bar, slot) in columns.iter().enumerate() {
+            let c = slot.as_ref().expect("slot");
+            for (name, cap) in [("left", c.left.capacity()), ("right", c.right.capacity())] {
+                assert_eq!(cap, 0, "bar {bar}: the {name} column was emptied, not released");
+            }
+        }
+
+        for (plane, out) in [(0usize, &mix), (1, &left), (2, &right)] {
+            assert_eq!(out.len(), frames, "plane {plane}: wrong frame count");
+            for (fi, row) in out.iter().enumerate() {
+                assert_eq!(row.len(), n_bars, "plane {plane} frame {fi}: wrong bar count");
+                for (bar, &got) in row.iter().enumerate() {
+                    assert_eq!(
+                        got.to_bits(), cell(plane, bar, fi).to_bits(),
+                        "plane {plane} frame {fi} bar {bar}",
+                    );
+                }
+            }
+        }
+
+        // A short column fills what it has; the rest of that bar stays zero.
+        let mut ragged: Vec<Option<Cols>> = (0..n_bars)
+            .map(|bar| {
+                let mut c = Cols::zeroed(0, false);
+                let have = if bar == 2 { frames - 3 } else { frames };
+                for fi in 0..have {
+                    c.mix.push(cell(0, bar, fi));
+                }
+                Some(c)
+            })
+            .collect();
+        let out = transpose_plane(&mut ragged, frames, n_bars, |c| &mut c.mix);
+        for (fi, row) in out.iter().enumerate() {
+            for (bar, &got) in row.iter().enumerate() {
+                let want = if bar == 2 && fi >= frames - 3 { 0.0 } else { cell(0, bar, fi) };
+                assert_eq!(got.to_bits(), want.to_bits(), "ragged frame {fi} bar {bar}");
+            }
+        }
+        for slot in &ragged {
+            assert_eq!(slot.as_ref().expect("slot").mix.capacity(), 0);
+        }
+    }
+
+    /// Every direct bar equals a sequential evaluation of the same superlet,
+    /// bit for bit — mono and joint, including the derived mix.
+    #[test]
+    fn direct_bars_match_a_sequential_reference_bit_for_bit() {
+        let sr = SR_A;
+        let hop = hop_for_fps(sr, 60.0);
+        let (lo, hi, n_bars) = (200.0f32, 5_000.0, 48);
+        let c = cfg(1.0, 1.0, 4, 0.5);
+        let bar_freq = |bar: usize| c.scale.bar_center(bar, n_bars, lo, hi);
+        let bar_q = |bar: usize| {
+            effective_q_at(bar_freq(bar), c.scale.grid_q_at(bar, n_bars, lo, hi), &c)
+        };
+        let direct: Vec<usize> = (0..n_bars)
+            .filter(|&bar| !Superlet::new(bar_freq(bar), bar_q(bar), &c, sr as f32).prefers_fft(hop))
+            .collect();
+        assert!(direct.len() >= 8, "setup: only {} direct bars", direct.len());
+
+        let work = WorkCells::default();
+        let seams = Seams::production();
+
+        // Mono.
+        let sig = tone(&[300.0, 1_200.0], 0.5, sr);
+        let frames = frame_count(sig.len(), hop);
+        let got = analyze_via(never_gpu, &sig, sr, n_bars, lo, hi, hop, &c);
+        assert_eq!(got.len(), frames, "setup: unexpected frame count");
+        let chans = Input::Mono(&sig).chans();
+        for &bar in &direct {
+            let sl = Superlet::new(bar_freq(bar), bar_q(bar), &c, sr as f32);
+            for (fi, row) in got.iter().enumerate() {
+                let (m, _, _) = sl.frame(&chans, (fi * hop) as isize, &work, &seams);
+                assert_eq!(
+                    row[bar].to_bits(), m.to_bits(),
+                    "mono bar {bar}, frame {fi}: {} vs {m}", row[bar],
+                );
+            }
+        }
+
+        // Joint: mix, left and right.
+        let l = tone(&[300.0, 1_200.0], 0.5, sr);
+        let r = tone(&[450.0, 2_000.0], 0.5, sr);
+        let joint = analyze_joint_via(never_gpu, &l, &r, sr, n_bars, lo, hi, hop, &c);
+        let jchans = Input::Joint { left: &l, right: &r }.chans();
+        for &bar in &direct {
+            let sl = Superlet::new(bar_freq(bar), bar_q(bar), &c, sr as f32);
+            let rows = joint.mix.iter().zip(&joint.left).zip(&joint.right);
+            for (fi, ((mix, left), right)) in rows.enumerate() {
+                let (m, lv, rv) = sl.frame(&jchans, (fi * hop) as isize, &work, &seams);
+                for (name, got_v, want) in [
+                    ("mix", mix[bar], m),
+                    ("left", left[bar], lv),
+                    ("right", right[bar], rv),
+                ] {
+                    assert_eq!(
+                        got_v.to_bits(), want.to_bits(),
+                        "joint {name} bar {bar}, frame {fi}: {got_v} vs {want}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// With every device dispatch failing, the missing-bar sweep must rebuild
+    /// exactly what a CPU-only run produces — bit for bit, not to a tolerance:
+    /// both go through the same shared-transform route on the cores.
+    #[test]
+    fn the_missing_bar_sweep_matches_a_cpu_only_run_bit_for_bit() {
+        if super::super::gpu::GpuFft::shared().is_none() {
+            println!("no GPU adapter — the forced-fallback sweep is not exercised here");
+            return;
+        }
+        let sr = 16_000u32;
+        let n = (3.0 * sr as f32) as usize;
+        let tau = std::f32::consts::TAU;
+        let l: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.5 * (tau * 45.0 * t).sin() + 0.2 * (tau * 900.0 * t).sin()
+            })
+            .collect();
+        let r: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.4 * (tau * 45.0 * t + 0.7).sin() + 0.3 * (tau * 300.0 * t).sin()
+            })
+            .collect();
+        let hop = hop_for_fps(sr, 60.0);
+        let (lo, hi, bars) = (20.0f32, 8_000.0, 96);
+        let c = cfg(1.0, 1.2, 4, 0.5);
+
+        let every_dispatch_fails = |_chunk: usize, _channel: usize| true;
+        let swept = analyze_joint_seamed(
+            eligible_gpu,
+            Seams { dispatch_fault: Some(&every_dispatch_fails), ..Seams::production() },
+            &l, &r, sr, bars, lo, hi, hop, &c,
+        );
+        assert!(swept.work.device_failures > 0, "setup: no dispatch was made to fail");
+        let cpu_only = analyze_joint_via(never_gpu, &l, &r, sr, bars, lo, hi, hop, &c);
+        assert!(!cpu_only.mix.is_empty(), "setup: the CPU-only run produced nothing");
+
+        for (name, a, b) in [
+            ("mix", &swept.mix, &cpu_only.mix),
+            ("left", &swept.left, &cpu_only.left),
+            ("right", &swept.right, &cpu_only.right),
+        ] {
+            assert_eq!(a.len(), b.len(), "{name}: frame counts differ");
+            for (fi, (ra, rb)) in a.iter().zip(b.iter()).enumerate() {
+                for (bar, (x, y)) in ra.iter().zip(rb.iter()).enumerate() {
+                    assert_eq!(
+                        x.to_bits(), y.to_bits(),
+                        "{name} frame {fi} bar {bar}: swept {x} vs CPU-only {y}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Progress reports every bar exactly once, and cancelling stops the run.
+    ///
+    /// **Portability.** The bound on how much work escapes a cancellation is a
+    /// function of how many bars can be in flight, which is the worker count —
+    /// so the test owns the worker count instead of inheriting the global pool,
+    /// whose size is the machine's core count. Both cancellation cases run in an
+    /// explicitly sized local pool and assert a bound derived from that size.
+    /// Production cancellation is unchanged; only the test's control over
+    /// in-flight work changed.
+    #[test]
+    fn progress_and_cancellation_survive_the_job_sweeps() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sr = SR_A;
+        let sig = tone(&[1_000.0], 0.5, sr);
+        let hop = hop_for_fps(sr, 60.0);
+        let (lo, hi, n_bars) = (200.0f32, 5_000.0, 64);
+        let c = cfg(1.0, 1.0, 4, 0.5);
+
+        const WORKERS: usize = 2;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(WORKERS)
+            .build()
+            .expect("local pool");
+
+        // ── every bar reported exactly once on a complete run ─────────────
+        let seen = Mutex::new(Vec::<usize>::new());
+        let out = pool.install(|| {
+            analyze_with_progress(
+                &sig, sr, n_bars, lo, hi, hop, &c,
+                &|| true,
+                &|bar| seen.lock().unwrap_or_else(|e| e.into_inner()).push(bar),
+            )
+        });
+        assert!(!out.is_empty(), "setup: the run produced nothing");
+        let mut bars = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        bars.sort_unstable();
+        assert_eq!(
+            bars, (0..n_bars).collect::<Vec<_>>(),
+            "progress did not report every bar exactly once",
+        );
+
+        // ── cancelled between bars: bounded by the workers, not the machine ──
+        //
+        // Cancellation is polled before a bar is committed to, so a bar finishes
+        // after the cut-off only if its check passed before it. At most one bar
+        // per worker sits between "check passed" and "finished" at any instant,
+        // so at most WORKERS more can complete after the LIMIT-th does.
+        const LIMIT: usize = 8;
+        let done = AtomicUsize::new(0);
+        let cancelled = pool.install(|| {
+            analyze_with_progress(
+                &sig, sr, n_bars, lo, hi, hop, &c,
+                &|| done.load(Ordering::Relaxed) < LIMIT,
+                &|_| { done.fetch_add(1, Ordering::Relaxed); },
+            )
+        });
+        assert!(cancelled.is_empty(), "a cancelled run must yield nothing");
+        let ran = done.load(Ordering::Relaxed);
+        assert!(
+            ran <= LIMIT + WORKERS,
+            "{ran} bars finished after cancelling at {LIMIT}, which {WORKERS} workers \
+             cannot account for",
+        );
+        assert!(ran < n_bars, "the run was not cancelled at all: {ran} of {n_bars} bars");
+
+        // ── cancelled *inside* a bar, deterministically ───────────────────
+        //
+        // The case above only ever reaches the frame-zero check, because its
+        // bars are 30 frames long and the in-bar check fires every
+        // CANCEL_CHECK_FRAMES. This one gives a single worker one long direct
+        // bar and cancels on its third poll, which can only be the check at
+        // frame 2 × CANCEL_CHECK_FRAMES.
+        let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("pool");
+        let long_hop = 8usize;
+        let frames_wanted = 2 * CANCEL_CHECK_FRAMES + 1;
+        let long_sig = tone(&[6_000.0], (frames_wanted * long_hop) as f32 / sr as f32, sr);
+        let long_frames = frame_count(long_sig.len(), long_hop);
+        assert!(
+            long_frames > 2 * CANCEL_CHECK_FRAMES,
+            "setup: {long_frames} frames is too few to reach the second in-bar check",
+        );
+        // One bar, high and narrow, so the run has no group phase at all and
+        // every poll below belongs to the direct route. The condition is the
+        // planner's own: a bar is direct when no member kernel is worth
+        // transforming.
+        let (dlo, dhi, d_bars) = (6_000.0f32, 9_000.0, 1);
+        let dcfg = cfg(1.0, 1.0, 2, 0.5);
+        for bar in 0..d_bars {
+            let f = dcfg.scale.bar_center(bar, d_bars, dlo, dhi);
+            let q = effective_q_at(f, dcfg.scale.grid_q_at(bar, d_bars, dlo, dhi), &dcfg);
+            let transformed: Vec<usize> = superlet_cycles(q, &dcfg)
+                .into_iter()
+                .map(|c| morlet_taps(f, c, sr as f32))
+                .filter(|&k| fft_is_cheaper(k, long_hop))
+                .collect();
+            assert!(
+                transformed.is_empty() && f < sr as f32 / 2.0,
+                "setup: bar {bar} at {f} Hz is not a direct bar: {transformed:?} taps transform",
+            );
+        }
+
+        let polls = AtomicUsize::new(0);
+        let finished = AtomicUsize::new(0);
+        let stopped = one.install(|| {
+            analyze_routed(
+                Input::Mono(&long_sig), sr, d_bars, dlo, dhi, long_hop, &dcfg,
+                &|| polls.fetch_add(1, Ordering::Relaxed) < 2,
+                &|_| { finished.fetch_add(1, Ordering::Relaxed); },
+                never_gpu,
+                Seams::production(),
+            )
+            .mix
+        });
+        assert!(stopped.is_empty(), "a cancelled run must yield nothing");
+        assert_eq!(
+            finished.load(Ordering::Relaxed), 0,
+            "the first bar completed, so the in-bar check never abandoned it",
+        );
+        assert_eq!(
+            polls.load(Ordering::Relaxed), 3,
+            "expected polls at frames 0, {CANCEL_CHECK_FRAMES} and {} of the first bar",
+            2 * CANCEL_CHECK_FRAMES,
+        );
     }
 
     #[test]

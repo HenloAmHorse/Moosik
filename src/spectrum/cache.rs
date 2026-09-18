@@ -398,10 +398,38 @@ impl PreFrames {
     // ── encoding ────────────────────────────────────────────────────────────
 
     /// Serialise as v4. Only meaningful for 12-bit data.
+    ///
+    /// # What this deliberately does not keep
+    ///
+    /// The straightforward encoder holds four things at once: a low-byte plane
+    /// (1 B/cell), an **unpacked** high-nibble plane (1 B/cell), the packed
+    /// nibbles (0.5), and two compressed blocks that are then copied into the
+    /// file. Two of those are avoidable and neither costs anything to avoid.
+    ///
+    /// * Nibbles pair by cell index across the whole plane, so they can be
+    ///   packed *during* the scan that produces them. The unpacked plane never
+    ///   needs to exist.
+    /// * `compress_into` writes into a buffer the caller owns, so each block can
+    ///   be compressed straight into the file rather than into a `Vec` that is
+    ///   then copied in and dropped.
+    ///
+    /// `lz4_flex::compress` and `compress_into` both call
+    /// `compress_into_sink_with_dict::<false>` with an empty dictionary and
+    /// differ only in the sink they write through, so identical bytes are
+    /// expected by construction. **Expected is not established**:
+    /// `the_v4_encoder_is_byte_identical_to_the_staged_form` holds this to the
+    /// previous encoder's exact output, and that test is what decides.
     pub fn to_v4(&self) -> Vec<u8> {
         let cells = self.frames * self.bars;
+        let packed_len = cells.div_ceil(2);
+
+        // One scan, two planes: the low bytes, and the high nibbles already
+        // packed two to a byte. The parity that matters is the running cell
+        // count, which `lo.len()` already is — nibbles pair across the plane,
+        // not within a row.
         let mut lo: Vec<u8> = Vec::with_capacity(cells);
-        let mut hi: Vec<u8> = Vec::with_capacity(cells);
+        let mut hi: Vec<u8> = Vec::with_capacity(packed_len);
+        let mut pending = 0u8;
         for row in self.codes.chunks_exact(self.bars.max(1)) {
             let mut prev = 0i32;
             for &q in row {
@@ -410,23 +438,56 @@ impl PreFrames {
                 prev = q;
                 let z = (((d << 1) ^ (d >> 31)) as u32) & (V4_MAX_CODE as u32);
                 lo.push((z & 0xFF) as u8);
-                hi.push((z >> 8) as u8);
+                let nib = ((z >> 8) as u8) & 0x0F;
+                if lo.len() % 2 == 1 {
+                    pending = nib;
+                } else {
+                    hi.push(pending | (nib << 4));
+                }
             }
         }
-        let lo_block = lz4_flex::compress(&lo);
-        let hi_block = lz4_flex::compress(&pack_nibbles(&hi));
+        // An odd cell count leaves one nibble in hand, and its spare half-byte
+        // is written as zero — exactly what packing the finished plane did.
+        if cells % 2 == 1 {
+            hi.push(pending);
+        }
+        debug_assert_eq!(hi.len(), packed_len, "the packed nibble plane is the wrong size");
 
-        let mut out = Vec::with_capacity(V4_HEADER + lo_block.len() + hi_block.len());
-        out.extend_from_slice(&MAGIC_V4.to_le_bytes());
-        out.extend_from_slice(&(self.frames as u32).to_le_bytes());
-        out.extend_from_slice(&(self.bars as u32).to_le_bytes());
-        out.push(V4_BITS as u8);
-        out.push(0); // flags
-        out.extend_from_slice(&0u16.to_le_bytes()); // reserved
-        out.extend_from_slice(&(lo_block.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(hi_block.len() as u32).to_le_bytes());
-        out.extend_from_slice(&lo_block);
-        out.extend_from_slice(&hi_block);
+        let mut out: Vec<u8> = Vec::with_capacity(
+            V4_HEADER + lz4_flex::block::get_maximum_output_size(lo.len()),
+        );
+        out.resize(V4_HEADER, 0);
+
+        // The low plane goes first and is released the moment its block is
+        // written, so the high plane's pass never holds both.
+        let at = out.len();
+        out.resize(at + lz4_flex::block::get_maximum_output_size(lo.len()), 0);
+        let lo_len = lz4_flex::compress_into(&lo, &mut out[at..])
+            .expect("the slice is get_maximum_output_size");
+        drop(lo);
+        out.truncate(at + lo_len);
+
+        let at = out.len();
+        out.resize(at + lz4_flex::block::get_maximum_output_size(hi.len()), 0);
+        let hi_len = lz4_flex::compress_into(&hi, &mut out[at..])
+            .expect("the slice is get_maximum_output_size");
+        drop(hi);
+        out.truncate(at + hi_len);
+
+        let h = &mut out[..V4_HEADER];
+        h[0..4].copy_from_slice(&MAGIC_V4.to_le_bytes());
+        h[4..8].copy_from_slice(&(self.frames as u32).to_le_bytes());
+        h[8..12].copy_from_slice(&(self.bars as u32).to_le_bytes());
+        h[12] = V4_BITS as u8;
+        h[13] = 0; // flags
+        h[14..16].copy_from_slice(&0u16.to_le_bytes()); // reserved
+        h[16..20].copy_from_slice(&(lo_len as u32).to_le_bytes());
+        h[20..24].copy_from_slice(&(hi_len as u32).to_le_bytes());
+
+        // The buffer was sized for the worst case LZ4 could have produced; the
+        // caller keeps this, and the sidecar keeps two of them, so give the
+        // slack back. The copy this costs is smaller than the peak above.
+        out.shrink_to_fit();
         out
     }
 }
@@ -455,34 +516,6 @@ pub fn quantise(v: f32, max_code: u16) -> u16 {
 fn wrap_signed(d: i32, bits: u32) -> i32 {
     let shift = 32 - bits;
     (d << shift) >> shift
-}
-
-/// Two 4-bit values per byte, low nibble first.
-fn pack_nibbles(vals: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vals.len().div_ceil(2));
-    let mut it = vals.chunks_exact(2);
-    for c in &mut it {
-        out.push((c[0] & 0x0F) | ((c[1] & 0x0F) << 4));
-    }
-    if let [last] = it.remainder() {
-        out.push(last & 0x0F); // the spare nibble is written as zero
-    }
-    out
-}
-
-fn unpack_nibbles(bytes: &[u8], n: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(n);
-    for &b in bytes {
-        out.push(b & 0x0F);
-        if out.len() == n {
-            break;
-        }
-        out.push(b >> 4);
-        if out.len() == n {
-            break;
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -624,14 +657,23 @@ fn decode_v4(
     if hi_bytes.len() != hi_packed {
         return Err(CacheError::PayloadSize { want: hi_packed, got: hi_bytes.len() });
     }
-    let hi = unpack_nibbles(&hi_bytes, cells);
 
+    // Nibbles are read out of the packed buffer as they are needed. The
+    // unpacked plane this used to build was a byte per cell, alive alongside
+    // the packed buffer, the low plane and the codes — about a quarter of the
+    // read's memory, held to save an index shift.
+    //
+    // `hi_packed` is `cells.div_ceil(2)` and has just been checked, so `i >> 1`
+    // is in range for every `i < cells`. An odd cell count leaves the last high
+    // nibble unread: that is the spare zero the encoder wrote.
     let mut codes = reserve_codes(cells)?;
     for r in 0..frames {
         let base = r * bars;
         let mut prev = 0i32;
         for i in base..base + bars {
-            let z = (lo[i] as u32) | ((hi[i] as u32) << 8);
+            let packed = hi_bytes[i >> 1];
+            let nib = if i % 2 == 0 { packed & 0x0F } else { packed >> 4 };
+            let z = (lo[i] as u32) | ((nib as u32) << 8);
             let d = ((z >> 1) as i32) ^ -((z & 1) as i32);
             prev = (prev + d) & V4_MAX_CODE as i32;
             codes.push(prev as u16);
@@ -744,6 +786,14 @@ pub(crate) mod fault {
         TempWritten,
         /// A file's length has been taken, before its contents are read.
         AfterMetadata,
+        /// A mono cache has been encoded and nothing has touched the disk.
+        ///
+        /// Reaching this point *is* the observation: the encode is the one step
+        /// the save wrapper's own cancellation check exists to skip, and it
+        /// leaves no trace a test could otherwise look for.
+        CacheEncoded,
+        /// The same moment for a sidecar.
+        SidecarEncoded,
     }
 
     type Callback = Box<dyn Fn()>;
@@ -755,6 +805,15 @@ pub(crate) mod fault {
     /// Arm `f` to run the next time `at` is reached on this thread, once.
     pub fn on(at: Hook, f: impl Fn() + 'static) {
         HOOKS.with(|h| h.borrow_mut().push((at, Box::new(f))));
+    }
+
+    /// Forget every armed hook on this thread.
+    ///
+    /// A hook that is armed at a moment the operation then *skips* is never
+    /// consumed, and the next arming of the same moment would find the stale
+    /// one first. A test that deliberately skips a moment clears afterwards.
+    pub fn clear() {
+        HOOKS.with(|h| h.borrow_mut().clear());
     }
 
     /// Run and remove the callback armed at `at`, if there is one.
@@ -770,7 +829,7 @@ pub(crate) mod fault {
 }
 
 #[cfg(not(test))]
-mod fault {
+pub(crate) mod fault {
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub enum At {
         MidWrite,
@@ -780,6 +839,8 @@ mod fault {
     pub enum Hook {
         TempWritten,
         AfterMetadata,
+        CacheEncoded,
+        SidecarEncoded,
     }
     #[inline(always)]
     pub fn fires(_: At) -> bool {
@@ -1032,6 +1093,128 @@ mod tests {
     }
 
     // ── the container ──────────────────────────────────────────────────────
+
+    /// Two 4-bit values per byte, low nibble first — the encoder's former
+    /// second pass.
+    ///
+    /// Test-only now: the encoder packs during its scan and the decoder reads
+    /// nibbles in place, so nothing in production builds an unpacked plane. It
+    /// survives here because the byte-identity test's reference encoder is the
+    /// old encoder, and that one needed it.
+    fn pack_nibbles(vals: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(vals.len().div_ceil(2));
+        let mut it = vals.chunks_exact(2);
+        for c in &mut it {
+            out.push((c[0] & 0x0F) | ((c[1] & 0x0F) << 4));
+        }
+        if let [last] = it.remainder() {
+            out.push(last & 0x0F); // the spare nibble is written as zero
+        }
+        out
+    }
+
+    /// Codes chosen to exercise the delta-zigzag path rather than a signal.
+    ///
+    /// Includes both endpoints, both directions of a delta that wraps the 12-bit
+    /// range, the largest jumps in each direction, and a run that is constant so
+    /// the delta is zero.
+    fn adversarial_codes(frames: usize, bars: usize) -> Vec<u16> {
+        let mut v = Vec::with_capacity(frames * bars);
+        for f in 0..frames {
+            for b in 0..bars {
+                let i = f * bars + b;
+                v.push(match i % 9 {
+                    0 => 0,                        // the floor
+                    1 => V4_MAX_CODE,              // the ceiling: delta wraps up
+                    2 => 0,                        // and straight back down
+                    3 => V4_MAX_CODE / 2,
+                    4 => V4_MAX_CODE / 2,          // a zero delta
+                    5 => V4_MAX_CODE / 2 + 1,      // the smallest positive delta
+                    6 => V4_MAX_CODE / 2 - 1,
+                    7 => ((i * 2_654_435_761) % (V4_MAX_CODE as usize + 1)) as u16,
+                    _ => V4_MAX_CODE,
+                });
+            }
+        }
+        v
+    }
+
+    /// The v4 encoder writes exactly the bytes the staged encoder wrote.
+    ///
+    /// The reference below is the shape `to_v4` had before it packed nibbles
+    /// during the scan and compressed into the output: a low plane, a separate
+    /// **unpacked** high-nibble plane, `pack_nibbles` over that, two
+    /// `lz4_flex::compress` calls, and a copy of both blocks into the file.
+    ///
+    /// `lz4_flex::compress` and `compress_into` share one compression core and
+    /// differ only in the sink, so identical output is expected by
+    /// construction. **A source argument is not evidence**, so this compares the
+    /// bytes over shapes chosen to break the packing: odd and even cell counts,
+    /// odd and even bar counts, one frame, one bar, and code sequences that hit
+    /// both endpoints and wrap the delta in both directions.
+    #[test]
+    fn the_v4_encoder_is_byte_identical_to_the_staged_form() {
+        fn reference(pf: &PreFrames) -> Vec<u8> {
+            let cells = pf.len() * pf.bars();
+            let mut lo: Vec<u8> = Vec::with_capacity(cells);
+            let mut hi: Vec<u8> = Vec::with_capacity(cells);
+            for row in pf.codes.chunks_exact(pf.bars().max(1)) {
+                let mut prev = 0i32;
+                for &q in row {
+                    let q = q.min(V4_MAX_CODE) as i32;
+                    let d = wrap_signed(q - prev, V4_BITS);
+                    prev = q;
+                    let z = (((d << 1) ^ (d >> 31)) as u32) & (V4_MAX_CODE as u32);
+                    lo.push((z & 0xFF) as u8);
+                    hi.push((z >> 8) as u8);
+                }
+            }
+            let lo_block = lz4_flex::compress(&lo);
+            let hi_block = lz4_flex::compress(&pack_nibbles(&hi));
+
+            let mut out = Vec::with_capacity(V4_HEADER + lo_block.len() + hi_block.len());
+            out.extend_from_slice(&MAGIC_V4.to_le_bytes());
+            out.extend_from_slice(&(pf.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(pf.bars() as u32).to_le_bytes());
+            out.push(V4_BITS as u8);
+            out.push(0);
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&(lo_block.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(hi_block.len() as u32).to_le_bytes());
+            out.extend_from_slice(&lo_block);
+            out.extend_from_slice(&hi_block);
+            out
+        }
+
+        let mut odd_cells = 0usize;
+        let mut even_cells = 0usize;
+        for &frames in &[1usize, 2, 3, 5, 8, 17, 33] {
+            for &bars in &[1usize, 2, 3, 7, 8, 65, 253] {
+                let pf = PreFrames::from_codes(
+                    adversarial_codes(frames, bars), frames, bars, V4_MAX_CODE,
+                );
+                let got = pf.to_v4();
+                let want = reference(&pf);
+                assert_eq!(got, want, "{frames}x{bars}: v4 bytes changed");
+
+                if (frames * bars) % 2 == 1 { odd_cells += 1 } else { even_cells += 1 }
+
+                // And it is still readable as itself.
+                let back = decode(&got, bars, BARS).expect("decode");
+                assert_eq!(back, pf, "{frames}x{bars}: round trip");
+            }
+        }
+        assert!(odd_cells > 0 && even_cells > 0,
+                "setup: {odd_cells} odd and {even_cells} even cell counts");
+
+        // Real magnitudes as well as adversarial codes.
+        for bars in [1usize, 2, 3, 7, 64, 1023, 1024] {
+            let pf = PreFrames::from_analysis(&awkward(bars));
+            assert_eq!(pf.to_v4(), reference(&pf), "awkward bars={bars}");
+        }
+        let pf = PreFrames::from_analysis(&rows(97, 253));
+        assert_eq!(pf.to_v4(), reference(&pf), "realistic shape");
+    }
 
     #[test]
     fn v4_round_trips_every_awkward_shape() {

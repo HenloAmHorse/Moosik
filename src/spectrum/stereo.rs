@@ -361,27 +361,61 @@ pub fn payload_fingerprint(bytes: &[u8]) -> u64 {
 /// The two channels are ordinary v4 payloads — the same encoder, the same
 /// quantiser, the same tests — laid end to end behind a header that says which
 /// mono analysis they belong to.
+///
+/// # Written once, not built and then copied
+///
+/// The obvious form builds the payload by concatenating the two channels, then
+/// builds the file by concatenating the header and the payload — so at the end
+/// the two channel buffers, the payload and the file are all alive, about
+/// `3 × (left + right)` for a structure that is `left + right` of actual
+/// content. On the corpus that is a 177–264 MiB peak for a 62–92 MB file.
+///
+/// Here the file is laid out once. Space for the header is reserved, each
+/// channel is appended and released as it is appended, and the header is filled
+/// in afterwards — the payload fingerprint is the only field that has to wait,
+/// and it is computed over the payload region of the file itself.
+///
+/// **The bytes are identical to the concatenated form, by construction rather
+/// than by argument**: the payload region of the output *is* left followed by
+/// right, in that order, so `payload_fingerprint` folds over the same bytes in
+/// the same sequence. The eight-byte word straddling the left/right boundary
+/// and the trailing remainder are the same words, because there is only one
+/// byte sequence involved. Nothing streams and nothing carries pending bytes.
 pub fn encode(id: Identity, mono: &PreFrames, pair: &Stereo) -> Vec<u8> {
+    fn put32(b: &mut [u8], at: usize, v: u32) {
+        b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put64(b: &mut [u8], at: usize, v: u64) {
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
     let left = pair.left.to_v4();
     let right = pair.right.to_v4();
-    let mut payload = Vec::with_capacity(left.len() + right.len());
-    payload.extend_from_slice(&left);
-    payload.extend_from_slice(&right);
+    let (left_len, right_len) = (left.len(), right.len());
 
-    let mut out = Vec::with_capacity(HEADER + payload.len());
-    out.extend_from_slice(&MAGIC.to_le_bytes());
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&(pair.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(pair.bars() as u32).to_le_bytes());
-    out.extend_from_slice(&FINGERPRINT_V1.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // reserved
-    out.extend_from_slice(&id.source.to_le_bytes());
-    out.extend_from_slice(&id.params.to_le_bytes());
-    out.extend_from_slice(&fingerprint(mono).to_le_bytes());
-    out.extend_from_slice(&payload_fingerprint(&payload).to_le_bytes());
-    out.extend_from_slice(&(left.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(right.len() as u32).to_le_bytes());
-    out.extend_from_slice(&payload);
+    let mut out = Vec::with_capacity(HEADER + left_len + right_len);
+    out.resize(HEADER, 0);
+    out.extend_from_slice(&left);
+    drop(left); // its bytes are in `out` now; holding it as well is the cost
+    out.extend_from_slice(&right);
+    drop(right);
+
+    let payload = payload_fingerprint(&out[HEADER..]);
+    let mono_fp = fingerprint(mono);
+
+    let h = &mut out[..HEADER];
+    put32(h, 0, MAGIC);
+    put32(h, 4, VERSION);
+    put32(h, 8, pair.len() as u32);
+    put32(h, 12, pair.bars() as u32);
+    put32(h, 16, FINGERPRINT_V1);
+    put32(h, 20, 0); // reserved
+    put64(h, 24, id.source);
+    put64(h, 32, id.params);
+    put64(h, 40, mono_fp);
+    put64(h, 48, payload);
+    put32(h, 56, left_len as u32);
+    put32(h, 60, right_len as u32);
     out
 }
 
@@ -566,6 +600,112 @@ mod tests {
         let left = PreFrames::from_analysis(&rows(frames, bars, 2));
         let right = PreFrames::from_analysis(&rows(frames, bars, 3));
         (mono, Stereo::new(left, right).expect("same shape"))
+    }
+
+    /// The file is byte-identical to the build-then-concatenate form.
+    ///
+    /// The reference below is the shape `encode` had before it laid the file
+    /// out in place: two channel payloads, concatenated, fingerprinted, and
+    /// copied in behind a header. It exists only here, and it is the thing the
+    /// new code has to reproduce exactly — header, fingerprints and payload.
+    ///
+    /// **Every left/right boundary remainder is covered.** `payload_fingerprint`
+    /// folds eight bytes at a time and then a remainder, so the byte at which
+    /// the left payload ends decides which word straddles the boundary and what
+    /// the trailing remainder is. The shapes below are chosen to hit all eight
+    /// values of `left_len % 8`, and the test fails if any is missed rather than
+    /// passing quietly on seven.
+    #[test]
+    fn the_sidecar_is_byte_identical_to_the_concatenated_form() {
+        fn reference(id: Identity, mono: &PreFrames, pair: &Stereo) -> Vec<u8> {
+            let left = pair.left().to_v4();
+            let right = pair.right().to_v4();
+            let mut payload = Vec::with_capacity(left.len() + right.len());
+            payload.extend_from_slice(&left);
+            payload.extend_from_slice(&right);
+
+            let mut out = Vec::with_capacity(HEADER + payload.len());
+            out.extend_from_slice(&MAGIC.to_le_bytes());
+            out.extend_from_slice(&VERSION.to_le_bytes());
+            out.extend_from_slice(&(pair.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(pair.bars() as u32).to_le_bytes());
+            out.extend_from_slice(&FINGERPRINT_V1.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&id.source.to_le_bytes());
+            out.extend_from_slice(&id.params.to_le_bytes());
+            out.extend_from_slice(&fingerprint(mono).to_le_bytes());
+            out.extend_from_slice(&payload_fingerprint(&payload).to_le_bytes());
+            out.extend_from_slice(&(left.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(right.len() as u32).to_le_bytes());
+            out.extend_from_slice(&payload);
+            out
+        }
+
+        let mut seen = [false; 8];
+        let mut checked = 0usize;
+        // Enough shapes and contents that the compressed left payload lands on
+        // every remainder; each is also checked for byte equality regardless.
+        for frames in [1usize, 2, 3, 5, 7, 8, 11, 13, 17, 23, 31, 40, 64, 97] {
+            for bars in [1usize, 3, 7, 8, 16, 33, 64, 65] {
+                let mono = PreFrames::from_analysis(&rows(frames, bars, 1));
+                let left = PreFrames::from_analysis(&rows(frames, bars, 2));
+                let right = PreFrames::from_analysis(&rows(frames, bars, 3));
+                let pair = Stereo::new(left, right).expect("same shape");
+
+                let got = encode(ID, &mono, &pair);
+                let want = reference(ID, &mono, &pair);
+                assert_eq!(got, want, "{frames}x{bars}: the file bytes changed");
+
+                let left_len = u32_at(&got, 56);
+                seen[left_len % 8] = true;
+                checked += 1;
+
+                // And it still reads back as itself.
+                let back = decode_with(&got, ID, &mono, BARS, Limits::default())
+                    .unwrap_or_else(|e| panic!("{frames}x{bars}: {e}"));
+                assert_eq!(back, pair, "{frames}x{bars}");
+            }
+        }
+        assert!(checked >= 100, "setup: only {checked} shapes");
+        let missed: Vec<usize> = (0..8).filter(|&i| !seen[i]).collect();
+        assert!(
+            missed.is_empty(),
+            "left/right boundary remainders not covered: {missed:?}",
+        );
+    }
+
+    /// A damaged payload is still caught, wherever the damage lands.
+    ///
+    /// Laying the file out in place means the fingerprint is taken over the
+    /// output buffer rather than over a separate payload vector. This holds it
+    /// to the same job: a flipped bit anywhere in either channel, including the
+    /// bytes either side of the boundary between them, is refused as corrupt
+    /// rather than decoded.
+    #[test]
+    fn a_bit_flipped_anywhere_in_the_payload_is_refused() {
+        let (mono, pair) = trio(40, 64);
+        let blob = encode(ID, &mono, &pair);
+        let left_len = u32_at(&blob, 56);
+        let boundary = HEADER + left_len;
+        let spots = [
+            HEADER,                 // first byte of left
+            HEADER + 1,
+            boundary - 8,           // the word that straddles the boundary
+            boundary - 1,           // last byte of left
+            boundary,               // first byte of right
+            boundary + 1,
+            blob.len() - 8,
+            blob.len() - 1,         // the trailing remainder
+        ];
+        for at in spots {
+            let mut bad = blob.clone();
+            bad[at] ^= 0x01;
+            let got = decode_with(&bad, ID, &mono, BARS, Limits::default());
+            assert!(
+                matches!(got, Err(SidecarError::Corrupt { .. })),
+                "a bit flipped at {at} was not refused as corrupt: {got:?}",
+            );
+        }
     }
 
     #[test]
