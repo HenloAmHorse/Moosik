@@ -2,6 +2,86 @@
 
 ## [Unreleased]
 
+## [1.5.2.1] - 2026-09-26
+
+A lyrics release. Japanese lyrics can now be read in romaji or with furigana,
+alongside a translation where the lyrics source has one, and synced sheets
+keep their word-level timing. Playback, pre-processing, the spectrum and every
+cache format are unchanged from 1.5.2.
+
+### Added
+
+- **Romaji, furigana and Both views** for lyrics containing Japanese. The
+  lyrics window offers **Original / Furigana / Romaji / Both**. In **Both**,
+  the reading goes either under each line or under each word (**Lines /
+  Words**).
+  - **Where readings come from.** Romaji is taken from the lyrics source where
+    it supplies one (NetEase's romaji sheet). Otherwise it is generated
+    locally, from a Japanese dictionary built into the app, and shown in
+    italics, because a dictionary cannot know a song's chosen reading of a
+    kanji.
+  - **Word by word, and when that fails.** A supplied reading is placed under
+    the words by aligning it with the generated one. If it cannot be placed
+    word by word, the line shows it whole instead of guessing.
+- **Furigana written into the lyrics decides.** An annotation such as
+  `剣(つるぎ)` is the reading used, in every view, even when an online source's
+  romaji says otherwise.
+  - **Overriding it is deliberate.** The romaji editor (✎) lets you correct any
+    line. If your reading would replace furigana the lyrics wrote, or you tick
+    **Use this reading instead of the lyrics'** on a supplied reading that
+    disagrees with it, the window shows the lyrics' reading and yours and asks.
+    **Keep the lyrics' reading** changes nothing. **Use my reading** makes
+    yours win in every view, and ↺ puts the lyrics' reading back.
+  - **The lyric text itself is never changed.** The choice is stored
+    separately.
+- **Karaoke highlighting** from word-level timing already in the sheet
+  (enhanced LRC, `<mm:ss.xx>` inside a line). Earlier versions discarded that
+  timing on load; it is now kept, shown, and written back when you save. No
+  timing is guessed for sheets that do not have it.
+- **Translations** where the lyrics source has one (from NetEase, mostly
+  Chinese), shown under each line when switched on.
+
+### Changed
+
+- **Sidecar files.** Lyrics are still saved as `song.lrc` beside the track.
+  Romaji, translation and confirmed reading choices go in their own files
+  beside it, **`song.romaji.lrc`**, **`song.translation.lrc`** and
+  **`song.reading-override.lrc`**, each mirroring `song.lrc` line by line.
+  `song.lrc` stays the plain sheet other players read. The audio file is never
+  written.
+- **Saving is all or nothing, and keeps what it replaces.**
+  - Every file about to change is backed up first; each is replaced whole; if
+    any step fails, those already changed are put back.
+  - The window says whether the save succeeded, was undone, or could not be
+    fully undone, and names the backups.
+  - A romaji or translation file that a save overwrites or removes (because
+    the sheet changed under it) is kept as `….old`, `….old.2`, and so on.
+    Nothing tidies these up yet.
+- **The Sync editor keeps each line's romaji, translation and word timing**
+  when you retime it. Retyping a line's text drops that line's word timing,
+  which would otherwise point at the wrong letters.
+- Times that need millisecond precision are saved with three digits; whole
+  centiseconds are written the usual two-digit way.
+
+### Known limitations
+
+- **One copy of the app.** A save refuses to run while another save of the
+  same track is in progress in the same copy of Moosik. Two separate copies of
+  Moosik saving the same track at the same moment are not prevented from
+  interleaving; each file is still replaced whole and backed up first.
+- **Generated readings can be wrong**, above all where a song reads a kanji
+  unusually. They are marked as generated and can be corrected.
+- **Original shows the lyrics as stored,** bracketed annotations included,
+  even where you chose your own reading.
+- **The app is larger:** the Japanese dictionary adds about 48 MB to the
+  executable.
+
+### Version number
+
+Cargo cannot hold a four-part version, so the package version is `1.5.2+1`.
+The build turns that into **1.5.2.1**, and that is what the log, the network
+User-Agent and the Windows file properties report. The tag is `v1.5.2.1`.
+
 ## [1.5.2] - 2026-09-18
 
 A performance and correctness release for the pre-processor. Every analysis

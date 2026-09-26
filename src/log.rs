@@ -446,7 +446,7 @@ pub fn error() -> Option<&'static str> {
 fn banner(y: i64, mo: u32, dy: u32, h: u32, mi: u32, s: u32) {
     write_line(&format!(
         "Moosik {} — session log",
-        env!("CARGO_PKG_VERSION")
+        env!("MOOSIK_VERSION")
     ));
     write_line(&format!(
         "started   {y:04}-{mo:02}-{dy:02} {h:02}:{mi:02}:{s:02} UTC"

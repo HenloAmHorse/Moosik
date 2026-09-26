@@ -33,6 +33,10 @@ pub struct Hit {
     /// because `plain` is precisely the field it reads. A value that must never
     /// be mistaken for lyrics does not belong in a field that means lyrics.
     pub id: Option<String>,
+    /// Romaji as its own LRC, when the source has it.
+    pub romaji: Option<String>,
+    /// A translation as its own LRC, when the source has it.
+    pub translation: Option<String>,
 }
 
 impl Hit {

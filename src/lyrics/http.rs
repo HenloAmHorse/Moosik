@@ -7,7 +7,7 @@ use std::time::Duration;
 const TIMEOUT: Duration = Duration::from_secs(12);
 
 const UA: &str = concat!(
-    "moosik/", env!("CARGO_PKG_VERSION"),
+    "moosik/", env!("MOOSIK_VERSION"),
     " (https://github.com/HenloAmHorse/Moosik-Player)"
 );
 
@@ -63,5 +63,18 @@ mod tests {
         assert_eq!(esc("ロキ"), "%E3%83%AD%E3%82%AD");
         assert_eq!(esc("a&b=c"), "a%26b%3Dc");
         assert_eq!(esc("SWIPE×SWIPE"), "SWIPE%C3%97SWIPE");
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    /// The product version is the package version with a build number as its
+    /// fourth part, `1.5.2+1` → `1.5.2.1`, and it is what the User-Agent says.
+    #[test]
+    fn the_user_agent_names_the_product_version() {
+        let v = env!("MOOSIK_VERSION");
+        assert_eq!(v, env!("CARGO_PKG_VERSION").replace('+', "."));
+        assert!(!v.contains('+'));
+        assert!(super::UA.starts_with(&format!("moosik/{v} ")), "{}", super::UA);
     }
 }

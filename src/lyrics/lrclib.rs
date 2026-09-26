@@ -30,6 +30,8 @@ fn hit_from(v: &serde_json::Value) -> Hit {
         synced: opt("syncedLyrics"),
         // LRCLIB returns lyrics with the record, so nothing to fetch later.
         id: None,
+        romaji: None,
+        translation: None,
     }
 }
 

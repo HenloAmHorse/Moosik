@@ -25,6 +25,22 @@ See also [BIT_PERFECT.md](BIT_PERFECT.md) and [SPECTRUM.md](SPECTRUM.md).
 - **Manual search** — type anything, see the hits with synced-vs-plain marked, pick one
 - **Tap-along sync editor** — play the song and press Space as each line starts; a plain sheet becomes a timed one in a few minutes. Re-times existing sheets too, and resumes at the first untimed line
 - **Sidecar-only writes** — lyrics are saved as `.lrc`; the audio file is never modified, which also makes this safe for DSD
+- **Karaoke highlighting** — where a sheet times its individual words (enhanced LRC, `<mm:ss.xx>` inside a line), each word lights as it is sung. That timing is kept on load and written back on save. Sheets without it simply highlight the current line; no timing is guessed
+- **Japanese readings: Original / Furigana / Romaji / Both** — for lyrics containing Japanese. **Both** puts the reading under each line or under each word (**Lines / Words**)
+  - **Where readings come from:** romaji supplied by the lyrics source (NetEase's romaji sheet) is used where there is one. Otherwise it is generated locally from a built-in Japanese dictionary and shown in *italics*, since a dictionary cannot know a song's chosen reading of a kanji
+  - **Word by word, with a fallback:** a supplied reading is placed under the words by aligning it with the generated one. Where it cannot be placed word by word, the line shows it whole rather than guessing
+  - **Original** shows the lyrics exactly as stored
+- **Furigana written into the lyrics wins** — an annotation such as `剣(つるぎ)` is the reading used in every view, even where an online source's romaji disagrees
+- **Correcting readings (✎)** — edit any line's romaji; a change you make is kept, and ↺ returns a line to its generated or annotated reading
+  - **Overriding the lyrics' own furigana is deliberate.** If your reading would replace one the lyrics annotate, or you tick **Use this reading instead of the lyrics'** on a supplied reading that disagrees with it, the window shows both readings and asks. **Keep the lyrics' reading** changes nothing; **Use my reading** makes yours win in every view, and the Japanese is then shown without the replaced annotation
+  - The lyric text itself is never changed
+- **Translations** — shown under each line when the source has one (from NetEase, so mostly Chinese) and the **Translation** switch is on
+- **Separate files, beside `song.lrc`:** `song.romaji.lrc` (romaji a source supplied or you corrected), `song.translation.lrc`, and `song.reading-override.lrc` (the lines where you chose your reading over the lyrics' furigana). Each mirrors `song.lrc` line by line, so `song.lrc` stays the plain sheet other players read
+- **Saving is all or nothing**
+  - Every file about to change is backed up first; each is replaced whole; if any step fails, those already changed are put back, and the window says so and names the backups
+  - A romaji or translation file overwritten or removed by a save is kept as `….old` (then `.old.2`, …). Nothing removes these automatically yet
+  - Only one save of a track runs at a time **within one copy of Moosik**. Two separately running copies are not prevented from saving the same track at once
+- **The Sync editor keeps each line's romaji, translation and word timing** when it retimes a sheet; retyping a line drops that line's word timing
 
 ## Tag Editing
 

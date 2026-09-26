@@ -56,7 +56,11 @@ cargo build --release
 - **Parametric EQ** — up to 16 bands, dragged directly on the spectrum, with
   global and per-song presets
 - **Lyrics** — synced `.lrc`, read from the file or looked up online, with a
-  tap-along editor. Never writes to the audio file
+  tap-along editor and karaoke highlighting where the sheet times its words.
+  Japanese lyrics can be shown in romaji, with furigana, or both, word by word.
+  Readings come from the lyrics source or are generated, and furigana written
+  into the lyrics takes precedence unless you confirm otherwise. Translations
+  are shown where the source has one. Never writes to the audio file
 - **Tag editing** — with verified, non-destructive writes
 - **The rest** — gapless playback, ReplayGain, album-art overlays and mask mode,
   A-B repeat, bookmarks, sleep timer, play statistics, OS media keys, LUFS and

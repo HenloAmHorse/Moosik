@@ -1,6 +1,6 @@
 [package]
 name = "moosik"
-version = "1.5.2"
+version = "1.5.2+1"
 edition = "2024"
 
 [[bin]]
@@ -58,6 +58,7 @@ ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 wgpu = { version = "24", default-features = false, features = ["wgsl", "wgc", "metal"] }
 pollster = "0.4"
 bytemuck = "1"
+lindera = { version = "6", default-features = false, features = ["embed-ipadic"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # alsa-dsd: direct hw: access for native DSD (cpal already pulls this crate in

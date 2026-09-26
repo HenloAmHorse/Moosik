@@ -73,17 +73,26 @@ pub fn search(query: &str) -> Result<Vec<Hit>, String> {
         plain: None,
         synced: None,
         id: s.get("id").and_then(|x| x.as_i64()).map(|id| id.to_string()),
+        romaji: None,
+        translation: None,
     }).collect())
 }
 
 /// Fetch the lyrics for one search hit.
 pub fn fill_lyrics(h: &mut Hit) -> Result<(), String> {
     let Some(id) = h.id.clone() else { return Ok(()) };
-    let url = format!("{LYRIC}?id={id}&lv=1&kv=1&tv=-1");
+    // `rv` asks for the romaji sheet too. People write it, so its readings
+    // are right where a dictionary's guess is not.
+    let url = format!("{LYRIC}?id={id}&lv=1&kv=1&tv=-1&rv=-1");
     let Some(v) = get_json(&url, Some(REFERER))? else { return Ok(()) };
     check_code(&v)?;
     let text = v.pointer("/lrc/lyric").and_then(|x| x.as_str()).unwrap_or("");
     if text.trim().is_empty() { return Ok(()); }
+    let sheet = |key: &str| v.pointer(key).and_then(|x| x.as_str())
+        .filter(|r| !r.trim().is_empty()).map(str::to_string);
+    h.romaji = sheet("/romalrc/lyric");
+    // Mostly Chinese, since that is who writes them here; shown for what it is.
+    h.translation = sheet("/tlyric/lyric");
     // A sheet with no timestamps at all is still worth having — the sync editor
     // can time it — but it must not claim to be synced.
     if text.contains('[') && text.contains(']') {
