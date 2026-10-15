@@ -2,6 +2,151 @@
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-10-15
+
+Pre-processing does less work for the same output, the analysis cache is
+rebuilt around the content of the file it describes, and lyrics gain Korean
+romanization and translation tools. Three different things got faster or
+cheaper, and they are reported separately below: pre-processing a track,
+the real-time spectrum, and loading an analysis that was already saved.
+
+### Changed — Pre-processing (the spectrum analysis of a whole track)
+
+- Superlet pre-processing does less work for the same output: the inverse
+  transforms compute only the outputs that are used (a pruned inverse in the
+  vendored `rustfft`, with modification notices), forward transforms are shared
+  between the members that need the same ones, shared windows are scheduled per
+  member with bounded worker slots, and the code columns are mapped on the
+  analysis pool and transposed in cached bands. Each of these was checked to
+  give bit-identical codes against the previous output on the declared test
+  corpus. **The gains are workload-specific and are reported per track and
+  setting in the release comparison (docs/RELEASE_COMPARISON_153.md), not as
+  one overall figure.** Real-time
+  (tick) analysis is a separate path; see below.
+- A queued analysis keeps the settings it was requested at; a completion for
+  settings no longer selected is never installed.
+
+### Changed — Real-time spectrum
+
+- The real-time constant-Q bar mapping keeps its gather plan between ticks
+  instead of rebuilding it, and the Left/Right tick uses the same plan. This is
+  per-tick work; it says nothing about pre-processing time.
+
+### Changed — Analysis cache (see docs/CACHE.md)
+
+- New analyses are stored in `cache/v2/` and identified by the file's path,
+  size, last-modified time and a sampled content digest, as well as every
+  setting that affects the result. A file replaced at the same path is no
+  longer shown with the old file's analysis. A tag edit changes the
+  modified time, so it can cause a re-analysis.
+- Each analysis is published as one whole (spectrum and channels together)
+  after a final check of the file, so a crash leaves the previous analysis or
+  the complete new one. A write by another program in the moment between that
+  check and the save is not detected, and nothing is promised after a power
+  loss.
+- What is on screen, a finished analysis on its way to the screen and channels
+  being read are never deleted to meet the size limit; the excess is reported.
+  On network, removable or non-NTFS folders nothing is deleted at all, not
+  even the unfinished copy left by a cancelled or refused save: it stays, and
+  the message says it was left for a later cleanup.
+- Adding channels to a track whose Mix is already saved keeps that Mix only
+  when it was made from exactly the same decoded audio as the channels;
+  otherwise the new Mix is saved with them, so the two always belong together.
+- **Analyses written by 1.5.2.1 and earlier are kept untouched** and offered
+  only as clearly labelled legacy alternatives; they are never used
+  automatically, imported or deleted by this version. The first play of each
+  track at your settings analyses it again.
+- Re-analyze no longer deletes the old analysis first: the new one replaces it
+  only once it has been saved completely.
+
+### Changed — Loading a saved analysis
+
+These figures are for reading an analysis that is already in the cache back
+into the display. They are not pre-processing time, not key or loudness
+analysis, and not the time it takes a song to start playing.
+
+- Every analysis file is checked against its SHA-256 when it is read; the
+  check runs on a second thread while the data is decoded, and what was
+  decoded is used only if the check passed. Left and Right are decoded at the
+  same time, and a payload-sized copy was removed.
+- Measured on one computer with three inputs (3.5 to 10 minutes long), files
+  in the system file cache, against 1.5.2.1 (which checked no digest): a
+  Mix-only load takes 0.95 to 0.97 times as long, Left/Right 0.56 to 0.57
+  times, Mix and Left/Right together 0.68 to 0.70 times. Other files and
+  computers will differ (docs/RELEASE_COMPARISON_153.md).
+
+### Changed — DSD and playback
+
+- DSD pre-processing runs at 88.2 kHz (96 kHz for the 48 kHz family) by
+  default, separately from the playback fallback rate and the live tap.
+- Resuming a released output, or reopening a route, describes the route that
+  is actually open; the live tap's description follows it.
+- The live and pre-process FFT sizes are chosen for their own feeds.
+
+### Added
+
+- Offline Korean lyric romanization and whole-line **Romanization / Both**
+  views, with supplied/corrected readings taking priority. Generated readings
+  are labelled as guesses; Japanese dictionary/furigana behavior is retained.
+- An explicit **Translate…** workflow for Japanese/Korean/English lyrics:
+  supplement matching source translations without replacing originals, request
+  machine-assisted Chinese translation, or edit/paste a row-matched translation.
+  Traditional/Simplified display uses the existing conversion/font support.
+  Online translation requires consent to third-party lyric processing and is
+  subject to provider quotas; results are previewed before adoption and saved
+  only on demand. Machine-assisted attribution persists in the sidecar.
+- An optional **Context-aware AI** translation provider (OpenAI, your own API
+  key, session-only): whole-song context, faithful or more fluent Traditional
+  Chinese (Taiwan), an optional single review pass, strict row-ID validation
+  and flags for doubtful rows. Off until configured; it discloses that the
+  whole original sheet is sent, its paid limits and that `store: false` is not
+  zero retention. Not quality-evaluated yet.
+  Agreement lapses on any settings or sheet change; new AI rows are stored in
+  canonical Traditional character forms; unchanged or non-Chinese answers are
+  flagged previews rather than errors; unreviewed drafts keep that note through
+  later edits; oversized sheets are refused before anything is copied.
+
+### Fixed
+
+- Translation-only saves no longer require marking the original sheet dirty:
+  checked backup/rollback writes only the affected translation sidecar. Stale
+  jobs cannot overwrite changed tracks/sheets, cancellation retains the worker
+  slot until completion, and unapplied manual edits survive competing actions.
+- Supplied Latin-only alternate readings are no longer silently replaced by
+  the original text through Japanese word alignment.
+
+### Known limitations
+
+- Loading a saved analysis costs more processor time than in 1.5.2.1 (about
+  1.3x) and, while Left/Right load, up to about 160 MB more memory, because
+  the digest is still computed in full and the two channels are decoded at
+  once (docs/RELEASE_COMPARISON_153.md).
+- High-sample-rate joint (L/R) analysis can still take longer than the track
+  plays: 1.23× real time for a 96 kHz track in the release comparison.
+- The first play of each track after updating re-analyses it; analyses from
+  1.5.2.1 and earlier are offered only as labelled legacy alternatives.
+- The cache's file identity samples the content rather than reading all of
+  it, so an edit that keeps the size and modified time and touches only bytes
+  between the samples is not detected. A write by another program between
+  the final check and the save is not detected either. Nothing is promised
+  after a power loss (see docs/CACHE.md).
+- The Windows executable needs the Microsoft Visual C++ 2015-2022
+  Redistributable (x64), which most Windows PCs already have.
+
+### Third-party notices
+
+- `THIRD_PARTY_NOTICES.txt` lists every third-party package and embedded data
+  set in the Windows executable with its license texts, including the IPADIC
+  and OpenCC dictionaries, the embedded fonts and the Rust standard library.
+  Where a package carries no license text of its own, the standard text is
+  supplied and marked as such (docs/THIRD_PARTY_NOTICES.md).
+
+### Version number
+
+The package version is `1.5.3`; the log, the network User-Agent and the
+Windows file properties report 1.5.3 (numeric file version 1.5.3.0). The tag
+is `v1.5.3`.
+
 ## [1.5.2.1] - 2026-09-26
 
 A lyrics release. Japanese lyrics can now be read in romaji or with furigana,

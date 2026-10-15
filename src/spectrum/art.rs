@@ -88,13 +88,18 @@ impl ArtSettingsStore {
     }
 
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::settings_path())
-            .ok()
+        // Through the spectrum's one profile reader, which a test build never
+        // lets reach the disk.
+        super::read_profile_text("art_settings.json", Self::settings_path)
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
 
     pub fn save(&self) {
+        // A test build never writes the owner's profile.
+        if cfg!(test) {
+            return;
+        }
         let path = Self::settings_path();
         if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
         if let Ok(json) = serde_json::to_string_pretty(self) {
@@ -126,7 +131,10 @@ impl ArtSettingsStore {
     }
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
+    #[cfg(test)]
+    return super::test_profile::root();
+    #[cfg(not(test))]
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .map(PathBuf::from)

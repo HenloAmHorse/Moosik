@@ -223,6 +223,37 @@ pub struct GpuSignal {
     n_sig: usize,
 }
 
+/// A stage of a device dispatch a test can make fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// The kernel side of a sub-chunk, shared by both channels.
+    Prepare,
+    /// One channel's convolution: 0 left (or mono), 1 right.
+    Channel(usize),
+}
+
+/// What a dispatch did, counted where it happened. Failed attempts count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DispatchCount {
+    pub prepare_attempts: u64,
+    pub prepare_failures: u64,
+    /// Per channel: dispatches attempted, succeeded and failed.
+    pub dispatch_attempts: [u64; 2],
+    pub dispatch_ok: [u64; 2],
+    pub dispatch_failures: [u64; 2],
+    /// Per channel: kernels sent to the device, attempted or not completed.
+    pub kernel_dispatches: [u64; 2],
+}
+
+/// A kernel batch already packed, uploaded and transformed on the device.
+struct PreparedKernels {
+    /// Whichever ping-pong buffer the kernel FFT finished in.
+    ker: wgpu::Buffer,
+    /// Tap count and half-width per kernel, for the extract pass.
+    meta: wgpu::Buffer,
+    w: usize,
+}
+
 /// One kernel's taps, as the pipeline needs them.
 pub struct GpuKernel<'a> {
     pub re: &'a [f32],
@@ -487,6 +518,194 @@ impl GpuFft {
     /// Convolve a prepared signal against a batch of kernels.
     #[allow(clippy::too_many_arguments)]
     pub fn convolve_with(
+        &self, prepared: &GpuSignal, signal_len: usize, hop: usize, frames: usize,
+        kernels: &[GpuKernel],
+    ) -> Result<Vec<Vec<C32>>, String> {
+        let _ = signal_len;
+        let mut count = DispatchCount::default();
+        self.convolve_channels(prepared, None, hop, frames, kernels, &|_| false, &mut count)
+            .map(|(a, _)| a)
+    }
+
+    /// One channel or two against the same kernels, with the kernel side —
+    /// packing, upload, the kernel FFT and the per-kernel metadata — prepared
+    /// **once** per sub-chunk and read by both channels.
+    ///
+    /// The kernel spectrum is a function of the kernels alone, so both
+    /// channels read the bytes either would have computed. Everything after
+    /// the preparation stays per channel: its own product buffers, passes,
+    /// submission and readback, in the same order as before (left, then
+    /// right), so a channel's failure is still that channel's.
+    ///
+    /// `fault` lets a test fail a stage exactly as a device would: it is
+    /// asked before each preparation and each channel dispatch. `count` is
+    /// incremented at the operations themselves, failed attempts included.
+    /// Any failure fails the call: the caller recovers the pair.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn convolve_channels(
+        &self, a: &GpuSignal, b: Option<&GpuSignal>, hop: usize, frames: usize,
+        kernels: &[GpuKernel], fault: &dyn Fn(Stage) -> bool, count: &mut DispatchCount,
+    ) -> Result<(Vec<Vec<C32>>, Vec<Vec<C32>>), String> {
+        let joint = b.is_some();
+        if kernels.is_empty() || frames == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let (n, blocks) = (a.n, a.blocks);
+        if b.is_some_and(|b| b.n != n || b.stride != a.stride || b.blocks != blocks || b.n_sig != a.n_sig) {
+            return Err("the channel signals were prepared with different geometry".into());
+        }
+        let cplx = std::mem::size_of::<C32>() as u64;
+        // How many kernels fit at once: the product buffer is the big one.
+        let per_kernel = blocks as u64 * n as u64 * cplx;
+        let budget = self.max_buffer.min(256 << 20);
+        let chunk = ((budget / per_kernel.max(1)) as usize).clamp(1, kernels.len());
+
+        let mut out_a = vec![Vec::new(); kernels.len()];
+        let mut out_b = vec![Vec::new(); if joint { kernels.len() } else { 0 }];
+        for start in (0..kernels.len()).step_by(chunk) {
+            let end = (start + chunk).min(kernels.len());
+            let group = &kernels[start..end];
+            count.prepare_attempts += 1;
+            if fault(Stage::Prepare) {
+                count.prepare_failures += 1;
+                return Err("injected device failure: kernel preparation".into());
+            }
+            let pk = self.prepare_kernels(group, n);
+            for (ci, (sig, out)) in std::iter::once((a, &mut out_a[start..end]))
+                .chain(b.map(|b| (b, &mut out_b[start..end])))
+                .enumerate()
+            {
+                count.dispatch_attempts[ci] += 1;
+                count.kernel_dispatches[ci] += group.len() as u64;
+                let r = if fault(Stage::Channel(ci)) {
+                    Err(format!("injected device failure: channel {ci}"))
+                } else {
+                    self.convolve_one(sig, &pk, hop, frames, out)
+                };
+                if let Err(e) = r {
+                    count.dispatch_failures[ci] += 1;
+                    return Err(e);
+                }
+                count.dispatch_ok[ci] += 1;
+            }
+        }
+        Ok((out_a, out_b))
+    }
+
+    /// The kernel side of a sub-chunk: pack, upload, transform. Independent of
+    /// the signal. Submitted on its own; the queue orders it before the
+    /// channel submissions that read it.
+    fn prepare_kernels(&self, group: &[GpuKernel], n: usize) -> PreparedKernels {
+        let cplx = std::mem::size_of::<C32>() as u64;
+        let w = group.len();
+        // Kernels, time-reversed and zero-padded, transformed on device.
+        let mut khost = vec![[0.0f32; 2]; w * n];
+        for (gi, k) in group.iter().enumerate() {
+            let taps = k.re.len().min(n);
+            for i in 0..taps {
+                khost[gi * n + i] = [k.re[taps - 1 - i], k.im[taps - 1 - i]];
+            }
+        }
+        let ker_a = self.storage("ker-a", (w * n) as u64 * cplx);
+        let ker_b = self.storage("ker-b", (w * n) as u64 * cplx);
+        self.queue.write_buffer(&ker_a, 0, bytemuck::cast_slice(&khost));
+        let meta: Vec<u32> = group.iter()
+            .flat_map(|k| [k.re.len() as u32, k.half as u32])
+            .collect();
+        let metabuf = self.storage("meta", (meta.len() * 4).max(8) as u64);
+        self.queue.write_buffer(&metabuf, 0, bytemuck::cast_slice(&meta));
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let k_in_b = self.encode_fft(&mut enc, &ker_a, &ker_b, n, w, false);
+        self.queue.submit(Some(enc.finish()));
+        PreparedKernels { ker: if k_in_b { ker_b } else { ker_a }, meta: metabuf, w }
+    }
+
+    /// One channel against an already-transformed kernel batch: the passes and
+    /// readback `convolve_with` has always run, unchanged.
+    fn convolve_one(
+        &self, prepared: &GpuSignal, pk: &PreparedKernels, hop: usize, frames: usize,
+        out: &mut [Vec<C32>],
+    ) -> Result<(), String> {
+        let (n, stride, blocks) = (prepared.n, prepared.stride, prepared.blocks);
+        let cplx = std::mem::size_of::<C32>() as u64;
+        let per_kernel = blocks as u64 * n as u64 * cplx;
+        let sig = &prepared.buf;
+        let w = pk.w;
+        let prod_a = self.storage("prod-a", w as u64 * per_kernel);
+        let prod_b = self.storage("prod-b", w as u64 * per_kernel);
+        // Two floats a frame now, not one.
+        let outbuf = self.storage("resp", (w * frames * 8) as u64);
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let (cgx, cgy, cspan) =
+            dispatch_2d(((n * blocks * w) as u32).div_ceil(WORKGROUP));
+        let cu = self.uniform("conv-u", &[n as u32, blocks as u32, w as u32, cspan]);
+        let cbind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("conv-bind"), layout: &self.conv_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sig.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pk.ker.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: prod_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cu.as_entire_binding() },
+            ],
+        });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.conv);
+            pass.set_bind_group(0, &cbind, &[]);
+            pass.dispatch_workgroups(cgx, cgy, 1);
+        }
+        let p_in_b = self.encode_fft(&mut enc, &prod_a, &prod_b, n, blocks * w, true);
+        let prod = if p_in_b { &prod_b } else { &prod_a };
+        let (egx, egy, espan) = dispatch_2d(((w * frames) as u32).div_ceil(WORKGROUP));
+        let eu = self.uniform("ex-u", &[
+            n as u32, stride as u32, blocks as u32, w as u32,
+            frames as u32, hop as u32, prepared.n_sig as u32, espan,
+        ]);
+        let ebind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ex-bind"), layout: &self.extract_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: prod.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pk.meta.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: outbuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: eu.as_entire_binding() },
+            ],
+        });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.extract);
+            pass.set_bind_group(0, &ebind, &[]);
+            pass.dispatch_workgroups(egx, egy, 1);
+        }
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resp-read"), size: (w * frames * 8) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        enc.copy_buffer_to_buffer(&outbuf, 0, &staging, 0, (w * frames * 8) as u64);
+        self.queue.submit(Some(enc.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+        {
+            let view = slice.get_mapped_range();
+            let got: &[C32] = bytemuck::cast_slice(&view);
+            for (gi, col) in out.iter_mut().enumerate() {
+                *col = got[gi * frames..(gi + 1) * frames].to_vec();
+            }
+        }
+        staging.unmap();
+        Ok(())
+    }
+
+    /// **Frozen control, test builds only.** `convolve_with` exactly as it
+    /// stood before the kernel side was shared (batch 1, from `4ca1300`),
+    /// copied rather than reimplemented, so a benchmark and an exactness test
+    /// compare against the shipped code and not a refactor of it.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn convolve_frozen(
         &self, prepared: &GpuSignal, signal_len: usize, hop: usize, frames: usize,
         kernels: &[GpuKernel],
     ) -> Result<Vec<Vec<C32>>, String> {
@@ -884,6 +1103,113 @@ mod tests {
                  keep.len());
         assert!(compared > frames / 2, "too few interior frames compared");
         assert!(worst < 1e-4, "gpu pipeline differs from CPU by {worst:.3e}");
+    }
+
+    /// Signals and kernels at the production device floor (2^17), enough
+    /// kernels to split into two sub-chunks, left and right different.
+    fn floor_case(g: &GpuFft) -> (Vec<f32>, Vec<f32>, usize, usize, usize, Vec<crate::spectrum::aslt::Morlet>) {
+        use crate::spectrum::aslt::{fft_block_len, frame_count, hop_for_fps, Morlet};
+        let sr = 48_000u32;
+        let len = 20 * sr as usize;
+        let tau = std::f32::consts::TAU;
+        let l: Vec<f32> = (0..len).map(|i| { let t = i as f32 / sr as f32; 0.5 * (tau * 41.0 * t).sin() + 0.2 * (tau * 97.0 * t).sin() }).collect();
+        let r: Vec<f32> = (0..len).map(|i| { let t = i as f32 / sr as f32; 0.4 * (tau * 41.0 * t + 0.9).sin() + 0.3 * (tau * 63.0 * t).sin() }).collect();
+        let n = 1usize << 17;
+        let hop = hop_for_fps(sr, 60.0);
+        let frames = frame_count(len, hop);
+        let mut mors = Vec::new();
+        let mut f = 22.0f32;
+        while mors.len() < 20 && f < 400.0 {
+            let mut c = 20.0f32;
+            while c < 4_000.0 {
+                let m = Morlet::new(f, c, sr as f32);
+                if fft_block_len(m.taps()) == n { mors.push(m); break; }
+                c *= 1.07;
+            }
+            f *= 1.08;
+        }
+        assert!(mors.len() >= 17, "setup: only {} kernels at 2^17", mors.len());
+        let per_kernel = (len.div_ceil(n / 2)) as u64 * n as u64 * 8;
+        let chunk = (g.max_buffer.min(256 << 20) / per_kernel.max(1)) as usize;
+        assert!(chunk < mors.len(), "setup: the kernels fit one sub-chunk ({chunk})");
+        (l, r, n, hop, frames, mors)
+    }
+
+    fn col_bits(v: &[Vec<C32>]) -> Vec<Vec<[u32; 2]>> {
+        v.iter().map(|c| c.iter().map(|x| [x[0].to_bits(), x[1].to_bits()]).collect()).collect()
+    }
+
+    /// Shared kernel preparation is the frozen dispatch, bit for bit: both
+    /// channels, every kernel, every frame (NaN edge markers included), across
+    /// more than one sub-chunk, at the production device floor. So is the
+    /// refactored per-channel call. And the counters say what happened: one
+    /// preparation per sub-chunk shared by both channels, against two when
+    /// each channel prepares its own.
+    #[test]
+    fn shared_kernel_preparation_is_the_frozen_dispatch_bit_for_bit() {
+        let Some(g) = gpu() else { println!("no GPU adapter — skipping"); return; };
+        let (l, r, n, hop, frames, mors) = floor_case(g);
+        let kernels: Vec<GpuKernel> = mors.iter().map(|m| GpuKernel { re: m.re_taps(), im: m.im_taps(), half: m.half_width() }).collect();
+        let a = g.prepare_signal(&l, n, n / 2).expect("prepare left");
+        let b = g.prepare_signal(&r, n, n / 2).expect("prepare right");
+        let fa = g.convolve_frozen(&a, l.len(), hop, frames, &kernels).expect("frozen left");
+        let fb = g.convolve_frozen(&b, r.len(), hop, frames, &kernels).expect("frozen right");
+        let mut shared = DispatchCount::default();
+        let (sa, sb) = g.convolve_channels(&a, Some(&b), hop, frames, &kernels, &|_| false, &mut shared).expect("shared");
+        let mut sep = DispatchCount::default();
+        let (pa, _) = g.convolve_channels(&a, None, hop, frames, &kernels, &|_| false, &mut sep).expect("separate left");
+        let (pb, _) = g.convolve_channels(&b, None, hop, frames, &kernels, &|_| false, &mut sep).expect("separate right");
+        assert_ne!(col_bits(&fa), col_bits(&fb), "setup: the two channels are the same");
+        assert_eq!(col_bits(&sa), col_bits(&fa), "shared left differs from the frozen dispatch");
+        assert_eq!(col_bits(&sb), col_bits(&fb), "shared right differs from the frozen dispatch");
+        assert_eq!(col_bits(&pa), col_bits(&fa), "separate left differs from the frozen dispatch");
+        assert_eq!(col_bits(&pb), col_bits(&fb), "separate right differs from the frozen dispatch");
+        let subs = shared.prepare_attempts;
+        assert!(subs >= 2, "setup: one sub-chunk");
+        assert_eq!(shared, DispatchCount {
+            prepare_attempts: subs, prepare_failures: 0,
+            dispatch_attempts: [subs, subs], dispatch_ok: [subs, subs], dispatch_failures: [0, 0],
+            kernel_dispatches: [kernels.len() as u64; 2],
+        });
+        assert_eq!(sep.prepare_attempts, 2 * subs, "separate preparation did not prepare per channel");
+    }
+
+    /// A failure at each stage fails the call and is counted where it
+    /// happened: a failed preparation dispatches nothing; a failed right
+    /// channel follows a counted, successful left one; a failed left channel
+    /// never reaches the right.
+    #[test]
+    fn each_dispatch_stage_fails_where_it_is_told_to_and_is_counted() {
+        let Some(g) = gpu() else { println!("no GPU adapter — skipping"); return; };
+        let (l, r, n, hop, frames, mors) = floor_case(g);
+        let kernels: Vec<GpuKernel> = mors.iter().map(|m| GpuKernel { re: m.re_taps(), im: m.im_taps(), half: m.half_width() }).collect();
+        let a = g.prepare_signal(&l, n, n / 2).expect("prepare left");
+        let b = g.prepare_signal(&r, n, n / 2).expect("prepare right");
+        let run = |fault: &dyn Fn(Stage) -> bool| {
+            let mut c = DispatchCount::default();
+            let r = g.convolve_channels(&a, Some(&b), hop, frames, &kernels, fault, &mut c);
+            (r.is_err(), c)
+        };
+        let (err, c) = run(&|s| s == Stage::Prepare);
+        assert!(err);
+        assert_eq!((c.prepare_attempts, c.prepare_failures, c.dispatch_attempts), (1, 1, [0, 0]));
+        let (err, c) = run(&|s| s == Stage::Channel(1));
+        assert!(err);
+        assert_eq!((c.dispatch_attempts, c.dispatch_ok, c.dispatch_failures), ([1, 1], [1, 0], [0, 1]));
+        let (err, c) = run(&|s| s == Stage::Channel(0));
+        assert!(err);
+        assert_eq!((c.dispatch_attempts, c.dispatch_ok, c.dispatch_failures), ([1, 0], [0, 0], [1, 0]));
+        // A later sub-chunk: the first completes for both channels, then the
+        // second's preparation fails.
+        let seen = std::cell::Cell::new(0);
+        let (err, c) = run(&|s| { if s == Stage::Prepare { seen.set(seen.get() + 1); } s == Stage::Prepare && seen.get() == 2 });
+        assert!(err);
+        assert_eq!((c.prepare_attempts, c.prepare_failures, c.dispatch_ok), (2, 1, [1, 1]));
+        // Channels prepared with different geometry are refused, not read.
+        let short = g.prepare_signal(&r[..r.len() / 2], n, n / 2).expect("prepare short");
+        let mut c = DispatchCount::default();
+        assert!(g.convolve_channels(&a, Some(&short), hop, frames, &kernels, &|_| false, &mut c).is_err());
+        assert_eq!(c, DispatchCount::default(), "a refused pair was counted as work");
     }
 
     /// The decisive comparison: the resident pipeline against the CPU route it

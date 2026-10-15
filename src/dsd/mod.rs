@@ -452,6 +452,21 @@ pub fn open_reader(path: &Path) -> Result<DsdFileReader, String> {
     DsdReader::new(std::io::BufReader::new(f), info)
 }
 
+/// [`open_reader`] for a file that is already open: the header is parsed from
+/// this handle and the samples are read through it, so nothing is reopened by
+/// pathname. The analysis cache needs this: its source snapshot, the decode
+/// and the publication checkpoint must all see the same open file.
+pub fn open_reader_file(mut f: File) -> Result<DsdFileReader, String> {
+    let mut magic = [0u8; 4];
+    read_exact_at(&mut f, 0, &mut magic)?;
+    let info = match &magic {
+        b"DSD " => parse_dsf(&mut f)?,
+        b"FRM8" => parse_dff(&mut f)?,
+        _ => return Err("not a DSD file (no DSF/DSDIFF magic)".into()),
+    };
+    DsdReader::new(std::io::BufReader::new(f), info)
+}
+
 impl<R: Read + Seek> DsdReader<R> {
     pub fn new(mut src: R, info: DsdInfo) -> Result<Self, String> {
         let block = if info.container == DsdContainer::Dsf {

@@ -25,10 +25,28 @@ use std::path::Path;
 use super::dop::DSD_SILENCE;
 use super::DsdReader;
 
-/// Selectable analysis target rates (44.1k-family; a 48k-family DSD source
-/// lands on 192/384 kHz via nearest-rate matching).
-pub const ANALYSIS_RATES: [u32; 2] = [176_400, 352_800];
-pub const DEFAULT_ANALYSIS_RATE: u32 = 176_400;
+// Two consumers decimate DSD, and they are separate settings with separate
+// owners: the PCM *playback* fallback (audio, used only when neither native
+// DSD nor DoP can carry the stream) and the spectrum's *preprocessing* feed
+// (analysis only). Before 1.5.3 one setting drove both. Targets are
+// 44.1k-family; a 48k-family DSD source lands on the 48k-family rate nearest
+// the target (`analysis_rate_for`), so the rate *produced* is what consumers
+// must use, never the target.
+
+/// Selectable PCM-fallback playback rates.
+pub const FALLBACK_RATES: [u32; 2] = [176_400, 352_800];
+/// The PCM-fallback playback rate when nothing was chosen.
+pub const DEFAULT_FALLBACK_RATE: u32 = 176_400;
+/// Selectable spectrum preprocessing feed rates. 88.2 kHz (96 kHz for a
+/// 48k-family source) still leaves a transition band above the 24 kHz
+/// analysis band; nothing lower is offered (44.1 kHz cannot represent it).
+pub const PREPROCESS_RATES: [u32; 3] = [88_200, 176_400, 352_800];
+/// The preprocessing feed rate for a profile with no settings file at all.
+/// Existing profiles keep the rate they had (see `spectrum::dsd_rates_from`).
+pub const DEFAULT_PREPROCESS_RATE: u32 = 88_200;
+/// The one rate both consumers used before they were separated, and what a
+/// settings file that names no rate meant then (and so still means).
+pub const LEGACY_ANALYSIS_RATE: u32 = 176_400;
 
 /// The output rate actually produced for a DSD source rate and requested
 /// target: `dsd_rate / (8 × 2^k)` with `k` chosen nearest the target.
@@ -85,7 +103,8 @@ fn design_lowpass(n: usize, fc: f64) -> Vec<f32> {
 /// Stage-1 filter length: 16 history bytes = 128 taps.
 const S1_BYTES: usize = 16;
 const S1_TAPS: usize = S1_BYTES * 8;
-/// Stage-1 cutoff (fraction of the DSD rate): 0.45 × the ÷8 output Nyquist.
+/// Stage-1 cutoff (fraction of the DSD rate): 0.45 / 8, which is 0.9 × the ÷8
+/// output Nyquist (0.5 / 8).
 /// With 128 Blackman taps the stopband starts around 0.077 — everything that
 /// can fold into the final analysis band (≤ ¼ of the stage-1 output rate
 /// whenever at least one ÷2 stage follows) is fully attenuated.
@@ -222,6 +241,12 @@ pub type DsdFilePcmSource = DsdPcmSource<BufReader<File>>;
 /// Open a DSD file as a PCM sample stream near `target_rate`.
 pub fn open_pcm_source(path: &Path, target_rate: u32) -> Result<DsdFilePcmSource, String> {
     DsdPcmSource::new(super::open_reader(path)?, target_rate)
+}
+
+/// [`open_pcm_source`] for a file that is already open (see
+/// `dsd::open_reader_file`).
+pub fn open_pcm_source_file(f: std::fs::File, target_rate: u32) -> Result<DsdFilePcmSource, String> {
+    DsdPcmSource::new(super::open_reader_file(f)?, target_rate)
 }
 
 impl<R: Read + Seek> DsdPcmSource<R> {

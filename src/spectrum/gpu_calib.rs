@@ -140,7 +140,57 @@ const SCHEMA: u32 = 1;
 ///       which is the designed response to an identity change and not a defect.
 ///       The cost of not bumping is deciding on evidence that no longer
 ///       describes this program.
-const PRODUCER: u32 = 2;
+///   3 — the device route changed shape (1.5.3 batch 1). A joint dispatch
+///       prepares each sub-chunk's kernels once for both channels instead of
+///       once per channel, and a chunk's dispatch no longer always overlaps
+///       the previous chunk's assembly: the overlap is given up when the
+///       estimated returned columns would exceed the overlap budget. The
+///       FFT methods' frame loop also moved onto the analysis pool; that code
+///       is not on the superlet route, the only one calibrated here, and is
+///       not a reason for this bump. Measured on one 192 kHz
+///       chunk, shared preparation changed the device time by under 0.2 %;
+///       the overlap change was not timed. Small or not, a verdict that is
+///       `Settled` is never re-measured, so evidence produced by the earlier
+///       device route is discarded rather than trusted.
+///   4 — the cores' member work and the measured group interval changed
+///       (1.5.3 round 3/4 CPU candidate). A joint member's two channels now
+///       share one kernel transform and one pass over the edge frames, and
+///       the superlet sink maps each finished column to cache codes inside
+///       the interval a group's cost is recorded over. Those two are the
+///       reason for this bump. (Corrected in round 5: the transpose of the
+///       codes runs after every group, and the direct route's bars — whose
+///       frames are now evaluated in runs — run after the groups too; neither
+///       is inside any recorded interval, and neither is a reason for the
+///       bump.) Output is unchanged; cost is not. Measured end to end on the cores (CPU route), the whole
+///       analysis fell by 0–16 % depending on the track and wavelet count; a
+///       device sample also contains cores work (kernel building, edge fills,
+///       declined members, the mapping), which changed by an unmeasured
+///       amount. A `Settled` verdict never re-measures its losing route, so
+///       producer-3 evidence is discarded rather than trusted.
+///   5 — the cores' no-blocks pass shares forward transforms (1.5.3 round 9).
+///       Eligible own-route members of a cores size-sequential group that
+///       share a transform geometry now reuse one forward transform of each
+///       signal block instead of computing it per member. Output is unchanged
+///       bit for bit; the measured cost of a cores group is not (the whole
+///       analysis of one 88.2 kHz DSD track fell by about a quarter on the
+///       owner's machine). Device-selected groups do not run this pass and do
+///       not get the change. A `Settled` comparison never re-measures its
+///       losing route, so a size settled on the device under producer 4 would
+///       keep a cores cost that no longer describes this program; producer-4
+///       evidence is reconsidered rather than trusted. The spectrum cache's
+///       format and identity are untouched: this is calibration evidence only.
+///   6 — the cores' overlap-save inverses compute only the outputs the
+///       analysis consumes, with the spectral product formed in the
+///       transform's first pass, and shared windows are scheduled one member
+///       per task (1.5.3 round 11). Output is unchanged bit for bit; the cost
+///       of a cores group is not (round 10 measured the whole analysis of one
+///       88.2 kHz DSD track about a third shorter). Device-selected groups do
+///       not get the change. As for producer 5, a size settled under producer
+///       5 would keep a cores cost that no longer describes this program, so
+///       producer-5 evidence is reconsidered rather than trusted. Again the
+///       spectrum cache's format and identity are untouched: a cache written
+///       before this change holds the same values and stays current.
+const PRODUCER: u32 = 6;
 
 /// Everything that has to match for two measurements to be comparable.
 ///
@@ -777,6 +827,281 @@ fn test_dir() -> Option<PathBuf> {
 #[cfg(not(test))]
 fn test_dir() -> Option<PathBuf> {
     None
+}
+
+/// Who may touch the calibration's process-global state during a test run.
+///
+/// The calibration fixtures (`Env` in the tests below, [`aslt_test_env`],
+/// [`isolated_test_env`]) redirect the calibration's directory, adapter and
+/// live state for one test. Before this existed, nothing stopped another test
+/// from reaching the same globals in the middle of that test: a spectrum
+/// window applies its settings through [`set_mode`] and [`set_workers`], and
+/// its pre-processing worker enters [`install`] — which supersedes every older
+/// execution — and calls [`flush`], which saves whatever state is live. The
+/// calibration environment lock could not cover them: the worker runs on its
+/// own thread, and having it take that lock would deadlock a test that holds
+/// the lock while it waits for its worker.
+///
+/// So the gate has two roles:
+///
+/// * an **owner** — a calibration fixture — which waits until every live
+///   [`Ticket`] is its own, holds the gate for its lifetime, and on release
+///   waits for the tickets given out on its thread during that lifetime to be
+///   dropped, so its workers have returned before its environment is restored;
+/// * **tickets**, taken where spectrum-side test code begins to reach those
+///   globals: by a `SpectrumAnalyzer` when it is built (which covers the window
+///   around it, its settings and its UI handlers) and by the test helpers that
+///   call the pre-process directly. A worker is handed a **clone**, which never
+///   waits, so no worker can block on the gate.
+///
+/// A thread that owns the gate may take tickets of its own; its workers then
+/// count toward its release. A thread that holds tickets may become the owner:
+/// it waits only for other threads' tickets.
+///
+/// Waits are bounded: a schedule that cannot complete panics with a message
+/// naming the gate rather than wedging the suite.
+#[cfg(test)]
+pub(crate) mod gate {
+    use std::sync::{Condvar, Mutex, MutexGuard};
+    use std::thread::ThreadId;
+    use std::time::{Duration, Instant};
+
+    const LIMIT: Duration = Duration::from_secs(600);
+
+    struct State {
+        owner: Option<ThreadId>,
+        /// Live tickets, by the thread that took the original.
+        live: Vec<(ThreadId, usize)>,
+        /// Owners waiting. A thread holding no ticket waits behind them, so a
+        /// stream of new tickets cannot starve a calibration fixture.
+        waiting_owners: usize,
+        /// Ticket requests currently waiting.
+        waiting_tickets: usize,
+        /// Owners waiting in `retire_workers` for their workers' tickets.
+        retiring: usize,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        owner: None,
+        live: Vec::new(),
+        waiting_owners: 0,
+        waiting_tickets: 0,
+        retiring: 0,
+    });
+    static CHANGED: Condvar = Condvar::new();
+
+    fn lock() -> MutexGuard<'static, State> {
+        STATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    impl State {
+        fn count(&self, t: ThreadId) -> usize {
+            self.live.iter().find(|e| e.0 == t).map_or(0, |e| e.1)
+        }
+        fn add(&mut self, t: ThreadId) {
+            match self.live.iter_mut().find(|e| e.0 == t) {
+                Some(e) => e.1 += 1,
+                None => self.live.push((t, 1)),
+            }
+        }
+        fn remove(&mut self, t: ThreadId) {
+            if let Some(i) = self.live.iter().position(|e| e.0 == t) {
+                self.live[i].1 -= 1;
+                if self.live[i].1 == 0 {
+                    self.live.swap_remove(i);
+                }
+            }
+        }
+        fn others(&self, t: ThreadId) -> usize {
+            self.live.iter().filter(|e| e.0 != t).map(|e| e.1).sum()
+        }
+    }
+
+    fn wait(g: MutexGuard<'static, State>, since: Instant, what: &str) -> MutexGuard<'static, State> {
+        let Some(left) = LIMIT.checked_sub(since.elapsed()) else {
+            drop(g);
+            panic!("calibration test gate: {what} did not happen within {LIMIT:?}");
+        };
+        CHANGED.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()).0
+    }
+
+    /// The right to reach the calibration's globals from spectrum-side test
+    /// code, held for as long as that code may do so and cloned into each
+    /// worker that may.
+    pub struct Ticket {
+        origin: ThreadId,
+    }
+
+    /// Take a ticket on this thread, waiting while another thread owns the
+    /// gate.
+    pub fn ticket() -> Ticket {
+        let me = std::thread::current().id();
+        let since = Instant::now();
+        let mut g = lock();
+        let mut counted = false;
+        loop {
+            let free = match g.owner {
+                Some(o) => o == me,
+                None => g.count(me) > 0 || g.waiting_owners == 0,
+            };
+            if free {
+                break;
+            }
+            if !counted {
+                g.waiting_tickets += 1;
+                counted = true;
+                CHANGED.notify_all();
+            }
+            g = wait(g, since, "a ticket");
+        }
+        if counted {
+            g.waiting_tickets -= 1;
+        }
+        g.add(me);
+        Ticket { origin: me }
+    }
+
+    impl Clone for Ticket {
+        /// Never waits: the original already holds the gate open.
+        fn clone(&self) -> Self {
+            lock().add(self.origin);
+            Ticket { origin: self.origin }
+        }
+    }
+
+    impl Drop for Ticket {
+        fn drop(&mut self) {
+            lock().remove(self.origin);
+            CHANGED.notify_all();
+        }
+    }
+
+    /// Exclusive use of the calibration's globals, for a calibration fixture.
+    pub struct Owner {
+        me: ThreadId,
+        /// This thread's live tickets when it took the gate. Anything above
+        /// that on release was given out during the ownership.
+        before: usize,
+    }
+
+    /// Take the gate: wait until no other thread owns it and no other thread's
+    /// ticket is live.
+    pub fn own() -> Owner {
+        let me = std::thread::current().id();
+        let since = Instant::now();
+        let mut g = lock();
+        assert_ne!(g.owner, Some(me), "calibration test gate: taken twice on one thread");
+        g.waiting_owners += 1;
+        while g.owner.is_some() || g.others(me) > 0 {
+            acknowledge_blocked(me);
+            g = wait(g, since, "ownership");
+        }
+        g.waiting_owners -= 1;
+        g.owner = Some(me);
+        let before = g.count(me);
+        Owner { me, before }
+    }
+
+    impl Owner {
+        /// Wait until every ticket given out on this thread during the
+        /// ownership is gone — the workers that carried them have returned
+        /// from their thread bodies. Called before the fixture restores its
+        /// environment, and again (as a no-op) on release.
+        pub fn retire_workers(&self) {
+            let since = Instant::now();
+            let mut g = lock();
+            let mut counted = false;
+            while g.count(self.me) > self.before {
+                if std::thread::panicking() {
+                    // The test has already failed: report that, not a hang.
+                    if counted {
+                        g.retiring -= 1;
+                    }
+                    return;
+                }
+                if !counted {
+                    g.retiring += 1;
+                    counted = true;
+                    CHANGED.notify_all();
+                }
+                g = wait(g, since, "the owner's workers exiting");
+            }
+            if counted {
+                g.retiring -= 1;
+            }
+        }
+    }
+
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.retire_workers();
+            lock().owner = None;
+            CHANGED.notify_all();
+        }
+    }
+
+    /// Ticket requests currently waiting on the gate.
+    pub fn waiting_tickets() -> usize {
+        lock().waiting_tickets
+    }
+
+    /// Owners currently waiting for their workers' tickets before restoring.
+    pub fn retiring() -> usize {
+        lock().retiring
+    }
+
+    /// Whether this thread owns the gate right now.
+    pub fn owned_here() -> bool {
+        lock().owner == Some(std::thread::current().id())
+    }
+
+    /// One thread's request to be told when its `own` call first blocks.
+    static BLOCKED: Mutex<Option<(ThreadId, std::sync::mpsc::Sender<()>)>> = Mutex::new(None);
+
+    /// Tell `to`, once, when this thread's next [`own`] has to wait. Armed by
+    /// the thread that will call `own`, so the acknowledgement names that
+    /// request and no other.
+    pub fn acknowledge_when_blocked(to: std::sync::mpsc::Sender<()>) {
+        *BLOCKED.lock().unwrap_or_else(|e| e.into_inner()) = Some((std::thread::current().id(), to));
+    }
+
+    /// Never blocks: called under `STATE`, and `BLOCKED` is only ever taken
+    /// last.
+    fn acknowledge_blocked(me: ThreadId) {
+        let mut b = BLOCKED.lock().unwrap_or_else(|e| e.into_inner());
+        if b.as_ref().is_some_and(|(t, _)| *t == me) {
+            let _ = b.take().unwrap().1.send(());
+        }
+    }
+}
+
+/// A per-thread observer a restoration test installs, run by a fixture's drop
+/// immediately after it puts the mode and worker selection back, while that
+/// thread still owns the gate and holds `ENV`, and with no `STATE` or `POOL`
+/// guard held.
+#[cfg(test)]
+pub(crate) mod restore_observer {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run `f` at this thread's next fixture restoration, once.
+    pub fn arm(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    /// Remove an observer that never ran.
+    pub fn disarm() {
+        HOOK.with(|h| *h.borrow_mut() = None);
+    }
+
+    pub(crate) fn fire() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
 }
 
 /// The external dependencies a test replaces, so the schedules below drive the
@@ -1510,6 +1835,37 @@ pub fn mode() -> GpuMode {
     }
 }
 
+/// The GPU mode and the worker selection as configured, for a test fixture to
+/// put back exactly.
+///
+/// `workers` is the stored selection, not [`workers`]: 0 means nothing was
+/// ever selected, which `set_workers(0)` cannot express (it stores the
+/// default's count).
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Globals {
+    pub mode: GpuMode,
+    pub workers: usize,
+}
+
+#[cfg(test)]
+impl Globals {
+    pub(crate) fn capture() -> Self {
+        Self { mode: mode(), workers: WORKERS.load(O::Relaxed) }
+    }
+
+    /// Store this selection, dropping the pool when it changes, as
+    /// [`set_workers`] does.
+    pub(crate) fn restore(self) {
+        set_mode(self.mode);
+        if WORKERS.swap(self.workers, O::Relaxed) != self.workers
+            && let Ok(mut g) = POOL.lock()
+        {
+            *g = None;
+        }
+    }
+}
+
 /// Throw away everything measured under the current identity and probe again.
 ///
 /// The probe takes a few seconds and holds the calibration lock, so callers run
@@ -1689,6 +2045,8 @@ pub fn record(units: f64, secs: f64, outcome: Outcome) -> Option<Landed> {
         return None;
     }
     let mut d = PENDING.with(|p| p.borrow_mut().take())?;
+    #[cfg(test)]
+    RECORDED.lock().unwrap_or_else(|e| e.into_inner()).push((d.n, d.to_device, outcome));
     // A lookup against the generation this decision was made under. Never the
     // initializing path: a completion from an execution that is no longer
     // current must not rekey, reload or re-probe anything on its way to being
@@ -1705,6 +2063,21 @@ pub fn record(units: f64, secs: f64, outcome: Outcome) -> Option<Landed> {
     }
 }
 
+/// `(attempts, outstanding)` for block size `n` in the current calibration:
+/// whether an exploration attempt was charged or refunded.
+#[cfg(test)]
+pub fn attempts_for_test(n: usize) -> Option<(u32, u32)> {
+    STATE.lock().ok().and_then(|g| {
+        g.as_ref().and_then(|c| c.stored.sizes.get(&n).map(|s| (s.attempts, s.outstanding)))
+    })
+}
+
+/// Every decision `record` consumed, as `(block size, routed to the device,
+/// outcome)`. Only reachable while an `aslt_test_env` lets `record` record,
+/// and that fixture holds the environment lock, so only its holder sees it.
+#[cfg(test)]
+pub static RECORDED: std::sync::Mutex<Vec<(usize, bool, Outcome)>> = std::sync::Mutex::new(Vec::new());
+
 /// Whether this thread is holding a routing decision.
 ///
 /// For the `aslt` tests, which check that the group loop's scope discipline
@@ -1713,6 +2086,29 @@ pub fn record(units: f64, secs: f64, outcome: Outcome) -> Option<Landed> {
 #[cfg(test)]
 pub fn pending_is_empty() -> bool {
     PENDING.with(|p| p.borrow().is_none())
+}
+
+/// The decision parked on this thread, as `(block size, routed to the device,
+/// reserved an exploration attempt, work started)`. Thread-local like the slot
+/// itself: ask from the thread that owns the group.
+#[cfg(test)]
+pub fn pending_for_test() -> Option<(usize, bool, bool, bool)> {
+    PENDING.with(|p| p.borrow().as_ref().map(|d| (d.n, d.to_device, d.reserved, d.started)))
+}
+
+/// Whether the live calibration holds a write the debounce has not saved.
+#[cfg(test)]
+pub fn dirty_for_test() -> Option<bool> {
+    STATE.lock().ok().and_then(|g| g.as_ref().map(|c| c.dirty))
+}
+
+/// `(device samples, cores samples)` for block size `n` in the current
+/// calibration.
+#[cfg(test)]
+pub fn samples_for_test(n: usize) -> Option<(u32, u32)> {
+    STATE.lock().ok().and_then(|g| {
+        g.as_ref().and_then(|c| c.stored.sizes.get(&n).map(|s| (s.gpu_n, s.cpu_n)))
+    })
 }
 
 /// An isolated calibration environment for a test in another module.
@@ -1737,7 +2133,11 @@ pub fn pending_is_empty() -> bool {
 /// drop then restores the `None` it had saved — which sends [`path`] back to
 /// the running user's profile while the second fixture is still using it.
 ///
-/// Lock order: `ENV` is taken **first** and released **last**; `TEST_DIR`,
+/// Lock order: [`gate`] ownership first (it may wait for spectrum-side tickets,
+/// and must not do so while holding `ENV`), then `ENV`. On drop the fixture
+/// first waits for the workers its own tickets went to, then restores —
+/// including the GPU mode and worker selection it found, captured under both
+/// locks before anything was changed. `ENV` is released before the gate. Under `ENV`: `TEST_DIR`,
 /// `ADAPTER`, `PROBE` and `STATE` are only ever taken under it, and each is
 /// released before the next is taken. Production never takes `ENV` — it does
 /// not exist outside a test build — so holding it across an analysis cannot
@@ -1747,11 +2147,27 @@ pub fn pending_is_empty() -> bool {
 #[cfg(test)]
 pub struct AsltTestEnv {
     _guard: std::sync::MutexGuard<'static, ()>,
+    /// Taken before `_guard`, and its workers retired before anything is
+    /// restored: see [`gate`].
+    owner: gate::Owner,
     dir: PathBuf,
+    /// Put back on drop.
+    prior: Globals,
 }
 
 #[cfg(test)]
 impl AsltTestEnv {
+    /// The mode and worker selection this fixture found, and will put back.
+    pub fn prior(&self) -> Globals {
+        self.prior
+    }
+
+    /// Put `prior` back on drop instead, for a test that let a waiting
+    /// constructor change the settings between two fixtures.
+    pub fn restore_on_drop(&mut self, prior: Globals) {
+        self.prior = prior;
+    }
+
     /// Whether any group actually took a decision. Without this a test that
     /// silently routed nothing would pass by vacuum.
     pub fn saw_a_decision(&self) -> bool {
@@ -1771,6 +2187,7 @@ impl AsltTestEnv {
 #[cfg(test)]
 impl Drop for AsltTestEnv {
     fn drop(&mut self) {
+        self.owner.retire_workers();
         *inject::TEST_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *inject::ADAPTER.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *inject::PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1778,13 +2195,17 @@ impl Drop for AsltTestEnv {
         invalidate();
         *STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         retire_pending();
+        self.prior.restore();
+        restore_observer::fire();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 #[cfg(test)]
 fn test_env(tag: &str, live: bool) -> AsltTestEnv {
+    let owner = gate::own();
     let guard = inject::ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let prior = Globals::capture();
     let dir = std::env::temp_dir().join(format!(
         "moosik_calib_{tag}_{}_{:x}",
         std::process::id(),
@@ -1806,7 +2227,7 @@ fn test_env(tag: &str, live: bool) -> AsltTestEnv {
     if live {
         set_mode(GpuMode::Auto);
     }
-    AsltTestEnv { _guard: guard, dir }
+    AsltTestEnv { _guard: guard, owner, dir, prior }
 }
 
 /// A calibration that will hand out decisions. See [`AsltTestEnv`].
@@ -1977,12 +2398,18 @@ mod tests {
     /// dependencies replaced. Nothing here re-implements a decision.
     struct Env {
         _guard: std::sync::MutexGuard<'static, ()>,
+        /// Taken before `_guard`: see [`gate`].
+        owner: super::gate::Owner,
         dir: PathBuf,
+        /// The mode and worker selection found, put back on drop.
+        prior: Globals,
     }
 
     impl Env {
         fn new(tag: &str) -> Self {
+            let owner = super::gate::own();
             let guard = inject::ENV.lock().unwrap_or_else(|e| e.into_inner());
+            let prior = Globals::capture();
             let dir = std::env::temp_dir().join(format!(
                 "moosik_calib_{tag}_{}_{:x}",
                 std::process::id(),
@@ -2008,7 +2435,7 @@ mod tests {
             *STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
             set_mode(GpuMode::Auto);
 
-            Self { _guard: guard, dir }
+            Self { _guard: guard, owner, dir, prior }
         }
 
         fn file(&self) -> PathBuf {
@@ -2042,6 +2469,7 @@ mod tests {
 
     impl Drop for Env {
         fn drop(&mut self) {
+            self.owner.retire_workers();
             *inject::TEST_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *inject::ADAPTER.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *inject::PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -2051,9 +2479,146 @@ mod tests {
             inject::ALLOW_RECORD.store(false, AO::Relaxed);
             invalidate();
             *STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            set_mode(GpuMode::Auto);
+            self.prior.restore();
+            super::restore_observer::fire();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// A mode and an explicit worker count that `p` does not already give.
+    fn other_than(p: Globals) -> Globals {
+        let mode = if p.mode == GpuMode::Always { GpuMode::Off } else { GpuMode::Always };
+        let now = if p.workers == 0 { default_workers() } else { p.workers };
+        Globals { mode, workers: (if now == 2 { 3 } else { 2 }).min(core_count()) }
+    }
+
+    /// What the restoration observer saw, on the dropping thread, immediately
+    /// after the fixture put its settings back.
+    #[derive(Debug)]
+    struct Restored {
+        owned_here: bool,
+        globals: Globals,
+        /// The pool size and thread name seen from inside `install`.
+        pool: (usize, String),
+        expected_threads: usize,
+    }
+
+    /// A fixture puts back the mode and worker selection it found, and not
+    /// before a worker still carrying one of its tickets has let go.
+    ///
+    /// The worker reports the pool it actually ran on from inside `install`.
+    /// An observer waits until the fixture's drop is blocked on that worker
+    /// ([`gate::retiring`]), reads the settings, and only then releases it.
+    ///
+    /// The restored state is read by [`restore_observer`] inside the fixture's
+    /// drop, while the dropping thread still owns the gate. A rival owner is
+    /// already queued in `gate::own` by then (acknowledged by the gate, not
+    /// inferred from a counter), so it can only change the globals after the
+    /// observation; it then does so, puts back what it found and exits. No
+    /// live global is read after the fixture is gone.
+    /// The timeouts fail a schedule that cannot complete; they decide nothing.
+    fn restoration_waits_for_a_retained_worker(
+        make: impl FnOnce() -> (Box<dyn std::any::Any>, Globals),
+    ) {
+        let limit = Dur::from_secs(60);
+        let (fixture, prior) = make();
+        let held = other_than(prior);
+        set_mode(held.mode);
+        set_workers(held.workers);
+        assert_eq!(Globals::capture(), held);
+
+        let ticket = gate::ticket();
+        let carried = ticket.clone();
+        drop(ticket);
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _carried = carried;
+            let seen = install(|| {
+                (rayon::current_num_threads(), std::thread::current().name().unwrap_or("").to_string())
+            });
+            seen_tx.send(seen).unwrap();
+            release_rx.recv_timeout(limit).expect("the worker was never released");
+        });
+        let (threads, name) = seen_rx.recv_timeout(limit).expect("the worker never ran");
+        assert_eq!(threads, held.workers, "install did not run the held pool size");
+        assert!(name.starts_with("moosik-analyse-"), "install ran on {name:?}, not the analysis pool");
+
+        // A rival fixture, queued behind this one before it is dropped.
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let rival = std::thread::spawn(move || {
+            gate::acknowledge_when_blocked(blocked_tx);
+            let f = isolated_test_env("rival");
+            let found = f.prior();
+            let mine = other_than(found);
+            set_mode(mine.mode);
+            set_workers(mine.workers);
+            assert_eq!(Globals::capture(), mine, "the rival could not set its own globals");
+            drop(f);
+        });
+        blocked_rx.recv_timeout(limit).expect("the rival never queued behind the fixture");
+
+        let (obs_tx, obs_rx) = mpsc::channel();
+        restore_observer::arm(move || {
+            let pool = install(|| {
+                (rayon::current_num_threads(), std::thread::current().name().unwrap_or("").to_string())
+            });
+            let _ = obs_tx.send(Restored {
+                owned_here: gate::owned_here(),
+                globals: Globals::capture(),
+                pool,
+                expected_threads: workers(),
+            });
+        });
+        let observer = std::thread::spawn(move || {
+            let since = std::time::Instant::now();
+            while gate::retiring() == 0 {
+                assert!(since.elapsed() < limit, "the fixture never waited for its worker");
+                std::thread::sleep(Dur::from_millis(1));
+            }
+            let during = Globals::capture();
+            release_tx.send(()).unwrap();
+            during
+        });
+        drop(fixture);
+        restore_observer::disarm();
+        let during = observer.join().unwrap();
+        worker.join().unwrap();
+        rival.join().expect("the rival fixture failed");
+        assert_eq!(during, held, "restored while a worker still carried the fixture's ticket");
+
+        let seen = obs_rx.try_recv().expect("the fixture never reported its restoration");
+        assert!(seen.owned_here, "restoration observed after the fixture gave up the gate");
+        assert_eq!(seen.globals, prior, "the previous mode and worker selection were not put back");
+        assert_eq!(seen.pool.0, seen.expected_threads, "install still runs the held pool");
+        assert!(seen.pool.1.starts_with("moosik-analyse-"), "install ran on {:?}", seen.pool.1);
+    }
+
+    #[test]
+    fn the_calibration_fixture_restores_mode_and_workers_after_its_workers() {
+        restoration_waits_for_a_retained_worker(|| {
+            let f = Env::new("retained_env");
+            let p = f.prior;
+            (Box::new(f), p)
+        });
+    }
+
+    #[test]
+    fn the_aslt_fixture_restores_mode_and_workers_after_its_workers() {
+        restoration_waits_for_a_retained_worker(|| {
+            let f = aslt_test_env("retained_aslt");
+            let p = f.prior();
+            (Box::new(f), p)
+        });
+    }
+
+    #[test]
+    fn the_isolated_fixture_restores_mode_and_workers_after_its_workers() {
+        restoration_waits_for_a_retained_worker(|| {
+            let f = isolated_test_env("retained_isolated");
+            let p = f.prior();
+            (Box::new(f), p)
+        });
     }
 
     /// A size production actually routes.
@@ -3762,6 +4327,102 @@ mod tests {
         }
     }
 
+    /// A valid settled verdict written by an older producer is not this
+    /// program's evidence. Loaded through the production routing, its verdict
+    /// is not inherited, its samples are not carried into the new identity, and
+    /// the size is explored again as the policy explores any new size. The same
+    /// file under the current producer is reused, verdict and samples alike,
+    /// across a reload — a new application run is not a reason to restart.
+    ///
+    /// Settled on the cores (the device measured twice as slow), so the
+    /// exploration the old identity loses is visible as a device route.
+    fn an_older_producer_is_explored_again_and_a_current_one_is_reused(tag: &str, old_producer: u32) {
+        assert!(old_producer < PRODUCER, "setup: producer {old_producer} is not older than {PRODUCER}");
+        let _env = Env::new(tag);
+        assert!(_env.file().starts_with(std::env::temp_dir()), "the test touched a non-temporary calibration file");
+        as_analysis(|| {
+            for _ in 0..MIN_SAMPLES {
+                group(N, Outcome::Device, 2.0);
+                group(N, Outcome::Cores, 1.0);
+            }
+            assert_eq!(_env.stat(N).unwrap().verdict(), Verdict::Settled(false), "setup");
+        });
+        flush();
+        let current: Stored = _env.on_disk().expect("setup: nothing written");
+        assert_eq!(current.key.producer, PRODUCER, "setup: written under another producer");
+        let settled = current.sizes[&N];
+
+        // The routes production takes for N, one group at a time, recording
+        // what each one cost on the route it took.
+        let routes = |k: u32| -> Vec<bool> {
+            as_analysis(|| (0..k).map(|_| {
+                let scope = begin_group();
+                let r = use_device(N);
+                scope.work_started();
+                record(UNITS, 1.0, if r { Outcome::Device } else { Outcome::Cores });
+                r
+            }).collect())
+        };
+        // A fresh application run: the file is all that survives.
+        let reload = |stored: &Stored| {
+            std::fs::write(_env.file(), serde_json::to_string_pretty(stored).unwrap()).unwrap();
+            invalidate();
+            *STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        };
+
+        // The old producer on disk, every other component matching.
+        let mut old = current.clone();
+        old.key.producer = old_producer;
+        reload(&old);
+        let r = routes(MIN_SAMPLES + 1);
+        assert!(r.contains(&true), "the producer-{old_producer} verdict was inherited: routes {r:?}");
+        let fresh = _env.stat(N).expect("no state for N after routing");
+        assert!(fresh.gpu_n + fresh.cpu_n <= MIN_SAMPLES + 1,
+                "samples were carried over from producer {old_producer}: {fresh:?}");
+        assert!(fresh.attempts <= MIN_SAMPLES + 1,
+                "attempts were carried over from producer {old_producer}: {fresh:?}");
+        assert_eq!(_env.live(|c| c.stored.key.producer), Some(PRODUCER));
+
+        // The same file under the current producer: reused as it stands.
+        reload(&current);
+        assert_eq!(routes(MIN_SAMPLES + 1), vec![false; MIN_SAMPLES as usize + 1],
+                   "a current-producer verdict was not reused");
+        let reused = _env.stat(N).unwrap();
+        assert_eq!(reused.verdict(), Verdict::Settled(false));
+        assert_eq!(reused.gpu_n, settled.gpu_n, "the device samples were not reused");
+        assert!(reused.cpu_n > settled.cpu_n, "the stored cores samples were not built on");
+        assert!(_env.file().starts_with(std::env::temp_dir()), "the test touched a non-temporary calibration file");
+    }
+
+    /// Batch 1 changed the device route's kernel preparation and overlap.
+    #[test]
+    fn a_producer_2_verdict_is_explored_again_and_a_current_one_is_reused() {
+        an_older_producer_is_explored_again_and_a_current_one_is_reused("producer_bump", 2);
+    }
+
+    /// Round 4: the CPU candidate's member and mapping changes.
+    #[test]
+    fn a_producer_3_verdict_is_explored_again_and_a_current_one_is_reused() {
+        an_older_producer_is_explored_again_and_a_current_one_is_reused("producer_bump_3", 3);
+    }
+
+    /// Round 9: forward-transform sharing changed the cost of a cores group
+    /// and not of a device one. Adapter, cores and workers are covered by
+    /// `every_identity_component_invalidates_on_its_own`.
+    #[test]
+    fn a_producer_4_verdict_is_explored_again_and_a_current_one_is_reused() {
+        an_older_producer_is_explored_again_and_a_current_one_is_reused("producer_bump_4", 4);
+    }
+
+    /// Round 11: the pruned inverse and per-member scheduling changed the
+    /// cost of a cores group and not of a device one. Producer-5 evidence is
+    /// explored again; producer-6 evidence is reused.
+    #[test]
+    fn a_producer_5_verdict_is_explored_again_and_a_current_one_is_reused() {
+        assert_eq!(PRODUCER, 6, "the producer was not bumped for round 11");
+        an_older_producer_is_explored_again_and_a_current_one_is_reused("producer_bump_5", 5);
+    }
+
     /// A file that is missing, truncated, not JSON, or carrying impossible
     /// statistics is the same case as no file.
     #[test]
@@ -3935,6 +4596,73 @@ mod tests {
             group(N, Outcome::Device, 1.0);
             assert!(_env.stat(N).is_some(), "an eligible size created no entry");
         });
+    }
+
+    // ── interference from outside the fixture, forced ────────────────────────
+    //
+    // Two schedules in which code that does not hold this fixture's gate
+    // reaches the calibration's globals mid-test, each matching one of the
+    // assertions that failed in the round 9 closeout's release run. They show
+    // the mechanisms are real and reachable through production entry points;
+    // they do not show that either one is what happened in that run. The
+    // competitor is deliberately unticketed — that is the interference
+    // `gate` exists to exclude from spectrum-side test code.
+
+    /// A flush from another thread, between a group being recorded and the
+    /// test inspecting what the debounce held, saves the held write: the
+    /// state is clean and the file has changed. This is the failure
+    /// "a held write left the state clean".
+    #[test]
+    fn a_competing_flush_saves_a_held_write_before_it_is_inspected() {
+        let _env = Env::new("forced_flush");
+        as_analysis(|| {
+            group(N, Outcome::Device, 1.0);
+        });
+        flush();
+        let before = std::fs::read_to_string(_env.file()).expect("setup: nothing written");
+
+        // A production recording the debounce holds.
+        as_analysis(|| {
+            group(N, Outcome::Device, 1.0);
+        });
+        assert!(_env.live(|c| c.dirty).unwrap_or(false), "setup: the write was not held");
+        assert_eq!(std::fs::read_to_string(_env.file()).unwrap(), before, "setup: the write was not held");
+        let held = _env.stat(N).expect("setup: no state");
+
+        // The competitor, at the boundary before inspection, run to completion.
+        within(Dur::from_secs(20), "the competing flush", flush);
+
+        assert!(!_env.live(|c| c.dirty).unwrap_or(true),
+                "the competing flush did not save the held write");
+        let on_disk = _env.on_disk().expect("the file is gone");
+        assert_eq!(on_disk.sizes.get(&N), Some(&held), "what was saved is not the held state");
+        assert_ne!(std::fs::read_to_string(_env.file()).unwrap(), before);
+    }
+
+    /// An analysis started on another thread after this one, before this
+    /// one's first group, supersedes it. With no live state yet, this one may
+    /// not initialize: its group takes no decision, its `record` lands
+    /// nothing, and the flush writes no file. This is the failure in
+    /// `unusable_files_are_refused_and_start_over`. (With a live state under
+    /// a matching key the fast path would have served it — see
+    /// `ensure_current` — so this needs the fresh start that test has.)
+    #[test]
+    fn a_competing_analysis_stops_a_fresh_one_from_initializing() {
+        let _env = Env::new("forced_supersede");
+        let landed = as_analysis(|| {
+            within(Dur::from_secs(20), "the competing analysis", || install(|| ()));
+            group(N, Outcome::Device, 1.0)
+        });
+        flush();
+        assert!(landed.is_none(), "the superseded group recorded: {landed:?}");
+        assert!(_env.stat(N).is_none(), "the superseded group created state");
+        assert!(!_env.file().exists(), "a file was written for a superseded execution");
+
+        // Setup: the same schedule without the competitor does write it.
+        let landed = as_analysis(|| group(N, Outcome::Device, 1.0));
+        flush();
+        assert!(landed.is_some(), "setup: an uncontested group recorded nothing");
+        assert!(_env.file().exists(), "setup: an uncontested group wrote no file");
     }
 
     /// Off stays off, even with a settled device verdict on disk.

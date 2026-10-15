@@ -10,12 +10,18 @@
 //! Embedded lyrics are still *read* (lofty normalises `USLT`, Vorbis `LYRICS`
 //! and the iTunes atom to one key), they are simply never written.
 
+pub mod ai;
 pub mod http;
 pub mod lrclib;
 pub mod matching;
 pub mod netease;
+pub mod korean;
 pub mod romaji;
+pub mod translation;
 pub mod ui;
+pub mod zh;
+#[cfg(test)]
+mod language_save_tests;
 
 pub use matching::Hit;
 
@@ -174,6 +180,10 @@ pub struct Lyrics {
     /// Title/artist from the sheet's own metadata tags, when it carried any.
     pub title: Option<String>,
     pub artist: Option<String>,
+    /// Attribution for the translation, not for the original lyric sheet.
+    /// Saved only in the translation sidecar; machine-assisted text must not
+    /// silently become a source-supplied translation after restarting.
+    pub translation_credit: Option<String>,
 }
 
 impl Lyrics {
@@ -375,7 +385,7 @@ pub fn parse(text: &str, source: LyricSource) -> Lyrics {
         while lines.last().is_some_and(|l| l.text.is_empty()) { lines.pop(); }
     }
 
-    Lyrics { lines, source, offset_ms, title, artist }
+    Lyrics { lines, source, offset_ms, title, artist, translation_credit: None }
 }
 
 /// Take enhanced-LRC word timings (`<00:12.34>`) out of a line's text,
@@ -429,6 +439,9 @@ pub fn load(track: &Path, embedded: Option<&str>) -> Option<Lyrics> {
     for e in Extra::ALL {
         if let Ok(text) = std::fs::read_to_string(extra_path(track, e)) {
             attach(&mut l.lines, &text, e);
+            if e == Extra::Translation {
+                l.translation_credit = translation_credit(&text);
+            }
         }
     }
     Some(l)
@@ -472,6 +485,9 @@ pub fn attach(lines: &mut [LyricLine], text: &str, e: Extra) {
         if !t.trim().is_empty() { *e.field(l) = Some(t.trim().to_string()); }
     };
     let raw: Vec<LyricLine> = text.lines()
+        // Our attribution is metadata, not an empty lyric row. Keep real
+        // blank rows: they are load-bearing in partly timed extra sheets.
+        .filter(|r| !is_translation_credit(r))
         .map(|r| parse(r, LyricSource::Sidecar).lines.into_iter().next().unwrap_or_default())
         .collect();
     if raw.len() == lines.len() && raw.iter().zip(lines.iter()).all(|(r, l)| cs(r.at) == cs(l.at)) {
@@ -513,7 +529,7 @@ pub fn embedded_text(path: &Path) -> Option<String> {
 /// its timestamp, blank where there is none — for romaji, where it is still
 /// generated, so a guess is never saved as though someone had checked it.
 pub fn render_extra(lyrics: &Lyrics, e: Extra) -> String {
-    Lyrics {
+    let mut text = Lyrics {
         lines: lyrics.lines.iter().map(|l| LyricLine {
             at: l.at, text: e.get(l).cloned().unwrap_or_default(), ..Default::default()
         }).collect(),
@@ -521,7 +537,27 @@ pub fn render_extra(lyrics: &Lyrics, e: Extra) -> String {
         offset_ms: 0,
         title: None,
         artist: None,
-    }.to_lrc()
+        translation_credit: None,
+    }.to_lrc();
+    if e == Extra::Translation && let Some(credit) = &lyrics.translation_credit {
+        let safe: String = credit.chars().filter(|c| !matches!(c, '\r' | '\n' | '[' | ']'))
+            .take(160).collect();
+        text.push_str(&format!("[moosik_translation:{safe}]\n"));
+    }
+    text
+}
+
+/// A note written by this app; it is attribution, never a language detector
+/// or a claim that a translator's output has been independently checked.
+fn translation_credit(text: &str) -> Option<String> {
+    text.lines().find_map(|line| line.trim().strip_prefix("[moosik_translation:")
+        .and_then(|s| s.strip_suffix(']')).filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(160).collect()))
+}
+
+fn is_translation_credit(line: &str) -> bool {
+    line.trim().strip_prefix("[moosik_translation:")
+        .and_then(|s| s.strip_suffix(']')).is_some()
 }
 
 /// Write one extra on its own. Tests use it to lay files down; the app saves
@@ -590,8 +626,21 @@ pub fn save_all(track: &Path, lyrics: &Lyrics, sheet: bool, romaji: bool) -> Sav
     save_all_with(track, lyrics, sheet, romaji, &mut |_, _| Ok(()))
 }
 
+/// Translation-only edits use the same checked backup/rollback transaction,
+/// without rewriting the original sheet or its readings.
+pub fn save_changes(track: &Path, lyrics: &Lyrics, sheet: bool, romaji: bool, translation: bool) -> SaveOutcome {
+    save_changes_with(track, lyrics, sheet, romaji, translation, &mut |_, _| Ok(()))
+}
+
 pub(crate) fn save_all_with(
     track: &Path, lyrics: &Lyrics, sheet: bool, romaji: bool,
+    hook: &mut dyn FnMut(Stage, &Path) -> std::io::Result<()>,
+) -> SaveOutcome {
+    save_changes_with(track, lyrics, sheet, romaji, false, hook)
+}
+
+pub(crate) fn save_changes_with(
+    track: &Path, lyrics: &Lyrics, sheet: bool, romaji: bool, translation: bool,
     hook: &mut dyn FnMut(Stage, &Path) -> std::io::Result<()>,
 ) -> SaveOutcome {
     struct Change { path: PathBuf, new: Option<String>, existed: bool, backup: Option<PathBuf>, extra: bool }
@@ -614,7 +663,7 @@ pub(crate) fn save_all_with(
     for e in Extra::ALL {
         // A romaji edit can confirm or reset an override, so the override
         // file travels with the romaji.
-        if sheet || (romaji && e != Extra::Translation) {
+        if sheet || (romaji && e != Extra::Translation) || (translation && e == Extra::Translation) {
             let any = lyrics.lines.iter().any(|l| e.get(l).is_some());
             wanted.push((extra_path(track, e), any.then(|| render_extra(lyrics, e)), true));
         }

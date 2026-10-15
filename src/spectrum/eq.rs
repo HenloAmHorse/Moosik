@@ -110,6 +110,12 @@ impl EqPresetLibrary {
     }
 
     pub fn load() -> Self {
+        // A test build never reads the owner's presets. With a default preset
+        // set there, `on_play` applied it, and the next track change wrote the
+        // library back to the real profile from inside the test suite.
+        if cfg!(test) {
+            return Self::default();
+        }
         std::fs::read_to_string(Self::preset_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -117,6 +123,10 @@ impl EqPresetLibrary {
     }
 
     pub fn save(&self) {
+        // Nor writes them, whatever a test does to the library in memory.
+        if cfg!(test) {
+            return;
+        }
         let path = Self::preset_path();
         if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
         if let Ok(json) = serde_json::to_string_pretty(self) {
@@ -433,8 +443,36 @@ impl KWeightFilter {
 }
 
 pub(crate) fn home_dir() -> PathBuf {
+    #[cfg(test)]
+    return super::test_profile::root();
+    #[cfg(not(test))]
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    /// The suite runs on the owner's machine. A library loaded in a test starts
+    /// empty whatever the profile holds, and nothing a test does to one reaches
+    /// the profile — the real file is compared before and after (read only).
+    #[test]
+    fn tests_never_read_or_write_the_owners_presets() {
+        let real = EqPresetLibrary::preset_path();
+        let before = std::fs::read(&real).ok();
+        let lib = EqPresetLibrary::load();
+        assert!(lib.default_id.is_none() && lib.global.is_empty() && lib.last_used.is_empty());
+        let l = EqPresetLibrary {
+            default_id: Some(7),
+            last_used: [("C:/music/x.flac".to_string(), PresetRef { scope: PresetScope::Global, id: 7 })]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        l.save();
+        assert_eq!(std::fs::read(&real).ok(), before, "a test wrote the owner's presets");
+    }
 }

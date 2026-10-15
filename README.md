@@ -17,8 +17,10 @@ professional-grade spectrum analyzer, and a parametric EQ, built in Rust.
 
 ## Build
 
-Requires Rust (stable, edition 2024). There are no prebuilt binaries — building
-it is how you run it.
+Requires Rust (stable, edition 2024). Tagged releases attach a prebuilt Windows
+x86_64 executable (it needs the Microsoft Visual C++ 2015-2022 Redistributable,
+x64, which most Windows PCs already have); on other platforms, building it is
+how you run it.
 
 On Linux, the audio backend (cpal/ALSA) needs the ALSA development headers:
 
@@ -31,9 +33,19 @@ Then:
 ```sh
 git clone https://github.com/HenloAmHorse/Moosik
 cd Moosik
-cargo build --release
+cargo build --release --locked
 ./target/release/moosik
 ```
+
+`--locked` builds exactly the dependency versions in `Cargo.lock`. Three crates
+are built from the copies under `vendor/` (`eframe`, `egui`, `rustfft`); each
+has a `PATCH.md` saying what differs from the published release and why. The
+first build downloads the other crates, and `lindera`'s build script downloads
+and compiles the Japanese (IPADIC) dictionary. To build again without a
+network: run `cargo fetch --locked` once, set
+`LINDERA_BUILD_DICTIONARY_CACHE_DIR` to a directory of your choice for that
+first build so the compiled dictionary is kept there, and later build with
+`--locked --offline` and the same variable.
 
 ## What it does
 
@@ -48,19 +60,32 @@ cargo build --release
   spectrum, GPU offload, and per-channel views including a left/right difference
   plot. Channels work from the cache as well as live: a stereo analysis derives
   the mix from the two channels' complex responses rather than analysing it a
-  third time, and stores them in a sidecar beside the cache
+  third time, and stores them with the analysis
   ([docs/SPECTRUM.md](docs/SPECTRUM.md)). Pre-processing a track is the
   heaviest thing Moosik does, and recent work has gone into making it cost less
   CPU and hold less memory while producing exactly the same output — see the
   changelog for what was measured and what it covers
+- **Analysis cache** — a finished analysis is reused only for the same file
+  (path, size, modified time and a content sample) at the same settings, and is
+  saved as one whole, so a crash never leaves the spectrum and its channels out
+  of step; what is on screen is never deleted to make room. Analyses from older
+  versions are kept and offered only as labelled alternatives. The guarantees
+  and their limits are in [docs/CACHE.md](docs/CACHE.md)
 - **Parametric EQ** — up to 16 bands, dragged directly on the spectrum, with
   global and per-song presets
 - **Lyrics** — synced `.lrc`, read from the file or looked up online, with a
   tap-along editor and karaoke highlighting where the sheet times its words.
   Japanese lyrics can be shown in romaji, with furigana, or both, word by word.
   Readings come from the lyrics source or are generated, and furigana written
-  into the lyrics takes precedence unless you confirm otherwise. Translations
-  are shown where the source has one. Never writes to the audio file
+  into the lyrics takes precedence unless you confirm otherwise. Korean lyrics
+  also have offline, correctable romanization. Chinese translations can be
+  supplied by the source, supplemented on request, manually edited, or generated
+  on request for Japanese/Korean/English; generated results require a preview
+  and explicit adoption. Traditional/Simplified display is available. Online
+  translation sends lyric text to a third party only after consent; it is not
+  confidential processing. An optional context-aware AI translation uses your
+  own OpenAI API key (off until configured; its translation quality has not
+  been evaluated). Never writes to the audio file
 - **Tag editing** — with verified, non-destructive writes
 - **The rest** — gapless playback, ReplayGain, album-art overlays and mask mode,
   A-B repeat, bookmarks, sleep timer, play statistics, OS media keys, LUFS and
@@ -85,7 +110,6 @@ describes what the current release does.
 
 | | |
 |---|---|
-| **1.5.3** | Experimental performance work on pre-processing: bounded streaming and shared FFT work, memory pressure, and further exact-output optimisation. Groundwork for separating the visualisation consumer from an analysis consumer. |
 | **1.6.0** | Professional audio-analysis features. Harmonic and pitch analysis, time-frequency inspection and channel-analysis tools are candidate directions. |
 
 Principles that work is meant to hold to:
@@ -108,6 +132,9 @@ Principles that work is meant to hold to:
 |---|---|
 | [docs/BIT_PERFECT.md](docs/BIT_PERFECT.md) | the exactness contract in full, and DSD |
 | [docs/SPECTRUM.md](docs/SPECTRUM.md) | the analyser, the superlet transform, and the EQ |
+| [docs/CACHE.md](docs/CACHE.md) | the analysis cache: what it guarantees, what it does not, and older versions' files |
+| [docs/RELEASE_COMPARISON_153.md](docs/RELEASE_COMPARISON_153.md) | 1.5.3 measured against 1.5.2.1: pre-processing time, CPU, memory, and loading a saved analysis |
+| [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) | third-party licenses and notices for the Windows executable ([how they were assembled](docs/THIRD_PARTY_NOTICES.md)) |
 | [docs/FEATURES.md](docs/FEATURES.md) | album art, lyrics, tags, appearance, player |
 | [docs/ICON.md](docs/ICON.md) | what the icon is |
 | [CHANGELOG.md](CHANGELOG.md) | what changed, and why |
@@ -142,6 +169,11 @@ All pulled automatically via Cargo:
 | `souvlaki` | OS media-key / now-playing integration (MPRIS / SMTC / macOS) |
 | `image` | Album art decoding |
 | `serde` / `serde_json` | Preset / settings persistence |
+| `lz4_flex` | Analysis cache compression |
+| `ring` | SHA-256 for the analysis cache's identity (already in the build through `ureq`'s TLS) |
+| `ureq` | HTTPS for lyrics lookup and on-request translation |
+| `lindera` | Japanese readings (embedded IPADIC dictionary) |
+| `ferrous-opencc` | Traditional/Simplified Chinese display conversion |
 
 ## License
 

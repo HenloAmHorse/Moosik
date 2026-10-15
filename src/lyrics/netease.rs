@@ -112,6 +112,27 @@ pub fn fill_lyrics(h: &mut Hit) -> Result<(), String> {
 pub fn find(
     artist: &str, title: &str, _album: &str, duration: Option<Duration>,
 ) -> Result<Option<Hit>, String> {
+    find_with(artist, title, duration, false, || false, search, fill_lyrics)
+}
+
+/// Translation lookup may skip a matching original-only upload, and checks
+/// cancellation between HTTP requests. It never posts the current lyric sheet.
+pub fn find_translation(
+    artist: &str, title: &str, duration: Option<Duration>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Option<Hit>, String> {
+    find_with(artist, title, duration, true,
+        || cancel.load(std::sync::atomic::Ordering::Acquire), search, fill_lyrics)
+}
+
+fn find_with(
+    artist: &str, title: &str, duration: Option<Duration>, translation_only: bool,
+    cancelled: impl Fn() -> bool,
+    mut search: impl FnMut(&str) -> Result<Vec<Hit>, String>,
+    mut fill: impl FnMut(&mut Hit) -> Result<(), String>,
+) -> Result<Option<Hit>, String> {
+    let check = || if cancelled() { Err("Translation lookup cancelled.".to_string()) } else { Ok(()) };
+    check()?;
     let (na, nt) = (normalise_artist(artist), normalise_title(title));
     if nt.is_empty() { return Ok(None); }
 
@@ -136,15 +157,22 @@ pub fn find(
     } else {
         rank(search(&format!("{na} {nt}"))?)
     };
+    check()?;
     if ranked.is_empty() { ranked = rank(search(&nt)?); }
+    check()?;
 
     // Two, not one: an instrumental or karaoke upload can rank well and carry
     // nothing, and giving up after the first would miss the real take. Two, not
     // four: past that the candidates are poor enough that the requests are
     // better saved.
     for mut h in ranked.into_iter().take(2) {
-        fill_lyrics(&mut h)?;
-        if h.best_text().is_some() { return Ok(Some(h)); }
+        check()?;
+        fill(&mut h)?;
+        check()?;
+        if h.best_text().is_some()
+            && (!translation_only || h.translation.as_ref().is_some_and(|t| !t.trim().is_empty())) {
+            return Ok(Some(h));
+        }
     }
     Ok(None)
 }
@@ -152,6 +180,35 @@ pub fn find(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn translation_lookup_skips_original_only_hits_and_stops_between_calls() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let hit = |id: &str| Hit { title: "Example".into(), artist: "Fixture".into(),
+            duration: 100.0, id: Some(id.into()), ..Default::default() };
+        let mut filled = Vec::new();
+        let found = find_with("Fixture", "Example", None, true, || false,
+            |_| Ok(vec![hit("1"), hit("2")]), |h| {
+                let id = h.id.as_deref().unwrap();
+                filled.push(id.to_string());
+                h.plain = Some("Original".into());
+                if id == "2" { h.translation = Some("翻譯".into()); }
+                Ok(())
+            }).unwrap().unwrap();
+        assert_eq!(found.id.as_deref(), Some("2"));
+        assert_eq!(filled, ["1", "2"]);
+
+        let cancel = AtomicBool::new(false);
+        let mut fills = 0;
+        let result = find_with("Fixture", "Example", None, true, || cancel.load(Ordering::Acquire),
+            |_| { cancel.store(true, Ordering::Release); Ok(vec![hit("1")]) },
+            |_| { fills += 1; Ok(()) });
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert_eq!(fills, 0, "cancel after search must prevent another HTTP call");
+        let result = find_with("Fixture", "Example", None, true, || true,
+            |_| panic!("cancel before start must not search"), |_| panic!("must not fill"));
+        assert!(result.is_err());
+    }
 
     /// A listed row has no lyrics yet, and must not pretend otherwise.
     ///

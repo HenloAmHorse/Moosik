@@ -33,7 +33,7 @@
 //! precision it was written with rather than being requantised on load to
 //! simplify the type.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 /// Span of the level axis, in dB. A stored 0 means −80 dB.
@@ -130,15 +130,26 @@ const MAGIC_V3: u32 = 0x4D53_5033; // "MSP3"
 ///  8  u32  bars           1..=MAX_BAR_COUNT
 /// 12  u8   bits           12; any other value is unsupported, not an error to
 ///                         guess at
-/// 13  u8   flags          reserved, must be 0
-/// 14  u16  reserved       must be 0
+/// 13  u8   flags          0, or FLAG_RECORD
+/// 14  u16  record_len     0 without a record; 1..=65535 with one
 /// 16  u32  lo_len         compressed length of the low plane, in bytes
 /// 20  u32  hi_len         compressed length of the high plane, in bytes
-/// 24  ..   lo block       LZ4 block, no size prefix
+/// 24  ..   record         `record_len` bytes of ASCII, only with FLAG_RECORD
+/// ..  ..   lo block       LZ4 block, no size prefix
 /// ..  ..   hi block       LZ4 block, no size prefix
 /// ```
 ///
-/// The file must be exactly `24 + lo_len + hi_len` bytes. Neither block carries
+/// The file must be exactly `24 + record_len + lo_len + hi_len` bytes.
+///
+/// # The settings record
+///
+/// A file with `FLAG_RECORD` states the exact settings it was analysed at (see
+/// `spectrum::identity`). It sits in the same file as the rows, so it is
+/// published by the same atomic rename: a reader can never see rows without
+/// their record, or a record without its rows. Bytes 13–15 were reserved and
+/// required to be zero, so a build older than the record refuses such a file
+/// outright rather than reading rows it cannot vouch for. A file without the
+/// flag is exactly the v4 every earlier build wrote. Neither block carries
 /// its own uncompressed size: the reader knows both from `frames × bars` and
 /// passes them to the decompressor, so a corrupt file cannot ask for an
 /// allocation by declaring one.
@@ -162,6 +173,9 @@ const MAGIC_V3: u32 = 0x4D53_5033; // "MSP3"
 const MAGIC_V4: u32 = 0x4D53_5034;
 
 const V4_HEADER: usize = 24;
+
+/// Header flag: a settings record follows the header.
+const FLAG_RECORD: u8 = 1;
 
 /// Why a cache could not be read. Every variant is a reason to recompute, never
 /// a reason to trust part of the file.
@@ -275,6 +289,11 @@ impl PreFrames {
             codes.extend(row.iter().map(|&v| quantise(v, V4_MAX_CODE)));
         }
         Self::assemble(codes, frames, bars, V4_MAX_CODE)
+    }
+
+    /// Build from v4 codes already laid out frames × bars.
+    pub fn from_v4_codes(codes: Vec<u16>, frames: usize, bars: usize) -> Self {
+        Self::from_codes(codes, frames, bars, V4_MAX_CODE)
     }
 
     /// Build from codes already at a known depth. Used by the readers.
@@ -420,6 +439,13 @@ impl PreFrames {
     /// `the_v4_encoder_is_byte_identical_to_the_staged_form` holds this to the
     /// previous encoder's exact output, and that test is what decides.
     pub fn to_v4(&self) -> Vec<u8> {
+        self.to_v4_with(&[])
+    }
+
+    /// v4 with a settings record in the header; an empty record writes the
+    /// plain v4 `to_v4` does, byte for byte.
+    pub fn to_v4_with(&self, record: &[u8]) -> Vec<u8> {
+        assert!(record.len() <= u16::MAX as usize, "a settings record is at most 64 KiB");
         let cells = self.frames * self.bars;
         let packed_len = cells.div_ceil(2);
 
@@ -453,10 +479,12 @@ impl PreFrames {
         }
         debug_assert_eq!(hi.len(), packed_len, "the packed nibble plane is the wrong size");
 
+        let start = V4_HEADER + record.len();
         let mut out: Vec<u8> = Vec::with_capacity(
-            V4_HEADER + lz4_flex::block::get_maximum_output_size(lo.len()),
+            start + lz4_flex::block::get_maximum_output_size(lo.len()),
         );
         out.resize(V4_HEADER, 0);
+        out.extend_from_slice(record);
 
         // The low plane goes first and is released the moment its block is
         // written, so the high plane's pass never holds both.
@@ -479,8 +507,8 @@ impl PreFrames {
         h[4..8].copy_from_slice(&(self.frames as u32).to_le_bytes());
         h[8..12].copy_from_slice(&(self.bars as u32).to_le_bytes());
         h[12] = V4_BITS as u8;
-        h[13] = 0; // flags
-        h[14..16].copy_from_slice(&0u16.to_le_bytes()); // reserved
+        h[13] = if record.is_empty() { 0 } else { FLAG_RECORD };
+        h[14..16].copy_from_slice(&(record.len() as u16).to_le_bytes());
         h[16..20].copy_from_slice(&(lo_len as u32).to_le_bytes());
         h[20..24].copy_from_slice(&(hi_len as u32).to_le_bytes());
 
@@ -628,12 +656,11 @@ fn decode_v4(
     if bits as u32 != V4_BITS {
         return Err(CacheError::UnsupportedBits(bits));
     }
-    if raw[13] != 0 || raw[14] != 0 || raw[15] != 0 {
-        return Err(CacheError::Reserved);
-    }
+    let rec = record_len(raw)?;
+    let start = V4_HEADER + rec;
     let lo_len = le_u32(raw, 16) as usize;
     let hi_len = le_u32(raw, 20) as usize;
-    let declared = V4_HEADER
+    let declared = start
         .checked_add(lo_len)
         .and_then(|n| n.checked_add(hi_len))
         .ok_or(CacheError::LengthMismatch { declared: usize::MAX, actual: raw.len() })?;
@@ -647,10 +674,10 @@ fn decode_v4(
     let hi_packed = cells.div_ceil(2);
     check_expansion("low plane", lo_len, cells, limits)?;
     check_expansion("high plane", hi_len, hi_packed, limits)?;
-    let lo = lz4_flex::decompress(&raw[V4_HEADER..V4_HEADER + lo_len], cells)
+    let lo = lz4_flex::decompress(&raw[start..start + lo_len], cells)
         .map_err(|_| CacheError::Decompress)?;
     let hi_bytes =
-        lz4_flex::decompress(&raw[V4_HEADER + lo_len..], hi_packed).map_err(|_| CacheError::Decompress)?;
+        lz4_flex::decompress(&raw[start + lo_len..], hi_packed).map_err(|_| CacheError::Decompress)?;
     if lo.len() != cells {
         return Err(CacheError::PayloadSize { want: cells, got: lo.len() });
     }
@@ -680,6 +707,61 @@ fn decode_v4(
         }
     }
     Ok(PreFrames::from_codes(codes, frames, bars, V4_MAX_CODE))
+}
+
+/// The length of the settings record a v4 header declares; 0 for none.
+///
+/// Bytes 13–15 were reserved. Anything but "no flag, no length" or "the record
+/// flag, a non-zero length" is a writer this build does not know.
+fn record_len(raw: &[u8]) -> Result<usize, CacheError> {
+    let len = u16::from_le_bytes([raw[14], raw[15]]) as usize;
+    match raw[13] {
+        0 if len == 0 => Ok(0),
+        FLAG_RECORD if len > 0 => Ok(len),
+        _ => Err(CacheError::Reserved),
+    }
+}
+
+/// The settings record of a decoded-or-not v4 file, if it has one.
+///
+/// `None` for every other case — v2, v3, v4 without a record, a record that is
+/// not ASCII, or a file too short to hold what it declares. None of those is an
+/// error to the caller: each means "states no exact settings".
+pub fn record_of(raw: &[u8]) -> Option<&str> {
+    if raw.len() < V4_HEADER || le_u32(raw, 0) != MAGIC_V4 {
+        return None;
+    }
+    let len = record_len(raw).ok().filter(|&n| n > 0)?;
+    let rec = raw.get(V4_HEADER..V4_HEADER + len)?;
+    rec.is_ascii().then(|| std::str::from_utf8(rec).ok()).flatten()
+}
+
+/// Read only a cache's header and settings record — at most 64 KiB, never the
+/// rows. For telling analyses apart without decoding any of them.
+pub fn read_record(path: &Path) -> Option<String> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; V4_HEADER];
+    f.read_exact(&mut head).ok()?;
+    if le_u32(&head, 0) != MAGIC_V4 {
+        return None;
+    }
+    let len = record_len(&head).ok().filter(|&n| n > 0)?;
+    let mut raw = head.to_vec();
+    raw.resize(V4_HEADER + len, 0);
+    f.read_exact(&mut raw[V4_HEADER..]).ok()?;
+    record_of(&raw).map(str::to_owned)
+}
+
+/// Read and decode a cache, and return the settings record it carries.
+pub fn read_with_record(
+    path: &Path,
+    want_bars: usize,
+    max_bars: usize,
+) -> Result<(PreFrames, Option<String>), CacheError> {
+    let limits = Limits::default();
+    let raw = read_bounded(path, limits)?;
+    let frames = decode_with(&raw, want_bars, max_bars, limits)?;
+    Ok((frames, record_of(&raw).map(str::to_owned)))
 }
 
 fn decode_legacy(
@@ -732,58 +814,18 @@ fn decode_legacy(
 // Writing
 // ---------------------------------------------------------------------------
 
-/// Points at which a test may make the write fail.
-///
-/// Real failures here are a full disk, a revoked permission, a reader holding
-/// the destination open, or the process dying — none of which a test can
-/// arrange reliably, and the previous attempt at one arranged nothing at all:
-/// it created a directory at a path the timestamped temporary could never
-/// collide with, so the write succeeded and the test asserted only that the
-/// result still decoded.
+/// Moments a test may hook (reading, and the analysis worker's encode and
+/// commit points; see `Hook`).
 #[cfg(test)]
 pub(crate) mod fault {
-    use std::cell::{Cell, RefCell};
-
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub enum At {
-        None,
-        /// After some of the temporary is on disk, before the rest.
-        MidWrite,
-        /// After a complete temporary, before it is published.
-        BeforePublish,
-    }
-
-    thread_local! {
-        static POINT: Cell<At> = const { Cell::new(At::None) };
-    }
-
-    pub fn arm(at: At) {
-        POINT.with(|p| p.set(at));
-    }
-
-    /// True once, if armed at `at`. Disarms itself so one arming fires once.
-    pub fn fires(at: At) -> bool {
-        POINT.with(|p| {
-            if p.get() == at {
-                p.set(At::None);
-                true
-            } else {
-                false
-            }
-        })
-    }
+    use std::cell::RefCell;
 
     /// Moments inside an operation at which a test may change state the
-    /// operation then observes for itself.
-    ///
-    /// This is not the same thing as [`At`]. `At` injects a failure; a hook
-    /// injects nothing — it lets a test move the world underneath an operation
-    /// that is genuinely in flight, so what the operation does next is its own
-    /// real behaviour rather than a substituted error.
+    /// operation then observes for itself. A hook injects nothing — it lets a
+    /// test move the world underneath an operation that is genuinely in
+    /// flight, so what the operation does next is its own real behaviour.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum Hook {
-        /// The temporary is written, before the publication decision.
-        TempWritten,
         /// A file's length has been taken, before its contents are read.
         AfterMetadata,
         /// A mono cache has been encoded and nothing has touched the disk.
@@ -794,6 +836,9 @@ pub(crate) mod fault {
         CacheEncoded,
         /// The same moment for a sidecar.
         SidecarEncoded,
+        /// The final cancellation check has passed and the rename is next:
+        /// the one moment at which a cancelled writer still publishes.
+        Committing,
     }
 
     type Callback = Box<dyn Fn()>;
@@ -805,15 +850,6 @@ pub(crate) mod fault {
     /// Arm `f` to run the next time `at` is reached on this thread, once.
     pub fn on(at: Hook, f: impl Fn() + 'static) {
         HOOKS.with(|h| h.borrow_mut().push((at, Box::new(f))));
-    }
-
-    /// Forget every armed hook on this thread.
-    ///
-    /// A hook that is armed at a moment the operation then *skips* is never
-    /// consumed, and the next arming of the same moment would find the stale
-    /// one first. A test that deliberately skips a moment clears afterwards.
-    pub fn clear() {
-        HOOKS.with(|h| h.borrow_mut().clear());
     }
 
     /// Run and remove the callback armed at `at`, if there is one.
@@ -831,132 +867,31 @@ pub(crate) mod fault {
 #[cfg(not(test))]
 pub(crate) mod fault {
     #[derive(Clone, Copy, PartialEq, Eq)]
-    pub enum At {
-        MidWrite,
-        BeforePublish,
-    }
-    #[derive(Clone, Copy, PartialEq, Eq)]
     pub enum Hook {
-        TempWritten,
         AfterMetadata,
         CacheEncoded,
         SidecarEncoded,
-    }
-    #[inline(always)]
-    pub fn fires(_: At) -> bool {
-        false
+        Committing,
     }
     #[inline(always)]
     pub fn run(_: Hook) {}
 }
 
-/// How a write ended.
-///
-/// Distinguishing these is the point: a cancelled write and a published one
-/// both leave the destination in a valid state, and a caller that cannot tell
-/// them apart will report a cancelled save as a successful one.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Written {
-    /// The rename happened. The file at `path` is the new one.
-    Published,
-    /// Cancellation was observed before the commit decision. The destination
-    /// is exactly as it was — its previous bytes, or still absent — and no
-    /// temporary survives.
-    Cancelled,
-}
-
-/// Write `bytes` to `path`, replacing any existing file only once the new one
-/// is complete.
-///
-/// # The publication boundary
-///
-/// **The rename is the publication boundary.** Nothing before it is visible to
-/// a reader: the bytes go to a uniquely named sibling, and until the rename
-/// succeeds the destination is either absent or exactly its previous contents.
-/// Anything that goes wrong before that point — a short write, a full disk, a
-/// cancelled analysis — leaves the destination untouched and removes the
-/// temporary.
-///
-/// Cancellation is carried through to that boundary, not merely checked
-/// before the call. `cancelled` is consulted twice: once on entry, with the
-/// encoding done and nothing yet on disk, and once immediately before the
-/// rename. **That second check is the commit decision.** Cancellation that
-/// arrives after it may be too late — the rename is a single step and nothing
-/// here pretends to make it interruptible — but cancellation observed at or
-/// before it is honoured, and the destination keeps its previous contents.
-///
-/// A cache is written at the end of an analysis that can take minutes, and the
-/// old file is often still the one being displayed. Writing in place means a
-/// crash, a full disk or an abort between `create` and the last `write_all`
-/// leaves a truncated file where a valid one was, and the next run recomputes
-/// the whole track. So the new file is built under a unique sibling name and
-/// moved into place in one step.
-///
-/// `fs::rename` replaces an existing destination on Windows as well as on Unix.
-/// If it fails — the destination held open by a reader, for instance — the
-/// temporary is removed and the existing file is left exactly as it was.
-pub fn write_atomic_cancellable(
-    path: &Path,
-    bytes: &[u8],
-    cancelled: &dyn Fn() -> bool,
-) -> std::io::Result<Written> {
-    // The encoding is done and nothing exists yet, so this one is free.
-    if cancelled() {
-        return Ok(Written::Cancelled);
-    }
+/// Write a fixture file in one step (tests only). Production never writes a
+/// cache file directly: the analysis cache store (`store`) publishes
+/// generations with its own atomic write and head commit.
+#[cfg(test)]
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = path.with_extension(format!("tmp-{}-{stamp:x}", std::process::id()));
-
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        if fault::fires(fault::At::MidWrite) {
-            // Half of it, then stop — the shape of a disk filling up.
-            f.write_all(&bytes[..bytes.len() / 2])?;
-            f.sync_all()?;
-            return Err(std::io::Error::other("injected mid-write failure"));
-        }
-        f.write_all(bytes)?;
-        // The temporary is complete and nothing is published. A test cancels
-        // here, so the flag it flips changes while the operation is genuinely
-        // in flight rather than before it ever started.
-        fault::run(fault::Hook::TempWritten);
-        f.sync_all()
-    };
-    if let Err(e) = write() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if fault::fires(fault::At::BeforePublish) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(std::io::Error::other("injected publication failure"));
-    }
-    // The commit decision. Everything above is invisible to a reader; the
-    // rename below is not.
-    if cancelled() {
-        let _ = std::fs::remove_file(&tmp);
-        return Ok(Written::Cancelled);
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(Written::Published)
-}
-
-/// [`write_atomic_cancellable`] with nothing to cancel it, for the tests that
-/// are about something else. Production always has an abort flag to pass.
-#[cfg(test)]
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    write_atomic_cancellable(path, bytes, &|| false).map(|_| ())
+    let tmp = path.with_extension("fixture-tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Read and decode a cache file under the default [`Limits`].
+#[cfg(test)]
 pub fn read(path: &Path, want_bars: usize, max_bars: usize) -> Result<PreFrames, CacheError> {
     read_with(path, want_bars, max_bars, Limits::default())
 }
@@ -976,6 +911,7 @@ pub fn read(path: &Path, want_bars: usize, max_bars: usize) -> Result<PreFrames,
 /// `max_file_bytes + 1` bytes and no more. **The overflow allowance is exactly
 /// one byte** — never a second buffer's worth, and never however much the file
 /// happens to have become.
+#[cfg(test)]
 pub fn read_with(
     path: &Path,
     want_bars: usize,
@@ -1034,6 +970,37 @@ pub(crate) fn read_bounded(path: &Path, limits: Limits) -> Result<Vec<u8>, Cache
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A settings record rides in the header of the same file as the rows: an
+    /// empty record is the plain v4 every earlier build wrote, byte for byte;
+    /// a record is read back exactly, from the header alone; and a file cut
+    /// anywhere — record included — is refused whole.
+    #[test]
+    fn a_settings_record_is_part_of_the_file_it_describes() {
+        let rows: Vec<Vec<f32>> = (0..9).map(|i| (0..7).map(|b| ((i * b) % 5) as f32 / 4.0).collect()).collect();
+        let f = PreFrames::from_analysis(&rows);
+        assert_eq!(f.to_v4_with(&[]), f.to_v4(), "an empty record changed the plain v4");
+        let rec = "moosik-analysis/1;src=0;bars=7;sr=44100;hop=245";
+        let blob = f.to_v4_with(rec.as_bytes());
+        assert_eq!(blob.len(), f.to_v4().len() + rec.len());
+        assert_eq!(decode(&blob, 7, 64).unwrap(), f);
+        assert_eq!(record_of(&blob), Some(rec));
+        assert_eq!(record_of(&f.to_v4()), None, "a plain v4 claimed a record");
+        for cut in [V4_HEADER + 3, V4_HEADER + rec.len(), blob.len() - 1] {
+            assert!(decode(&blob[..cut], 7, 64).is_err(), "a file cut at {cut} decoded");
+        }
+        assert_eq!(record_of(&blob[..V4_HEADER + 3]), None, "a cut record was returned");
+        // The header read: garbage where the rows would be does not matter.
+        let d = TmpDir::new("record");
+        let p = d.join("r.spectrumcache");
+        let mut head = blob[..V4_HEADER + rec.len()].to_vec();
+        head.extend_from_slice(b"not rows");
+        std::fs::write(&p, &head).unwrap();
+        assert_eq!(read_record(&p).as_deref(), Some(rec));
+        std::fs::write(&p, &blob).unwrap();
+        let (back, r) = read_with_record(&p, 7, 64).unwrap();
+        assert_eq!((back, r.as_deref()), (f, Some(rec)));
+    }
 
     /// A directory of its own, removed on drop. Never the owner's real cache.
     struct TmpDir(std::path::PathBuf);
@@ -1403,6 +1370,11 @@ mod tests {
             r[i] = 1;
             assert_eq!(decode(&r, 32, BARS), Err(CacheError::Reserved), "byte {i}");
         }
+        // A length with no record flag, or a flag this build does not know.
+        let mut r = good.clone();
+        r[13] = 2;
+        r[14] = 1;
+        assert_eq!(decode(&r, 32, BARS), Err(CacheError::Reserved));
 
         // Declared block lengths that do not add up.
         let mut len = good.clone();
@@ -1554,128 +1526,6 @@ mod tests {
         write_atomic(&p, &pf.to_v4()).unwrap();
         let back = read(&p, 128, BARS).unwrap();
         assert_eq!(back, pf);
-    }
-
-    /// Deterministic failure at each stage, asserting the destination's exact
-    /// previous bytes.
-    ///
-    /// The previous version of this test blocked a path the timestamped
-    /// temporary could never have used, so the write simply succeeded and the
-    /// assertion — that the result decoded — held for the wrong reason.
-    #[test]
-    fn a_failed_write_leaves_the_previous_bytes_exactly() {
-        for at in [fault::At::MidWrite, fault::At::BeforePublish] {
-            let d = TmpDir::new("failed_write");
-            let p = d.join("keep.spectrumcache");
-            let original = PreFrames::from_analysis(&rows(16, 32)).to_v4();
-            write_atomic(&p, &original).unwrap();
-            let before = std::fs::read(&p).unwrap();
-            assert_eq!(before, original);
-
-            let replacement = PreFrames::from_analysis(&rows(8, 32)).to_v4();
-            assert_ne!(replacement, original, "setup: the two must differ");
-
-            fault::arm(at);
-            let got = write_atomic(&p, &replacement);
-            assert!(got.is_err(), "{at:?}: the injected failure did not surface");
-
-            let after = std::fs::read(&p).unwrap();
-            assert_eq!(
-                after, before,
-                "{at:?}: the destination changed despite a failed write"
-            );
-            assert!(strays(&d).is_empty(), "{at:?}: left {:?}", strays(&d));
-        }
-    }
-
-    /// Cancellation observed while the write is in flight publishes nothing.
-    ///
-    /// The flag is the real one the production path uses, and it is flipped
-    /// after the temporary is on disk — not before the call, and not by
-    /// standing an injected I/O error in for a cancellation. The hook asserts
-    /// the temporary exists at the moment it fires, so the test also proves
-    /// *when* it cancelled.
-    #[test]
-    fn cancelling_while_the_write_is_in_flight_publishes_nothing() {
-        for existing in [false, true] {
-            let d = TmpDir::new("cancel_inflight");
-            let p = d.join("c.spectrumcache");
-            let original = PreFrames::from_analysis(&rows(16, 32)).to_v4();
-            if existing {
-                write_atomic(&p, &original).unwrap();
-            }
-
-            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let set = flag.clone();
-            let dir = d.0.clone();
-            fault::on(fault::Hook::TempWritten, move || {
-                assert!(
-                    !strays_in(&dir).is_empty(),
-                    "setup: the temporary should be on disk by now"
-                );
-                set.store(true, std::sync::atomic::Ordering::Relaxed);
-            });
-
-            let replacement = PreFrames::from_analysis(&rows(8, 32)).to_v4();
-            assert_ne!(replacement, original, "setup: the two must differ");
-            let seen = flag.clone();
-            let got = write_atomic_cancellable(&p, &replacement, &move || {
-                seen.load(std::sync::atomic::Ordering::Relaxed)
-            });
-
-            assert_eq!(got.unwrap(), Written::Cancelled, "existing={existing}");
-            assert!(
-                flag.load(std::sync::atomic::Ordering::Relaxed),
-                "setup: the hook never ran, so nothing was cancelled mid-flight"
-            );
-            if existing {
-                assert_eq!(
-                    std::fs::read(&p).unwrap(),
-                    original,
-                    "a cancelled write changed the destination"
-                );
-            } else {
-                assert!(!p.exists(), "a cancelled write created a file");
-            }
-            assert!(strays(&d).is_empty(), "left {:?}", strays(&d));
-        }
-    }
-
-    /// Cancellation already true on entry: nothing is created at all.
-    #[test]
-    fn cancelling_before_the_write_starts_creates_nothing() {
-        let d = TmpDir::new("cancel_early");
-        let bytes = PreFrames::from_analysis(&rows(8, 16)).to_v4();
-
-        let fresh = d.join("fresh.spectrumcache");
-        assert_eq!(
-            write_atomic_cancellable(&fresh, &bytes, &|| true).unwrap(),
-            Written::Cancelled
-        );
-        assert!(!fresh.exists(), "a cancelled write created a file");
-
-        let held = d.join("held.spectrumcache");
-        let original = PreFrames::from_analysis(&rows(16, 16)).to_v4();
-        write_atomic(&held, &original).unwrap();
-        assert_eq!(
-            write_atomic_cancellable(&held, &bytes, &|| true).unwrap(),
-            Written::Cancelled
-        );
-        assert_eq!(std::fs::read(&held).unwrap(), original);
-        assert!(strays(&d).is_empty());
-    }
-
-    /// A predicate that never fires publishes, and says so.
-    #[test]
-    fn an_uncancelled_write_reports_publication() {
-        let d = TmpDir::new("published");
-        let p = d.join("p.spectrumcache");
-        let pf = PreFrames::from_analysis(&rows(8, 16));
-        assert_eq!(
-            write_atomic_cancellable(&p, &pf.to_v4(), &|| false).unwrap(),
-            Written::Published
-        );
-        assert_eq!(read(&p, 16, BARS).unwrap(), pf);
     }
 
     /// A file replaced with a much larger one *after* its length is taken is

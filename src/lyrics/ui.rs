@@ -13,6 +13,101 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+/// What the viewer did, for tests and measurement. Test builds only.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Default, Debug, PartialEq)]
+    pub struct Stats {
+        /// Viewer passes.
+        pub passes: u64,
+        /// Sheet lines the viewer loop went through.
+        pub rows_visited: u64,
+        /// Lines it built a presentation for and laid out.
+        pub rows_laid_out: u64,
+        /// `scroll_to_me` calls made for Follow.
+        pub follow_requests: u64,
+    }
+
+    thread_local! {
+        static STATS: Cell<Stats> = Cell::new(Stats::default());
+    }
+
+    pub fn bump(f: impl FnOnce(&mut Stats)) {
+        STATS.with(|s| {
+            let mut v = s.get();
+            f(&mut v);
+            s.set(v);
+        });
+    }
+
+    /// The counts since the last call, reset.
+    pub fn take() -> Stats {
+        STATS.with(|s| s.replace(Stats::default()))
+    }
+
+    thread_local! {
+        static SCROLL_ID: Cell<Option<egui::Id>> = const { Cell::new(None) };
+    }
+
+    thread_local! {
+        static DRAWN: std::cell::RefCell<Vec<(usize, f32, f32, egui::Id)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A row drawn this pass: its index, top (from the content's top), height
+    /// and the id of the `Ui` it was drawn in.
+    pub fn drew(i: usize, top: f32, h: f32, id: egui::Id) { DRAWN.with(|d| d.borrow_mut().push((i, top, h, id))); }
+    /// The rows drawn since the last call.
+    pub fn take_drawn() -> Vec<(usize, f32, f32, egui::Id)> { DRAWN.with(|d| std::mem::take(&mut *d.borrow_mut())) }
+
+    thread_local! {
+        static VIEW: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+    }
+    /// The scroll offset and content height after the viewer's last pass.
+    pub fn set_view(v: (f32, f32)) { VIEW.with(|c| c.set(v)); }
+    pub fn view() -> (f32, f32) { VIEW.with(|c| c.get()) }
+
+    thread_local! {
+        static TRANSLATIONS: std::cell::RefCell<Vec<(usize, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    /// A translation line as shown this pass.
+    pub fn translation(i: usize, t: &str) { TRANSLATIONS.with(|v| v.borrow_mut().push((i, t.to_string()))); }
+    pub fn take_translations() -> Vec<(usize, String)> { TRANSLATIONS.with(|v| std::mem::take(&mut *v.borrow_mut())) }
+
+    /// The viewer's ScrollArea id, so a test can read and set its offset.
+    pub fn set_scroll_id(id: egui::Id) { SCROLL_ID.with(|s| s.set(Some(id))); }
+    pub fn scroll_id() -> Option<egui::Id> { SCROLL_ID.with(|s| s.get()) }
+    use eframe::egui;
+}
+
+#[cfg(test)]
+mod viewer_tests;
+#[cfg(test)]
+mod font_tests;
+mod translation_ui;
+#[cfg(test)]
+mod language_tests;
+
+/// Font families for Chinese translation text, Traditional- and
+/// Simplified-first. Installed by `setup_fonts`; see there for why.
+pub const ZH_HANT: &str = "moosik_zh_hant";
+pub const ZH_HANS: &str = "moosik_zh_hans";
+
+/// Prefix of the family `setup_fonts` names each installation of the fonts
+/// by; see [`fonts_rev`].
+pub const FONTS_REV: &str = "moosik_fonts_rev:";
+
+/// Which installation of the app's fonts `families` (those in use) belong to:
+/// it changes whenever the fonts are replaced, faces included, and is 0 when
+/// they were never set up.
+fn fonts_rev(families: &[egui::FontFamily]) -> u64 {
+    families.iter().find_map(|f| match f {
+        egui::FontFamily::Name(n) => n.strip_prefix(FONTS_REV)?.parse().ok(),
+        _ => None,
+    }).unwrap_or(0)
+}
+
 /// What the window wants the player to do. The window never touches playback
 /// itself — it is handed a position and hands back an intent.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -31,7 +126,7 @@ pub struct TrackRef<'a> {
     pub duration: Option<Duration>,
 }
 
-/// Which script the viewer shows, for a sheet with Japanese in it.
+/// Original, Japanese furigana, or a Japanese/Korean/supplied Latin reading.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum Script {
     #[default]
@@ -49,21 +144,56 @@ struct Auto {
     text: String,
     words: Vec<Word>,
     line: String,
+    /// Korean uses whole-line readings, never the Japanese/Hanja tokenizer.
+    korean: bool,
     /// How the line reads, and the supplied romaji and override it was
     /// worked out for.
     reading: Option<(Option<String>, bool, super::romaji::Reading)>,
+    /// What the line shows with no singing position, for the script and
+    /// per-word choice it was worked out for. Kept until either changes or
+    /// the reading is worked out again; a line being sung is presented
+    /// afresh, since its position moves.
+    shown: Option<(Script, bool, Shown)>,
 }
 
 impl Auto {
     /// The line's reading for this supplied romaji and override, worked out
     /// once and kept until either changes.
-    fn reading(&mut self, given: Option<&str>, overrides: bool) -> super::romaji::Reading {
+    fn reading(&mut self, given: Option<&str>, overrides: bool) -> &super::romaji::Reading {
         let fresh = self.reading.as_ref().is_some_and(|(g, o, _)| g.as_deref() == given && *o == overrides);
         if !fresh {
-            let r = super::romaji::read_line(&self.words, given, overrides);
+            let r = if self.korean || !self.words.iter().any(|w| w.jp) {
+                let supplied = given.filter(|s| !s.trim().is_empty());
+                super::romaji::Reading {
+                    words: None,
+                    line: supplied.unwrap_or(&self.line).to_string(),
+                    guessed: supplied.is_none() && self.line != self.text,
+                    furigana: super::romaji::Furigana::Words(vec![vec![(self.text.clone(), None)]]),
+                }
+            } else {
+                super::romaji::read_line(&self.words, given, overrides)
+            };
             self.reading = Some((given.map(str::to_string), overrides, r));
+            self.shown = None;
         }
-        self.reading.as_ref().map(|r| r.2.clone()).unwrap_or_else(|| unreachable!())
+        &self.reading.as_ref().unwrap_or_else(|| unreachable!()).2
+    }
+
+    /// What `line` shows in `script` with the singing at `upto`: from the
+    /// cache when there is no position, worked out when there is.
+    fn shown(&mut self, script: Script, per_word: bool, line: &LyricLine, upto: Option<usize>)
+        -> std::borrow::Cow<'_, Shown>
+    {
+        self.reading(line.romaji.as_deref(), line.overrides_sheet());
+        let reading = self.reading.as_ref().map(|r| &r.2);
+        if upto.is_some() {
+            return std::borrow::Cow::Owned(present(script, per_word, line, &self.words, reading, upto));
+        }
+        if !self.shown.as_ref().is_some_and(|(s, p, _)| *s == script && *p == per_word) {
+            let shown = present(script, per_word, line, &self.words, reading, None);
+            self.shown = Some((script, per_word, shown));
+        }
+        std::borrow::Cow::Borrowed(&self.shown.as_ref().unwrap_or_else(|| unreachable!()).2)
     }
 }
 
@@ -73,8 +203,14 @@ fn auto_for<'a>(memo: &'a mut Vec<Auto>, i: usize, text: &str) -> &'a mut Auto {
     if memo.len() <= i { memo.resize_with(i + 1, Default::default); }
     let a = &mut memo[i];
     if a.text != text || a.words.is_empty() {
-        let words = super::romaji::words(text);
-        *a = Auto { text: text.to_string(), line: super::romaji::join(&words), words, reading: None };
+        let korean = super::korean::has_hangul(text);
+        let words = if korean {
+            vec![Word { text: text.to_string(), romaji: text.to_string(), ..Default::default() }]
+        } else {
+            super::romaji::words(text)
+        };
+        let line = if korean { super::korean::romanize(text) } else { super::romaji::join(&words) };
+        *a = Auto { text: text.to_string(), line, korean, words, reading: None, shown: None };
     }
     a
 }
@@ -315,7 +451,10 @@ enum Fetched {
 }
 
 pub struct LyricsWindow {
-    pub open: bool,
+    /// Private: every show/hide goes through [`LyricsWindow::set_open`], so
+    /// the main toolbar cannot hide the window without its translation
+    /// lifecycle.
+    open: bool,
     /// Track the loaded sheet belongs to, so a track change reloads.
     loaded_for: Option<PathBuf>,
     lyrics: Option<Lyrics>,
@@ -350,6 +489,8 @@ pub struct LyricsWindow {
     /// Light the current line as it is sung.
     karaoke: bool,
     show_translation: bool,
+    translation: translation_ui::TranslationState,
+    translation_dirty: bool,
     auto: Vec<Auto>,
     romaji_editing: bool,
     romaji_edit: Vec<RomajiRow>,
@@ -364,6 +505,106 @@ pub struct LyricsWindow {
     // ── Display ────────────────────────────────────────────────────────────
     font_size: f32,
     auto_scroll: bool,
+    follow: Follow,
+    geometry: Geometry,
+    /// How a translation is shown; persisted by the app (`Appearance`).
+    pub translation_display: super::zh::ChineseDisplay,
+    /// Converted translations, per line, for the sheet `zh_sheet` names.
+    zh: super::zh::Cache,
+    zh_sheet: Option<(u64, Option<PathBuf>)>,
+    /// Draw every row, as before rows out of view were skipped: the
+    /// reference the skipping is tested against.
+    #[cfg(test)]
+    draw_every_row: bool,
+}
+
+/// The height each row took when last drawn, so rows out of view can be
+/// skipped by exactly that much instead of laid out on every pass.
+///
+/// Heights are measured, never estimated: a row with no height yet is drawn,
+/// and so is the active row, always (Follow centres it, wherever it is). A
+/// row keeps two heights, because the active line is larger and bold and can
+/// wrap where the same line otherwise does not. Anything that can change every
+/// row's height — the sheet, track, text size, fonts, width, scale, script,
+/// per-word choice, translation — is the [`GeomKey`] and starts over, which
+/// draws every row once; a change to one line's text, readings or
+/// translation is its [`row_fingerprint`] and forgets that row only.
+#[derive(Default)]
+struct Geometry {
+    key: Option<GeomKey>,
+    rows: Vec<RowGeom>,
+}
+
+#[derive(Clone, Default)]
+struct RowGeom {
+    fp: Option<u64>,
+    /// Inactive, active.
+    h: [Option<f32>; 2],
+}
+
+#[derive(Clone, PartialEq)]
+struct GeomKey {
+    sheet: u64,
+    track: Option<PathBuf>,
+    lines: usize,
+    font: u32,
+    /// The fonts in use ([`fonts_rev`]): the same size in another face is
+    /// another height.
+    fonts: u64,
+    width: u32,
+    ppp: u32,
+    script: Script,
+    per_word: bool,
+    translation: bool,
+    chinese: super::zh::ChineseDisplay,
+}
+
+/// What of a line its drawn height depends on, besides the [`GeomKey`].
+fn row_fingerprint(line: &LyricLine) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (&line.text, &line.romaji, &line.translation, &line.reading_override).hash(&mut h);
+    h.finish()
+}
+
+/// What Follow last centred for, and whether the view has come to rest there.
+///
+/// Follow asks the scroll area to centre the active line until the view is
+/// still — two passes with the same offset and content height for the same
+/// [`FollowKey`] — and then stops asking. Asking on every pass, as it used to,
+/// is harmless while the target is reachable, but a line that cannot be
+/// centred (the first, the last) leaves a nonzero delta that the scroll area
+/// clamps and answers with another repaint, for ever: a redraw loop for as
+/// long as the player stays paused there.
+///
+/// Anything that moves the view or the line wakes it: a hand scroll changes
+/// the offset (and is pulled back, as before), and a new active line, sheet,
+/// text size, fonts, view size, script or translation toggle changes the key.
+#[derive(Default)]
+struct Follow {
+    key: Option<FollowKey>,
+    /// Offset and content height after the last pass. Compared within half a
+    /// pixel, not exactly.
+    view: Option<(f32, f32)>,
+    settled: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct FollowKey {
+    on: bool,
+    sheet: u64,
+    track: Option<PathBuf>,
+    active: Option<usize>,
+    font: u32,
+    fonts: u64,
+    /// The scroll area's size: a taller or shorter view has another centre.
+    width: u32,
+    height: u32,
+    script: Script,
+    per_word: bool,
+    translation: bool,
+    karaoke: bool,
+    chinese: super::zh::ChineseDisplay,
 }
 
 impl Default for LyricsWindow {
@@ -388,6 +629,8 @@ impl Default for LyricsWindow {
             per_word: true,
             karaoke: true,
             show_translation: true,
+            translation: translation_ui::TranslationState::default(),
+            translation_dirty: false,
             auto: Vec::new(),
             romaji_editing: false,
             romaji_edit: Vec::new(),
@@ -396,18 +639,30 @@ impl Default for LyricsWindow {
             romaji_dirty: false,
             font_size: 17.0,
             auto_scroll: true,
+            follow: Follow::default(),
+            geometry: Geometry::default(),
+            translation_display: super::zh::ChineseDisplay::Original,
+            zh: super::zh::Cache::default(),
+            zh_sheet: None,
+            #[cfg(test)]
+            draw_every_row: false,
         }
     }
 }
 
 impl LyricsWindow {
-    fn busy(&self) -> bool { self.fetch_rx.is_some() || self.search_rx.is_some() }
+    fn busy(&self) -> bool { self.fetch_rx.is_some() || self.search_rx.is_some() || self.translation.is_busy() }
 
     /// Load whatever is already on disk or in the tags for this track.
     ///
     /// Never fetches. An automatic network call on every track change is a
     /// surprise the user did not ask for, so lookup is always a button.
     fn load_local(&mut self, track: &TrackRef) {
+        self.cancel_translation();
+        self.translation.clear_sheet();
+        // An old lookup must not install a sheet on a different track.
+        self.fetch_rx = None;
+        self.search_rx = None;
         self.lyrics = super::load(track.path, super::embedded_text(track.path).as_deref());
         self.loaded_for = Some(track.path.to_path_buf());
         self.results.clear();
@@ -415,6 +670,7 @@ impl LyricsWindow {
         self.dirty = false;
         self.romaji_editing = false;
         self.romaji_dirty = false;
+        self.translation_dirty = false;
         self.pending.clear();
         self.sheet_rev += 1;
         self.cursor = 0;
@@ -429,6 +685,7 @@ impl LyricsWindow {
     }
 
     fn start_fetch(&mut self, track: &TrackRef) {
+        if self.translation.is_editing() { return; }
         let (tx, rx) = std::sync::mpsc::channel();
         let (a, t, al, d) = (track.artist.to_string(), track.title.to_string(),
                              track.album.to_string(), track.duration);
@@ -445,6 +702,7 @@ impl LyricsWindow {
     }
 
     fn start_search(&mut self) {
+        if self.translation.is_editing() { return; }
         let q = self.search_query.trim().to_string();
         if q.is_empty() { return; }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -458,12 +716,16 @@ impl LyricsWindow {
     /// people paste both, and refusing timestamps would mean stripping the very
     /// thing that makes a paste worth having.
     fn take_paste(&mut self) {
+        if self.translation.is_editing() { return; }
         let l = super::parse(&self.paste_buf, LyricSource::Online);
         if l.is_empty() {
             self.status = "Nothing to use — the box is empty.".into();
             return;
         }
         let synced = l.is_synced();
+        self.cancel_translation();
+        self.translation.clear_sheet();
+        self.translation_dirty = false;
         let n = l.lines.len();
         self.lyrics = Some(l);
         self.dirty = true;
@@ -489,6 +751,7 @@ impl LyricsWindow {
     /// text just to draw a list would be a request per row — so a row that
     /// arrived empty is filled in the background before it is applied.
     fn choose(&mut self, hit: Hit) {
+        if self.translation.is_editing() { return; }
         if hit.best_text().is_some() { self.apply(&hit); return; }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -506,8 +769,12 @@ impl LyricsWindow {
 
     /// Adopt a search result as the current sheet, without saving it.
     fn apply(&mut self, hit: &Hit) {
+        if self.translation.is_editing() { return; }
         match hit.best_text() {
             Some(text) => {
+                self.cancel_translation();
+                self.translation.clear_sheet();
+                self.translation_dirty = false;
                 let mut l = super::parse(text, LyricSource::Online);
                 if let Some(r) = &hit.romaji { super::attach(&mut l.lines, r, Extra::Romaji); }
                 if let Some(t) = &hit.translation { super::attach(&mut l.lines, t, Extra::Translation); }
@@ -535,7 +802,12 @@ impl LyricsWindow {
     /// sheet would leave it pairing against lines that no longer exist.
     fn save(&mut self, track: &TrackRef) {
         let Some(l) = &self.lyrics else { return };
-        let (saved, status) = describe(super::save_all(track.path, l, self.dirty, self.romaji_dirty));
+        let outcome = if self.translation_dirty {
+            super::save_changes(track.path, l, self.dirty, self.romaji_dirty, true)
+        } else {
+            super::save_all(track.path, l, self.dirty, self.romaji_dirty)
+        };
+        let (saved, status) = describe(outcome);
         self.status = status;
         // The unsaved flags clear only on success, so a failed Save can simply
         // be pressed again.
@@ -543,11 +815,15 @@ impl LyricsWindow {
             if self.dirty && let Some(ly) = &mut self.lyrics { ly.source = LyricSource::Sidecar; }
             self.dirty = false;
             self.romaji_dirty = false;
+            self.translation_dirty = false;
         }
     }
 
     /// Open the romaji editor, each line prefilled with what the viewer shows.
     fn begin_romaji_edit(&mut self) {
+        if self.translation.is_editing() { return; }
+        self.cancel_translation();
+        self.translation.clear_preview();
         let Some(l) = &self.lyrics else { return };
         self.romaji_edit = l.lines.iter().enumerate()
             .map(|(i, x)| {
@@ -629,6 +905,7 @@ impl LyricsWindow {
     /// furigana, or keep the sheet's. Keeping leaves those lines exactly as
     /// they were before the edit.
     fn resolve_pending(&mut self, use_mine: bool) {
+        if self.translation.is_editing() { return; }
         let pending = std::mem::take(&mut self.pending);
         if !use_mine {
             self.status = "Kept the reading written in the lyrics.".into();
@@ -671,8 +948,8 @@ impl LyricsWindow {
                 }
             }
             ui.horizontal(|ui| {
-                if ui.button("Use my reading").clicked() { answer = Some(true); }
-                if ui.button("Keep the lyrics' reading").clicked() { answer = Some(false); }
+                if ui.add_enabled(!self.translation.is_editing(), egui::Button::new("Use my reading")).clicked() { answer = Some(true); }
+                if ui.add_enabled(!self.translation.is_editing(), egui::Button::new("Keep the lyrics' reading")).clicked() { answer = Some(false); }
             });
         });
         ui.add_space(4.0);
@@ -683,6 +960,11 @@ impl LyricsWindow {
     /// already had, so this re-times an existing sheet as happily as it times a
     /// plain one.
     fn begin_edit(&mut self) {
+        if self.translation.is_editing() { return; }
+        self.cancel_translation();
+        self.translation.clear_preview();
+        // Consent names the current original sheet, not future edited text.
+        self.translation.reset_consent();
         let lines = self.lyrics.as_ref().map(|l| l.lines.clone()).unwrap_or_default();
         self.edit = lines;
         if self.edit.is_empty() { self.edit.push(LyricLine::default()); }
@@ -709,6 +991,7 @@ impl LyricsWindow {
             offset_ms: old.map(|l| l.offset_ms).unwrap_or(0),
             title: old.and_then(|l| l.title.clone()),
             artist: old.and_then(|l| l.artist.clone()),
+            translation_credit: old.and_then(|l| l.translation_credit.clone()),
         });
         self.sheet_rev += 1;
         self.pending.clear();
@@ -722,7 +1005,16 @@ impl LyricsWindow {
         &mut self, ctx: &egui::Context, track: Option<TrackRef>, pos: Duration,
     ) -> LyricsAction {
         if !self.open { return LyricsAction::None; }
-        let Some(track) = track else { return LyricsAction::None };
+        let Some(track) = track else {
+            // No current track: the playlist was cleared or replaced, or the
+            // playing track removed. The sheet and `loaded_for` are kept so
+            // unsaved edits survive the same file coming back; for exactly
+            // that reason translation work from before is abandoned, never
+            // adopted later. A completion is still consumed here.
+            self.abandon_translation();
+            self.poll_translation();
+            return LyricsAction::None;
+        };
 
         if self.loaded_for.as_deref() != Some(track.path) {
             self.load_local(&track);
@@ -755,7 +1047,7 @@ impl LyricsWindow {
                         ui.label(RichText::new(&self.status).size(11.5)
                                  .color(pal::text_dim(dark)));
                     }
-                    if self.dirty || self.romaji_dirty {
+                    if self.dirty || self.romaji_dirty || self.translation_dirty {
                         ui.label(RichText::new("• unsaved").size(11.5).color(pal::amber(dark)));
                     }
                 });
@@ -765,6 +1057,7 @@ impl LyricsWindow {
                 if self.search_open { self.search_panel(ui); }
                 if !self.pending.is_empty() { self.pending_panel(ui); }
                 if self.paste_open { self.paste_panel(ui); }
+                if self.translation.is_open() { self.translation_panel(ui, &track); }
                 if self.editing {
                     action = self.editor(ui, pos).max_or(action);
                 } else if self.romaji_editing {
@@ -775,11 +1068,27 @@ impl LyricsWindow {
             });
         });
 
-        if close { self.open = false; }
+        if close { self.set_open(false); }
         action
     }
 
+    pub fn is_open(&self) -> bool { self.open }
+
+    /// The main toolbar's Lyrics button.
+    pub fn toggle(&mut self) { self.set_open(!self.open); }
+
+    /// Show or hide the window; the toolbar button and the window's own close
+    /// both come here. A hidden window is not drawn, so it cannot see the
+    /// track change under it: hiding abandons translation work (see
+    /// `abandon_translation`). Unsaved sheet edits and a manual translation
+    /// draft are kept for reopening.
+    pub fn set_open(&mut self, open: bool) {
+        if self.open && !open { self.abandon_translation(); }
+        self.open = open;
+    }
+
     fn poll(&mut self) {
+        self.poll_translation();
         if let Some(rx) = &self.fetch_rx
             && let Ok(msg) = rx.try_recv() {
             self.fetch_rx = None;
@@ -821,7 +1130,8 @@ impl LyricsWindow {
     fn toolbar(&mut self, ui: &mut egui::Ui, track: &TrackRef) -> LyricsAction {
         let mut action = LyricsAction::None;
         ui.horizontal_wrapped(|ui| {
-            let idle = !self.busy();
+            let translation_editing = self.translation.is_editing();
+            let idle = !self.busy() && !translation_editing;
             if ui.add_enabled(idle && !self.editing && !self.romaji_editing, egui::Button::new("🔍 Find lyrics"))
                 .on_hover_text(
                     "Look this track up on LRCLIB.\n\nTries the exact tags first, then \
@@ -837,7 +1147,7 @@ impl LyricsWindow {
             {
                 self.search_open = !self.search_open;
             }
-            if ui.add_enabled(!self.editing && !self.romaji_editing, egui::Button::new("📋 Paste…"))
+            if ui.add_enabled(!self.editing && !self.romaji_editing && !translation_editing, egui::Button::new("📋 Paste…"))
                 .on_hover_text(
                     "Paste lyrics from anywhere.\n\nThe database does not have \
                      everything — a niche Vocaloid or UTAU library is mostly \
@@ -862,13 +1172,13 @@ impl LyricsWindow {
                 }
             } else {
                 let has = self.lyrics.is_some();
-                if ui.add_enabled(has, egui::Button::new("⏱ Sync…"))
+                if ui.add_enabled(has && !translation_editing, egui::Button::new("⏱ Sync…"))
                     .on_hover_text("Time the lines by tapping along with the song.")
                     .clicked()
                 {
                     self.begin_edit();
                 }
-                if ui.add_enabled(has && (self.dirty || self.romaji_dirty),
+                if ui.add_enabled(has && !translation_editing && (self.dirty || self.romaji_dirty || self.translation_dirty),
                                   egui::Button::new("💾 Save"))
                     .on_hover_text(format!(
                         "Write {}\n\nA sidecar file — the audio file is never modified. \
@@ -883,13 +1193,14 @@ impl LyricsWindow {
                 }
             }
 
-            if self.is_japanese() && !self.editing && !self.romaji_editing {
+            if self.has_readings() && !self.editing && !self.romaji_editing {
                 ui.separator();
                 for (s, label) in [(Script::Original, "Original"), (Script::Furigana, "Furigana"),
-                                   (Script::Romaji, "Romaji"), (Script::Both, "Both")] {
+                                   (Script::Romaji, "Romanization"), (Script::Both, "Both")] {
+                    if s == Script::Furigana && !self.is_japanese() { continue; }
                     ui.selectable_value(&mut self.script, s, label);
                 }
-                if self.script == Script::Both {
+                if self.script == Script::Both && self.is_japanese() {
                     ui.label(RichText::new("·").color(pal::text_faint(ui.visuals().dark_mode)));
                     ui.selectable_value(&mut self.per_word, false, "Lines")
                         .on_hover_text("Romaji under each line");
@@ -897,10 +1208,10 @@ impl LyricsWindow {
                         .on_hover_text("Romaji under each word, so you can see which \
                                         sound belongs to which word");
                 }
-                if ui.button("✎").on_hover_text(
-                    "Correct the romaji.\n\nRomaji the lyrics source supplied is used as it \
-                     is; the rest is generated from a dictionary and shown in italics, \
-                     because a song's reading of a kanji is often not the dictionary's.")
+                if ui.add_enabled(!translation_editing, egui::Button::new("✎")).on_hover_text(
+                    "Correct the romanization.\n\nSupplied or corrected readings take priority. \
+                     Japanese dictionary and Korean standard-pronunciation guesses are italic. \
+                     A singer's pronunciation can differ; you can correct it here.")
                     .clicked()
                 {
                     self.begin_romaji_edit();
@@ -908,6 +1219,12 @@ impl LyricsWindow {
             }
 
             if !self.editing && !self.romaji_editing {
+                if ui.add_enabled(self.lyrics.as_ref().is_some_and(|l| !l.is_empty()),
+                    egui::Button::new("Translate…")).on_hover_text(
+                    "Find matching Chinese translations, translate Japanese/Korean/English on request, \
+                     or edit/paste a translation. Never automatic.").clicked() {
+                    self.open_translation();
+                }
                 // Only offered where the sheet times its words.
                 if self.lyrics.as_ref().is_some_and(|l| l.has_word_timing()) {
                     ui.separator();
@@ -916,7 +1233,25 @@ impl LyricsWindow {
                 }
                 if self.lyrics.as_ref().is_some_and(|l| l.lines.iter().any(|x| x.translation.is_some())) {
                     ui.checkbox(&mut self.show_translation, "Translation")
-                        .on_hover_text("The translation the lyrics source had, under each line.");
+                        .on_hover_text("Show supplied, machine-assisted or edited translations under each line.");
+                    if self.show_translation {
+                        use super::zh::ChineseDisplay as Z;
+                        let label = |z: Z| match z { Z::Original => "As is", Z::Traditional => "繁體", Z::Simplified => "简体" };
+                        egui::ComboBox::from_id_salt("lyr_zh")
+                            .selected_text(label(self.translation_display))
+                            .width(64.0)
+                            .show_ui(ui, |ui| {
+                                for z in [Z::Original, Z::Traditional, Z::Simplified] {
+                                    ui.selectable_value(&mut self.translation_display, z, label(z));
+                                }
+                            })
+                            .response
+                            .on_hover_text("Show a Chinese translation in Traditional (Taiwan character forms) or \
+                                 Simplified characters.\n\nFor display only: the translation is saved as \
+                                 the source had it. The translation carries no language tag, so this \
+                                 applies to every translation line; a line with kana or hangul is never \
+                                 converted.");
+                    }
                 }
             }
 
@@ -932,7 +1267,7 @@ impl LyricsWindow {
             {
                 ui.separator();
                 let mut off = l.offset_ms as f32 / 1000.0;
-                if ui.add(egui::DragValue::new(&mut off).speed(0.05).suffix(" s")
+                if ui.add_enabled(!translation_editing, egui::DragValue::new(&mut off).speed(0.05).suffix(" s")
                           .range(-30.0..=30.0))
                     .on_hover_text("Nudge the timing. Positive shows lines earlier.")
                     .changed()
@@ -1051,25 +1386,97 @@ impl LyricsWindow {
             });
             return;
         };
+        #[cfg(test)]
+        probe::bump(|s| s.passes += 1);
         let active = l.active_index(pos);
-        let script = if l.lines.iter().any(|x| super::romaji::has_kana(&x.text)) {
-            self.script
-        } else {
-            Script::Original
+        let script = self.display_script();
+        // The translation's family, if installed (it is unless fonts were never
+        // set up, as in a bare test context): Simplified-first for Simplified,
+        // Traditional-first otherwise. And which fonts are in use: a font picked
+        // in Look replaces the faces under the same names and sizes.
+        let zh = egui::FontFamily::Name(match self.translation_display {
+            super::zh::ChineseDisplay::Simplified => ZH_HANS,
+            _ => ZH_HANT,
+        }.into());
+        let (has_zh, fonts) = ui.ctx().fonts(|f| {
+            let families = f.families();
+            (families.contains(&zh), fonts_rev(&families))
+        });
+        let translation_family = if has_zh { zh } else { egui::FontFamily::Proportional };
+        // Centre the active line only until the view is still (see `Follow`).
+        // The scroll area takes all the room left, so that is its size.
+        let room = ui.available_size();
+        let key = FollowKey {
+            on: self.auto_scroll, sheet: self.sheet_rev, track: self.loaded_for.clone(), active,
+            font: self.font_size.to_bits(), fonts, width: room.x.to_bits(), height: room.y.to_bits(), script,
+            per_word: self.per_word, translation: self.show_translation, karaoke: self.karaoke,
+            chinese: self.translation_display,
         };
+        let centre = self.auto_scroll && (self.follow.key.as_ref() != Some(&key) || !self.follow.settled);
+        // A new sheet: its converted translations start over, and the romaji
+        // memo stops at its length.
+        let sheet = Some((self.sheet_rev, self.loaded_for.clone()));
+        if self.zh_sheet != sheet {
+            self.zh.clear();
+            self.auto.truncate(l.lines.len());
+            self.zh_sheet = sheet;
+        }
+        // Rows out of view are skipped by exactly the height they took when
+        // last drawn (see `Geometry`); this is what they are keyed by.
+        let gkey = GeomKey {
+            sheet: self.sheet_rev, track: self.loaded_for.clone(), lines: l.lines.len(),
+            font: self.font_size.to_bits(), fonts, width: ui.available_width().to_bits(),
+            ppp: ui.ctx().pixels_per_point().to_bits(), script, per_word: self.per_word,
+            translation: self.show_translation, chinese: self.translation_display,
+        };
+        if self.geometry.key.as_ref() != Some(&gkey) {
+            self.geometry = Geometry { key: Some(gkey), rows: Vec::new() };
+        }
+        self.geometry.rows.resize(l.lines.len(), RowGeom::default());
+        let cull = true;
+        #[cfg(test)]
+        let cull = cull && !self.draw_every_row;
         // `auto_shrink` defaults to true on both axes, which sizes the scroll
         // area to its content — so the scrollbar sits against the longest lyric
         // line, stranded in the middle of the window. Lyrics are short lines in
         // a wide panel, which makes it especially obvious.
-        egui::ScrollArea::vertical().id_salt("lyr_view")
-            .auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(6.0);
+        let out = egui::ScrollArea::vertical().id_salt("lyr_view")
+            .auto_shrink([false, false]).show_viewport(ui, |outer, vis| {
+            let origin = outer.cursor().min.y;
+            // `vis` is this pass's own view: a scroll requested now moves the
+            // offset for the next pass, which draws what it then shows. The
+            // margin only absorbs rounding at the edges.
+            let margin = 100.0;
+            outer.add_space(6.0);
             for (i, line) in l.lines.iter().enumerate() {
+                #[cfg(test)]
+                probe::bump(|s| s.rows_visited += 1);
                 let is_active = active == Some(i);
                 if line.text.trim().is_empty() {
-                    ui.add_space(self.font_size * 0.6);
+                    outer.add_space(self.font_size * 0.6);
                     continue;
                 }
+                // The active line is larger and bold, so it can wrap where the
+                // same line does not: it has its own measured height.
+                let slot = usize::from(is_active);
+                let fp = row_fingerprint(line);
+                let g = &mut self.geometry.rows[i];
+                if g.fp != Some(fp) { *g = RowGeom { fp: Some(fp), h: [None, None] }; }
+                let y = outer.cursor().min.y - origin;
+                if cull && !is_active && let Some(h) = g.h[slot]
+                    && (y + h < vis.top() - margin || y > vis.bottom() + margin)
+                {
+                    outer.add_space(h);
+                    continue;
+                }
+                #[cfg(test)]
+                probe::bump(|s| s.rows_laid_out += 1);
+                let top = outer.cursor().min.y;
+                // Each row in a child with its own id: the same ids whatever
+                // was skipped above it.
+                let mut row = outer.new_child(egui::UiBuilder::new().id_salt(("lyr_row", i))
+                    .max_rect(outer.available_rect_before_wrap()).layout(*outer.layout()));
+                let ui = &mut row;
                 let (size, colour) = if is_active {
                     (self.font_size * 1.06, pal::accent(dark))
                 } else if active.is_some_and(|a| i < a) {
@@ -1086,15 +1493,6 @@ impl LyricsWindow {
                 };
                 if upto.is_some() { look.colour = pal::text(dark); }
 
-                // Not generated unless shown: the dictionary loads on first use.
-                let (words, reading) = if script == Script::Original {
-                    (Vec::new(), None)
-                } else {
-                    let a = auto_for(&mut self.auto, i, &line.text);
-                    let r = a.reading(line.romaji.as_deref(), line.overrides_sheet());
-                    (a.words.clone(), Some(r))
-                };
-                look.guessed = reading.as_ref().is_some_and(|r| r.guessed);
                 let text_label = |ui: &mut egui::Ui, look: &Look, text: &str, upto: Option<usize>| match upto {
                     Some(u) => ui.add(egui::Label::new(
                         sung_job(text, u, look.size, look.lit, look.colour))),
@@ -1104,44 +1502,99 @@ impl LyricsWindow {
                         ui.add(egui::Label::new(rt).sense(egui::Sense::hover()))
                     }
                 };
-                let mut resp = match present(script, self.per_word, line, &words, reading.as_ref(), upto) {
-                    Shown::Cells(c) => draw_cells(ui, &c, &look),
-                    Shown::Romaji(romaji) => {
-                        let mut rt = RichText::new(&romaji).size(size).color(colour);
-                        if is_active { rt = rt.strong(); }
-                        if look.guessed { rt = rt.italics(); }
-                        ui.add(egui::Label::new(rt).sense(egui::Sense::hover()))
-                    }
-                    Shown::Text { text, upto, under } => {
-                        let mut resp = text_label(ui, &look, &text, upto);
-                        if let Some(romaji) = under {
-                            ui.add_space(-2.0);
-                            let mut rt = RichText::new(&romaji).size(size * 0.72).color(colour);
+                // Original is the stored text as it is; nothing to work out.
+                // Other scripts are generated only when shown (the dictionary
+                // loads on first use) and kept per line (`Auto::shown`).
+                let mut resp = if script == Script::Original {
+                    text_label(ui, &look, &line.text, upto)
+                } else {
+                    let a = auto_for(&mut self.auto, i, &line.text);
+                    look.guessed = a.reading(line.romaji.as_deref(), line.overrides_sheet()).guessed;
+                    match &*a.shown(script, self.per_word, line, upto) {
+                        Shown::Cells(c) => draw_cells(ui, c, &look),
+                        Shown::Romaji(romaji) => {
+                            let mut rt = RichText::new(romaji).size(size).color(colour);
+                            if is_active { rt = rt.strong(); }
                             if look.guessed { rt = rt.italics(); }
-                            resp = resp.union(ui.add(egui::Label::new(rt)));
+                            ui.add(egui::Label::new(rt).sense(egui::Sense::hover()))
                         }
-                        resp
+                        Shown::Text { text, upto, under } => {
+                            let mut resp = text_label(ui, &look, text, *upto);
+                            if let Some(romaji) = under {
+                                ui.add_space(-2.0);
+                                let mut rt = RichText::new(romaji).size(size * 0.72).color(colour);
+                                if look.guessed { rt = rt.italics(); }
+                                resp = resp.union(ui.add(egui::Label::new(rt)));
+                            }
+                            resp
+                        }
                     }
                 };
                 if script != Script::Original && look.guessed {
-                    resp = resp.on_hover_text("Generated reading — may misread a kanji. ✎ corrects it.");
+                    resp = resp.on_hover_text("Generated pronunciation — a song's reading can differ. ✎ corrects it.");
                 }
                 if self.show_translation && let Some(t) = &line.translation {
+                    let t = self.zh.get(i, t, self.translation_display);
+                    #[cfg(test)]
+                    probe::translation(i, t);
                     ui.add_space(-1.0);
-                    ui.label(RichText::new(t).size(size * 0.8).color(pal::text_faint(dark)));
+                    ui.label(RichText::new(t).size(size * 0.8).family(translation_family.clone())
+                             .color(pal::text_faint(dark)));
                 }
-                if is_active && self.auto_scroll {
+                if is_active && centre {
+                    #[cfg(test)]
+                    probe::bump(|s| s.follow_requests += 1);
                     resp.scroll_to_me(Some(egui::Align::Center));
                 }
                 ui.add_space(3.0);
+                // What the row measured, kept unless it moved by more than half
+                // a pixel: positions are snapped to the screen's pixels, so the
+                // same row measures a hair differently at each fractional
+                // scroll offset, and advancing by that would make the content
+                // height — and Follow's notion of a still view — flicker.
+                let measured = row.cursor().min.y - top;
+                let half_px = 0.5 / outer.ctx().pixels_per_point();
+                let kept = &mut self.geometry.rows[i].h[slot];
+                let h = match *kept {
+                    Some(k) if (k - measured).abs() <= half_px => k,
+                    _ => { *kept = Some(measured); measured }
+                };
+                #[cfg(test)]
+                probe::drew(i, top - origin, h, row.id());
+                outer.add_space(h);
             }
-            ui.add_space(ui.available_height().max(80.0));
+            outer.add_space(outer.available_height().max(80.0));
         });
+        // Still means still to the eye: within half a pixel. Positions are
+        // snapped to egui's grid, so a view resting against the end of its
+        // range can trade a few hundredths of a point between passes.
+        let view = (out.state.offset.y, out.content_size.y);
+        #[cfg(test)]
+        probe::set_view(view);
+        let half_px = 0.5 / ui.ctx().pixels_per_point();
+        let still = self.follow.view.is_some_and(|(o, c)| (o - view.0).abs() <= half_px && (c - view.1).abs() <= half_px);
+        self.follow.settled = self.follow.key.as_ref() == Some(&key) && still;
+        self.follow.key = Some(key);
+        self.follow.view = Some(view);
+        #[cfg(test)]
+        probe::set_scroll_id(out.id);
     }
 
     fn is_japanese(&self) -> bool {
         self.lyrics.as_ref()
             .is_some_and(|l| l.lines.iter().any(|x| super::romaji::has_kana(&x.text)))
+    }
+
+    fn has_readings(&self) -> bool {
+        self.lyrics.as_ref().is_some_and(|l| l.lines.iter().any(|x|
+            super::romaji::has_kana(&x.text) || super::korean::has_hangul(&x.text)
+            || x.romaji.as_ref().is_some_and(|r| !r.trim().is_empty())))
+    }
+
+    fn display_script(&self) -> Script {
+        if !self.has_readings() || (self.script == Script::Furigana && !self.is_japanese()) {
+            Script::Original
+        } else { self.script }
     }
 
     fn romaji_editor(&mut self, ui: &mut egui::Ui) {
@@ -1659,7 +2112,7 @@ mod tests {
 
     fn reading_of(w: &mut LyricsWindow, i: usize) -> super::super::romaji::Reading {
         let line = w.lyrics.as_ref().unwrap().lines[i].clone();
-        auto_for(&mut w.auto, i, &line.text).reading(line.romaji.as_deref(), line.overrides_sheet())
+        auto_for(&mut w.auto, i, &line.text).reading(line.romaji.as_deref(), line.overrides_sheet()).clone()
     }
     fn furigana_first(r: &super::super::romaji::Reading) -> (String, Option<String>) {
         match &r.furigana {
@@ -1826,7 +2279,7 @@ mod tests {
     fn shown(w: &mut LyricsWindow, i: usize, script: Script, per_word: bool, upto: Option<usize>) -> Shown {
         let line = w.lyrics.as_ref().unwrap().lines[i].clone();
         let a = auto_for(&mut w.auto, i, &line.text);
-        let r = a.reading(line.romaji.as_deref(), line.overrides_sheet());
+        let r = a.reading(line.romaji.as_deref(), line.overrides_sheet()).clone();
         let words = a.words.clone();
         present(script, per_word, &line, &words, Some(&r), upto)
     }
@@ -2008,5 +2461,39 @@ mod tests {
         let seek = LyricsAction::Seek(Duration::from_secs(3));
         assert_eq!(LyricsAction::None.max_or(seek), seek);
         assert_eq!(seek.max_or(LyricsAction::None), seek);
+    }
+
+
+    /// Showing a translation converted never touches what is stored or saved:
+    /// switching the display marks nothing unsaved, and a save writes the
+    /// translation as the source had it.
+    #[test]
+    fn a_converted_translation_is_saved_as_the_source_had_it() {
+        let s = Scratch::new("zh_save");
+        let track = s.track();
+        let trans = "[00:01.00]我们说过这些话\n[00:05.00]爱与梦\n";
+        s.put("song.lrc", "[00:01.00]心\n[00:05.00]空\n");
+        s.put("song.translation.lrc", trans);
+        let tr = track_ref(&track);
+        let mut w = LyricsWindow::default();
+        w.load_local(&tr);
+        let before: Vec<_> = w.lyrics.as_ref().unwrap().lines.iter().map(|l| l.translation.clone()).collect();
+        for mode in [super::super::zh::ChineseDisplay::Traditional, super::super::zh::ChineseDisplay::Simplified] {
+            w.translation_display = mode;
+            let shown = w.zh.get(0, before[0].as_deref().unwrap(), mode).to_string();
+            assert!(mode != super::super::zh::ChineseDisplay::Traditional || shown == "我們說過這些話", "{shown}");
+            assert!(!w.dirty && !w.romaji_dirty, "a display switch marked the sheet unsaved");
+        }
+        let after: Vec<_> = w.lyrics.as_ref().unwrap().lines.iter().map(|l| l.translation.clone()).collect();
+        assert_eq!(after, before, "the stored translation changed");
+        // An edit elsewhere, then a save while Traditional is shown.
+        w.translation_display = super::super::zh::ChineseDisplay::Traditional;
+        w.lyrics.as_mut().unwrap().offset_ms = 250;
+        w.dirty = true;
+        w.save(&tr);
+        assert!(!w.dirty, "the save reported: {}", w.status);
+        let saved = s.read("song.translation.lrc").unwrap_or_default();
+        assert!(saved.contains("我们说过这些话") && saved.contains("爱与梦") && !saved.contains("我們"),
+                "the saved translation is not the source's: {saved}");
     }
 }

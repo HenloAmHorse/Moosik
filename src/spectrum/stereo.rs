@@ -491,7 +491,9 @@ pub fn decode_with(
 
     // The mono cache's own contents, in full.
     let want_mono = u64_at(raw, 40);
+    let p = super::store::prof::span("lr.mono_fingerprint");
     let got_mono = fingerprint(mono);
+    drop(p);
     if want_mono != got_mono {
         return Err(SidecarError::DifferentMonoContent { want: want_mono, got: got_mono });
     }
@@ -508,20 +510,28 @@ pub fn decode_with(
 
     // The bytes themselves, before anything trusts their contents.
     let want_payload = u64_at(raw, 48);
+    let p = super::store::prof::span("lr.payload_fingerprint");
     let got_payload = payload_fingerprint(&raw[HEADER..declared]);
+    drop(p);
     if want_payload != got_payload {
         return Err(SidecarError::Corrupt { want: want_payload, got: got_payload });
     }
 
-    let left = cache::decode_with(&raw[HEADER..HEADER + left_len], bars, max_bars, limits)
-        .map_err(|err| SidecarError::Channel { side: Side::Left, err })?;
-    let right = cache::decode_with(
-        &raw[HEADER + left_len..declared],
-        bars,
-        max_bars,
-        limits,
-    )
-    .map_err(|err| SidecarError::Channel { side: Side::Right, err })?;
+    // The two channels are independent: Right is decoded on a second thread
+    // while Left is decoded here (here alone if that thread cannot start).
+    let _p = super::store::prof::span("lr.decode_channels");
+    let decode_right = || cache::decode_with(&raw[HEADER + left_len..declared], bars, max_bars, limits);
+    let (left, right) = std::thread::scope(|s| {
+        let r = std::thread::Builder::new().spawn_scoped(s, decode_right);
+        let l = cache::decode_with(&raw[HEADER..HEADER + left_len], bars, max_bars, limits);
+        let r = match r {
+            Ok(h) => h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+            Err(_) => decode_right(),
+        };
+        (l, r)
+    });
+    let left = left.map_err(|err| SidecarError::Channel { side: Side::Left, err })?;
+    let right = right.map_err(|err| SidecarError::Channel { side: Side::Right, err })?;
 
     // The header said what shape to expect; the payloads have to agree with it,
     // or the header was describing something other than what it carried.
