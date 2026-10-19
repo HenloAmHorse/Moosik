@@ -16,12 +16,10 @@ See also [BIT_PERFECT.md](BIT_PERFECT.md) and [FEATURES.md](FEATURES.md).
 - **Selectable palette** — seven colour ramps (Classic, Kugelblitz, Ice, Magma, Aurora, Mono, and an Album-accent ramp that follows the cover art), picked from the control row with a gradient swatch preview and applied across bars, octave bands, line, filled, spectrogram, and waterfall
 - **Settings persist** — the view settings (style, bars, window, interpolation, padding, overlap, bar mapping, frequency range, …) restore across launches (`~/.moosik/spectrum.json`)
 - **Peak Hold** — configurable marker that tracks the highest level per bar; three decay modes (Linear, Gravity, Fade Out), hold time, fall speed, thickness, and color all adjustable
-- **CQT bar mapping** — Constant-Q Transform mapping gives each bar the same relative frequency resolution regardless of pitch, just like professional analyzers
+- **FFT constant-Q weighting** — gathers a single FFT's magnitudes with frequency-dependent weights. It is not a true constant-Q transform and does not create detail absent from that FFT. A separate true CQT is planned for 1.5.5; old FFT caches will not be relabelled as CQT results
 - **Adaptive Superlet Transform** — an alternative to the FFT that analyses the waveform directly with sets of Morlet wavelets, taking the geometric mean of their responses. Where an FFT uses one window width for the whole spectrum, this varies it per frequency, which is what a log-spaced bar grid actually wants. Pre-process only; the live view keeps using the FFT. Five quality presets plus a Custom mode exposing the window budget, sharpness, wavelet count and spread, with a live readout comparing each against the FFT
-  - *Bass*: resolves detail no FFT setting reaches — at 60 Hz it separates tones 1.5 Hz apart that a 171 ms FFT window renders as a single blob. The cost is honest and unavoidable: constant-Q at the bottom of hearing needs windows measured in seconds, so bass responds more slowly. The window budget is a slider, not a hidden curve
-  - *Treble*: strictly better, for free — 24 ms of temporal smearing at 10 kHz against the FFT's 171 ms, with no loss of frequency detail the display can show
-  - *Around 500 Hz – 2 kHz*: roughly a wash. An FFT is genuinely good there, and nothing pretends otherwise
-  - Analysis runs 1–17 minutes per five-minute track depending on preset, with a live ETA, a progress bar and an Abort button. Long wavelets are convolved in the frequency domain, which is 4–5× faster and numerically identical (measured worst-case difference 2×10⁻⁷)
+  - Frequency and time response depend on the actual kernel, frequency grid, wavelet count and window budget. Longer bass windows trade temporal localization for frequency selectivity; a denser display is not proof of greater resolving power
+  - Pre-processing time is workload- and hardware-dependent. The UI provides an ETA, progress and Abort. Frequency-domain convolution and shared/pruned work reduce cost where applicable; see the measured release comparison rather than treating an old timing range or one fixture as a universal speed/accuracy claim
 - **Configurable FFT** — up to 16× zero-padding, six window functions (Hann, Hamming, Blackman, Flat Top), up to 87.5% overlap
 - **Six interpolation modes** — None, Linear, Catmull-Rom, PCHIP, Akima, Lanczos
 - **Auto FFT size scaling** — adapts to the track's sample rate to maintain a consistent analysis window
@@ -63,6 +61,54 @@ See also [BIT_PERFECT.md](BIT_PERFECT.md) and [FEATURES.md](FEATURES.md).
 - **Loaded on demand** — the sidecar is read on a worker when a channel view
   asks for it, and released on return to Mix. The file stays, so asking again
   reads rather than re-analyses
+
+### Whole track (Pre-process)
+
+The finished analysis of the whole track as one time–frequency picture, drawn
+from the stored cells (no smoothing, no ISO 226 weighting). Opening it never
+starts an analysis.
+
+| On the plot | Does |
+|---|---|
+| Wheel | zoom time: around the playhead while following (following carries on), around the pointer otherwise |
+| Shift + wheel | zoom frequency, around the pointer (following carries on) |
+| Drag | pan (does not seek; sets following aside) |
+| Click | seek playback to that time; paused stays paused |
+| Middle click | fit the whole track (does not seek) |
+| Overview strip | click or drag to move the time window |
+
+The toolbar has **Fit track**, **Time ±** and **Freq ±** for the same
+without a mouse wheel or middle button (Time ± zooms around the playhead while
+following, around the middle otherwise), and **Mouse help** lists the
+gestures.
+
+- **Follow playback** (on by default, remembered) moves the time window with
+  the playhead every frame — not a page at a time — keeping the zoom and the
+  frequency range, with the playhead a third of the way across. Zooming in
+  time while following zooms around the playhead, which keeps its place, and
+  following carries on; a frequency zoom does not touch it either. A drag or
+  the overview strip sets it aside; **Resume follow** picks it up again at the
+  current zoom. Pausing stops the scrolling; a click seeks and following
+  carries on from there. At the whole-track zoom there is nothing to scroll.
+- **What a pixel is.** Magnified, the one stored cell under it; reduced, the
+  largest cell of exactly the frames and bars its pixel covers. That holds for
+  every frame drawn while following or panning, not only once things stop:
+  the picture is kept as columns, each keyed by the frames it covers, and a
+  column is reused only when its frames are the same. The drawn time window
+  sits on the pixel grid (within half a pixel of where it was asked to be).
+- **Preparing a view.** Larger zooms, distant seeks and long pans can need
+  background work. If a complete picture at the same size is already visible,
+  it stays together with its own axes and readout until the replacement is
+  ready; all planes then switch together. The corner says **Preparing view…
+  showing previous view**. Wheel input continues to accumulate and following
+  stays enabled. The old image is neither stretched nor relabelled. First
+  opening, resizing, changing the source or changing the palette can still
+  show **loading** when there is no compatible complete picture to retain.
+- **Repeat keeps the view.** Playing the same track again, with its analysis
+  unchanged, restarts playback only: the zoom, the frequency range and the
+  picture stay (following, if on, scrolls back to the start at the same zoom).
+  Another track, changed audio, other settings or a newer analysis are loaded
+  as before.
 
 ## Parametric EQ
 

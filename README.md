@@ -17,6 +17,10 @@ professional-grade spectrum analyzer, and a parametric EQ, built in Rust.
 
 ## Build
 
+**Current release: [1.5.4](https://github.com/HenloAmHorse/Moosik-Player/releases/tag/v1.5.4).**
+Download the Windows x86_64 `.exe` and the accompanying notices. There is no
+installer; local translation models are optional, separate downloads.
+
 Requires Rust (stable, edition 2024). Tagged releases attach a prebuilt Windows
 x86_64 executable (it needs the Microsoft Visual C++ 2015-2022 Redistributable,
 x64, which most Windows PCs already have); on other platforms, building it is
@@ -31,8 +35,8 @@ sudo apt install libasound2-dev   # Debian/Ubuntu
 Then:
 
 ```sh
-git clone https://github.com/HenloAmHorse/Moosik
-cd Moosik
+git clone https://github.com/HenloAmHorse/Moosik-Player
+cd Moosik-Player
 cargo build --release --locked
 ./target/release/moosik
 ```
@@ -55,16 +59,19 @@ first build so the compiled dictionary is kept there, and later build with
   reason instead of quietly converting
 - **DSD** — `.dsf` and `.dff` as first-class formats, over DoP or native ASIO
   (Windows) and ALSA (Linux)
-- **Spectrum analyzer** — pre-processed and real-time, seven visualisation
-  styles, an adaptive superlet transform that beats an FFT at both ends of the
-  spectrum, GPU offload, and per-channel views including a left/right difference
+- **Spectrum analyzer** — pre-processed and real-time visualisation,
+  frequency-dependent adaptive superlet analysis, GPU offload, and
+  per-channel views including a left/right difference
   plot. Channels work from the cache as well as live: a stereo analysis derives
   the mix from the two channels' complex responses rather than analysing it a
   third time, and stores them with the analysis
   ([docs/SPECTRUM.md](docs/SPECTRUM.md)). Pre-processing a track is the
   heaviest thing Moosik does, and recent work has gone into making it cost less
   CPU and hold less memory while producing exactly the same output — see the
-  changelog for what was measured and what it covers
+  changelog for what was measured and what it covers. **Whole track** adds
+  exact stored-cell time-frequency inspection, zoom/pan, playback follow,
+  click-to-seek and middle-click fit. Pending views retain the previous
+  complete picture and coordinates until a coherent replacement is ready
 - **Analysis cache** — a finished analysis is reused only for the same file
   (path, size, modified time and a content sample) at the same settings, and is
   saved as one whole, so a crash never leaves the spectrum and its channels out
@@ -85,7 +92,14 @@ first build so the compiled dictionary is kept there, and later build with
   translation sends lyric text to a third party only after consent; it is not
   confidential processing. An optional context-aware AI translation uses your
   own OpenAI API key (off until configured; its translation quality has not
-  been evaluated). Never writes to the audio file
+  been evaluated). Downloadable local models need no API key; their output
+  also requires preview and explicit adoption. Hy-MT2 30B has an experimental
+  lower-RAM GPU route (16 GiB available RAM, 21 GiB commit headroom and a
+  7+ GiB dedicated graphics card). Smaller models remain available for more
+  modest hardware. The local workbench supports custom instructions, seeded
+  alternative drafts, feedback revisions, locked rows, eight session draft
+  versions, selective adoption and one-step undo. Feedback does not train the
+  model. Never writes to the audio file
 - **Tag editing** — with verified, non-destructive writes
 - **The rest** — gapless playback, ReplayGain, album-art overlays and mask mode,
   A-B repeat, bookmarks, sleep timer, play statistics, OS media keys, LUFS and
@@ -110,6 +124,7 @@ describes what the current release does.
 
 | | |
 |---|---|
+| **1.5.5** | A true constant-Q transform and further measured pre-process/real-time performance work; the current constant-Q weighting remains FFT-based. |
 | **1.6.0** | Professional audio-analysis features. Harmonic and pitch analysis, time-frequency inspection and channel-analysis tools are candidate directions. |
 
 Principles that work is meant to hold to:

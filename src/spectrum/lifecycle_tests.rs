@@ -67,7 +67,11 @@ fn write_wav(path: &Path, freqs: &[f32], seed: u32) {
 }
 
 fn write_wav_noise(path: &Path, freqs: &[f32], seed: u32, noise_amp: f32) {
-    let n = SR as usize;
+    write_wav_secs(path, freqs, seed, noise_amp, 1);
+}
+
+fn write_wav_secs(path: &Path, freqs: &[f32], seed: u32, noise_amp: f32, secs: usize) {
+    let n = SR as usize * secs;
     let mut x = seed.max(1);
     let mut data = Vec::with_capacity(n * 4);
     for i in 0..n {
@@ -1118,3 +1122,11 @@ fn a_queued_channel_request_keeps_its_settings_or_lapses_with_them() {
 // ── The analysis cache store through production entry points ─────────────
 #[path = "cache_v2_tests.rs"]
 mod cache_v2;
+
+// ── The whole-track view through production entry points ─────────────────
+#[path = "wholetrack_int_tests.rs"]
+mod wholetrack_int;
+
+// ── The whole-track view's component cost (ignored benchmark) ─────────────
+#[path = "wholetrack_bench.rs"]
+mod wholetrack_bench;

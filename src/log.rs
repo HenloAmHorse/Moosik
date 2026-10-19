@@ -444,9 +444,12 @@ pub fn error() -> Option<&'static str> {
 }
 
 fn banner(y: i64, mo: u32, dy: u32, h: u32, mi: u32, s: u32) {
+    let label = env!("MOOSIK_BUILD_LABEL");
     write_line(&format!(
-        "Moosik {} — session log",
-        env!("MOOSIK_VERSION")
+        "Moosik {}{}{} — session log",
+        env!("MOOSIK_VERSION"),
+        if label.is_empty() { "" } else { " " },
+        label
     ));
     write_line(&format!(
         "started   {y:04}-{mo:02}-{dy:02} {h:02}:{mi:02}:{s:02} UTC"

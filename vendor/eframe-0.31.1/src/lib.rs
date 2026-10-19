@@ -187,6 +187,10 @@ mod native;
 #[cfg(feature = "persistence")]
 pub use native::file_storage::storage_dir;
 
+/// Moosik local patch: event, pass and present counts. See `PATCH.md`.
+#[cfg(all(not(target_arch = "wasm32"), feature = "moosik_windows_linked_viewport"))]
+pub use native::moosik_counters;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod icon_data;
 

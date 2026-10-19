@@ -27,6 +27,7 @@
 
 use super::cache::{self, CacheError, Limits, PreFrames};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Sidecar magic, "MSPS".
 pub const MAGIC: u32 = 0x4D53_5053;
@@ -206,8 +207,11 @@ impl std::fmt::Display for SidecarError {
 /// not something any consumer should have to check for.
 #[derive(Clone, Default, PartialEq)]
 pub struct Stereo {
-    left: PreFrames,
-    right: PreFrames,
+    /// Shared, never mutated in place: a reader (the whole-track view's
+    /// raster worker) can hold a channel without copying it, and `clear`
+    /// replaces rather than empties.
+    left: Arc<PreFrames>,
+    right: Arc<PreFrames>,
 }
 
 impl std::fmt::Debug for Stereo {
@@ -228,7 +232,7 @@ impl Stereo {
         if left.len() != right.len() || left.bars() != right.bars() {
             return None;
         }
-        Some(Self { left, right })
+        Some(Self { left: Arc::new(left), right: Arc::new(right) })
     }
 
     pub fn left(&self) -> &PreFrames {
@@ -237,6 +241,11 @@ impl Stereo {
 
     pub fn right(&self) -> &PreFrames {
         &self.right
+    }
+
+    /// Both channels as shared handles, for a reader off the UI thread.
+    pub fn shared(&self) -> (Arc<PreFrames>, Arc<PreFrames>) {
+        (self.left.clone(), self.right.clone())
     }
 
     /// Rows, which both channels have the same number of.
@@ -268,8 +277,8 @@ impl Stereo {
 
     /// Release both allocations. See `PreFrames::clear`.
     pub fn clear(&mut self) {
-        self.left.clear();
-        self.right.clear();
+        self.left = Arc::default();
+        self.right = Arc::default();
     }
 }
 

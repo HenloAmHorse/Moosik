@@ -2,6 +2,60 @@
 
 ## [Unreleased]
 
+## [1.5.4] - 2026-10-19
+
+Whole-track time-frequency inspection, downloadable local translation and a
+seeded translation workbench. No change to the bit-perfect playback contract.
+
+- Local translation workbench: explicit seed and three variation levels,
+  draw-another action, saved custom instructions and session feedback.
+  Revisions include the previous draft as context; the host preserves locked
+  and unselected rows. Keep eight session draft versions, compare changed
+  lines, choose rows to adopt, and undo the last local Apply if the sheet
+  has not changed. Nothing trains the model or adopts results automatically.
+
+- Spectrum: the whole-track view keeps its exact columns while the camera
+  moves, follows playback continuously, fits on a middle click, and keeps
+  its analysis and zoom when the same track repeats.
+- Whole-track time zoom: reuse repeated magnified queries and exact short
+  blocks, cover rounded span boundaries without needless index rebuilds,
+  and avoid recoding/uploading obsolete background columns.
+- Whole-track presentation: when a pan or zoom needs background work,
+  retain the complete previous image together with its axes and readout,
+  then commit all planes together. Pending work is not uploaded over that
+  image; wheel input still accumulates. No interpolation or stretched
+  preview is used. A new analysis, palette or raster size cannot reuse an
+  incompatible picture; first preparation can still show loading.
+- Lyrics: the text size is remembered; local translation offers Hy-MT2 7B
+  and 1.8B beside Qwen2.5 7B, can reuse model files already on disk, and
+  shows a readable setup card.
+- Local translation (Hy-MT2): rows are sent and answered in lyric order on
+  sheets of ten rows or more, "More fluent" now reaches the model, and a
+  corrective retry says why the first answer was refused.
+- Local translation: model advice and startup use the same RAM/commit
+  requirements and GiB units. Hy-MT2 30B has an explicit experimental
+  lower-RAM graphics-card route using the existing model, with more weights
+  on the card and buffered loading; it requires 16 GiB available RAM,
+  21 GiB commit headroom including reserve, and a 7+ GiB dedicated card.
+  Changing that route invalidates results made under the previous settings.
+- UI: translation controls and hints use English consistently; language
+  choices and user-entered instructions can use their own language.
+- Packaging: updated third-party notices, including the license texts shown
+  by optional local-model setup. No model weights or inference runtime are
+  bundled in the executable; packs require a separate explicit download/import.
+
+### Limits
+
+- Whole-track background preparation can delay a new camera. The old image,
+  axes and readout stay together until it is ready; first preparation or an
+  incompatible source/geometry change can still show loading. This release
+  does not promise to eliminate CPU spikes during rapid zoom/pan.
+- Local model quality depends on the song and settings. Feedback is a new
+  inference request, not model training; new seeds can repeat the same wording.
+  Draft history is session-only. Results still require Preview, Apply and Save.
+- The 30B lower-RAM route trades physical RAM for VRAM and commit; it is not
+  a 9-GiB route. Smaller models remain available for weaker hardware.
+
 ## [1.5.3] - 2026-10-15
 
 Pre-processing does less work for the same output, the analysis cache is

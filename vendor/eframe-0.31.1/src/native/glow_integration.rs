@@ -558,6 +558,9 @@ impl GlowWinitRunning<'_> {
 
         profiling::finish_frame!();
 
+        #[cfg(feature = "moosik_windows_linked_viewport")]
+        super::moosik_counters::bump(super::moosik_counters::Counter::Redraw, viewport_id == ViewportId::ROOT);
+
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
@@ -566,6 +569,8 @@ impl GlowWinitRunning<'_> {
             let viewport = &glutin.viewports[&viewport_id];
             let is_immediate = viewport.viewport_ui_cb.is_none();
             if is_immediate && viewport_id != ViewportId::ROOT {
+                #[cfg(feature = "moosik_windows_linked_viewport")]
+                super::moosik_counters::bump(super::moosik_counters::Counter::RedirectedToParent, false);
                 // This will only happen if this is an immediate viewport.
                 // That means that the viewport cannot be rendered by itself and needs his parent to be rendered.
                 if let Some(parent_viewport) = glutin.viewports.get(&viewport.ids.parent) {
@@ -763,6 +768,8 @@ impl GlowWinitRunning<'_> {
                 ))?;
 
             gl_surface.swap_buffers(context)?;
+            #[cfg(feature = "moosik_windows_linked_viewport")]
+            super::moosik_counters::bump(super::moosik_counters::Counter::Present, viewport_id == ViewportId::ROOT);
             frame_timer.resume();
         }
 
@@ -831,6 +838,18 @@ impl GlowWinitRunning<'_> {
         //
         // See: https://github.com/emilk/egui/issues/903
         let mut repaint_asap = false;
+
+        #[cfg(feature = "moosik_windows_linked_viewport")]
+        {
+            use super::moosik_counters::{bump, Counter};
+            let root = viewport_id == Some(ViewportId::ROOT);
+            match event {
+                winit::event::WindowEvent::Moved(_) => bump(Counter::Moved, root),
+                winit::event::WindowEvent::Resized(_) => bump(Counter::Resized, root),
+                winit::event::WindowEvent::ScaleFactorChanged { .. } => bump(Counter::ScaleFactor, root),
+                _ => {}
+            }
+        }
 
         match event {
             winit::event::WindowEvent::Focused(new_focused) => {
@@ -1591,6 +1610,8 @@ fn render_immediate_viewport(
 
     {
         profiling::scope!("swap_buffers");
+        #[cfg(feature = "moosik_windows_linked_viewport")]
+        super::moosik_counters::bump(super::moosik_counters::Counter::Present, false);
         if let Err(err) = gl_surface.swap_buffers(current_gl_context) {
             log::error!("swap_buffers failed: {err}");
         }

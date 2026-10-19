@@ -11,6 +11,9 @@ pub mod stereo;
 pub mod alt_cache;
 pub mod identity;
 pub mod store;
+pub mod wholetrack;
+mod wholetrack_ring;
+mod wholetrack_ui;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
@@ -1355,6 +1358,16 @@ pub struct SpectrumAnalyzer {
     /// the same generation, under the same pin — never whatever the head
     /// names by the time the read starts.
     pre_cache: Option<CacheRef>,
+    /// The settings record the installed matrix was analysed at, when it is
+    /// known: `AnalysisSettings::record` of a verified hit or a current
+    /// completion, or the record a legacy file states. `None` for a nominal
+    /// legacy file, whose settings nothing on disk records.
+    ///
+    /// Cleared by every install and clear, and set after the install by the
+    /// production sites that know it, so a site that forgets reads as
+    /// "geometry unknown" rather than as another analysis's geometry. The
+    /// whole-track view takes its axes from this, never from the sliders.
+    pre_record: Option<String>,
     /// The cache store for `cache_dir()`, opened once (see `store()`).
     store: Option<(PathBuf, Arc<store::Store>)>,
     /// Bumped whenever the installed matrix changes. A read that completes
@@ -1661,6 +1674,7 @@ impl SpectrumAnalyzer {
             peak_input: vec![0.0f32; DEFAULT_BAR_COUNT],
             pre_channels: PreChannels::Missing,
             pre_cache: None,
+            pre_record: None,
             store: None,
             pre_generation: 0,
             pre_request_serial: 0,
@@ -2442,7 +2456,7 @@ impl SpectrumAnalyzer {
     /// chosen alternate cannot differ in what they carry with them. `identity`
     /// must be the one `cache` was keyed with — it is what a sidecar is checked
     /// against when it is read.
-    fn install_cached(&mut self, frames: cache::PreFrames, cache: CacheRef) {
+    fn install_cached(&mut self, frames: cache::PreFrames, cache: CacheRef, record: Option<String>) {
         let _p = store::prof::span("install");
         let rate = self.sample_rate as f64 / self.pre_hop() as f64;
         let channels = cache.channels();
@@ -2460,6 +2474,7 @@ impl SpectrumAnalyzer {
             self.pending_waveform = Some(raw.iter().map(|&v| v / peak).collect());
         }
         self.set_pre_frames_with(frames, channels, Some(cache), rate);
+        self.pre_record = record;
     }
 
     /// The cache store for this analyser's cache directory, opened (and its
@@ -2507,6 +2522,46 @@ impl SpectrumAnalyzer {
         let record = settings.record(self.sample_rate);
         let desc = store::Descriptor { record, source };
         lookup_generation(&store, &settings.stem(), &desc, n_bars).map(|(f, i, _)| (f, i))
+    }
+
+    /// Whether what is installed is exactly the hit `start_preprocess(path)`
+    /// would install now at `sample_rate`: a store generation keyed by the
+    /// current settings, still the head of its stem, whose descriptor — the
+    /// settings record and the source file as it is *now* — is the one that
+    /// would be asked for. Then a repeat of the track keeps it rather than
+    /// reading and decoding it again.
+    ///
+    /// The same checks as the exact lookup, minus re-reading the payload:
+    /// one source snapshot (at most 1 MiB) and the head file. The rows are
+    /// the ones already in memory, verified when they were installed, and the
+    /// generation behind them is pinned by the installed handle. A chosen
+    /// alternate, a legacy file, a result shown from memory only, a newer
+    /// generation, other settings, a changed file or a pending request for
+    /// this track's channels all answer no, and take the ordinary path.
+    pub fn installed_matches(&mut self, path: &Path, sample_rate: u32) -> bool {
+        if self.pre_frames.is_empty() || self.pre_stereo_request.as_deref() == Some(path) {
+            return false;
+        }
+        let settings = self.effective_settings(path);
+        let (identity, unit) = settings.key(&self.cache_dir());
+        let installed = match &self.pre_cache {
+            Some(CacheRef::Store { unit: u, installed, identity: id }) if *u == unit && *id == identity => installed.clone(),
+            _ => return false,
+        };
+        let record = settings.record(sample_rate);
+        if installed.stem != settings.stem() || self.pre_record.as_deref() != Some(record.as_str()) {
+            return false;
+        }
+        let Some(store) = self.store() else { return false };
+        if store.dir() != installed.store.dir()
+            || store.head_state(&installed.stem) != store::HeadState::Valid(installed.generation)
+        {
+            return false;
+        }
+        match store::SourceSnapshot::of_path(path) {
+            Ok(source) => store::Descriptor { record, source }.digest() == installed.envelope.descriptor,
+            Err(_) => false,
+        }
     }
 
     /// The settings in force now, as they would be launched for `track`.
@@ -2616,7 +2671,8 @@ impl SpectrumAnalyzer {
             // questions: whether future analyses should *produce* channels, and
             // whether channels this track already has can be *found*. With the
             // preference off, a track analysed in stereo appeared to have none.
-            self.install_cached(frames, CacheRef::Store { unit, installed: Arc::new(installed), identity });
+            let record = settings.record(self.sample_rate);
+            self.install_cached(frames, CacheRef::Store { unit, installed: Arc::new(installed), identity }, Some(record));
             return;
         }
         // Either the standing preference, or the explicit request.
@@ -3008,6 +3064,8 @@ impl SpectrumAnalyzer {
             None => cache.as_ref().map_or(PreChannels::Missing, CacheRef::channels),
         };
         self.set_pre_frames_with(frames, channels, cache, frame_rate);
+        // `current` above: these are the settings in force, at this rate.
+        self.pre_record = Some(job.settings.record(job.sample_rate));
     }
 
     /// Where this analyser's caches live.
@@ -3102,6 +3160,7 @@ impl SpectrumAnalyzer {
         self.channels_arrived = matches!(channels, PreChannels::Resident(_));
         self.pre_channels = channels;
         self.pre_cache = cache;
+        self.pre_record = None;
         self.pre_frame_rate = frame_rate;
         // A read in flight against the previous matrix is now stale. The link
         // stays open so the result arrives and is refused, rather than
@@ -3121,10 +3180,21 @@ impl SpectrumAnalyzer {
         self.pre_frames = std::sync::Arc::new(cache::PreFrames::default());
         self.pre_channels = PreChannels::Missing;
         self.pre_cache = None;
+        self.pre_record = None;
         self.pre_generation = self.pre_generation.wrapping_add(1);
         self.reset_channels();
         self.invalidate_pre_cursor();
         self.pre_revision = self.pre_revision.wrapping_add(1);
+    }
+
+    /// The settings record of the installed matrix, if known. See `pre_record`.
+    pub fn pre_record(&self) -> Option<&str> {
+        self.pre_record.as_deref()
+    }
+
+    /// Where the installed matrix came from, if anywhere but memory.
+    pub fn pre_cache(&self) -> Option<&CacheRef> {
+        self.pre_cache.as_ref()
     }
 
     /// The installed channels, for tests that need to see what was installed.
@@ -6799,6 +6869,9 @@ struct SpectrumSettings {
     /// Waterfall history depth, in seconds. `None` in files written before the
     /// control existed, which take the default rather than 0.
     #[serde(default)] waterfall_secs: Option<f32>,
+    /// The whole-track view follows playback. `None` in files written before
+    /// it existed, which take the default (on).
+    #[serde(default)] whole_track_follow: Option<bool>,
     #[serde(default)] diff_layout:   channels::DiffLayout,
     #[serde(default)] min_freq:      f32,
     #[serde(default)] max_freq:      f32,
@@ -7040,6 +7113,11 @@ struct AltNotice {
 
 pub struct SpectrumWindow {
     pub open: bool,
+    /// The whole-track view, hosted in the plot area while selected.
+    pub whole_track: wholetrack_ui::WholeTrackView,
+    /// A seek the whole-track view asked for, for the player to carry out
+    /// through its own seek path. See [`SpectrumWindow::take_seek_request`].
+    pending_seek: Option<f64>,
     pub mode: SpectrumMode,
     pub style: VizStyle,
     /// Which channel spectrum to draw. Held as what the user asked for, not as
@@ -7372,6 +7450,8 @@ impl SpectrumWindow {
         let analyzer = SpectrumAnalyzer::new(Arc::clone(&buf));
         let mut w = Self {
             open: false,
+            whole_track: wholetrack_ui::WholeTrackView::new(),
+            pending_seek: None,
             mode: SpectrumMode::PreProcess,
             style: VizStyle::Bars,
             channel_view: channels::ChannelView::Mix,
@@ -7628,6 +7708,7 @@ impl SpectrumWindow {
             smoothing:     self.smoothing,
             pre_smoothing: Some(self.pre_smoothing),
             waterfall_secs: Some(self.waterfall_secs),
+            whole_track_follow: Some(self.whole_track.follow),
             diff_layout:   self.diff_layout,
             min_freq:      self.min_freq,
             max_freq:      self.max_freq,
@@ -7681,6 +7762,7 @@ impl SpectrumWindow {
             .map(|v| v.clamp(*timing::WATERFALL_SECS_RANGE.start(),
                              *timing::WATERFALL_SECS_RANGE.end()))
             .unwrap_or(timing::DEFAULT_WATERFALL_SECS);
+        self.whole_track.follow = s.whole_track_follow.unwrap_or(true);
         self.min_freq      = s.min_freq;
         self.max_freq      = s.max_freq;
         self.interp_mode   = s.interp_mode.clone();
@@ -8372,6 +8454,7 @@ impl SpectrumWindow {
             let cache = CacheRef::Store { unit, installed: Arc::new(installed), identity };
             let channels = cache.channels();
             self.analyzer.set_pre_frames_with(frames, channels, Some(cache), rate);
+            self.analyzer.pre_record = Some(settings.record(self.analyzer.sample_rate));
             self.spectral_ceiling = None; // recompute on next tick
             self.spectral_ceiling_attempted = false;
             self.needs_reanalysis = false;
@@ -8526,7 +8609,7 @@ impl SpectrumWindow {
     /// Revalidate a candidate in full, then retire whatever is running for this
     /// track and install it. Nothing is touched until the read has succeeded.
     fn adopt(&mut self, track: &PathBuf, cand: alt_cache::Candidate) -> Result<(), String> {
-        let (frames, cache) = if cand.legacy {
+        let (frames, cache, record) = if cand.legacy {
             // Each legacy kind under its own identity: a rounded-name file's
             // sidecar was written against the legacy key, a record file's
             // against the exact settings identity.
@@ -8548,7 +8631,9 @@ impl SpectrumWindow {
             if want.is_some() && record != want {
                 return Err("its settings record does not match this track at these settings".into());
             }
-            (frames, CacheRef::Legacy { path: cand.path.clone(), identity })
+            // A nominal file states no settings: its geometry is not known.
+            let record = if cand.nominal { None } else { record };
+            (frames, CacheRef::Legacy { path: cand.path.clone(), identity }, record)
         } else {
             // A store analysis: re-read under a new pin, for this source as it
             // is now. A file changed since discovery is no longer a match.
@@ -8565,7 +8650,8 @@ impl SpectrumWindow {
                 store::Miss::DescriptorMismatch => "it is no longer a valid analysis of this track as the file is now".to_string(),
                 store::Miss::Damaged(e) | store::Miss::Io(e) => format!("the file could not be read ({e})"),
             })?;
-            (frames, CacheRef::Store { unit, installed: Arc::new(installed), identity })
+            let record = Some(desc.record.clone());
+            (frames, CacheRef::Store { unit, installed: Arc::new(installed), identity }, record)
         };
         if frames.is_empty() {
             return Err("the file holds no rows".into());
@@ -8574,7 +8660,7 @@ impl SpectrumWindow {
         // so no completion of it — queued, or sent after this — can land on
         // top of what is installed next.
         self.analyzer.retire_analysis();
-        self.analyzer.install_cached(frames, cache);
+        self.analyzer.install_cached(frames, cache, record);
         self.spectral_ceiling = None;
         self.spectral_ceiling_attempted = false;
         self.needs_reanalysis = false;
@@ -9092,7 +9178,15 @@ impl SpectrumWindow {
         self.analyzer.min_freq = self.min_freq;
         self.analyzer.max_freq = self.max_freq;
         let resuming = self.analyzer.owns_live_job_for(path, sample_rate);
-        if resuming {
+        // The same track again with its finished analysis still installed and
+        // still exactly what an exact lookup would install: playback restarts,
+        // the analysis does not. Keeping it keeps the planes, the store pin and
+        // the analyser's revision, so nothing downstream (the whole-track view's
+        // zoom, its rasters, the waveform) is rebuilt for a transport event.
+        // A chosen alternate takes its own path below (it is re-adopted).
+        let mut retained = !resuming && !changed && chosen.is_none()
+            && self.analyzer.installed_matches(path, sample_rate);
+        if resuming || retained {
             self.analyzer.reset_keeping_analysis();
         } else {
             self.analyzer.reset();
@@ -9103,11 +9197,20 @@ impl SpectrumWindow {
         self.sync_fft_sizes();
         self.analyzer.bar_count = self.bar_count;
         self.sync_params();
-        self.spectral_ceiling = None;
-        self.spectral_ceiling_attempted = false;
-        self.waveform = None;
+        // Checked again with every setting now applied: anything `sync_params`
+        // changed that the installed analysis does not match ends the
+        // retention, and the ordinary request below replaces it.
+        if retained && !self.analyzer.installed_matches(path, sample_rate) {
+            retained = false;
+            self.analyzer.clear_pre_frames();
+        }
+        if !retained {
+            self.spectral_ceiling = None;
+            self.spectral_ceiling_attempted = false;
+            self.waveform = None;
+            self.track_analysis = None;
+        }
         self.waveform_rx = None;
-        self.track_analysis = None;
         self.needs_reanalysis = false;
         // The window's half of the presentation state, which `analyzer.reset()`
         // above cannot reach: peak decay and the uploaded waterfall texture.
@@ -9132,7 +9235,7 @@ impl SpectrumWindow {
         // Skipped while resuming: the job in flight is already doing exactly
         // this work. Otherwise the request never waits here: if a cancelled
         // job is still finishing, this one is queued and starts after it.
-        if !resuming {
+        if !resuming && !retained {
             let track = path.to_path_buf();
             let kept = chosen.is_some_and(|c| self.adopt(&track, c).is_ok());
             if !kept {
@@ -9161,6 +9264,14 @@ impl SpectrumWindow {
     /// FFT run rate, not the UI repaint rate (which can spike when the mouse
     /// moves over the spectrum viewport).
     pub fn tick(&mut self, elapsed_secs: f64, is_playing: bool) {
+        // Only the playhead line moves with playback; the view's raster does not.
+        self.whole_track.playhead = elapsed_secs;
+        // Not on screen — the window closed (its close box or the main
+        // toolbar), another mode, or the toggle off: nothing is kept for it.
+        // Minimised or unfocused is still on screen and keeps its picture.
+        if !self.whole_track_shown() {
+            self.whole_track.retire();
+        }
         // Poll background results — always, even when paused
         if let Some(ref rx) = self.waveform_rx
             && let Ok((wf, analysis)) = rx.try_recv() {
@@ -9733,8 +9844,43 @@ impl SpectrumWindow {
     /// "showing channels" means.
     fn wants_pre_channels(&self) -> bool {
         self.mode == SpectrumMode::PreProcess
-            && self.channel_view.needs_channels()
-            && self.style_supports_channels()
+            && ((self.channel_view.needs_channels() && self.style_supports_channels())
+                || (self.whole_track_shown() && self.whole_track.wants_channels()))
+    }
+
+    /// Whether the whole-track view is on screen: the window open, in
+    /// Pre-process, with the view selected.
+    fn whole_track_shown(&self) -> bool {
+        self.open && self.mode == SpectrumMode::PreProcess && self.whole_track.open
+    }
+
+    /// A seek the whole-track view asked for, in seconds, taken once. The
+    /// player carries it out through its own seek path, as it does for the
+    /// seek bar.
+    pub fn take_seek_request(&mut self) -> Option<f64> {
+        self.pending_seek.take()
+    }
+
+    /// Draw the whole-track view in place of the plot, and do what it asks.
+    fn whole_track_ui(&mut self, ui: &mut egui::Ui) {
+        let pal = Palette::new(self.palette_kind, self.palette_accent);
+        let analysing = self.analyzer.analysis_busy()
+            .then(|| self.analyzer.analysis_progress.load(Ordering::Relaxed));
+        match self.whole_track.ui(ui, &self.analyzer, &pal, analysing, self.show_debug) {
+            Some(wholetrack_ui::Action::Seek(t)) => self.pending_seek = Some(t),
+            Some(wholetrack_ui::Action::AnalyseChannels) => {
+                if let Some(path) = self.current_path.clone() {
+                    self.analyzer.pre_stereo_request = Some(path.clone());
+                    self.analyzer.start_preprocess(path);
+                }
+            }
+            Some(wholetrack_ui::Action::Reanalyze) => {
+                if !self.reanalyze() {
+                    self.status_msg = "Re-analyze is not available while an analysis is still finishing.".into();
+                }
+            }
+            None => {}
+        }
     }
 
     /// Bring channel residency in line with what is being drawn.
@@ -9954,7 +10100,11 @@ impl SpectrumWindow {
 
     /// Render the spectrum as a separate OS window via `show_viewport_immediate`.
     pub fn show(&mut self, ctx: &egui::Context) {
-        if !self.open { return; }
+        if !self.open {
+            // Closed by the main toolbar between ticks: release now as well.
+            self.whole_track.retire();
+            return;
+        }
 
         // Instrumentation: measure the REAL repaint interval (how often this
         // window is actually being redrawn) and the wall-clock cost of the
@@ -9980,6 +10130,7 @@ impl SpectrumWindow {
         ctx.show_viewport_immediate(vp_id, vp_builder, |vp_ctx, _class| {
             if vp_ctx.input(|i| i.viewport().close_requested()) {
                 self.open = false;
+                self.whole_track.retire();
                 return;
             }
             // F3 toggles debug overlay
@@ -10019,6 +10170,27 @@ impl SpectrumWindow {
                         ui.selectable_value(&mut self.style, VizStyle::OctaveBands, "Octave");
                     }
                     ui.selectable_value(&mut self.style, VizStyle::Phasescope, "Phase");
+                    // The whole-track view replaces the plot while it is on and
+                    // leaves the views above exactly as they were. It reads a
+                    // finished analysis, so it exists only in Pre-process.
+                    if self.mode == SpectrumMode::PreProcess {
+                        let was = self.whole_track.open;
+                        ui.toggle_value(&mut self.whole_track.open, "Whole track")
+                            .on_hover_text(
+                                "The whole analysed track as a time–frequency picture: \
+                                 zoom with the wheel (Shift+wheel for frequency), drag to \
+                                 pan, click to seek, middle-click to fit.\n\nIt shows the \
+                                 stored analysis cells — no smoothing, no ISO 226 — and \
+                                 never starts an analysis by being opened.",
+                            );
+                        if was && !self.whole_track.open {
+                            self.whole_track.close();
+                        }
+                    } else {
+                        // Another mode keeps the preference and releases the
+                        // data; returning to Pre-process shows it again.
+                        self.whole_track.retire();
+                    }
                     ui.separator();
                     // ── Channel view ────────────────────────────────────────
                     // Mix is always offered. The rest are enabled only when a
@@ -11592,6 +11764,11 @@ The Mix is unaffected.                                  Analysing the track agai
 
                 ui.separator();
 
+                if self.whole_track.open && self.mode == SpectrumMode::PreProcess {
+                    self.whole_track_ui(ui);
+                    return;
+                }
+
                 let avail = ui.available_size();
                 let sense = if self.show_eq { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
                 let (rect, spec_response) = ui.allocate_exact_size(avail, sense);
@@ -12174,6 +12351,12 @@ The Mix is unaffected.                                  Analysing the track agai
                     }
 
                 }
+            });
+            crate::frame_log::spectrum_pass(|| {
+                let (inner, ppp) = vp_ctx.input(|i| (i.viewport().inner_rect, i.pixels_per_point()));
+                let size = inner.map_or("null".to_string(), |r| format!("[{:.1},{:.1}]", r.width(), r.height()));
+                format!("{{\"inner\":{size},\"ppp\":{ppp:.3},\"style\":\"{:?}\",\"whole_track\":{}}}",
+                    self.style, self.whole_track.log_note())
             });
         });
 

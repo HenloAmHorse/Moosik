@@ -3,12 +3,15 @@
 
 use super::*;
 use crate::lyrics::ai;
+use crate::lyrics::local_ai;
 use crate::lyrics::translation::{self, SourceLanguage};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[path = "translation_workbench.rs"]
+mod translation_workbench;
 
 #[derive(Default)]
 pub(super) struct TranslationState {
@@ -22,6 +25,8 @@ pub(super) struct TranslationState {
     edit: Option<ManualEdit>,
     provider: Provider,
     ai: AiSettings,
+    local: LocalSettings,
+    workbench: translation_workbench::Workbench,
 }
 
 /// Which online translation an explicit request uses.
@@ -30,6 +35,240 @@ pub(super) enum Provider {
     #[default]
     Basic,
     Ai,
+    /// PROTOTYPE: the downloadable local pack, on this computer.
+    Local,
+}
+
+/// PROTOTYPE local-pack settings, for this session only.
+struct LocalSettings {
+    /// The model chosen; at start the first installed one, else the first listed.
+    pack: &'static local_ai::Pack,
+    source: Option<local_ai::Source>,
+    target: local_ai::Target,
+    fluent: bool,
+    gpu: bool,
+    low_ram: bool,
+    preferences: local_ai::Preferences,
+    root: std::path::PathBuf,
+    /// Whether the pack is installed, as last checked (after install/remove).
+    installed: Option<bool>,
+    /// Bytes already downloaded and kept for resuming, as last checked.
+    partial: u64,
+    /// The download's terms are on screen, waiting for "Download now".
+    consent_open: bool,
+    install: Option<Install>,
+    /// This computer and the advice for it, read when the advice is first
+    /// opened (and again on request), never at start.
+    advice: Option<(local_ai::advice::Machine, local_ai::advice::Advice)>,
+}
+
+/// The model the user last chose, by pack ID, in the local-model folder.
+const CHOSEN: &str = "chosen-model.txt";
+
+fn chosen_pack(root: &std::path::Path) -> Option<&'static local_ai::Pack> {
+    let id = std::fs::read_to_string(root.join(CHOSEN)).ok()?;
+    local_ai::PACKS.iter().copied().find(|p| p.id == id.trim())
+}
+
+fn remember_choice(root: &std::path::Path, pack: &local_ai::Pack) {
+    if std::fs::create_dir_all(root).is_ok() {
+        let _ = std::fs::write(root.join(CHOSEN), pack.id);
+    }
+}
+
+impl Default for LocalSettings {
+    fn default() -> Self {
+        let root = local_ai::default_root();
+        // The model chosen last time; else the first installed one; else the first listed.
+        let pack = chosen_pack(&root)
+            .or_else(|| local_ai::PACKS.iter().copied().find(|p| local_ai::installed(&root, p)))
+            .unwrap_or(local_ai::PACKS[0]);
+        #[cfg(not(test))]
+        let preferences = local_ai::Preferences::load(&root);
+        #[cfg(test)]
+        let preferences = local_ai::Preferences::default();
+        Self { pack, source: None, target: local_ai::Target::TraditionalChinese, fluent: false, gpu: true, low_ram: false, preferences,
+               root, installed: None, partial: 0, consent_open: false, install: None, advice: None }
+    }
+}
+
+impl super::LyricsWindow {
+    /// "Which model for this computer?": the three kinds of advice, each with
+    /// its route and costs, and a button that only selects it (no download,
+    /// no run). Returns a pick the user chose, with whether it uses the card.
+    fn advice_ui(&mut self, ui: &mut egui::Ui) -> Option<(&'static local_ai::Pack, local_ai::Device)> {
+        use local_ai::advice;
+        let mut chosen = None;
+        egui::CollapsingHeader::new("Which model for this computer?").id_salt("local_advice").show(ui, |ui| {
+            let l = &mut self.translation.local;
+            if l.advice.is_none() {
+                let m = advice::inventory();
+                let a = advice::advise(local_ai::PACKS, &m);
+                l.advice = Some((m, a));
+            }
+            let Some((m, a)) = l.advice.clone() else { return };
+            let gb = local_ai::memory::gib;
+            ui.label(format!(
+                "This computer: {} RAM ({} free now){}. Planned within {} of graphics memory and {} of RAM, keeping \
+                 {} of graphics memory and {} of RAM for Windows, the desktop and Moosik.",
+                gb(m.ram_total), gb(m.ram_free),
+                m.gpu.as_ref().map_or(", no graphics card's dedicated memory reported".to_string(),
+                    |g| format!(", {} with {} of its own memory", g.name, gb(g.dedicated))),
+                gb(a.budget.vram), gb(a.budget.ram), gb(advice::VRAM_RESERVE), gb(advice::RAM_RESERVE),
+            ));
+            for (what, tip, pick) in [
+                ("Quality first", "The best-judged model this computer can run at all, on its fastest route that fits.", a.quality),
+                ("Balanced", "The best-judged model that fits with room to spare and answers a 10-row sheet within \
+                    about 15 s.", a.balanced),
+                ("Largest that fits", "The biggest model this computer can hold. Size is not quality.", a.largest),
+            ] {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(what).strong()).on_hover_text(tip);
+                    if let Some(p) = pick
+                        && ui.button("Use this").on_hover_text("Selects this model and route. Nothing is downloaded or run.").clicked()
+                    {
+                        chosen = Some((p.pack, p.device()));
+                    }
+                });
+                match pick {
+                    Some(p) => {
+                        let c = p.cost;
+                        ui.label(format!(
+                            "{} — {}. About {:.0} s per 10-row sheet; {} RAM{}. {}.",
+                            p.pack.label, p.path.label(), c.secs_per_sheet, gb(c.ram),
+                            if c.vram > 0 { format!(", {} graphics memory", gb(c.vram)) } else { String::new() },
+                            if c.measured { "Measured on one computer (RTX 2060 SUPER 8 GB)" } else { "Estimated, not measured" },
+                        ));
+                        let fits = local_ai::memory::room(p.need(), m.headroom());
+                        let text = local_ai::memory::startup_text(p.need(), m.headroom());
+                        let colour = if fits == local_ai::memory::Room::Fits { ui.visuals().text_color() } else { ui.visuals().warn_fg_color };
+                        ui.label(egui::RichText::new(text).color(colour));
+                    }
+                    None => {
+                        ui.label("Nothing known fits this computer.");
+                    }
+                }
+            }
+            ui.label(egui::RichText::new(local_ai::QUALITY_BASIS).small());
+            if ui.small_button("Check this computer again").clicked() {
+                self.translation.local.advice = None;
+            }
+        });
+        chosen
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallKind {
+    Download,
+    /// Using files already on this computer.
+    Import,
+}
+
+struct Install {
+    kind: InstallKind,
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<InstallMessage>,
+    progress: Option<local_ai::Progress>,
+    /// (when, bytes received over the network) over the last half minute.
+    samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+    /// When bytes last arrived.
+    last_bytes: std::time::Instant,
+}
+
+enum InstallMessage {
+    Progress(local_ai::Progress),
+    /// What to tell the user.
+    Done(Result<String, String>),
+}
+
+/// How far back the download speed is measured.
+const SPEED_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Install {
+    fn new(kind: InstallKind, cancel: Arc<AtomicBool>, rx: Receiver<InstallMessage>) -> Self {
+        let now = std::time::Instant::now();
+        Self { kind, cancel, rx, progress: None, samples: Default::default(), last_bytes: now }
+    }
+
+    fn update(&mut self, p: local_ai::Progress) {
+        let now = std::time::Instant::now();
+        if self.progress.is_none_or(|o| o.fetched != p.fetched) {
+            self.last_bytes = now;
+        }
+        self.samples.push_back((now, p.fetched));
+        while self.samples.front().is_some_and(|(t, _)| now - *t > SPEED_WINDOW) {
+            self.samples.pop_front();
+        }
+        self.progress = Some(p);
+    }
+
+    /// Network bytes per second over the last half minute, once at least
+    /// five seconds of it are known. Bytes already on disk from an earlier
+    /// attempt are not in it.
+    fn speed(&self) -> Option<f64> {
+        let ((t0, b0), (t1, b1)) = (self.samples.front()?, self.samples.back()?);
+        let dt = (*t1 - *t0).as_secs_f64();
+        (dt >= 5.0).then(|| b1.saturating_sub(*b0) as f64 / dt)
+    }
+
+    fn describe(&self, cancelling: bool) -> String {
+        let gb = |b: u64| b as f64 / 1e9;
+        let what = match self.progress {
+            None => match self.kind {
+                InstallKind::Download => "Starting the download…".to_string(),
+                InstallKind::Import => "Reading the chosen files…".to_string(),
+            },
+            Some(p) => match p.phase {
+                local_ai::Phase::Download => format!("Downloading {}: {:.2} of {:.2} GB", p.file, gb(p.done), gb(p.total)),
+                local_ai::Phase::Check => format!("Checking {} against its pinned SHA-256…", p.file),
+                local_ai::Phase::Copy => format!("Copying {}: {:.2} of {:.2} GB", p.file, gb(p.done), gb(p.total)),
+                local_ai::Phase::Unpack => "Setting up the runtime…".to_string(),
+            },
+        };
+        if cancelling { format!("Stopping. {what}") } else { what }
+    }
+
+    /// Speed, a cautious time left, and reconnects, while downloading.
+    fn rate_line(&self) -> Option<String> {
+        let p = self.progress?;
+        if p.phase != local_ai::Phase::Download {
+            return None;
+        }
+        let idle = self.last_bytes.elapsed().as_secs();
+        let reconnects = match p.reconnects {
+            0 => String::new(),
+            1 => " · reconnected once".into(),
+            n => format!(" · reconnected {n} times"),
+        };
+        Some(if idle >= 10 {
+            format!("No data for {idle} s: waiting (it reconnects by itself), or cancel and resume later.{reconnects}")
+        } else {
+            match self.speed() {
+                Some(s) if s > 0.0 => format!("{:.2} MB/s · about {} left{reconnects}", s / 1e6,
+                    eta(p.total.saturating_sub(p.done) as f64 / s)),
+                _ => format!("Measuring the speed…{reconnects}"),
+            }
+        })
+    }
+}
+
+/// A time left, rounded up, never more precise than it can be.
+fn eta(secs: f64) -> String {
+    let m = (secs / 60.0).ceil() as u64;
+    match m {
+        0 | 1 => "a minute".into(),
+        m if m < 60 => format!("{m} min"),
+        m => format!("{} h {} min", m / 60, m % 60),
+    }
+}
+
+struct LocalResult {
+    identity: local_ai::Identity,
+    flags: Vec<Option<local_ai::RowFlags>>,
+    /// Corrective retries the request needed (each accepted, or it failed).
+    retries: usize,
 }
 
 /// Context-aware AI settings, for this session only: nothing here is saved.
@@ -55,6 +294,7 @@ struct Consent {
     rev: u64,
 }
 
+#[derive(Clone)]
 struct Snapshot {
     track: Option<PathBuf>,
     rev: u64,
@@ -83,6 +323,8 @@ struct Task {
     progress: (usize, usize),
     /// The AI settings an AI request was made with; `None` otherwise.
     ai: Option<ai::Config>,
+    /// The identity a local request was made with; `None` otherwise.
+    local: Option<local_ai::Identity>,
 }
 
 enum Message {
@@ -95,6 +337,7 @@ struct Translated {
     credit: String,
     replaces_existing: bool,
     ai: Option<AiResult>,
+    local: Option<Box<LocalResult>>,
 }
 
 struct AiResult {
@@ -137,6 +380,8 @@ impl TranslationState {
         self.source = None;
     }
     pub(super) fn clear_sheet(&mut self) {
+        self.workbench = Default::default();
+        self.local.preferences.feedback.clear();
         self.clear_preview();
         self.open = false;
         self.consent = false;
@@ -203,6 +448,26 @@ impl LyricsWindow {
         captured.is_none_or(|c| self.translation.provider == Provider::Ai && self.ai_config().as_ref() == Some(c))
     }
 
+    /// The local identity as the settings stand: `None` until a source is chosen.
+    fn local_identity(&self) -> Option<local_ai::Identity> {
+        let l = &self.translation.local;
+        let style = if l.fluent { ai::Style::Fluent } else { ai::Style::Faithful };
+        let device = if !l.gpu { local_ai::Device::Cpu }
+            else if l.low_ram && l.pack.id == local_ai::HYMT2_30B.id { local_ai::Device::GpuLowRam }
+            else { local_ai::Device::Gpu };
+        let mut identity = local_ai::Identity::new(l.pack, l.source?, l.target, style, device);
+        identity.preferences = l.preferences.clone();
+        Some(identity)
+    }
+
+    fn local_matches(&self, captured: Option<&local_ai::Identity>) -> bool {
+        captured.is_none_or(|c| self.translation.provider == Provider::Local && self.local_identity().as_ref() == Some(c))
+    }
+
+    fn result_matches(&self, r: &Translated) -> bool {
+        self.ai_matches(r.ai.as_ref().map(|a| &a.config)) && self.local_matches(r.local.as_ref().map(|l| &l.identity))
+    }
+
     pub(super) fn cancel_translation(&mut self) {
         if let Some(task) = &self.translation.task {
             task.cancel.store(true, Ordering::Release);
@@ -215,6 +480,7 @@ impl LyricsWindow {
     /// and drop an unapplied preview. The worker keeps its slot until its
     /// completion is consumed. A manual draft is the user's text and is kept.
     pub(super) fn abandon_translation(&mut self) {
+        self.translation.workbench = Default::default();
         let t = &mut self.translation;
         let live = t.task.as_ref().is_some_and(|x| !x.cancel.load(Ordering::Acquire));
         if !live && t.preview.is_none() {
@@ -226,6 +492,16 @@ impl LyricsWindow {
         t.serial = t.serial.wrapping_add(1);
         t.preview = None;
         self.status = "Translation cancelled; nothing was applied.".into();
+        self.keep_local_warning();
+    }
+
+    /// A local runtime process or download that could not be confirmed
+    /// finished outranks every other status: no cancellation, track change or
+    /// stale completion may hide it.
+    fn keep_local_warning(&mut self) {
+        if let Some(w) = local_ai::outstanding(&self.translation.local.root) {
+            self.status = w;
+        }
     }
 
     pub(super) fn open_translation(&mut self) {
@@ -252,9 +528,19 @@ impl LyricsWindow {
         }
         let source = self.translation.source;
         let ai_mode = machine && self.translation.provider == Provider::Ai;
-        if machine && !ai_mode && (!self.translation.consent || source.is_none()) {
+        let local_mode = machine && self.translation.provider == Provider::Local;
+        if machine && !ai_mode && !local_mode && (!self.translation.consent || source.is_none()) {
             return;
         }
+        let local_ready = if local_mode {
+            let Some(identity) = self.local_identity() else { return };
+            if identity.route == local_ai::Route::Translate && self.translation.local.installed != Some(true) {
+                return;
+            }
+            Some(identity)
+        } else {
+            None
+        };
         // AI: agreement to exactly these settings and this sheet, a key, and
         // the sheet's physical bounds, all checked on borrowed state before
         // the snapshot below deep-copies the sheet.
@@ -289,17 +575,45 @@ impl LyricsWindow {
         } else {
             None
         };
+        let local_job = if let Some(identity) = local_ready {
+            let l = &snapshot.lyrics;
+            let texts: Vec<&str> = l.lines.iter().map(|x| x.text.as_str()).collect();
+            let revision = self.local_revision();
+            let wanted: Vec<bool> = l.lines.iter()
+                .map(|x| revision.is_some() || self.translation.replace || x.translation.as_ref().is_none_or(|s| s.trim().is_empty()))
+                .collect();
+            let job = local_ai::Job::new(identity, track.title, track.artist, &texts, &wanted)
+                .and_then(|job| if let Some(r) = revision { job.revise(r) } else { Ok(job) });
+            match job {
+                Ok(job) => Some(job),
+                Err(e) => {
+                    self.status = e;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let local_identity = local_job.as_ref().map(|j| j.identity.clone());
+        let local_revision = local_job.as_ref().is_some_and(local_ai::Job::is_revision);
+        let local_root = self.translation.local.root.clone();
+        let local_pack = self.translation.local.pack;
         let ai_config = ai_job.as_ref().map(|(job, _)| job.config().clone());
+        if local_mode {
+            self.archive_local_preview();
+        } else {
+            self.translation.workbench = Default::default();
+        }
         self.translation.clear_preview();
         self.translation.serial = self.translation.serial.wrapping_add(1);
         let serial = self.translation.serial;
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
         let (tx, rx) = mpsc::channel();
-        let replace = self.translation.replace;
+        let replace = self.translation.replace || local_revision;
         // Basic and supplied lookups work on a copy; the AI job already holds
         // what it sends and needs none.
-        let mut input = if ai_job.is_none() { Some(snapshot.lyrics.clone()) } else { None };
+        let mut input = if ai_job.is_none() && local_job.is_none() { Some(snapshot.lyrics.clone()) } else { None };
         if let Some(input) = input.as_mut()
             && machine
             && !replace
@@ -331,6 +645,13 @@ impl LyricsWindow {
                         let _ = tx.send(Message::Progress(done, total));
                     })?;
                     Ok(ai_translated(&job, o, replace))
+                } else if let Some(job) = local_job {
+                    let o = local_ai::run(&local_root, local_pack, &job, serial, &stop, |done, total| {
+                        let _ = tx.send(Message::Progress(done, total));
+                    })?;
+                    let credit = job.identity.credit(local_pack);
+                    Ok(Translated { rows: o.rows, credit, replaces_existing: replace, ai: None,
+                                    local: Some(Box::new(LocalResult { identity: job.identity, flags: o.flags, retries: o.retries.len() })) })
                 } else if machine {
                     let Some(input) = input else { return Err("Internal error: no input; nothing was sent.".into()) };
                     let source = source.ok_or_else(|| "Choose the source language.".to_string())?;
@@ -338,7 +659,7 @@ impl LyricsWindow {
                         let _ = tx.send(Message::Progress(done, total));
                     })?;
                     Ok(Translated { rows, credit: format!("{} ({} to Chinese)", translation::NAME, source.label()),
-                                    replaces_existing: replace, ai: None })
+                                    replaces_existing: replace, ai: None, local: None })
                 } else {
                     // Lookup is independent of LRCLIB's successful original
                     // lyric hit. Never install a different original sheet.
@@ -348,7 +669,7 @@ impl LyricsWindow {
                     if stop.load(Ordering::Acquire) { return Err("Cancelled.".into()); }
                     let rows = translation::supplement(&input, &hit)?;
                     Ok(Translated { rows, credit: format!("Supplement supplied by {}", hit.source),
-                                    replaces_existing: false, ai: None })
+                                    replaces_existing: false, ai: None, local: None })
                 }
             })).unwrap_or_else(|_| Err("The translation worker stopped unexpectedly; nothing was applied.".into()));
             let _ = tx.send(Message::Done(result));
@@ -362,9 +683,12 @@ impl LyricsWindow {
                     rx,
                     progress: (0, 0),
                     ai: ai_config,
+                    local: local_identity,
                 });
                 self.status = if ai_mode {
                     "Translating with OpenAI…"
+                } else if local_mode {
+                    "Translating on this computer…"
                 } else if machine {
                     "Translating…"
                 } else {
@@ -406,6 +730,7 @@ impl LyricsWindow {
                     let current = task.serial == self.translation.serial
                         && task.snapshot.matches(self)
                         && self.ai_matches(task.ai.as_ref())
+                        && self.local_matches(task.local.as_ref())
                         && !self.editing
                         && !self.romaji_editing
                         && !self.translation.is_editing();
@@ -413,11 +738,14 @@ impl LyricsWindow {
                         if current {
                             self.status = "Translation cancelled; nothing was applied.".into();
                         }
+                        self.keep_local_warning();
                         return;
                     }
                     if !current {
                         // Do not replace the new track/editor's status with a
-                        // stale request's result or error.
+                        // stale request's result or error (a process-safety
+                        // warning is not a result: it stays).
+                        self.keep_local_warning();
                         return;
                     }
                     match result {
@@ -428,7 +756,19 @@ impl LyricsWindow {
                                     .iter()
                                     .any(|s| s.as_ref().is_some_and(|s| !s.trim().is_empty())) =>
                         {
+                            let local_flagged = result.local.as_ref().map(|l| l.flags.iter().flatten().filter(|f| f.any()).count());
+                            let retried = result.local.as_ref().map_or(0, |l| l.retries);
+                            let retried = if retried > 0 {
+                                format!(" (the model's first answer for {retried} part(s) was refused and asked again once)")
+                            } else {
+                                String::new()
+                            };
                             self.status = match result.ai.as_ref().map(|a| (&a.review, a.flags.iter().flatten().filter(|f| f.any()).count())) {
+                                None if local_flagged.is_some_and(|n| n > 0) => format!(
+                                    "Local translation ready to preview{retried}; {} row(s) flagged for checking — Apply does not save it to disk.",
+                                    local_flagged.unwrap_or(0)),
+                                None if result.local.is_some() => format!(
+                                    "Local translation ready to preview{retried} — Apply does not save it to disk."),
                                 None => "Translation ready to preview — Apply does not save it to disk.".into(),
                                 Some((ai::Review::Failed(e), _)) => format!(
                                     "Unreviewed AI draft ready to preview: the review request failed. {e}"),
@@ -442,6 +782,7 @@ impl LyricsWindow {
                                 result,
                                 display: crate::lyrics::zh::Cache::default(),
                             });
+                            self.prepare_workbench_rows();
                         }
                         Ok(_) => {
                             self.status =
@@ -450,6 +791,7 @@ impl LyricsWindow {
                         }
                         Err(e) => self.status = e,
                     }
+                    self.keep_local_warning();
                     return;
                 }
             }
@@ -457,6 +799,7 @@ impl LyricsWindow {
     }
 
     fn apply_translation_preview(&mut self) {
+        if self.translation.is_busy() { return; }
         let Some(preview) = self.translation.preview.take() else {
             return;
         };
@@ -465,10 +808,13 @@ impl LyricsWindow {
                 "The lyrics changed. Find or translate again; nothing was applied.".into();
             return;
         }
-        if !self.ai_matches(preview.result.ai.as_ref().map(|a| &a.config)) {
+        if !self.result_matches(&preview.result) {
             self.status = "The AI settings changed since this preview was made; nothing was applied.".into();
             return;
         }
+        let before = preview.snapshot.clone();
+        let selected = self.translation.workbench.adopt.clone();
+        let local = preview.result.local.is_some();
         let Some(lyrics) = &mut self.lyrics else {
             return;
         };
@@ -480,15 +826,16 @@ impl LyricsWindow {
             || lyrics
                 .lines
                 .iter()
-                .zip(&preview.result.rows)
-                .any(|(line, new)| {
-                    new.is_none()
+                .zip(&preview.result.rows).enumerate()
+                .any(|(i, (line, new))| {
+                    (new.is_none() || (local && selected.get(i) == Some(&false)))
                         && line
                             .translation
                             .as_ref()
                             .is_some_and(|s| !s.trim().is_empty())
                 });
-        for (line, translated) in lyrics.lines.iter_mut().zip(preview.result.rows) {
+        for (i, (line, translated)) in lyrics.lines.iter_mut().zip(preview.result.rows).enumerate() {
+            if local && selected.get(i) == Some(&false) { continue; }
             if let Some(text) = translated
                 && line.translation.as_ref() != Some(&text)
             {
@@ -502,6 +849,9 @@ impl LyricsWindow {
             lyrics.translation_credit =
                 Some(merged_credit(&credit, previous.filter(|_| old_survives)));
             self.translation_changed();
+            if local && let Some(after) = self.translation_snapshot() {
+                self.translation.workbench.undo = Some((before, after));
+            }
         }
         self.status =
             "Translation applied — Save to keep it. Original lyrics and timing are unchanged."
@@ -583,7 +933,8 @@ impl LyricsWindow {
     }
 
     pub(super) fn translation_panel(&mut self, ui: &mut egui::Ui, track: &TrackRef) {
-        if self.translation.preview.as_ref().is_some_and(|p| !self.ai_matches(p.result.ai.as_ref().map(|a| &a.config))) {
+        self.poll_local_install();
+        if self.translation.preview.as_ref().is_some_and(|p| !self.preview_compatible(p)) {
             self.translation.preview = None;
             self.status = "The AI settings changed; the unapplied AI preview was discarded.".into();
         }
@@ -600,7 +951,7 @@ impl LyricsWindow {
         egui::ScrollArea::vertical().id_salt("translation_controls_scroll")
             .max_height(panel_height).show(ui, |ui| { ui.group(|ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label("中文翻譯 / Chinese translation");
+                ui.label("Translation");
                 if ui.button("✖").on_hover_text("Close this panel; an active request is cancelled.").clicked() {
                     self.translation.open = false;
                     cancel = true;
@@ -646,6 +997,7 @@ impl LyricsWindow {
                 ui.add_enabled_ui(idle, |ui| {
                     ui.radio_value(&mut provider, Provider::Basic, "Basic (MyMemory)");
                     ui.radio_value(&mut provider, Provider::Ai, "Context-aware AI (OpenAI, your key)");
+                    ui.radio_value(&mut provider, Provider::Local, "On this computer (prototype, local pack)");
                 });
             });
             self.set_source(source);
@@ -653,6 +1005,8 @@ impl LyricsWindow {
             self.set_provider(provider);
             if self.translation.provider == Provider::Ai {
                 machine = self.ai_panel(ui, idle);
+            } else if self.translation.provider == Provider::Local {
+                machine = self.local_panel(ui, idle);
             } else {
                 ui.label(RichText::new("Online translation sends lyric text to MyMemory, a third-party service. \
                     Its terms describe long-term segment storage and sharing with translation partners. \
@@ -671,6 +1025,8 @@ impl LyricsWindow {
                     let (done, total) = task.progress;
                     if total > 0 {
                         ui.label(if task.ai.is_some() { format!("{done}/{total} requests answered") }
+                                 // The local route reports the parts the sheet was sent in.
+                                 else if task.local.is_some() { format!("part {} of {total} on this computer", (done + 1).min(total)) }
                                  else { format!("{done}/{total} unique lines") });
                     }
                     cancel = ui.button("Cancel").clicked() || cancel;
@@ -680,9 +1036,18 @@ impl LyricsWindow {
                 ui.label(RichText::new("Existing source/user translations will be replaced only after Apply. \
                     Save keeps the previous sidecar as a backup.").small().color(pal::amber(ui.visuals().dark_mode)));
             }
+            self.local_history_ui(ui, idle);
+            let preview_current = self.translation.preview.as_ref().is_some_and(|p| self.result_matches(&p.result));
             if let Some(preview) = &mut self.translation.preview {
                 ui.separator();
                 ui.label(RichText::new(&preview.result.credit).small());
+                if let Some(l) = &preview.result.local {
+                    ui.label(format!("Draft seed {} · {}", l.identity.preferences.seed, l.identity.preferences.variation.label()));
+                    if !preview_current { ui.label("Instructions or seed changed. Generate a revision, or restore a version's settings before Apply."); }
+                    if !preview_current && ui.add_enabled(idle, egui::Button::new("Restore this draft's settings")).clicked() {
+                        self.translation.local.preferences = l.identity.preferences.clone();
+                    }
+                }
                 let amber = pal::amber(ui.visuals().dark_mode);
                 if let Some(a) = &preview.result.ai {
                     match &a.review {
@@ -698,8 +1063,33 @@ impl LyricsWindow {
                     }
                 }
                 egui::ScrollArea::vertical().id_salt("translation_preview").max_height(155.0).show(ui, |ui| {
-                    for (i, (original, translated)) in preview.snapshot.lyrics.lines.iter().zip(&preview.result.rows).enumerate() {
+                    for (i, (original, translated)) in preview.snapshot.lyrics.lines.iter().zip(&mut preview.result.rows).enumerate() {
                         if let Some(text) = translated {
+                            if preview.result.local.is_some() {
+                                let w = &mut self.translation.workbench;
+                                ui.add_enabled_ui(idle, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        if let Some(v) = w.locked.get_mut(i) { ui.checkbox(v, "Lock"); }
+                                        if let Some(v) = w.selected.get_mut(i) { ui.checkbox(v, "Revise"); }
+                                        if let Some(v) = w.adopt.get_mut(i) { ui.checkbox(v, "Adopt"); }
+                                    });
+                                });
+                                if let Some(previous) = w.history.last().filter(|p| p.snapshot.rev == preview.snapshot.rev)
+                                    .and_then(|p| p.result.rows.get(i)).and_then(Option::as_ref)
+                                {
+                                    ui.columns(2, |columns| {
+                                        columns[0].label(RichText::new(format!("Previous: {previous}")).small().weak());
+                                        columns[1].label(RichText::new(format!("Current: {text}")).small());
+                                    });
+                                    if previous != text && ui.add_enabled(idle, egui::Button::new("Use previous for this row")).clicked() {
+                                        text.clone_from(previous);
+                                        if let Some(l) = preview.result.local.as_mut() && let Some(flag) = l.flags.get_mut(i) { *flag = None; }
+                                        if !preview.result.credit.contains("selected draft rows") {
+                                            preview.result.credit.push_str("; includes selected draft rows");
+                                        }
+                                    }
+                                }
+                            }
                             ui.label(RichText::new(&original.text).small());
                             let family = translation_family(ui, self.translation_display);
                             ui.label(RichText::new(preview.display.get(i, text, self.translation_display)).family(family));
@@ -708,11 +1098,19 @@ impl LyricsWindow {
                             {
                                 ui.label(RichText::new(format!("⚠ Check this row: {}", f.describe())).small().color(amber));
                             }
+                            if let Some(f) = preview.result.local.as_ref().and_then(|l| l.flags.get(i).copied().flatten()) {
+                                if f.any() {
+                                    ui.label(RichText::new(format!("⚠ Check this row: {}", f.describe())).small().color(amber));
+                                } else if f.foreign_script {
+                                    // A note, not a warning: often a name kept as written.
+                                    ui.label(RichText::new(format!("Note: {}", f.describe())).small().weak());
+                                }
+                            }
                         }
                     }
                 });
                 ui.horizontal(|ui| {
-                    apply = ui.add_enabled(!editing_sheet, egui::Button::new("Apply translation")).clicked();
+                    apply = ui.add_enabled(!editing_sheet && idle && preview_current, egui::Button::new("Apply translation")).clicked();
                     if ui.button("Discard preview").clicked() { self.translation.preview = None; }
                 });
             }
@@ -889,6 +1287,325 @@ impl LyricsWindow {
     }
 }
 
+impl LyricsWindow {
+    /// Install or import progress and completion; refreshes the installed state.
+    fn poll_local_install(&mut self) {
+        let l = &mut self.translation.local;
+        if l.installed.is_none() {
+            l.installed = Some(local_ai::installed(&l.root, l.pack));
+            l.partial = local_ai::partial_bytes(&l.root, l.pack);
+        }
+        let Some(inst) = l.install.as_mut() else { return };
+        loop {
+            match inst.rx.try_recv() {
+                Ok(InstallMessage::Progress(p)) => inst.update(p),
+                Ok(InstallMessage::Done(r)) => {
+                    // A cancelled download is a download, not a translation.
+                    let r = match r {
+                        Err(_) if inst.cancel.load(Ordering::Acquire) => Err(match inst.kind {
+                            InstallKind::Download => "Download cancelled; what was downloaded is kept and resumes next time.",
+                            InstallKind::Import => "Copying cancelled; nothing was installed.",
+                        }.to_string()),
+                        r => r,
+                    };
+                    self.status = match (r, local_ai::outstanding(&l.root)) {
+                        (Ok(said), _) => said,
+                        // The installing thread returned; its connection may not have.
+                        (Err(e), Some(w)) => format!("{e} {w}"),
+                        (Err(e), None) => e,
+                    };
+                    l.install = None;
+                    l.installed = None;
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.status = "The pack download stopped unexpectedly; install again to resume.".into();
+                    l.install = None;
+                    l.installed = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// PROTOTYPE local-pack controls. Returns whether Translate was pressed.
+    /// Drawing never downloads or starts anything.
+    fn local_panel(&mut self, ui: &mut egui::Ui, idle: bool) -> bool {
+        // In a column as wide as what can be seen, so its text wraps there
+        // even when a wide row elsewhere in the panel made the panel wider.
+        let w = visible_width(ui);
+        let h = ui.available_height().max(1.0);
+        ui.allocate_ui_with_layout(egui::vec2(w, h), egui::Layout::top_down(egui::Align::Min), |ui| self.local_panel_body(ui, idle)).inner
+    }
+
+    fn local_panel_body(&mut self, ui: &mut egui::Ui, idle: bool) -> bool {
+        let gb = |b: u64| b as f64 / 1e9;
+        let supported = local_ai::platform_supported();
+        let mut start = false;
+        let mut download = false;
+        let mut remove = false;
+        let mut import: Option<std::path::PathBuf> = None;
+        let installing = self.translation.local.install.is_some();
+        let (mut pack, mut source, mut target, mut fluent, mut gpu, mut low_ram) = {
+            let l = &self.translation.local;
+            (l.pack, l.source, l.target, l.fluent, l.gpu, l.low_ram)
+        };
+        ui.add_enabled_ui(idle && !installing, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Model:");
+                egui::ComboBox::from_id_salt("local_pack")
+                    .selected_text(pack.label)
+                    .width((ui.available_width() - 8.0).clamp(120.0, 420.0))
+                    .truncate()
+                    .show_ui(ui, |ui| {
+                        for p in local_ai::PACKS {
+                            let have = local_ai::installed(&self.translation.local.root, p);
+                            let text = format!("{}{}", p.label, if have { " — installed" } else { "" });
+                            if ui.selectable_label(std::ptr::eq(pack, *p), text).clicked() {
+                                pack = p;
+                            }
+                        }
+                    });
+            });
+            ui.label(pack.summary);
+            if let Some((p, device)) = self.advice_ui(ui) {
+                pack = p;
+                gpu = device != local_ai::Device::Cpu;
+                low_ram = device == local_ai::Device::GpuLowRam;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("From:");
+                egui::ComboBox::from_id_salt("local_source")
+                    .selected_text(source.map(local_ai::Source::label).unwrap_or("Choose…"))
+                    .show_ui(ui, |ui| {
+                        for s in local_ai::Source::ALL {
+                            ui.selectable_value(&mut source, Some(s), s.label());
+                        }
+                    });
+                ui.label("Into:");
+                egui::ComboBox::from_id_salt("local_target").selected_text(target.label()).show_ui(ui, |ui| {
+                    for t in local_ai::Target::ALL {
+                        ui.selectable_value(&mut target, t, t.label());
+                    }
+                });
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(&mut fluent, false, "Faithful")
+                    .on_hover_text("Asks for an accurate translation of each line. The default.");
+                ui.radio_value(&mut fluent, true, "More fluent (meaning kept)")
+                    .on_hover_text("Also asks for natural lyric phrasing, with the meaning kept whole: \
+                                    nothing added or dropped, no rhyme at the meaning's cost. \
+                                    It is not a singable adaptation.");
+                ui.checkbox(&mut gpu, "Use the graphics card (Vulkan) when available");
+            });
+            if gpu && pack.id == local_ai::HYMT2_30B.id {
+                ui.checkbox(&mut low_ram, "Use less RAM (experimental; needs a 7+ GiB graphics card)");
+                if low_ram {
+                    let need = local_ai::memory_need(pack, local_ai::Device::GpuLowRam).expect("30B route");
+                    ui.label("Keeps the same model and context. Uses more graphics memory and commit headroom, and may run slower. No extra download.");
+                    ui.label(local_ai::memory::startup_text(need, local_ai::memory::read()));
+                }
+            }
+        });
+        {
+            let l = &mut self.translation.local;
+            if !std::ptr::eq(l.pack, pack) {
+                // Another model: its own install state, and no agreement carried over.
+                l.installed = None;
+                l.consent_open = false;
+                remember_choice(&l.root, pack);
+            }
+            (l.pack, l.source, l.target, l.fluent, l.gpu, l.low_ram) = (pack, source, target, fluent, gpu, low_ram);
+        }
+        let installed = self.translation.local.installed == Some(true);
+        let route = source.map(|s| local_ai::route(s, target));
+        match route {
+            Some(local_ai::Route::KeepOriginal) => {
+                ui.label("Same language: the original rows are used as they are; no model runs.");
+            }
+            Some(local_ai::Route::ConvertCharacters) => {
+                ui.label("Chinese to Chinese: the original rows are converted to Traditional characters (OpenCC s2tw); no model runs.");
+            }
+            _ => {}
+        }
+        let needs_pack = route.is_none_or(|r| r == local_ai::Route::Translate);
+        // Work that could not be confirmed finished blocks every pack action
+        // and model run here, and stays on screen until it has ended.
+        let held = local_ai::outstanding(&self.translation.local.root);
+        if let Some(w) = &held {
+            ui.colored_label(egui::Color32::from_rgb(0xd0, 0x60, 0x20), w);
+        }
+        let idle = idle && held.is_none();
+        let partial = self.translation.local.partial;
+        let (download_b, peak_b, installed_b) = local_ai::disk_needs(pack);
+        if needs_pack && !supported {
+            ui.label("Translation on this computer needs 64-bit Windows: the local pack's runtime is a Windows x64 build, \
+                so nothing is offered for download here. Same-language routes above still work.");
+        } else if let Some(inst) = &self.translation.local.install {
+            let cancelling = inst.cancel.load(Ordering::Acquire);
+            ui.label(RichText::new(inst.describe(cancelling)).strong());
+            let fraction = inst.progress.map_or(0.0, |p| if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 });
+            ui.add(egui::ProgressBar::new(fraction).show_percentage());
+            if let Some(line) = inst.rate_line() {
+                ui.label(line);
+            }
+            let label = match inst.kind {
+                InstallKind::Download => "Cancel download",
+                InstallKind::Import => "Cancel copying",
+            };
+            if ui.add_enabled(!cancelling, egui::Button::new(label)).clicked() {
+                inst.cancel.store(true, Ordering::Release);
+            }
+        } else if needs_pack && installed {
+            ui.label(format!("Installed: {:.2} GB in {}.", gb(installed_b), local_ai::pack_dir(&self.translation.local.root, pack).display()));
+        } else if needs_pack && !self.translation.local.consent_open {
+            let resume = if partial > 0 { format!(" {:.2} GB is already here and will be resumed.", gb(partial)) } else { String::new() };
+            ui.label(format!("Not installed. It needs a one-time download of {:.2} GB, or files you already have.{resume}", gb(download_b)));
+            ui.horizontal_wrapped(|ui| {
+                let label = if partial > 0 { "Resume download…" } else { "Download…" };
+                if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
+                    self.translation.local.consent_open = true;
+                }
+                ui.add_enabled_ui(idle, |ui| {
+                    ui.menu_button("Use files I already have…", |ui| {
+                        if ui.button("A pack folder (from another Moosik)…").clicked() {
+                            ui.close_menu();
+                            import = rfd::FileDialog::new().set_title("Choose an installed pack folder").pick_folder();
+                        }
+                        if ui.button("A model file (.gguf)…").clicked() {
+                            ui.close_menu();
+                            import = rfd::FileDialog::new().set_title("Choose the model file").add_filter("GGUF model", &["gguf"]).pick_file();
+                        }
+                    });
+                });
+            });
+        } else if needs_pack {
+            // The terms, before anything is fetched. Opening the panel or this
+            // card downloads nothing; only "Download now" does.
+            let free = local_ai::free_space(&self.translation.local.root);
+            let room = free.is_none_or(|f| f + partial >= peak_b + 1_000_000_000);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new(format!("Download {}?", pack.label)).heading());
+                egui::ScrollArea::vertical().max_height(ui.ctx().screen_rect().height() * 0.45).show(ui, |ui| {
+                    let label_w = 120.0;
+                    egui::Grid::new("local_terms").num_columns(2).spacing([12.0, 8.0]).striped(true)
+                        .min_col_width(60.0).max_col_width((ui.available_width() - label_w - 12.0).max(120.0)).show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, what: &str, text: String| {
+                            ui.label(RichText::new(what).strong());
+                            ui.add(egui::Label::new(text).wrap());
+                            ui.end_row();
+                        };
+                        row(ui, "What it is", pack.summary.to_string());
+                        row(ui, "Translates", format!("{} into {}.", local_ai::Source::ALL.map(local_ai::Source::label).join(", "),
+                            local_ai::Target::ALL.map(local_ai::Target::label).join(" or ")));
+                        row(ui, "Download", format!("{:.2} GB, once: the model from Hugging Face and the llama.cpp runtime from \
+                            GitHub (skipped when another installed pack already has it). Every file is checked against a pinned size \
+                            and SHA-256 before it is used.", gb(download_b)));
+                        row(ui, "Disk", format!("Up to {:.2} GB while installing, {:.2} GB once installed, in {}.{}", gb(peak_b),
+                            gb(installed_b), self.translation.local.root.display(),
+                            free.map(|f| format!(" {:.1} GB is free there now.", gb(f))).unwrap_or_default()));
+                        row(ui, "Memory", pack.resources.to_string());
+                        let gpu_need = if low_ram && pack.id == local_ai::HYMT2_30B.id { local_ai::memory_need(pack, local_ai::Device::GpuLowRam).expect("30B route") } else { pack.need_gpu };
+                        row(ui, "Before each run", local_ai::memory::admission_text(gpu_need, pack.need_cpu));
+                        row(ui, "Privacy", "Once installed it runs on this computer with no network access, no key and no \
+                            account. Nothing is sent, and nothing falls back to an online service.".to_string());
+                        row(ui, "Limitations", pack.limitations.to_string());
+                    });
+                    egui::CollapsingHeader::new("Licences and sources").show(ui, |ui| {
+                        ui.label(RichText::new(pack.notices).small());
+                    });
+                });
+                if !room {
+                    ui.colored_label(egui::Color32::from_rgb(0xd0, 0x60, 0x20),
+                        "There is not enough free space for the download and the install (plus 1 GB to spare).");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let label = if partial > 0 {
+                        format!("Resume download ({:.2} GB left)", gb(download_b.saturating_sub(partial)))
+                    } else {
+                        format!("Download now ({:.2} GB)", gb(download_b))
+                    };
+                    download = ui.add_enabled(idle && room, egui::Button::new(label)).clicked();
+                    if ui.button("Not now").clicked() {
+                        self.translation.local.consent_open = false;
+                    }
+                });
+            });
+        }
+        let can = idle && !installing && source.is_some() && (installed || !needs_pack) && (supported || !needs_pack);
+        start |= self.local_creative_settings(ui, can);
+        ui.horizontal_wrapped(|ui| {
+            let label = if self.translation.preview.as_ref().is_some_and(|p| p.result.local.is_some()) {
+                "Revise selected unlocked rows"
+            } else { "Translate on this computer" };
+            start |= ui.add_enabled(can, egui::Button::new(label)).clicked();
+            if installed {
+                remove = ui.add_enabled(idle && !installing, egui::Button::new("Remove this model")).clicked();
+            } else if partial > 0 && !installing {
+                remove = ui.add_enabled(idle, egui::Button::new(format!("Discard partial download ({:.2} GB)", gb(partial)))).clicked();
+            }
+        });
+        ui.label("Prototype. The result is machine translation by a local model and may mistranslate; check it before \
+            applying. Each result names the model that made it.");
+        if download {
+            self.translation.local.consent_open = false;
+            self.start_local_install(None);
+        }
+        if let Some(from) = import {
+            self.start_local_install(Some(from));
+        }
+        if remove {
+            let l = &mut self.translation.local;
+            let what = if installed { "Local model removed." } else { "Partial download discarded." };
+            self.status = match local_ai::remove(&l.root, pack) {
+                Ok(()) => what.into(),
+                Err(e) => e,
+            };
+            l.installed = None;
+        }
+        start
+    }
+
+    /// Download the selected pack, or (`from`) use files already on this
+    /// computer for it; either on its own thread.
+    fn start_local_install(&mut self, from: Option<std::path::PathBuf>) {
+        let l = &mut self.translation.local;
+        if l.install.is_some() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let root = l.root.clone();
+        let pack = l.pack;
+        let kind = if from.is_some() { InstallKind::Import } else { InstallKind::Download };
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new().name("local-pack-install".into()).spawn(move || {
+            let send = |p: local_ai::Progress| { let _ = tx.send(InstallMessage::Progress(p)); };
+            let r = match from {
+                None => local_ai::install_reporting(&root, pack, local_ai::PACKS, &mut local_ai::https_fetch, &stop, None, send)
+                    .map(|()| format!("{} installed and verified.", pack.label)),
+                Some(from) => local_ai::import(&root, pack, local_ai::PACKS, &from, &stop, send).map(|i| match i {
+                    local_ai::Imported::Installed => format!("{} installed from {}, verified; nothing was downloaded.", pack.label, from.display()),
+                    local_ai::Imported::Partial { copied, missing } => format!(
+                        "Copied and verified {} from {}. {:.2} GB still has to be downloaded to finish: choose Download.",
+                        copied.join(", "), from.display(), missing as f64 / 1e9),
+                }),
+            };
+            let _ = tx.send(InstallMessage::Done(r));
+        });
+        match spawned {
+            Ok(_) => l.install = Some(Install::new(kind, cancel, rx)),
+            Err(_) => self.status = "Could not start the pack download.".into(),
+        }
+    }
+}
+
+/// The width of `ui` that can be seen from its cursor, so text can wrap there.
+fn visible_width(ui: &egui::Ui) -> f32 {
+    (ui.clip_rect().right() - ui.cursor().left() - 4.0).clamp(100.0, ui.available_width().max(100.0))
+}
+
 /// The AI request for a sheet: every row's original text, and which rows
 /// want a translation (every row with Replace, otherwise those without one).
 fn ai_job_for(lyrics: &Lyrics, replace: bool, config: ai::Config, track: &TrackRef) -> Result<ai::Job, String> {
@@ -903,7 +1620,7 @@ fn ai_job_for(lyrics: &Lyrics, replace: bool, config: ai::Config, track: &TrackR
 fn ai_translated(job: &ai::Job, o: ai::Outcome, replace: bool) -> Translated {
     let config = job.config().clone();
     Translated { rows: o.rows, credit: config.credit(&o.review), replaces_existing: replace,
-                 ai: Some(AiResult { config, flags: o.flags, notes: o.notes, review: o.review }) }
+                 ai: Some(AiResult { config, flags: o.flags, notes: o.notes, review: o.review }), local: None }
 }
 
 fn pasted_rows(text: &str, expected: usize) -> Result<Vec<String>, String> {
@@ -1010,6 +1727,7 @@ mod tests {
             credit: "Synthetic machine translation".into(),
             replaces_existing,
             ai: None,
+            local: None,
         }
     }
 
@@ -1022,6 +1740,7 @@ mod tests {
             rx,
             progress: (0, 0),
             ai: None,
+            local: None,
         });
         tx
     }
@@ -1082,6 +1801,41 @@ mod tests {
             assert!(!w.translation_dirty);
             assert_eq!(w.status, "Current sheet status");
         }
+    }
+
+    /// A process-safety warning (a local runtime process or download that
+    /// could not be confirmed finished) survives cancellation, a stale
+    /// completion and a track change, and goes once the work has ended.
+    #[test]
+    fn a_local_process_warning_survives_cancel_stale_results_and_track_changes() {
+        let mut w = window();
+        let root = std::env::temp_dir().join(format!("moosik_ui_outstanding_{}", std::process::id()));
+        w.translation.local.root = root.clone();
+        let held = local_ai::seam::outstanding_for(&root);
+        // Cancelled, then its completion arrives.
+        let tx = queue(&mut w);
+        w.cancel_translation();
+        tx.send(Message::Done(Err("Local translation cancelled; nothing was applied.".into()))).unwrap();
+        w.poll_translation();
+        assert!(w.status.contains("could not be confirmed stopped"), "{}", w.status);
+        // A stale completion (the request was superseded).
+        let tx = queue(&mut w);
+        w.translation.serial = w.translation.serial.wrapping_add(1);
+        tx.send(Message::Done(Ok(result(false)))).unwrap();
+        w.poll_translation();
+        assert!(w.status.contains("could not be confirmed stopped"), "{}", w.status);
+        // A track change abandons the live request.
+        let _tx = queue(&mut w);
+        w.abandon_translation();
+        assert!(w.status.contains("could not be confirmed stopped"), "{}", w.status);
+        // Once the work has ended, cancellation reads as cancellation again.
+        drop(held);
+        w.translation.task = None;
+        let tx = queue(&mut w);
+        w.cancel_translation();
+        tx.send(Message::Done(Err("x".into()))).unwrap();
+        w.poll_translation();
+        assert!(w.status.contains("cancelled") && !w.status.contains("confirmed"), "{}", w.status);
     }
 
     #[test]
@@ -1191,6 +1945,7 @@ mod tests {
             credit: "Supplement supplied by NetEase".into(),
             replaces_existing: false,
             ai: None,
+            local: None,
         })))
         .unwrap();
         w.poll_translation();
@@ -1540,6 +2295,79 @@ mod tests {
         }
     }
 
+    /// The local setup card at narrow, ordinary and wide sizes and at three
+    /// scale factors: every piece of text stays inside the window (it wraps
+    /// rather than running off), and nothing on it is drawn smaller than the
+    /// body text — the licence notes are folded away by default.
+    #[test]
+    fn the_local_setup_card_is_readable_at_any_size_and_scale() {
+        // Tall enough that the whole panel is in view (the widths are the point).
+        for (wd, ht) in [(420.0, 1600.0), (520.0, 1600.0), (900.0, 1600.0)] {
+            for ppp in [1.0f32, 1.5, 2.0] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(ppp);
+                let body = ctx.style().text_styles[&egui::TextStyle::Body].size;
+                let mut w = window();
+                w.translation.open = true;
+                w.translation.provider = Provider::Local;
+                w.translation.local.source = Some(local_ai::Source::Japanese);
+                w.translation.local.installed = Some(false);
+                w.translation.local.consent_open = true;
+                let mut sizes = Vec::new();
+                for frame in 0..3 {
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(wd, ht))),
+                        ..Default::default()
+                    };
+                    let out = ctx.run(input, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| w.translation_panel(ui, &track()));
+                        });
+                    });
+                    sizes.clear();
+                    for cs in &out.shapes {
+                        if let egui::Shape::Text(t) = &cs.shape {
+                            let r = t.visual_bounding_rect();
+                            let text = t.galley.text().to_string();
+                            // The local panel's text wraps. (Rows of the shared panel above
+                            // it — the language row, the provider radios — are older and do
+                            // not wrap at the narrowest widths; not checked here.)
+                            let card = ["GB", "Measured on", "no network access", "translation model", "Hy-MT2", "Qwen"].iter().any(|k| text.contains(k));
+                            // The last frame, once a new scale has been applied.
+                            assert!(frame < 2 || !card || r.right() <= wd + 1.0, "{wd}x{ht} @{ppp}: {text:?} runs to {}", r.right());
+                            for sec in &t.galley.job.sections {
+                                sizes.push((sec.format.font_id.size, text.clone()));
+                            }
+                        }
+                    }
+                }
+                assert!(sizes.iter().any(|(_, t)| t.contains("Before each run")), "the card was not drawn");
+                for (size, text) in &sizes {
+                    if ["Download", "Disk", "Memory", "Before each run", "Privacy", "Limitations", "Translates", "What it is"].iter().any(|k| text == k) {
+                        assert!(*size >= body, "{text:?} at {size} < body {body}");
+                    }
+                }
+                let min_card = sizes.iter().filter(|(_, t)| t.len() > 40 && ["GB", "Measured on", "no network access", "translation model", "Into", "free"].iter().any(|k| t.contains(k))).map(|(s, _)| *s).fold(f32::MAX, f32::min);
+                assert!(min_card >= body, "{wd}x{ht} @{ppp}: some card text is {min_card} < body {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn changing_the_memory_route_makes_an_old_translation_stale() {
+        let mut w = window();
+        w.translation.provider = Provider::Local;
+        w.translation.local.pack = &local_ai::HYMT2_30B;
+        w.translation.local.source = Some(local_ai::Source::Japanese);
+        w.translation.local.gpu = true;
+        let old = w.local_identity().unwrap();
+        w.translation.local.low_ram = true;
+        assert_eq!(w.local_identity().unwrap().device, local_ai::Device::GpuLowRam);
+        assert!(!w.local_matches(Some(&old)));
+        w.translation.local.pack = &local_ai::HYMT2_7B;
+        assert_eq!(w.local_identity().unwrap().device, local_ai::Device::Gpu);
+    }
+
     // ── Context-aware AI mode ───────────────────────────────────────────
 
     use crate::lyrics::ai::tests::{SEND_GATE, SENTINEL_KEY, answer, completed};
@@ -1572,6 +2400,7 @@ mod tests {
                 notes: "The second row could mean either kind of love.".into(),
                 review,
             }),
+            local: None,
         }
     }
 
@@ -1890,7 +2719,7 @@ mod tests {
                 check(&w, "after a manual edit");
                 let tx = queue(&mut w);
                 tx.send(Message::Done(Ok(Translated { rows: vec![Some(format!("供應{i}")), None],
-                    credit: "Supplement supplied by NetEase".into(), replaces_existing: false, ai: None }))).unwrap();
+                    credit: "Supplement supplied by NetEase".into(), replaces_existing: false, ai: None, local: None }))).unwrap();
                 w.poll_translation();
                 w.apply_translation_preview();
                 check(&w, "after a supplied row");
@@ -1954,7 +2783,7 @@ mod tests {
             // A supplied supplement after the edits.
             let tx = queue(&mut w);
             tx.send(Message::Done(Ok(Translated { rows: vec![None, None, Some("喔喔".into())],
-                credit: "Supplement supplied by NetEase".into(), replaces_existing: false, ai: None }))).unwrap();
+                credit: "Supplement supplied by NetEase".into(), replaces_existing: false, ai: None, local: None }))).unwrap();
             w.poll_translation();
             w.apply_translation_preview();
             check(&w, "supplemented");
@@ -2049,7 +2878,7 @@ mod tests {
         let mut w = window();
         let tx = queue(&mut w);
         tx.send(Message::Done(Ok(Translated { rows: vec![Some("一起".into()), Some("爱".into())],
-            credit: "MyMemory machine translation".into(), replaces_existing: false, ai: None }))).unwrap();
+            credit: "MyMemory machine translation".into(), replaces_existing: false, ai: None, local: None }))).unwrap();
         w.poll_translation();
         w.apply_translation_preview();
         assert_eq!(w.lyrics.as_ref().unwrap().lines[1].translation.as_deref(), Some("爱"));
@@ -2076,7 +2905,7 @@ mod tests {
             let tx = queue(&mut w);
             let mut rows = vec![None; n];
             rows[0] = Some("一個字".to_string());
-            tx.send(Message::Done(Ok(Translated { rows, credit: "Synthetic".into(), replaces_existing: false, ai: None }))).unwrap();
+            tx.send(Message::Done(Ok(Translated { rows, credit: "Synthetic".into(), replaces_existing: false, ai: None, local: None }))).unwrap();
             w.poll_translation();
             assert!(w.translation.preview.is_some());
             let before_sheet = w.lyrics.as_ref().unwrap().to_lrc();
@@ -2142,5 +2971,169 @@ mod tests {
             assert!(!output.shapes.is_empty());
             assert!(!w.translation_dirty);
         }
+    }
+
+    // ------------------------------------------------ PROTOTYPE local pack
+
+    fn wait(w: &mut LyricsWindow) {
+        let t0 = std::time::Instant::now();
+        while w.translation.is_busy() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            w.poll_translation();
+        }
+    }
+
+    #[test]
+    fn local_chinese_to_chinese_needs_no_pack_and_stores_traditional() {
+        let mut w = sheet("[00:01.00]简体中文
+[00:02.00]歌词");
+        w.set_provider(Provider::Local);
+        w.translation.local.source = Some(local_ai::Source::Chinese);
+        w.translation.local.installed = Some(false);
+        w.start_translation(&track(), true);
+        wait(&mut w);
+        let p = w.translation.preview.as_ref().expect("a preview");
+        assert_eq!(p.result.rows, vec![Some("簡體中文".into()), Some("歌詞".into())]);
+        assert!(p.result.local.is_some() && p.result.ai.is_none());
+        w.apply_translation_preview();
+        assert_eq!(w.lyrics.as_ref().unwrap().lines[1].translation.as_deref(), Some("歌詞"));
+    }
+
+    #[test]
+    fn local_translation_does_not_start_without_an_installed_pack() {
+        let mut w = window();
+        w.set_provider(Provider::Local);
+        w.translation.local.source = Some(local_ai::Source::Korean);
+        w.translation.local.installed = Some(false);
+        w.start_translation(&track(), true);
+        assert!(!w.translation.is_busy());
+        w.translation.local.source = None;
+        w.translation.local.installed = Some(true);
+        w.start_translation(&track(), true);
+        assert!(!w.translation.is_busy(), "no source chosen");
+    }
+
+    fn workbench_draft(w: &mut LyricsWindow, seed: u32) {
+        w.set_provider(Provider::Local);
+        w.translation.local.source = Some(local_ai::Source::Korean);
+        w.translation.local.preferences.seed = seed;
+        let identity = w.local_identity().unwrap();
+        w.translation.preview = Some(Preview {
+            snapshot: w.translation_snapshot().unwrap(),
+            result: Translated { rows:vec![Some(format!("第一句 {seed}")),Some(format!("第二句 {seed}"))],
+                credit:"Local AI translation (synthetic fixture)".into(), replaces_existing:true, ai:None,
+                local:Some(Box::new(LocalResult { identity,flags:vec![None;2],retries:0 })) },
+            display:Default::default(),
+        });
+        w.prepare_workbench_rows();
+    }
+
+    #[test]
+    fn workbench_history_restores_seed_and_draft_without_touching_the_sheet() {
+        let mut w = window();
+        let before = w.lyrics.clone().unwrap();
+        workbench_draft(&mut w, 11);
+        w.translation.local.preferences.instructions = "少用啊吧".into();
+        assert!(!w.result_matches(&w.translation.preview.as_ref().unwrap().result));
+        assert!(w.preview_compatible(w.translation.preview.as_ref().unwrap()));
+        assert!(w.local_revision().is_some());
+        w.archive_local_preview();
+        workbench_draft(&mut w, 22);
+        w.restore_local_draft(0);
+        assert_eq!(w.translation.local.preferences.seed, 11);
+        assert!(w.translation.local.preferences.instructions.is_empty());
+        assert_eq!(w.translation.preview.as_ref().unwrap().result.rows[0].as_deref(),Some("第一句 11"));
+        assert_eq!(w.translation.workbench.history.len(),1);
+        assert_eq!(w.lyrics.as_ref().unwrap().lines,before.lines);
+        // Bounded history, including repeated draws; failed requests retain
+        // their archived predecessor instead of overwriting it.
+        for seed in 30..45 { w.archive_local_preview(); workbench_draft(&mut w, seed); }
+        assert_eq!(w.translation.workbench.history.len(),8);
+        w.loaded_for = Some(PathBuf::from("different.flac"));
+        assert!(w.local_revision().is_none());
+        w.restore_local_draft(0);
+        assert_eq!(w.translation.local.preferences.seed,44);
+    }
+
+    #[test]
+    fn workbench_selected_adoption_and_undo_do_not_overwrite_newer_edits() {
+        let mut w = window();
+        let before = w.lyrics.clone().unwrap();
+        workbench_draft(&mut w,11);
+        w.translation.workbench.adopt[1] = false;
+        w.apply_translation_preview();
+        assert_eq!(w.lyrics.as_ref().unwrap().lines[0].translation.as_deref(),Some("第一句 11"));
+        assert_eq!(w.lyrics.as_ref().unwrap().lines[1].translation,before.lines[1].translation);
+        w.undo_local_adoption();
+        assert_eq!(w.lyrics.as_ref().unwrap().lines,before.lines);
+        workbench_draft(&mut w,22);
+        w.apply_translation_preview();
+        w.lyrics.as_mut().unwrap().lines[0].translation = Some("new manual edit".into());
+        w.sheet_rev += 1;
+        w.undo_local_adoption();
+        assert_eq!(w.lyrics.as_ref().unwrap().lines[0].translation.as_deref(),Some("new manual edit"));
+    }
+
+    #[test]
+    fn workbench_seed_change_invalidates_a_pending_completion_and_lock_selection_is_captured() {
+        let mut w = window();
+        workbench_draft(&mut w,11);
+        w.translation.workbench.locked[0] = true;
+        w.translation.workbench.selected[1] = false;
+        let r = w.local_revision().unwrap();
+        assert_eq!(r.locked,vec![true,false]);
+        assert_eq!(r.selected,vec![true,false]);
+        let identity = w.local_identity().unwrap();
+        let mut result = w.translation.preview.take().unwrap().result;
+        let tx = queue(&mut w);
+        w.translation.task.as_mut().unwrap().local = Some(identity);
+        w.translation.local.preferences.reroll();
+        result.rows[0] = Some("stale result".into());
+        tx.send(Message::Done(Ok(result))).unwrap();
+        w.poll_translation();
+        assert!(w.translation.preview.is_none());
+        assert!(!w.translation_dirty);
+    }
+
+    #[test]
+    fn a_local_preview_is_not_applied_after_its_identity_changed() {
+        let mut w = sheet("[00:01.00]简体
+[00:02.00]歌词");
+        w.set_provider(Provider::Local);
+        w.translation.local.source = Some(local_ai::Source::Chinese);
+        w.start_translation(&track(), true);
+        wait(&mut w);
+        assert!(w.translation.preview.is_some());
+        w.translation.local.target = local_ai::Target::English;
+        w.apply_translation_preview();
+        assert!(w.lyrics.as_ref().unwrap().lines.iter().all(|l| l.translation.is_none()), "nothing applied");
+        // A queued completion made with other settings is never previewed.
+        w.translation.local.target = local_ai::Target::TraditionalChinese;
+        w.start_translation(&track(), true);
+        w.translation.local.fluent = true;
+        wait(&mut w);
+        assert!(w.translation.preview.is_none());
+    }
+}
+
+#[cfg(test)]
+mod choice_tests {
+    use super::*;
+
+    /// The local model the user picks is remembered by ID in the model
+    /// folder; an unknown or missing record falls back (to the first
+    /// installed, then the first listed), and nothing else is written.
+    #[test]
+    fn the_chosen_local_model_is_remembered() {
+        let root = std::env::temp_dir().join(format!("moosik_chosen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(chosen_pack(&root).is_none());
+        remember_choice(&root, &local_ai::HYMT2_1_8B);
+        assert_eq!(chosen_pack(&root).map(|p| p.id), Some(local_ai::HYMT2_1_8B.id));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "something besides the choice was written");
+        std::fs::write(root.join(CHOSEN), "no-such-pack").unwrap();
+        assert!(chosen_pack(&root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

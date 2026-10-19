@@ -90,8 +90,57 @@ mod appearance_tests {
         }).unwrap()).unwrap();
         assert_eq!(round.lyrics_translation, super::lyrics::zh::ChineseDisplay::Simplified);
     }
+
+    /// The lyric text size: an older file gets the default; a stored size
+    /// survives a save and a load into a new window (a restart); anything
+    /// unusable becomes a usable size without resetting the other fields.
+    #[test]
+    fn the_lyric_text_size_survives_a_restart_and_bad_values() {
+        use super::lyrics::ui::{LyricsWindow, TEXT_SIZE_DEFAULT, TEXT_SIZE_MAX, TEXT_SIZE_MIN};
+        let old = r#"{"ui_scale":1.0,"art_accent":true,"theme":"Dark","show_play_count":false,"ui_font":null}"#;
+        let a: super::Appearance = serde_json::from_str(old).unwrap();
+        assert_eq!(a.lyrics_text_size, TEXT_SIZE_DEFAULT);
+
+        let dir = std::env::temp_dir().join(format!("moosik_appearance_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let saved = super::Appearance { lyrics_text_size: 26.5, ui_scale: 1.2, ..Default::default() };
+        super::save_appearance(&dir, &saved);
+        let loaded = super::load_appearance(&dir);
+        let mut w = LyricsWindow::default();
+        w.set_text_size(loaded.lyrics_text_size);
+        assert_eq!(w.text_size(), 26.5);
+        assert_eq!(loaded.ui_scale, 1.2);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for (raw, want) in [
+            ("1e9", TEXT_SIZE_MAX),
+            ("-4", TEXT_SIZE_MIN),
+            ("\"big\"", TEXT_SIZE_DEFAULT),
+            ("null", TEXT_SIZE_DEFAULT),
+            ("[20]", TEXT_SIZE_DEFAULT),
+        ] {
+            let text = format!(r#"{{"ui_scale":1.3,"lyrics_text_size":{raw}}}"#);
+            let a: super::Appearance = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(a.lyrics_text_size, want, "{raw}");
+            assert_eq!(a.ui_scale, 1.3, "{raw}: a bad size reset another field");
+        }
+        let mut w = LyricsWindow::default();
+        w.set_text_size(f32::NAN);
+        assert_eq!(w.text_size(), TEXT_SIZE_DEFAULT);
+        w.set_text_size(f32::INFINITY);
+        assert_eq!(w.text_size(), TEXT_SIZE_DEFAULT);
+    }
+
+    /// A change is written once it is settled, and only if it is a change.
+    #[test]
+    fn the_lyric_text_size_is_saved_once_a_drag_ends() {
+        assert_eq!(super::lyrics_text_size_to_save(20.0, 17.0, false), None, "saved mid-drag");
+        assert_eq!(super::lyrics_text_size_to_save(20.0, 17.0, true), Some(20.0));
+        assert_eq!(super::lyrics_text_size_to_save(17.0, 17.0, true), None, "saved without a change");
+    }
 }
 mod fonts;
+mod frame_log;
 #[macro_use]
 mod log;
 mod lyrics;
@@ -5768,6 +5817,11 @@ struct Appearance {
     /// How the lyrics window shows a translation: as stored, or converted to
     /// Traditional or Simplified Chinese for display (never for saving).
     #[serde(default)] lyrics_translation: lyrics::zh::ChineseDisplay,
+    /// Lyric text size, in points. A file from before it existed, or one
+    /// holding something unusable, gets the default without losing the
+    /// rest of the appearance.
+    #[serde(default = "default_lyrics_text_size", deserialize_with = "lenient_lyrics_text_size")]
+    lyrics_text_size: f32,
 }
 
 impl Default for Appearance {
@@ -5780,8 +5834,23 @@ impl Default for Appearance {
             show_play_count: false,
             ui_font: None,
             lyrics_translation: lyrics::zh::ChineseDisplay::Original,
+            lyrics_text_size: lyrics::ui::TEXT_SIZE_DEFAULT,
         }
     }
+}
+
+fn default_lyrics_text_size() -> f32 { lyrics::ui::TEXT_SIZE_DEFAULT }
+
+/// Any JSON value: a finite number is kept within range, anything else is
+/// the default. Never an error, so one bad field cannot reset the others.
+fn lenient_lyrics_text_size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(d)?;
+    Ok(v.as_f64().map_or(lyrics::ui::TEXT_SIZE_DEFAULT, |x| lyrics::ui::sane_text_size(x as f32)))
+}
+
+/// What to write for the lyric text size, if anything: a settled change.
+fn lyrics_text_size_to_save(window: f32, saved: f32, settled: bool) -> Option<f32> {
+    (settled && window.to_bits() != saved.to_bits()).then_some(window)
 }
 
 /// UI-scale bounds — matches egui's own zoom range and keeps text legible.
@@ -6117,6 +6186,7 @@ impl MoosikApp {
             lyrics_window: {
                 let mut w = lyrics::ui::LyricsWindow::default();
                 w.translation_display = appearance.lyrics_translation;
+                w.set_text_size(appearance.lyrics_text_size);
                 w
             },
             tag_window: tags::ui::TagWindow::default(),
@@ -7480,6 +7550,7 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectra
 
 impl eframe::App for MoosikApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        frame_log::root_pass();
         // --- Frame limiter ---------------------------------------------------
         // eframe + an immediate child viewport (the spectrum window) free-run
         // the repaint loop: the child requests a repaint every frame, which
@@ -7887,6 +7958,14 @@ impl eframe::App for MoosikApp {
         self.track_accent = self.current_accent();
         self.spectrum_window.palette_accent = self.track_accent;
         self.spectrum_window.show(ctx);
+        // A click in the whole-track view seeks through the same path as the
+        // seek bar and the arrow keys, and only with a current track.
+        if let Some(t) = self.spectrum_window.take_seek_request()
+            && self.current_index.is_some()
+            && t.is_finite()
+        {
+            self.seek_to(Duration::from_secs_f64(t.max(0.0)));
+        }
         // The palette selector lives in the spectrum window; persist any change
         // it made back into the Appearance settings.
         if self.spectrum_window.palette_kind != self.appearance.spectrum_palette {
@@ -7936,9 +8015,18 @@ impl eframe::App for MoosikApp {
             {
                 self.seek_to(to);
             }
-            // Its one persisted preference, written when it changes.
-            if self.lyrics_window.translation_display != self.appearance.lyrics_translation {
+            // Its persisted preferences, written when they change — the text
+            // size once a slider drag is let go, not once per step of it.
+            let size = lyrics_text_size_to_save(
+                self.lyrics_window.text_size(),
+                self.appearance.lyrics_text_size,
+                self.lyrics_window.text_size_settled(),
+            );
+            if self.lyrics_window.translation_display != self.appearance.lyrics_translation || size.is_some() {
                 self.appearance.lyrics_translation = self.lyrics_window.translation_display;
+                if let Some(s) = size {
+                    self.appearance.lyrics_text_size = s;
+                }
                 save_appearance(&moosik_dir(), &self.appearance);
             }
         }
@@ -8860,7 +8948,10 @@ impl eframe::App for MoosikApp {
                         let dir = log::dir();
                         let _ = std::fs::create_dir_all(&dir);
                         #[cfg(windows)]
-                        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                        // Never while a local translation runtime's pipe ends are
+                        // inheritable, or Explorer could hold them open.
+                        let _ = crate::lyrics::local_ai::contain::ordinary_spawn(
+                            std::process::Command::new("explorer").arg(&dir));
                         #[cfg(target_os = "macos")]
                         let _ = std::process::Command::new("open").arg(&dir).spawn();
                         #[cfg(all(unix, not(target_os = "macos")))]
@@ -9595,6 +9686,11 @@ impl eframe::App for MoosikApp {
         save_player_prefs(&moosik_dir(), &PlayerPrefs {
             volume: self.volume, loop_mode: self.loop_mode,
         });
+        // A lyric size dragged up to the moment of closing.
+        if let Some(s) = lyrics_text_size_to_save(self.lyrics_window.text_size(), self.appearance.lyrics_text_size, true) {
+            self.appearance.lyrics_text_size = s;
+            save_appearance(&moosik_dir(), &self.appearance);
+        }
     }
 }
 

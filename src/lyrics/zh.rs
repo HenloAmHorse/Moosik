@@ -50,15 +50,33 @@ fn tw2s() -> &'static ferrous_opencc::OpenCC {
 
 /// A kana syllable or a hangul letter: a line that has one is not Chinese.
 fn certainly_not_chinese(s: &str) -> bool {
-    s.chars().any(|c| matches!(c,
+    s.chars().any(is_kana_or_hangul_letter)
+}
+
+/// A kana syllable or a hangul letter, never punctuation or a sound mark.
+/// The one rule for "this is Japanese or Korean script": the display uses it
+/// to leave such a line unconverted, and the local translator to flag a
+/// Chinese answer that kept such letters.
+pub(crate) fn is_kana_or_hangul_letter(c: char) -> bool {
+    matches!(c,
         // Hiragana ぁ–ゖ, katakana ァ–ヺ, the digraph letters ゟ and ヿ, the
-        // small-katakana extension, and halfwidth ｦ–ｯ, ｱ–ﾝ.
+        // small-katakana extension, halfwidth ｦ–ｯ, ｱ–ﾝ, and the kana
+        // supplement and extensions (historical and small kana letters).
         '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}' | '\u{309F}' | '\u{30FF}' | '\u{31F0}'..='\u{31FF}'
-        | '\u{FF66}'..='\u{FF6F}' | '\u{FF71}'..='\u{FF9D}'
+        | '\u{FF66}'..='\u{FF6F}' | '\u{FF71}'..='\u{FF9D}' | '\u{1B000}'..='\u{1B16F}'
         // Hangul syllables, jamo and their extensions, compatibility and
         // halfwidth jamo.
         | '\u{AC00}'..='\u{D7A3}' | '\u{1100}'..='\u{11FF}' | '\u{A960}'..='\u{A97C}'
-        | '\u{D7B0}'..='\u{D7FB}' | '\u{3131}'..='\u{318E}' | '\u{FFA0}'..='\u{FFDC}'))
+        | '\u{D7B0}'..='\u{D7FB}' | '\u{3131}'..='\u{318E}' | '\u{FFA0}'..='\u{FFDC}')
+}
+
+/// A Han character: the unified ideographs and every extension block, the
+/// compatibility ideographs, and the Han-script marks 々 〇 〡–〩 〸–〻.
+pub(crate) fn is_han(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}'
+        | '\u{20000}'..='\u{2EE5F}' | '\u{2F800}'..='\u{2FA1F}' | '\u{30000}'..='\u{323AF}'
+        | '\u{3005}' | '\u{3007}' | '\u{3021}'..='\u{3029}' | '\u{3038}'..='\u{303B}')
 }
 
 /// `text` as `mode` shows it. `None` when it is shown as it is.

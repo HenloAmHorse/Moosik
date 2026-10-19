@@ -9,6 +9,10 @@ pub mod file_storage;
 
 pub(crate) mod winit_integration;
 
+/// Moosik local patch: event, pass and present counts. See `PATCH.md`.
+#[cfg(feature = "moosik_windows_linked_viewport")]
+pub mod moosik_counters;
+
 /// Moosik local patch: shared minimized-sleep policy. See `PATCH.md`.
 #[cfg(all(
     feature = "moosik_windows_linked_viewport",

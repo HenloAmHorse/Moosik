@@ -503,7 +503,10 @@ pub struct LyricsWindow {
     romaji_dirty: bool,
 
     // ── Display ────────────────────────────────────────────────────────────
+    /// Lyric text size, in points; persisted by the app (`Appearance`).
     font_size: f32,
+    /// The size slider is being dragged: the app saves the size once it is let go.
+    font_dragging: bool,
     auto_scroll: bool,
     follow: Follow,
     geometry: Geometry,
@@ -607,6 +610,16 @@ struct FollowKey {
     chinese: super::zh::ChineseDisplay,
 }
 
+/// The lyric text sizes the slider offers, in points, and the default.
+pub const TEXT_SIZE_MIN: f32 = 11.0;
+pub const TEXT_SIZE_MAX: f32 = 34.0;
+pub const TEXT_SIZE_DEFAULT: f32 = 17.0;
+
+/// A text size made safe to use: finite and within the slider's range.
+pub fn sane_text_size(v: f32) -> f32 {
+    if v.is_finite() { v.clamp(TEXT_SIZE_MIN, TEXT_SIZE_MAX) } else { TEXT_SIZE_DEFAULT }
+}
+
 impl Default for LyricsWindow {
     fn default() -> Self {
         Self {
@@ -637,7 +650,8 @@ impl Default for LyricsWindow {
             pending: Vec::new(),
             sheet_rev: 0,
             romaji_dirty: false,
-            font_size: 17.0,
+            font_size: TEXT_SIZE_DEFAULT,
+            font_dragging: false,
             auto_scroll: true,
             follow: Follow::default(),
             geometry: Geometry::default(),
@@ -651,6 +665,23 @@ impl Default for LyricsWindow {
 }
 
 impl LyricsWindow {
+    /// The lyric text size, in points.
+    pub fn text_size(&self) -> f32 {
+        self.font_size
+    }
+
+    /// Set the lyric text size (a stored preference); anything unusable
+    /// becomes the nearest usable size, or the default.
+    pub fn set_text_size(&mut self, v: f32) {
+        self.font_size = sane_text_size(v);
+    }
+
+    /// The size is not in the middle of a slider drag, so a change can be
+    /// saved now without writing once per step of the drag.
+    pub fn text_size_settled(&self) -> bool {
+        !self.font_dragging
+    }
+
     fn busy(&self) -> bool { self.fetch_rx.is_some() || self.search_rx.is_some() || self.translation.is_busy() }
 
     /// Load whatever is already on disk or in the tags for this track.
@@ -1258,9 +1289,10 @@ impl LyricsWindow {
             ui.separator();
             ui.checkbox(&mut self.auto_scroll, "Follow")
                 .on_hover_text("Keep the current line centred.");
-            ui.add(egui::Slider::new(&mut self.font_size, 11.0..=34.0)
+            let size = ui.add(egui::Slider::new(&mut self.font_size, TEXT_SIZE_MIN..=TEXT_SIZE_MAX)
                    .show_value(false).trailing_fill(true))
-                .on_hover_text("Text size");
+                .on_hover_text("Text size (remembered)");
+            self.font_dragging = size.dragged();
 
             if let Some(l) = &self.lyrics
                 && l.is_synced()

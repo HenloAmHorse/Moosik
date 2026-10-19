@@ -316,6 +316,11 @@ impl PreFrames {
     /// Still called `clear`, and still called through `clear_pre_frames`, so
     /// the source-level guard in `nothing_writes_the_cached_matrix_directly`
     /// keeps counting what it was written to count.
+    ///
+    /// Outside the tests nothing calls it any more: the shared planes
+    /// (`pre_frames`, and `Stereo`'s since the whole-track view) are released
+    /// by replacing their `Arc`, never by clearing what another holder sees.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear(&mut self) {
         self.codes = Vec::new();
         self.frames = 0;

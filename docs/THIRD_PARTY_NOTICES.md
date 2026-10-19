@@ -2,7 +2,8 @@
 
 The notices themselves are in [`THIRD_PARTY_NOTICES.txt`](../THIRD_PARTY_NOTICES.txt),
 with two companion files in [`third_party/`](../third_party). This page says what
-they cover and how each open item was settled for 1.5.3. It records license
+they cover and how the original open items were settled for 1.5.3, with
+the scope rechecked for 1.5.4. It records license
 information; it is not a legal opinion.
 
 ## Scope
@@ -15,8 +16,18 @@ information; it is not a legal opinion.
   included anyway, so no judgement about which of them reach the executable
   is needed.
 - **Checked:** every package archive against its `Cargo.lock` checksum.
-- **Not covered:** dev-dependencies, the optional local-AI prototype (not part of
-  this release), and non-Windows targets.
+- **1.5.4 recheck:** dependency names, versions and lockfile checksums are
+  unchanged from 1.5.3 except Moosik's own version. The current Windows
+  normal/build graph was re-enumerated; the notices were regenerated from
+  retained hash-checked evidence with rustc 1.94.0. There are 298 packages
+  and 203 deduplicated texts, including the local-model setup license texts.
+- **Optional local translation:** the executable includes setup/consent UI
+  and upstream model/runtime license texts. Those texts are included in the
+  notices. Model weights, llama.cpp executables and its OpenMP runtime are
+  not bundled in the release assets; pack-specific notices are shown before
+  explicit download/import and installed with each pack.
+- **Not covered:** dev-dependencies and non-Windows targets. This is not a
+  claim that the optional separately downloaded runtime is linked into Moosik.
 
 ## Sources of the texts
 

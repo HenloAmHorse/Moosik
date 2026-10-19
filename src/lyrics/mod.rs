@@ -12,6 +12,7 @@
 
 pub mod ai;
 pub mod http;
+pub mod local_ai;
 pub mod lrclib;
 pub mod matching;
 pub mod netease;

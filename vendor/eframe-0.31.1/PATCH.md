@@ -16,7 +16,7 @@ through `[patch.crates-io]` in the workspace `Cargo.toml`.
 | licence | MIT OR Apache-2.0 |
 
 The tree was extracted from the checksum-verified official `.crate`. All 32
-archive entries remain present. Twenty-eight are byte-for-byte identical; four
+archive entries remain present. Twenty-seven are byte-for-byte identical; five
 are intentionally modified, as listed under "Files changed relative to the
 official archive" below. `.cargo_vcs_info.json` remains verbatim.
 `Cargo.toml.orig` remains the published archive copy but is **not** the active
@@ -98,20 +98,35 @@ tell the two apart. Because the root viewport also has no callback, the policy
 excludes `ViewportId::ROOT` and the viewport being painted explicitly. The
 class is not consulted at all, so a stale class cannot cause a false negative.
 
+## Counters for measurement (1.5.4)
+
+`src/native/moosik_counters.rs` (new) counts, by root window and other
+windows: `WindowEvent::Moved`, `Resized` and `ScaleFactorChanged`; redraws
+(`run_ui_and_paint` entered); immediate-child redraws handed to the parent;
+and buffer swaps (frames actually presented). The glow backend increments
+them; `pub use native::moosik_counters` exposes `snapshot()`. Moosik reads
+them only for its opt-in measurement log (`MOOSIK_FRAME_LOG`). They change
+no behaviour, are relaxed atomics, and exist only with the
+`moosik_windows_linked_viewport` feature. The wgpu backend is not counted
+(Moosik builds glow).
+
 ## Files changed relative to the official archive
 
 | file | change |
 |---|---|
 | `Cargo.toml` | adds the `moosik_windows_linked_viewport` feature |
-| `src/native/mod.rs` | declares `minimized_policy` |
+| `src/lib.rs` | re-exports `moosik_counters` |
+| `src/native/mod.rs` | declares `minimized_policy` and `moosik_counters` |
+| `src/native/moosik_counters.rs` | **new** — event, redraw and present counters |
 | `src/native/minimized_policy.rs` | **new** — the shared policy and its tests |
-| `src/native/glow_integration.rs` | adapter, one call at the sleep site, adapter tests |
+| `src/native/glow_integration.rs` | adapter, one call at the sleep site, adapter tests; counter increments |
 | `src/native/wgpu_integration.rs` | the same, symmetrically |
 | `LICENSE-MIT`, `LICENSE-APACHE` | **added** from upstream at the pinned commit |
 
 No other file is modified. In each backend exactly one line is replaced:
 `if window.is_minimized() == Some(true) {` gains a `!waive_minimized_sleep &&`
-guard.
+guard; the glow backend also gains the counter increments, each a
+feature-gated statement that adds one to a counter.
 
 ## Tests
 
