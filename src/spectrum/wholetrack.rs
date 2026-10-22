@@ -20,13 +20,15 @@
 //!
 //! * **Frequency.** Bar `i` of `n` is the grid cell `[freq_at(i/n),
 //!   freq_at((i+1)/n)]` of the record's [`FreqScale`] over the range the
-//!   producer actually spread the bars across. The superlet clamps that range at
+//!   producer actually spread the bars across. The superlet and true CQT clamp that range at
 //!   Nyquist; the FFT routes do not, so on an FFT analysis whose upper limit is
 //!   above Nyquist the bars wholly above it hold no analysed content (the
 //!   producer reads the edge bin for them). Those are shown as *no data*, not
 //!   as levels.
-//! * **Time.** Frame `k` sits at `k·hop / sr` on the player's timeline, which is
-//!   where the live display shows it. What that instant *means* differs by
+//! * **Time.** Frame `k` sits at `k·hop / sr` for the existing FFT and
+//!   Superlet routes. A true CQT sits at the nominal time `k / fps`; its
+//!   independently floored sample center is `floor(k·sr / fps)`, less than
+//!   one sample earlier. No rounded integer hop is accumulated. What that instant *means* differs by
 //!   transform and is stated rather than corrected: an FFT frame is the window
 //!   **starting** there (`fft` samples long); a superlet frame is the response
 //!   **centred** there.
@@ -77,6 +79,9 @@ pub enum Transform {
     Fft { size: usize, pad: usize, mapping: Mapping },
     /// The superlet: responses centred on each frame.
     Superlet,
+    /// Full constant-Q windows centered on independently floored samples,
+    /// on the nominal `k / frame_rate` display timeline.
+    TrueCqt { config: super::cqt::Config },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,6 +101,10 @@ impl Transform {
                 "FFT, constant-Q-weighted bar mapping (not a CQT)"
             }
             Transform::Superlet => "Superlet",
+            Transform::TrueCqt { config } if config.bass_limit_s.is_some() => {
+                "Responsive CQT (variable-Q, limited bass windows)"
+            }
+            Transform::TrueCqt { .. } => "True CQT (full centered windows)",
         }
     }
 
@@ -108,6 +117,14 @@ impl Transform {
                 t + size as f64 / sample_rate.max(1) as f64
             ),
             Transform::Superlet => format!("superlet response centred at {t:.3} s"),
+            Transform::TrueCqt { config } => {
+                let frame = (t * f64::from(config.frame_rate)).round().max(0.0) as usize;
+                let sample = super::cqt::frame_center(frame, sample_rate, config.frame_rate);
+                format!(
+                    "CQT response centred at sample {sample} ({:.6} s); nominal frame {t:.6} s, sample center floored (<1 sample); zero-extended edges",
+                    sample as f64 / sample_rate.max(1) as f64,
+                )
+            }
         }
     }
 }
@@ -116,13 +133,15 @@ impl Transform {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Geometry {
     pub sample_rate: u32,
+    /// Fixed integer hop, or 0 only for a true CQT's explicit frame clock.
+    /// Use `frame_rate()` / `frame_time()`, not `sr / hop`.
     pub hop: usize,
     pub bars: usize,
     /// The record's lower and upper limits.
     pub lo: f32,
     pub hi: f32,
     /// The upper end the bars are actually spread to: `hi` for the FFT routes,
-    /// `min(hi, sr/2)` for the superlet.
+    /// `min(hi, sr/2)` for the superlet and true CQT.
     pub axis_hi: f32,
     pub scale: FreqScale,
     pub transform: Transform,
@@ -173,17 +192,85 @@ impl Geometry {
         let freq = |k: &'static str| -> Result<f32, String> {
             hex_f32(need(k)?).filter(|f| *f > 0.0).ok_or_else(|| format!("`{k}` is not a frequency"))
         };
-        let sample_rate = num("sr")? as u32;
-        let hop = num("hop")?;
+        let sample_rate = u32::try_from(num("sr")?).map_err(|_| "the sample rate is too large")?;
+        let map = need("map")?;
+        let cqt_family = matches!(map, "true-cqt" | "vqt");
+        let hop = if cqt_family { 0 } else { num("hop")? };
         let bars = num("bars")?;
         let (lo, hi) = (freq("lo")?, freq("hi")?);
         let scale = parse_scale(need("scale")?).ok_or("the record's scale is not readable")?;
-        if sample_rate == 0 || hop == 0 || bars == 0 || lo >= hi {
+        if sample_rate == 0 || (hop == 0 && !cqt_family) || bars == 0 || lo >= hi {
             return Err("the record's geometry is degenerate".into());
         }
         let nyquist = sample_rate as f32 / 2.0;
-        let (transform, axis_hi) = match need("map")? {
+        let (transform, axis_hi) = match map {
             "superlet" => (Transform::Superlet, hi.min(nyquist)),
+            "true-cqt" | "vqt" => {
+                // These are the policies that give the row clock and grid
+                // their meaning. Refuse a record from another convention
+                // rather than plotting its rows on this build's axes.
+                if record.split(';').next() != Some(super::identity::SCHEMA) {
+                    return Err("the CQT record uses another schema".into());
+                }
+                let required = [
+                    "map", "sr", "hop", "bars", "lo", "hi", "scale", "cqt-rev", "bpo", "window", "fps",
+                    "anchor", "edge", "frame-clock", "grid-convention",
+                ];
+                for k in required {
+                    if record.split(';').filter_map(|f| f.split_once('='))
+                        .filter(|(key, _)| *key == k).count() != 1
+                    {
+                        return Err(format!("the CQT record needs exactly one `{k}`"));
+                    }
+                }
+                if num("cqt-rev")? != super::cqt::REVISION as usize {
+                    return Err("the CQT record uses another transform revision".into());
+                }
+                // The Responsive variant names its own revision and bass limit,
+                // exactly once each; Full CQT records carry neither.
+                let count = |k: &str| record.split(';').filter_map(|f| f.split_once('=')).filter(|(key, _)| *key == k).count();
+                let bass_limit_s = if map == "vqt" {
+                    if count("vqt-rev") != 1 || count("bass-limit") != 1 {
+                        return Err("the Responsive CQT record needs exactly one `vqt-rev` and `bass-limit`".into());
+                    }
+                    if num("vqt-rev")? != super::cqt::VQT_REVISION as usize {
+                        return Err("the Responsive CQT record uses another revision".into());
+                    }
+                    Some(hex_f32(need("bass-limit")?).ok_or("the Responsive CQT bass limit is not readable")?)
+                } else {
+                    if count("vqt-rev") != 0 || count("bass-limit") != 0 {
+                        return Err("a Full CQT record cannot carry Responsive fields".into());
+                    }
+                    None
+                };
+                for (k, expected) in [
+                    ("hop", "variable"),
+                    ("scale", "log"),
+                    ("anchor", "center"),
+                    ("edge", "zero-full"),
+                    ("frame-clock", "floor-k-sr-over-fps"),
+                    ("grid-convention", "log-cell-centres"),
+                ] {
+                    if need(k)? != expected {
+                        return Err(format!("the CQT record has an unsupported `{k}`"));
+                    }
+                }
+                let window = match need("window")? {
+                    "hann" => super::cqt::Window::Hann,
+                    "hamming" => super::cqt::Window::Hamming,
+                    "blackman" => super::cqt::Window::Blackman,
+                    "blackmanharris" => super::cqt::Window::BlackmanHarris,
+                    _ => return Err("the CQT record's window is not readable".into()),
+                };
+                let config = super::cqt::Config {
+                    bins_per_octave: u16::try_from(num("bpo")?).map_err(|_| "the CQT density is too large")?,
+                    window,
+                    frame_rate: hex_f32(need("fps")?).ok_or("the CQT frame rate is not readable")?,
+                    bass_limit_s,
+                };
+                config.validate().map_err(|e| e.to_string())?;
+                (Transform::TrueCqt { config }, hi.min(nyquist))
+            }
             m => {
                 let mapping = match m {
                     "flat" => Mapping::Flat,
@@ -204,7 +291,10 @@ impl Geometry {
 
     /// Frames per second of the matrix.
     pub fn frame_rate(&self) -> f64 {
-        self.sample_rate as f64 / self.hop as f64
+        match self.transform {
+            Transform::TrueCqt { config } => f64::from(config.frame_rate),
+            _ => self.sample_rate as f64 / self.hop as f64,
+        }
     }
 
     /// Where frame `k` sits on the player's timeline, in seconds.
@@ -223,6 +313,11 @@ impl Geometry {
 
     /// The bar's centre frequency, exactly as the producer computed it.
     pub fn bar_center(&self, i: usize) -> f32 {
+        if matches!(self.transform, Transform::TrueCqt { .. }) {
+            let lo = f64::from(self.lo);
+            return (lo * (f64::from(self.axis_hi) / lo)
+                .powf((i as f64 + 0.5) / self.bars as f64)) as f32;
+        }
         self.scale.bar_center(i, self.bars, self.lo, self.axis_hi)
     }
 
@@ -1137,3 +1232,127 @@ impl Worker {
 #[cfg(test)]
 #[path = "wholetrack_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod true_cqt_geometry_tests {
+    use super::*;
+
+    fn record(sample_rate: u32, frame_rate: f32) -> String {
+        // Deliberately not assembled by identity::record: the reader must
+        // agree with the public record contract, not share its string builder.
+        format!(
+            "moosik-analysis/1;src=0000000000000000;bars=16;lo=41a00000;hi=46ea6000;map=true-cqt;dsd=-;cqt-rev=1;bpo=48;window=blackman;scale=log;fps={:08x};anchor=center;edge=zero-full;frame-clock=floor-k-sr-over-fps;grid-convention=log-cell-centres;sr={sample_rate};hop=variable",
+            frame_rate.to_bits(),
+        )
+    }
+
+    /// A Responsive record parses back to its own config; a Full record that
+    /// carries Responsive fields, or a Responsive one missing them, is refused.
+    #[test]
+    fn responsive_records_round_trip_and_mixed_records_are_refused() {
+        let full = record(48_000, 180.0);
+        let vqt = full.replace("map=true-cqt", "map=vqt").replace(";sr=", ";vqt-rev=1;bass-limit=3e800000;sr=");
+        let g = Geometry::parse(&vqt).unwrap();
+        assert!(matches!(g.transform, Transform::TrueCqt { config } if config.bass_limit_s == Some(0.25)));
+        let g = Geometry::parse(&full).unwrap();
+        assert!(matches!(g.transform, Transform::TrueCqt { config } if config.bass_limit_s.is_none()));
+        for bad in [
+            full.replace(";sr=", ";bass-limit=3e800000;sr="),
+            full.replace("map=true-cqt", "map=vqt"),
+            vqt.replace("vqt-rev=1", "vqt-rev=2"),
+            vqt.replace("bass-limit=3e800000", "bass-limit=3c23d70a"),
+        ] {
+            assert!(Geometry::parse(&bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn true_cqt_axes_use_the_explicit_clock_and_nyquist_clamped_log_grid() {
+        for sr in [44_100, 48_000, 96_000] {
+            for fps in [180.0f32, 179.5] {
+                let g = Geometry::parse(&record(sr, fps)).unwrap();
+                assert_eq!(g.hop, 0, "a variable clock was represented as a constant hop");
+                assert_eq!(g.frame_rate(), f64::from(fps));
+                assert_eq!(g.scale, FreqScale::Log);
+                assert_eq!(g.axis_hi, (sr as f32 / 2.0).min(30_000.0));
+                assert_eq!(g.data_bars, 16);
+                assert!(matches!(g.transform, Transform::TrueCqt { config } if config.frame_rate == fps));
+                for k in [0usize, 1, 2, 3, 25_000, 1_000_001] {
+                    let nominal = k as f64 / f64::from(fps);
+                    assert_eq!(g.frame_time(k as f64), nominal);
+                    let actual = super::super::cqt::frame_center(k, sr, fps);
+                    let desired_sample = k as f64 * f64::from(sr) / f64::from(fps);
+                    assert_eq!(actual, desired_sample.floor() as usize);
+                    assert!((0.0..1.0).contains(&(desired_sample - actual as f64)), "sample quantization exceeded its stated bound");
+                    let note = g.transform.anchor_note(nominal, sr);
+                    assert!(note.contains(&format!("sample {actual} ")), "{note}");
+                    assert!(note.contains("nominal frame") && note.contains("zero-extended edges"), "{note}");
+                }
+                for i in 0..g.bars {
+                    let expected = (20.0_f64 * (f64::from(g.axis_hi) / 20.0)
+                        .powf((i as f64 + 0.5) / g.bars as f64)) as f32;
+                    assert_eq!(g.bar_center(i), expected);
+                    let (lo, hi) = g.bar_edges(i);
+                    assert!(lo < expected && expected < hi);
+                    assert!((g.bar_pos(expected) - (i as f64 + 0.5)).abs() < 1e-4);
+                }
+                // A rounded hop's drift is not hidden by using it for time.
+                let hop = (f64::from(sr) / f64::from(fps)).floor();
+                if hop != f64::from(sr) / f64::from(fps) {
+                    assert_ne!(g.frame_time(1_000_000.0), 1_000_000.0 * hop / f64::from(sr));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn true_cqt_records_refuse_other_clocks_windows_revisions_and_invalid_values() {
+        let good = record(48_000, 180.0);
+        assert!(Geometry::parse(&good).is_ok());
+        for bad in [
+            good.replace(";hop=variable", ";hop=267"),
+            good.replace(";hop=variable", ";hop=0"),
+            good.replace(";fps=43340000", ""),
+            good.replace(";fps=43340000", ";fps=00000000"),
+            good.replace(";fps=43340000", ";fps=7fc00000"),
+            good.replace(";fps=43340000", ";fps=7f800000"),
+            good.replace(";fps=43340000", ";fps=43fa0000"),
+            good.replace(";cqt-rev=1", ";cqt-rev=2"),
+            good.replace(";cqt-rev=1", ""),
+            good.replace(";bpo=48", ";bpo=0"),
+            good.replace(";bpo=48", ";bpo=65536"),
+            good.replace(";window=blackman", ";window=flattop"),
+            good.replace(";scale=log", ";scale=erb"),
+            good.replace(";anchor=center", ";anchor=start"),
+            good.replace(";edge=zero-full", ";edge=truncate-renormalize"),
+            good.replace(";frame-clock=floor-k-sr-over-fps", ";frame-clock=rounded-hop"),
+            good.replace(";grid-convention=log-cell-centres", ";grid-convention=bpo-stepped"),
+            good.replace(";sr=48000", ";sr=0"),
+            good.replace(";sr=48000", ";sr=4294967296"),
+            good.replace(";bars=16", ";bars=0"),
+            good.replace(";lo=41a00000", ";lo=47c35000"),
+            good.replace("moosik-analysis/1;", "moosik-analysis/10;"),
+            format!("{good};fps=43340000"),
+        ] {
+            assert!(Geometry::parse(&bad).is_err(), "accepted {bad}");
+        }
+        for w in ["hann", "hamming", "blackman", "blackmanharris"] {
+            assert!(Geometry::parse(&good.replace(";window=blackman", &format!(";window={w}"))).is_ok());
+        }
+    }
+
+    #[test]
+    fn snapshot_capture_accepts_exact_cqt_fps_and_refuses_rounded_hop_timing() {
+        let mut a = super::super::SpectrumAnalyzer::new(Arc::new(std::sync::Mutex::new(Vec::new())));
+        for sr in [44_100, 48_000, 96_000] {
+            let fps = 179.5f32;
+            a.sample_rate = sr;
+            a.set_pre_frames(PreFrames::from_v4_codes(vec![100; 16 * 4], 4, 16), f64::from(fps));
+            a.pre_record = Some(record(sr, fps));
+            let s = Snapshot::capture(&a, false).expect("an exact frame clock was refused");
+            assert_eq!(s.geometry.frame_rate(), f64::from(fps));
+            a.pre_frame_rate = f64::from(sr) / (f64::from(sr) / f64::from(fps)).floor();
+            assert!(matches!(Snapshot::capture(&a, false), Err(Unavailable::Inconsistent(_))), "a rounded-hop cache rate was accepted at {sr}");
+        }
+    }
+}

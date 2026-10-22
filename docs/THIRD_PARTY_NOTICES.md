@@ -1,26 +1,42 @@
 # Third-party notices: how they were assembled
 
 The notices themselves are in [`THIRD_PARTY_NOTICES.txt`](../THIRD_PARTY_NOTICES.txt),
-with two companion files in [`third_party/`](../third_party). This page says what
+with four companion files in [`third_party/`](../third_party). This page says what
 they cover and how the original open items were settled for 1.5.3, with
-the scope rechecked for 1.5.4. It records license
+the scope rechecked for 1.5.4 and regenerated for 1.5.5. It records license
 information; it is not a legal opinion.
+
+**1.5.5:** the current locked Windows normal/build graph was enumerated
+again, not inferred from the previous count. Its third-party set is the 298
+packages from 1.5.4 plus `cmake` 0.1.58, `opusic-sys` 0.7.5,
+`symphonia-codec-alac` 0.5.5 and `symphonia-format-caf` 0.5.5: **302 packages and
+205 deduplicated texts**. The original `moosik-codec-opus` 0.1.0 leaf is Moosik
+AGPL-3.0-only code, separately accounted for, not a 303rd third-party package.
 
 ## Scope
 
 - **What is covered:** the Windows x86_64 release executable with the default
-  features. That is the 298 third-party packages `cargo tree --locked` reaches
+  features. That is the 302 third-party packages `cargo tree --locked` reaches
   from `moosik` for `x86_64-pc-windows-msvc` (normal and build dependencies),
   the data they embed, the embedded fonts and the Rust standard library.
 - **Build-time-only packages** (build scripts, proc-macros) are marked and
   included anyway, so no judgement about which of them reach the executable
   is needed.
-- **Checked:** every package archive against its `Cargo.lock` checksum.
+- **Checked:** all 295 registry package archives against their current
+  `Cargo.lock` checksums, plus the published upstream archives of seven vendored
+  third-party packages against retained provenance hashes. A local path patch
+  has no registry checksum in `Cargo.lock`; these are distinct checks.
 - **1.5.4 recheck:** dependency names, versions and lockfile checksums are
   unchanged from 1.5.3 except Moosik's own version. The current Windows
   normal/build graph was re-enumerated; the notices were regenerated from
   retained hash-checked evidence with rustc 1.94.0. There are 298 packages
   and 203 deduplicated texts, including the local-model setup license texts.
+- **1.5.5 recheck:** the emitted 302-package inventory equals the complete
+  third-party graph, not merely its size. There are 282 normal-graph packages
+  and 20 reached only through build edges. The 1.5.4 text sources and exception
+  dispositions were reused with their content hashes; new license texts were
+  read from checksum-verified package archives. The Rust toolchain remains
+  rustc 1.94.0. No new upstream retrieval was needed.
 - **Optional local translation:** the executable includes setup/consent UI
   and upstream model/runtime license texts. Those texts are included in the
   notices. Model weights, llama.cpp executables and its OpenMP runtime are
@@ -55,7 +71,10 @@ information; it is not a legal opinion.
 | IPADIC (embedded by `lindera-ipadic` 6.0.0) | **The `COPYING` of the archive actually embedded is reproduced:** `mecab-ipadic-2.7.0-20250920`, archive SHA-256 `a7ba9f64…62db3d`. Its original bytes are in `third_party/`. The crate's NOTICE names the older 20070801 release; the notices state which data is embedded. The file's last line holds two bytes (0xF7 0xF7) with no verified rendering; they are kept in the original-bytes copy and noted. |
 | Embedded fonts | Only egui's default fonts (`epaint_default_fonts` 0.31.1: Hack, Ubuntu Light, Noto Emoji, emoji-icon-font). Their OFL-1.1, Ubuntu Font Licence, Hack and MIT texts are reproduced from the package. System fonts are read at runtime, not distributed. |
 | Vendored, modified `eframe`, `egui`, `rustfft` (MIT OR Apache-2.0) | **Distributed under MIT**, with the published archives' license files. Each `vendor/*/PATCH.md` lists what was changed. |
-| `symphonia` 0.5.5 family (MPL-2.0) | Used unmodified. The notices state where the Source Code Form is available (crates.io, same name and version, and the upstream repository). |
+| `symphonia` 0.5.5 family (MPL-2.0) | 1.5.5 vendors modified registry/Ogg/Matroska sources; their Source Code Form and patch descriptions are retained under `vendor/`. Other family crates remain unmodified. The newly enabled ALAC and CAF archives record the same packaged workspace commit as the retained upstream MPL text. The release source snapshot must include the modified sources; an upstream-only link is not a substitute for those changes. |
+| `rodio` 0.20.1 (MIT OR Apache-2.0) | Vendored decoder fixes; distributed under MIT with original texts and patch provenance retained. |
+| `opusic-sys` 0.7.5 / bundled libopus 1.6.1 | Native static Opus dependency; the verified archive's `LICENSE` and bundled `opus/COPYING` are byte-identical and both source labels are retained, together with `opus/AUTHORS`. The BSD notice also remains in `third_party/opusic-sys-0.7.5-LICENSE.txt`. No Opus DLL is redistributed. |
+| `cmake` 0.1.58 (MIT OR Apache-2.0) | Build-time Cargo helper for bundled libopus; both license texts come from its verified package archive. The CMake executable is a build tool, not bundled in the player. |
 | Rust standard library | The toolchain's `COPYRIGHT-library.html`, unmodified, in `third_party/`. |
 | Microsoft Visual C++ runtime | The executable imports `VCRUNTIME140.dll` and the Universal CRT. **Neither is redistributed;** the release notes state that the Visual C++ 2015-2022 Redistributable (x64) is required. |
 
@@ -65,3 +84,16 @@ The notices are generated from the locked dependency graph and retained,
 hash-checked evidence (package archives, the upstream retrievals with their
 URLs, times and SHA-256s, and the IPADIC archive). Any change to `Cargo.lock`,
 the vendored crates or the toolchain means regenerating them before a release.
+
+The research-only assembler is `research/v155/notices155.py`. It reuses the
+hash-pinned 1.5.4 assembler and its retained evidence without changing either,
+checks the current graph and archives, and writes provenance plus the exact
+package inventory to a fresh evidence directory. It refuses unknown graph
+changes and never builds or launches the player. The two completed generations
+were byte-identical; the earlier refused attempts are retained as evidence rather
+than described as successful runs.
+
+That assembler uses the maintainer's retained local research directories, which
+are not part of the distributed source snapshot. It is not an end-user build
+step: compiling Moosik from the corresponding source does not require those
+private evidence directories or running the notices assembler.

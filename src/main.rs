@@ -1,3 +1,7 @@
+mod audio_formats;
+mod audio_probe;
+#[cfg(test)]
+mod audio_format_tests;
 mod bitperfect;
 
 /// A counting allocator, armed on one thread at a time. Test builds only.
@@ -580,6 +584,8 @@ struct Track {
     bit_depth: Option<u8>,
     bitrate: Option<u32>,   // avg kbps
     file_size: u64,
+    codec: &'static str,
+    lossless: Option<bool>,
     // ReplayGain tags (dB gain, linear peak), if present in the file.
     rg_track_gain: Option<f32>,
     rg_album_gain: Option<f32>,
@@ -598,6 +604,7 @@ impl Track {
             sample_rate: m.sample_rate, channels: m.channels,
             bit_depth: m.bit_depth, bitrate: m.bitrate,
             file_size: m.file_size,
+            codec: m.codec, lossless: m.lossless,
             rg_track_gain: m.rg_track_gain, rg_album_gain: m.rg_album_gain,
             rg_track_peak: m.rg_track_peak, rg_album_peak: m.rg_album_peak,
         }
@@ -613,6 +620,8 @@ struct TrackMeta {
     sample_rate: Option<u32>, channels: Option<u8>,
     bit_depth: Option<u8>, bitrate: Option<u32>,
     file_size: u64,
+    codec: &'static str,
+    lossless: Option<bool>,
     rg_track_gain: Option<f32>, rg_album_gain: Option<f32>,
     rg_track_peak: Option<f32>, rg_album_peak: Option<f32>,
 }
@@ -651,6 +660,13 @@ fn read_metadata(path: &PathBuf) -> TrackMeta {
 
     let dsd_info = dsd::is_dsd_path(path).then(|| dsd::parse_file(path).ok()).flatten();
     let tagged = probe_tagged(path);
+    // Lofty remains the tag editor. The decoder probe supplies audio identity
+    // and read-only fallback metadata for containers Lofty does not handle.
+    let probed = if dsd_info.is_none() { audio_probe::probe(path) } else { None };
+    let codec = if dsd_info.is_some() { "DSD" }
+        else { probed.as_ref().map_or(codec_name(path), |p| p.codec) };
+    let lossless = if dsd_info.is_some() { Some(true) }
+        else { probed.as_ref().and_then(|p| p.lossless) };
 
     let (title, artist, album, year, genre, track_number) = if let Some(ref t) = tagged {
         let tag = t.primary_tag().or_else(|| t.first_tag());
@@ -667,7 +683,9 @@ fn read_metadata(path: &PathBuf) -> TrackMeta {
             (fallback_title.clone(), "Unknown Artist".to_string(), "Unknown Album".to_string(), None, None, None)
         }
     } else {
-        (fallback_title, "Unknown Artist".to_string(), "Unknown Album".to_string(), None, None, None)
+        (probed.as_ref().and_then(|p| p.title.clone()).unwrap_or(fallback_title),
+         probed.as_ref().and_then(|p| p.artist.clone()).unwrap_or_else(|| "Unknown Artist".into()),
+         probed.as_ref().and_then(|p| p.album.clone()).unwrap_or_else(|| "Unknown Album".into()), None, None, None)
     };
 
     let (duration, sample_rate, channels, bit_depth, bitrate) = if let Some(ref i) = dsd_info {
@@ -687,7 +705,8 @@ fn read_metadata(path: &PathBuf) -> TrackMeta {
             p.sample_rate(), p.channels(), p.bit_depth(), p.audio_bitrate(),
         )
     } else {
-        (None, None, None, None, None)
+        probed.as_ref().map_or((None, None, None, None, None), |p|
+            (p.duration, p.sample_rate, p.channels, p.bit_depth, None))
     };
 
     // ReplayGain tags (Vorbis comment / ID3 TXXX / iTunes atoms — lofty
@@ -707,7 +726,7 @@ fn read_metadata(path: &PathBuf) -> TrackMeta {
         .unwrap_or((None, None, None, None));
 
     TrackMeta { title, artist, album, year, genre, track_number,
-                duration, sample_rate, channels, bit_depth, bitrate, file_size,
+                duration, sample_rate, channels, bit_depth, bitrate, file_size, codec, lossless,
                 rg_track_gain, rg_album_gain, rg_track_peak, rg_album_peak }
 }
 
@@ -716,20 +735,7 @@ fn read_metadata(path: &PathBuf) -> TrackMeta {
 // ---------------------------------------------------------------------------
 
 fn codec_name(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("flac") => "FLAC",
-        Some("mp3")  => "MP3",
-        Some("ogg")  => "Ogg Vorbis",
-        Some("wav")  => "WAV / PCM",
-        Some("dsf")  => "DSD (DSF)",
-        Some("dff")  => "DSD (DSDIFF)",
-        _            => "Unknown",
-    }
-}
-
-fn is_lossless(path: &Path) -> bool {
-    matches!(path.extension().and_then(|e| e.to_str()),
-             Some("flac") | Some("wav") | Some("dsf") | Some("dff"))
+    audio_formats::container_label(path)
 }
 
 fn channel_layout(n: u8) -> &'static str {
@@ -6313,7 +6319,7 @@ impl MoosikApp {
 
     fn add_files(&mut self) {
         let paths = rfd::FileDialog::new()
-            .add_filter("Audio", &["flac", "wav", "mp3", "ogg", "dsf", "dff"])
+            .add_filter("Audio (containers: audio track only)", &audio_formats::import_extensions())
             .set_title("Add audio files")
             .pick_files();
         if let Some(paths) = paths {
@@ -6331,8 +6337,7 @@ impl MoosikApp {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                    && matches!(ext.to_lowercase().as_str(), "flac" | "wav" | "mp3" | "ogg" | "dsf" | "dff") {
+                } else if audio_formats::is_importable(&path) {
                     found.push(path);
                 }
             }
@@ -7348,8 +7353,8 @@ fn section(ui: &mut egui::Ui, heading: &str) {
 fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectral_ceiling: Option<SpectralCeiling>, analysis: Option<&TrackAnalysis>) {
     use egui::Grid;
 
-    let codec  = codec_name(&t.path);
-    let lossy  = !is_lossless(&t.path);
+    let codec  = t.codec;
+    let lossy  = t.lossless != Some(true);
     let fname  = t.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
 
     Grid::new("info_grid").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
@@ -7358,7 +7363,7 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectra
         row(ui, "Filename", fname);
         row(ui, "Size",     &fmt_size(t.file_size));
         row(ui, "Format",   codec);
-        row(ui, "Lossless", if lossy { "No (lossy)" } else { "Yes" });
+        row(ui, "Lossless", match t.lossless { Some(true) => "Yes", Some(false) => "No (lossy)", None => "Unknown" });
 
         // ── History ─────────────────────────────────────────────────────
         section(ui, "History");

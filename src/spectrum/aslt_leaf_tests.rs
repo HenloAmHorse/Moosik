@@ -230,8 +230,11 @@ fn leaf_capabilities_are_reported_accurately() {
         assert_eq!(p32.plan_fft_inverse(n).prunes(), want, "f32 inverse {n}");
         assert_eq!(p32.plan_fft_forward(n).prunes(), want, "f32 forward {n}");
     }
-    for n in [256usize, 512] {
-        assert!(!p64.plan_fft_inverse(n).prunes(), "f64 {n} has no pruned path");
+    // 1.5.5 adds exact f64 requested leaves; f32 expectations above stay
+    // unchanged. Both directions report capability, while 128 stays whole.
+    for (n, want) in [(128usize, false), (256, true), (512, true)] {
+        assert_eq!(p64.plan_fft_inverse(n).prunes(), want, "f64 inverse {n}");
+        assert_eq!(p64.plan_fft_forward(n).prunes(), want, "f64 forward {n}");
     }
 }
 

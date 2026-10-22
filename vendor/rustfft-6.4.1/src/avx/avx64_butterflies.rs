@@ -12,6 +12,11 @@ use super::avx64_utils;
 use super::avx_vector;
 use super::avx_vector::{AvxArray, AvxArrayMut, AvxVector, AvxVector128, AvxVector256, Rotation90};
 
+// Moosik 1.5.5: requested-output versions of the existing f64 leaf graphs.
+// Full transforms below are unchanged; the child owns only optional pruning.
+#[path = "avx64_pruned.rs"]
+mod pruned;
+
 // Safety: This macro will call `self::perform_fft_f32()` which probably has a #[target_feature(enable = "...")] annotation on it.
 // Calling functions with that annotation is unsafe, because it doesn't actually check if the CPU has the required features.
 // Callers of this macro must guarantee that users can't even obtain an instance of $struct_name if their CPU doesn't have the required CPU features.
@@ -212,6 +217,33 @@ macro_rules! boilerplate_fft_simd_butterfly_with_scratch {
                         self.len(),
                         |chunk, scratch| self.perform_fft_inplace(chunk, scratch),
                     )
+                }
+            }
+            // Moosik 1.5.5: the same leaf operation graph, evaluated only for
+            // 1..=4 requested outputs where implemented (256 and 512).
+            fn prunes(&self) -> bool {
+                self.leaf_prunes()
+            }
+            fn process_pruned_with_scratch(
+                &self,
+                buffer: &mut [Complex<T>],
+                scratch: &mut [Complex<T>],
+                needed: &[usize],
+                out: &mut [Complex<T>],
+                work: crate::PrunedWork<'_, T>,
+            ) {
+                crate::check_pruned(self, buffer.len(), scratch.len(), needed, out.len(), &work);
+                let done = unsafe {
+                    let b: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(buffer);
+                    let s: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(scratch);
+                    let o: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(out);
+                    self.pruned_leaf(b, s, needed, o)
+                };
+                if !done {
+                    self.process_with_scratch(buffer, scratch);
+                    for (o, &i) in out.iter_mut().zip(needed) {
+                        *o = buffer[i];
+                    }
                 }
             }
             #[inline(always)]

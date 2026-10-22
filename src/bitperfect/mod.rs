@@ -29,6 +29,8 @@ pub mod format;
 pub mod frame_ring;
 pub mod q31;
 pub mod state;
+#[cfg(test)]
+mod audio_import_tests;
 
 #[cfg(all(target_os = "linux", feature = "alsa-dsd"))]
 pub mod alsa_dsd;
@@ -899,18 +901,17 @@ pub fn prepare(path: &Path, start: Duration) -> Result<Prepared, state::FailureR
         .map_err(|e| FR::SourceParse(format!("unrecognized format: {e}")))?;
     let mut format = probed.format;
 
-    let track = format
-        .default_track()
+    let track = crate::audio_probe::audio_track(format.as_ref())
         .ok_or_else(|| FR::SourceParse("no audio track".into()))?;
     let track_id = track.id;
-    let params = track.codec_params.clone();
+    let mut params = track.codec_params.clone();
     let sample_rate = params
         .sample_rate
         .ok_or_else(|| FR::SourceParse("unknown sample rate".into()))?;
     let channels = params
         .channels
-        .map(|c| c.count() as u16)
-        .ok_or_else(|| FR::SourceParse("unknown channel layout".into()))?;
+        .or_else(|| params.channel_layout.map(|layout| layout.into_channels()))
+        .map(|c| c.count() as u16);
     let bits_per_sample = params.bits_per_sample;
 
     let mut decoder = symphonia::default::get_codecs()
@@ -926,7 +927,19 @@ pub fn prepare(path: &Path, start: Duration) -> Result<Prepared, state::FailureR
     // listener asked for. The audio and everything describing it disagreed, and
     // nothing anywhere reported a problem.
     let mut seeked_to = Duration::ZERO;
-    if start > Duration::ZERO {
+    let opus = params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS;
+    if opus { params = decoder.codec_params().clone(); }
+    // A fresh Opus decoder needs its preceding history. Until an indexed
+    // preroll path is verified, decode/discard from the beginning (bounded
+    // one-packet memory), rather than jump into a cold predictive decoder.
+    let mut opus_skip = if opus {
+        // Exact integer time conversion: e.g. 9 ms * 48 kHz must be 432
+        // frames, not 431 after a binary-float round trip.
+        u64::try_from(start.as_nanos() * u128::from(sample_rate) / 1_000_000_000)
+            .unwrap_or(u64::MAX)
+    } else { 0 };
+    let opus_target = opus_skip;
+    if start > Duration::ZERO && !opus {
         let to = format
             .seek(
                 SeekMode::Coarse,
@@ -936,7 +949,12 @@ pub fn prepare(path: &Path, start: Duration) -> Result<Prepared, state::FailureR
                 },
             )
             .map_err(|e| FR::Seek(format!("seek to {:.2}s failed: {e}", start.as_secs_f64())))?;
-        seeked_to = Duration::from_secs_f64(to.actual_ts as f64 / sample_rate.max(1) as f64);
+        // Matroska timestamps are container ticks (often milliseconds), not
+        // PCM samples. Use the selected audio track's actual time base.
+        let tb = params.time_base.filter(|tb| tb.numer != 0 && tb.denom != 0)
+            .unwrap_or_else(|| symphonia::core::units::TimeBase::new(1, sample_rate.max(1)));
+        let time = tb.calc_time(to.actual_ts);
+        seeked_to = Duration::from_secs_f64(time.seconds as f64 + time.frac);
         decoder.reset();
     }
 
@@ -971,6 +989,13 @@ pub fn prepare(path: &Path, start: Duration) -> Result<Prepared, state::FailureR
         match decoder.decode(&packet) {
             Ok(d) => {
                 let found = canonicalize_packet(&d, None, bits_per_sample, &mut primed)?;
+                if opus && opus_skip > 0 {
+                    let channels = usize::from(found.channels);
+                    let skip = opus_skip.min((primed.len() / channels) as u64);
+                    primed.drain(..skip as usize * channels);
+                    opus_skip -= skip;
+                    seeked_to = Duration::from_secs_f64((opus_target - opus_skip) as f64 / sample_rate as f64);
+                }
                 if primed.is_empty() {
                     continue;
                 }
@@ -1006,7 +1031,7 @@ pub fn prepare(path: &Path, start: Duration) -> Result<Prepared, state::FailureR
             SourceFormat {
                 kind,
                 sample_rate,
-                channels,
+                channels: channels.ok_or_else(|| FR::SourceParse("unknown channel layout at end of source".into()))?,
                 layout: params
                     .channels
                     .map(|c| ChannelLayout(c.bits()))

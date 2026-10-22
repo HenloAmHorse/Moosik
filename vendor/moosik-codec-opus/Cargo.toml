@@ -1,0 +1,11 @@
+[package]
+name = "moosik-codec-opus"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Moosik's bounded libopus decoder for Symphonia 0.5"
+publish = false
+
+[dependencies]
+opusic-sys = "=0.7.5"
+symphonia-core = "=0.5.5"

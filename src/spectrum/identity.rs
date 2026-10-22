@@ -36,8 +36,10 @@
 //! so an exact hit also needs the source to be unchanged.
 //!
 //! Anything that changes an analysis without changing a setting — a change to
-//! the transform's code — must bump [`SCHEMA`], which retires every record
-//! written before it. The compute route (CPU or GPU) is not part of the
+//! the transform's code — must change its identity. The true CQT has its own
+//! `cqt-rev` field; bumping it does not retire unrelated FFT or Superlet
+//! records. [`SCHEMA`] remains the version of the common record format. The
+//! compute route (CPU or GPU) is not part of the
 //! identity: it is an implementation of the same transform, not a setting.
 use std::path::{Path, PathBuf};
 
@@ -84,11 +86,13 @@ const TRANSFORM: [&str; 4] = ["q", "win", "n", "spread"];
 impl AnalysisSettings {
     /// Every result-affecting setting, exactly. The name is a hash of this.
     pub fn canonical(&self) -> String {
-        let map = match self.mapping {
+        let map = match &self.mapping {
             BarMappingMode::FlatOverlap => "flat",
             BarMappingMode::Gaussian => "gauss",
             BarMappingMode::Cqt => "cqw",
             BarMappingMode::Superlet => "superlet",
+            BarMappingMode::TrueCqt(c) if c.bass_limit_s.is_some() => "vqt",
+            BarMappingMode::TrueCqt(_) => "true-cqt",
         };
         let mut out = format!(
             "{SCHEMA};src={:016x};bars={};lo={};hi={};map={map};dsd={}",
@@ -98,6 +102,33 @@ impl AnalysisSettings {
             bits(self.max_freq),
             self.dsd_rate.map_or("-".into(), |r| r.to_string()),
         );
+        if let BarMappingMode::TrueCqt(c) = &self.mapping {
+            let window = match c.window {
+                super::cqt::Window::Hann => "hann",
+                super::cqt::Window::Hamming => "hamming",
+                super::cqt::Window::Blackman => "blackman",
+                super::cqt::Window::BlackmanHarris => "blackmanharris",
+            };
+            // A separate method and revision, never the old FFT-based CQT
+            // weighting. Its fixed mathematical policies are part of the
+            // identity too: full symmetric windows, centered responses,
+            // zero extension with the full-window gain, and independently
+            // rounded sample centers (not a repeatedly added integer hop).
+            // FFT and ASLT-only state cannot affect this transform.
+            out += &format!(
+                ";cqt-rev={};bpo={};window={window};scale=log;fps={};anchor=center;edge=zero-full;frame-clock=floor-k-sr-over-fps;grid-convention=log-cell-centres",
+                super::cqt::REVISION,
+                c.bins_per_octave,
+                bits(c.frame_rate),
+            );
+            // The Responsive variable-Q transform is a different method: its
+            // own revision and bass limit, appended only for it, so every
+            // Full CQT record stays byte-identical.
+            if let Some(t) = c.bass_limit_s {
+                out += &format!(";vqt-rev={};bass-limit={}", super::cqt::VQT_REVISION, bits(t));
+            }
+            return out;
+        }
         if let Some((fft, pad, ov, w, i, sc)) = &self.fft {
             let w = match w {
                 WindowFn::Hann => "hann",
@@ -134,7 +165,14 @@ impl AnalysisSettings {
     }
 
     /// The hop these settings analyse at, at `sample_rate`.
+    ///
+    /// A true CQT has a variable integer spacing when `sr / fps` is not
+    /// integral. This compatibility accessor is only its nominal floor;
+    /// derive its rate from `Config::frame_rate`, never from this value.
     pub fn hop(&self, sample_rate: u32) -> usize {
+        if let BarMappingMode::TrueCqt(c) = &self.mapping {
+            return (sample_rate as f64 / c.frame_rate as f64).floor().max(1.0) as usize;
+        }
         match (&self.fft, &self.aslt) {
             (_, Some((_, fps))) => super::aslt::hop_for_fps(sample_rate, *fps),
             (Some((fft, _, ov, ..)), _) => ((*fft as f32 * (1.0 - ov)).round() as usize).max(1),
@@ -145,6 +183,9 @@ impl AnalysisSettings {
     /// What a cache written at these settings, from audio at `sample_rate`,
     /// records about itself: the canonical settings and the frame geometry.
     pub fn record(&self, sample_rate: u32) -> String {
+        if matches!(&self.mapping, BarMappingMode::TrueCqt(_)) {
+            return format!("{};sr={sample_rate};hop=variable", self.canonical());
+        }
         format!("{};sr={sample_rate};hop={}", self.canonical(), self.hop(sample_rate))
     }
 
@@ -245,6 +286,30 @@ pub fn transform_of(fields: &[(&str, &str)], scale: FreqScale) -> Option<AsltCon
 mod tests {
     use super::*;
 
+    fn settings(mapping: BarMappingMode) -> AnalysisSettings {
+        let (fft, aslt) = match &mapping {
+            BarMappingMode::TrueCqt(_) => (None, None),
+            BarMappingMode::Superlet => (None, Some((AsltConfig {
+                q_ratio: 2.0,
+                max_window_s: 0.25,
+                n_wavelets: 9,
+                spread: 0.5,
+                scale: FreqScale::Blend(0.5),
+            }, 180.0))),
+            _ => (Some((8192, 2, 0.5, WindowFn::Hann, InterpolationMode::None, FreqScale::Log)), None),
+        };
+        AnalysisSettings {
+            track: PathBuf::from("C:/music/x.flac"),
+            bars: 1024,
+            min_freq: 20.0,
+            max_freq: 24_000.0,
+            mapping,
+            dsd_rate: None,
+            fft,
+            aslt,
+        }
+    }
+
     #[test]
     fn fnv_is_the_published_function() {
         // Reference values of FNV-1a-64.
@@ -271,5 +336,115 @@ mod tests {
         let mut big = t.clone();
         big[2] = ("n", "99");
         assert!(transform_of(&big, FreqScale::Log).is_none());
+    }
+
+    /// Adding one transform must not rename any existing analysis or turn
+    /// the shipped FFT constant-Q weighting into a true-CQT cache.
+    #[test]
+    fn adding_true_cqt_leaves_all_old_records_byte_identical() {
+        for (mapping, name) in [
+            (BarMappingMode::FlatOverlap, "flat"),
+            (BarMappingMode::Gaussian, "gauss"),
+            (BarMappingMode::Cqt, "cqw"),
+        ] {
+            let s = settings(mapping);
+            assert_eq!(s.record(48_000), format!(
+                "moosik-analysis/1;src={:016x};bars=1024;lo=41a00000;hi=46bb8000;map={name};dsd=-;fft=8192;pad=2;ov=3f000000;window=hann;interp=none;scale=log;sr=48000;hop=4096",
+                source_of(&s.track),
+            ));
+        }
+        let s = settings(BarMappingMode::Superlet);
+        assert_eq!(s.record(44_100), format!(
+            "moosik-analysis/1;src={:016x};bars=1024;lo=41a00000;hi=46bb8000;map=superlet;dsd=-;q=40000000;win=3e800000;n=9;spread=3f000000;scale=blend:3f000000;fps=43340000;sr=44100;hop=245",
+            source_of(&s.track),
+        ));
+    }
+
+    #[test]
+    fn true_cqt_has_its_own_pinned_record_and_variable_sample_clock() {
+        let s = settings(BarMappingMode::TrueCqt(super::super::cqt::Config::default()));
+        assert!(s.fft.is_none() && s.aslt.is_none());
+        let expected = format!(
+            "moosik-analysis/1;src={:016x};bars=1024;lo=41a00000;hi=46bb8000;map=true-cqt;dsd=-;cqt-rev=1;bpo=48;window=blackman;scale=log;fps=43340000;anchor=center;edge=zero-full;frame-clock=floor-k-sr-over-fps;grid-convention=log-cell-centres;sr=48000;hop=variable",
+            source_of(&s.track),
+        );
+        assert_eq!(s.record(48_000), expected);
+        // 48 kHz / 180 Hz is 266 2/3 samples, not a fixed hop of 266 or
+        // 267. The record must never state either approximation as its clock.
+        assert_eq!(s.hop(48_000), 266, "compatibility accessor is only the nominal floor");
+        assert!(!s.record(48_000).contains(";hop=266"));
+        assert!(!s.record(48_000).contains(";hop=267"));
+        // The old ASLT-only alternate machinery must not strip out this
+        // transform's own settings and offer it as a wavelet alternate.
+        let (rest, transform) = split_transform(&expected);
+        assert_eq!(rest, expected);
+        assert!(transform.is_empty());
+        assert!(transform_of(&transform, FreqScale::Log).is_none());
+    }
+
+    /// The Responsive variable-Q transform is its own method: `map=vqt` with
+    /// its revision and bass limit. Full CQT's pinned record (above) has
+    /// neither, so no Full CQT cache changes or is reused by it.
+    #[test]
+    fn responsive_cqt_has_its_own_method_and_limit_in_the_record() {
+        use super::super::cqt::Config;
+        let full = settings(BarMappingMode::TrueCqt(Config::default()));
+        let r = |t: f32| settings(BarMappingMode::TrueCqt(Config { bass_limit_s: Some(t), ..Config::default() }));
+        let expected = format!(
+            "moosik-analysis/1;src={:016x};bars=1024;lo=41a00000;hi=46bb8000;map=vqt;dsd=-;cqt-rev=1;bpo=48;window=blackman;scale=log;fps=43340000;anchor=center;edge=zero-full;frame-clock=floor-k-sr-over-fps;grid-convention=log-cell-centres;vqt-rev=1;bass-limit=3f000000;sr=48000;hop=variable",
+            source_of(&full.track),
+        );
+        assert_eq!(r(0.5).record(48_000), expected);
+        let (id, unit) = full.key(Path::new("D"));
+        for t in [0.25f32, 0.5, 1.0] {
+            assert_ne!(r(t).identity(), id);
+            assert_ne!(r(t).key(Path::new("D")).1, unit);
+        }
+        assert_ne!(r(0.25).identity(), r(0.5).identity());
+        let (rest, transform) = split_transform(&expected);
+        assert_eq!(rest, expected);
+        assert!(transform.is_empty());
+    }
+
+    #[test]
+    fn every_true_cqt_setting_separates_the_identity_from_other_methods() {
+        use super::super::cqt::{Config, Window};
+        let config = Config::default();
+        let baseline = settings(BarMappingMode::TrueCqt(config));
+        let (id, unit) = baseline.key(Path::new("D"));
+        for c in [
+            Config { bins_per_octave: 24, ..config },
+            Config { window: Window::Hann, ..config },
+            Config { window: Window::Hamming, ..config },
+            Config { window: Window::BlackmanHarris, ..config },
+            Config { frame_rate: f32::from_bits(config.frame_rate.to_bits() + 1), ..config },
+        ] {
+            let other = settings(BarMappingMode::TrueCqt(c));
+            assert_ne!(other.identity(), id, "configuration shared an identity: {c:?}");
+            assert_ne!(other.key(Path::new("D")).1, unit, "configuration shared a store unit: {c:?}");
+        }
+        for mapping in [BarMappingMode::Cqt, BarMappingMode::Superlet, BarMappingMode::FlatOverlap, BarMappingMode::Gaussian] {
+            assert_ne!(settings(mapping).identity(), id, "another method shared a true-CQT identity");
+        }
+        assert_ne!(baseline.record(44_100), baseline.record(48_000), "sample rate was absent from the record");
+        assert_eq!(baseline.identity(), baseline.clone().identity());
+        assert_eq!(baseline.key(Path::new("D")).1, unit);
+
+        // Display-grid and source settings remain part of the identity.
+        let mut other = baseline.clone();
+        other.bars += 1;
+        assert_ne!(other.identity(), id);
+        other = baseline.clone();
+        other.min_freq = f32::from_bits(other.min_freq.to_bits() + 1);
+        assert_ne!(other.identity(), id);
+        other = baseline.clone();
+        other.max_freq = f32::from_bits(other.max_freq.to_bits() + 1);
+        assert_ne!(other.identity(), id);
+        other = baseline.clone();
+        other.dsd_rate = Some(88_200);
+        assert_ne!(other.identity(), id);
+        other = baseline;
+        other.track = PathBuf::from("C:/music/other.flac");
+        assert_ne!(other.identity(), id);
     }
 }

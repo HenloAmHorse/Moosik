@@ -64,6 +64,10 @@ pub const V4_MAX_QUANT_ERROR_DB: f32 = AXIS_DB / (2.0 * V4_MAX_CODE as f32);
 /// Most frames a cache may declare. Matches the bound v3 enforced.
 pub const MAX_FRAMES: usize = 500_000;
 
+/// Preserve the original read allocation ceiling independently of the UI's
+/// maximum bar count. Wider analyses may hold fewer rows within this budget.
+pub const MAX_DECODED_CELLS: usize = 512_000_000;
+
 /// What one cache read is permitted to consume.
 ///
 /// # Why this exists
@@ -77,11 +81,11 @@ pub const MAX_FRAMES: usize = 500_000;
 ///
 /// # The numbers, and what they cost
 ///
-/// `max_cells` is deliberately the format's own implicit ceiling,
-/// `MAX_FRAMES × MAX_BAR_COUNT` — 512 M cells, a gibibyte of `u16`. That is
-/// what a legitimate 46-minute track at 180 fps and 1024 bars needs, so
-/// tightening it would refuse real files. It bounds the damage; it is not a
-/// snug fit, and nothing here pretends otherwise.
+/// `max_cells` retains the original 512 M-cell ceiling, roughly a gibibyte of
+/// `u16`. It is independent of `MAX_BAR_COUNT`: allowing 2048 bars must not
+/// silently double a file-controlled allocation limit. At 2048 bars this
+/// permits 250 000 rows, versus 500 000 at 1024 bars. It bounds the damage;
+/// it is not a snug fit, and nothing here pretends otherwise.
 ///
 /// `max_expansion` is the ratio a compressed block is trusted to expand by. It
 /// is *generous*: a digitally silent track's low plane is all zeros and LZ4
@@ -102,7 +106,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_file_bytes: 512 << 20,
-            max_cells: MAX_FRAMES * crate::spectrum::MAX_BAR_COUNT,
+            max_cells: MAX_DECODED_CELLS,
             max_expansion: 1024,
         }
     }
@@ -602,7 +606,7 @@ pub fn decode_with(
         return Err(CacheError::BarsMismatch { want: want_bars, got: bars });
     }
     // Checked, because `frames × bars` is attacker-influenced and both bounds
-    // above still permit half a billion cells.
+    // above can permit more cells than the independent allocation ceiling.
     let cells = frames
         .checked_mul(bars)
         .ok_or(CacheError::BadDimensions { frames, bars })?;
@@ -972,6 +976,8 @@ pub(crate) fn read_bounded(path: &Path, limits: Limits) -> Result<Vec<u8>, Cache
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod codec_screen;
 #[cfg(test)]
 mod tests {
     use super::*;

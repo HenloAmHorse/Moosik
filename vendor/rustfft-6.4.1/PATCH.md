@@ -1,5 +1,8 @@
 # rustfft 6.4.1 — Moosik patch (1.5.3)
 
+The opening archive/addition counts below describe the original 1.5.3 patch,
+not subsequent extensions.
+
 Exact published archive (copied from the local cargo registry) plus additions only — no existing
 line removed or changed (643 added lines under `src/`). Measured in round 10, in production
 since round 11.
@@ -64,3 +67,21 @@ since round 11.
   per-test geometry/branch evidence; recording is opt-in per thread, so analysis pool threads never
   accumulate it. `mixed_radix4` builds a radix-4 plan with the planner's own constructor for tests
   of a geometry the planner does not choose (f64 power-of-two plans are radix-8 chains).
+
+## 1.5.5: requested-output f64 Butterfly256/512 leaves
+
+The f64 scratch-butterfly macro now dispatches requested transforms to
+`avx64_pruned.rs`. The 256/512 leaves evaluate the original full graph for
+1..=4 requested outputs, using the original AVX/FMA primitives, constants,
+operand order and packed-transpose addresses. Existing full functions are
+unchanged; 64/128 and empty/5+ requests keep full execution and gather.
+No planner or FFT-size selection changes. The same CPU admission and pre-write
+argument checks apply. NaN payload/sign and floating-point status flags remain
+outside the existing equality contract.
+
+Tests live in `avx64_pruned_tests.rs`. An isolated offline gate at
+`research/v155/leaf_gates` mirrors them through the public AVX planner because
+the vendor's original dev-dependency wasm-bindgen-test is absent offline.
+It includes singleton, mixed-row, product, contract and exhaustive-pair checks
+against the unchanged full functions, both directions. This is local modified
+source under the upstream MIT/Apache-2.0 terms, not an upstream release.

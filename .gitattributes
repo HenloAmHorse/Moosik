@@ -1,3 +1,7 @@
 # Verbatim third-party texts: kept byte for byte, so no line-ending conversion and no whitespace checks.
 third_party/** -text -whitespace
 THIRD_PARTY_NOTICES.txt -text -whitespace
+# Verbatim upstream rodio files with original intentional trailing spaces.
+vendor/rodio-0.20.1/outreach/v0.20_announcement_and_call_for_userstories.md -whitespace
+vendor/rodio-0.20.1/src/decoder/mp3.rs -whitespace
+vendor/rodio-0.20.1/src/spatial_sink.rs -whitespace

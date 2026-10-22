@@ -17,14 +17,26 @@ professional-grade spectrum analyzer, and a parametric EQ, built in Rust.
 
 ## Build
 
-**Current release: [1.5.4](https://github.com/HenloAmHorse/Moosik-Player/releases/tag/v1.5.4).**
+**Current release: [1.5.5](https://github.com/HenloAmHorse/Moosik-Player/releases/tag/v1.5.5).**
 Download the Windows x86_64 `.exe` and the accompanying notices. There is no
 installer; local translation models are optional, separate downloads.
+
+1.5.5 adds a genuine pre-processed [CQT](docs/CQT.md) with a Responsive
+variable-Q bass option, 2048-bar spectra,
+[independent live padding and exact live FFT reuse](docs/REALTIME_FFT.md), and
+more [audio formats](docs/AUDIO_FORMATS.md), including native Opus. The existing
+FFT constant-Q weighting and Superlet remain separate choices, with their old
+caches preserved.
 
 Requires Rust (stable, edition 2024). Tagged releases attach a prebuilt Windows
 x86_64 executable (it needs the Microsoft Visual C++ 2015-2022 Redistributable,
 x64, which most Windows PCs already have); on other platforms, building it is
 how you run it.
+
+Building 1.5.5 and later also needs CMake and the platform's native C/C++ build
+tools for bundled libopus (on Windows, Visual Studio's Desktop development with
+C++ tools). This is a build requirement, not an extra program or Opus DLL that
+listeners must install; Opus is linked into the executable.
 
 On Linux, the audio backend (cpal/ALSA) needs the ALSA development headers:
 
@@ -41,9 +53,11 @@ cargo build --release --locked
 ./target/release/moosik
 ```
 
-`--locked` builds exactly the dependency versions in `Cargo.lock`. Three crates
-are built from the copies under `vendor/` (`eframe`, `egui`, `rustfft`); each
-has a `PATCH.md` saying what differs from the published release and why. The
+`--locked` builds exactly the dependency versions in `Cargo.lock`. Patched copies
+of `eframe`, `egui`, `rustfft`, `rodio`, `symphonia`, `symphonia-format-ogg` and
+`symphonia-format-mkv` are under `vendor/`; each has a `PATCH.md` saying what
+differs from the published release and why. The original local
+`moosik-codec-opus` adapter is there too. The
 first build downloads the other crates, and `lindera`'s build script downloads
 and compiles the Japanese (IPADIC) dictionary. To build again without a
 network: run `cargo fetch --locked` once, set
@@ -124,7 +138,6 @@ describes what the current release does.
 
 | | |
 |---|---|
-| **1.5.5** | A true constant-Q transform and further measured pre-process/real-time performance work; the current constant-Q weighting remains FFT-based. |
 | **1.6.0** | Professional audio-analysis features. Harmonic and pitch analysis, time-frequency inspection and channel-analysis tools are candidate directions. |
 
 Principles that work is meant to hold to:
@@ -147,6 +160,9 @@ Principles that work is meant to hold to:
 |---|---|
 | [docs/BIT_PERFECT.md](docs/BIT_PERFECT.md) | the exactness contract in full, and DSD |
 | [docs/SPECTRUM.md](docs/SPECTRUM.md) | the analyser, the superlet transform, and the EQ |
+| [docs/CQT.md](docs/CQT.md) | true CQT and the Responsive variable-Q option: definition and limits |
+| [docs/REALTIME_FFT.md](docs/REALTIME_FFT.md) | live FFT bars, padding and exact reuse |
+| [docs/AUDIO_FORMATS.md](docs/AUDIO_FORMATS.md) | which containers and codecs are read, and their limits |
 | [docs/CACHE.md](docs/CACHE.md) | the analysis cache: what it guarantees, what it does not, and older versions' files |
 | [docs/RELEASE_COMPARISON_153.md](docs/RELEASE_COMPARISON_153.md) | 1.5.3 measured against 1.5.2.1: pre-processing time, CPU, memory, and loading a saved analysis |
 | [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) | third-party licenses and notices for the Windows executable ([how they were assembled](docs/THIRD_PARTY_NOTICES.md)) |
@@ -175,7 +191,8 @@ All pulled automatically via Cargo:
 | `rodio` | Audio playback (normal mode) |
 | `cpal` | Direct device output (bit-perfect mode, Linux/macOS) |
 | `wasapi` | WASAPI exclusive-mode output (bit-perfect mode, Windows) |
-| `symphonia` | Audio decoding (MP3, FLAC, OGG, WAV, AAC, …) |
+| `symphonia` | Audio decoding (MP3, FLAC, OGG, WAV, AAC, ALAC, AIFF, CAF, …) |
+| `opusic-sys` | Bundled libopus for Ogg/WebM/Matroska Opus |
 | `rtrb` | Lock-free ring buffer (decode → output) |
 | `rustfft` | FFT engine |
 | `wgpu` / `pollster` / `bytemuck` | GPU compute for the superlet pre-process |

@@ -2,6 +2,88 @@
 
 ## [Unreleased]
 
+## [1.5.5] - 2026-10-22
+
+True CQT with a Responsive variable-Q bass option, common audio formats with
+native Opus, 2048-bar spectra, independent live padding and exact live FFT
+reuse. No change to the bit-perfect playback contract.
+
+- Unify the file-picker/folder audio inventory; expose AAC/M4A/MP4 audio and
+  enable ALAC, AIFF/AIFF-C and CAF readers. Add bundled native mono/stereo Opus
+  for Ogg and WebM/Matroska, shared by playback and analysis. Preserve codec
+  identity instead of guessing lossless status from a container extension.
+- Correct audio-track selection, empty trimmed packets and container time-base
+  handling in the shared decoder. Opus seeks currently decode/discard from the
+  beginning for correct history with bounded memory, trading seek latency for
+  correctness. No video renderer or universal codec/profile support is claimed;
+  see [Audio formats](docs/AUDIO_FORMATS.md) for the precise scope and limits.
+
+- **True CQT** is a separate pre-process analysis method, not the existing
+  FFT constant-Q weighting renamed. Every frequency has its own full centred
+  window; no bass support cap, sparse threshold or decimation is hidden in it.
+  Support resolution (12–192 bins/octave), four window shapes and analysis
+  frame rate are independent of the display bar count. More support trades
+  time localization and analysis work for frequency selectivity.
+- The new method reuses the cache/store and Whole track renderer, with distinct
+  CQT identities, a drift-free explicit frame clock, Nyquist-clamped logarithmic
+  axes, and Mix/Left/Right from two complex channel transforms. Existing FFT
+  and Superlet cache identities are unchanged; old FFT weighting stays selectable.
+  Pending CQT now shows a separately labelled LIVE FFT PREVIEW on ordinary
+  plots, using live PCM and its actual sample rate, then resets preview
+  history when stored CQT arrives. Whole track never stores/displays this
+  preview as CQT. Preview settings do not invalidate the analysis cache.
+- CQT reuses window values, evaluates only requested inverse-FFT outputs
+  where the unchanged plan supports exact pruning, and can parallelize
+  independent filters on the selected analysis-worker pool. Explicit buffers
+  are budgeted together; tight budgets keep smaller batches or serial work,
+  not shorter filters. Frozen-reference complex-bit/code comparisons guard
+  the numerical route. No throughput percentage is claimed without paired
+  quiet-machine measurements.
+- Extend the same bounded CQT inverse-worker route to 512/1024/2048-point
+  groups, previously forced serial even on the selected worker pool. Keep
+  existing memory admission, full windows, FFT operations and cache identity;
+  small budgets and calls outside an explicit pool still retain serial work.
+- Prepare independent CQT kernels on those already-admitted worker slots,
+  reusing their existing FFT scratch before source transforms. Preserve each
+  kernel's arithmetic and bank order, the same payload allowance and serial
+  fallback. Cancellation joins preparation before dropping a partial bank;
+  existing caches do not need invalidation for this scheduling change.
+- Live FFT Mix and channel transforms reuse sample, complex and scratch buffers
+  after warmup instead of allocating them every accepted tick. The tested FFT
+  coefficients and norms remain bit-identical to 1.5.4. This is not a claim
+  that the entire UI is allocation-free or that every workload is faster.
+- **Bass response → Responsive** adds a separate variable-Q transform beside
+  Full CQT, with its own identity and cache. Its bass limit accepts
+  0.05–10 s and starts at 0.25 s when selected; saved limits are kept. Full
+  CQT is unchanged.
+- Bars go up to 2048 (default still 1024). Existing 1024-bar caches are not
+  upsampled. **Live zero-padding** (1x/2x/4x/8x) is now separate from
+  Pre-process zero-padding; older profiles keep the previous 2x live behavior.
+- Live FFT: Flat and Gaussian overlap retain their geometry like the
+  constant-Q weighting already did, and a cold build evaluates each shared bar
+  edge once (a 2048-bar build in about 3.7 ms instead of 7.2 ms). Mix, Left
+  and Right each reuse their FFT when their own newest window is bit-identical
+  to the last one; smoothing and history still advance every tick. Outputs
+  are bit-identical.
+- Packaging: third-party notices regenerated for the new Opus, ALAC and CAF
+  dependencies (302 packages). Building now needs CMake and native C/C++
+  tools for the bundled libopus; listeners need nothing extra.
+
+### Limits
+
+- Full CQT bass support is long by definition (about 13.8 s at 20 Hz and 192
+  bins/octave); Responsive trades bass pitch separation for faster response.
+- 2048 bars can cost more than twice the analysis of 1024. Live reuse only
+  saves time when the display ticks faster than audio arrives (high analyser
+  FPS, bursty devices, paused); on always-fresh input it costs under 2%.
+- The analysis cache format is unchanged. A smaller reversible layout was
+  tried and rejected because it read and wrote more slowly.
+- Opus seeks decode from the start of the stream, trading seek latency for
+  correctness. No video renderer or universal codec/profile support.
+
+See [CQT](docs/CQT.md), [Live FFT](docs/REALTIME_FFT.md) and
+[Audio formats](docs/AUDIO_FORMATS.md) for definitions and limits.
+
 ## [1.5.4] - 2026-10-19
 
 Whole-track time-frequency inspection, downloadable local translation and a

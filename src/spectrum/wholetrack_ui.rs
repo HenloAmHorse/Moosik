@@ -1060,16 +1060,21 @@ fn provenance(s: &Snapshot) -> String {
     } else {
         String::new()
     };
+    let clock = match g.transform {
+        super::wholetrack::Transform::TrueCqt { .. } => format!(
+            "variable sample spacing at {} Hz; frame k at k/fps, sample center floor(k·sr/fps)",
+            g.sample_rate,
+        ),
+        _ => format!("hop {} at {} Hz", g.hop, g.sample_rate),
+    };
     format!(
-        "{} · {} · {} bars, {scale} scale, {:.0} Hz–{:.0} Hz{nyq} · {:.2} frames/s (hop {} at {} Hz) · {}",
+        "{} · {} · {} bars, {scale} scale, {:.0} Hz–{:.0} Hz{nyq} · {:.2} frames/s ({clock}) · {}",
         g.transform.label(),
         origin,
         g.bars,
         g.lo,
         g.axis_hi,
         g.frame_rate(),
-        g.hop,
-        g.sample_rate,
         "levels: stored display codes, −80…0 dB clipped, not dBFS; no smoothing or ISO 226",
     )
 }
@@ -1348,4 +1353,39 @@ pub(crate) fn hover(
         s.max_code,
         g.transform.anchor_note(time(kf), g.sample_rate),
     )
+}
+
+#[cfg(test)]
+mod true_cqt_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn cqt_provenance_does_not_describe_its_variable_clock_as_hop_zero() {
+        let cfg = super::super::cqt::Config::default();
+        let settings = super::super::AnalysisSettings {
+            track: std::path::PathBuf::from("C:/synthetic/cqt.wav"),
+            bars: 4,
+            min_freq: 20.0,
+            max_freq: 20_000.0,
+            mapping: super::super::BarMappingMode::TrueCqt(cfg),
+            dsd_rate: None,
+            fft: None,
+            aslt: None,
+        };
+        let mix = Arc::new(PreFrames::from_v4_codes(vec![100; 16], 4, 4));
+        let snapshot = Snapshot {
+            revision: 0,
+            origin: Origin::Memory,
+            pin: None,
+            geometry: Geometry::parse(&settings.record(48_000)).unwrap(),
+            inv_max: mix.inv_max(),
+            max_code: mix.max_code(),
+            mix,
+            lr: None,
+        };
+        let text = provenance(&snapshot);
+        assert!(text.contains("True CQT") && text.contains("180.00 frames/s"), "{text}");
+        assert!(text.contains("variable sample spacing") && text.contains("floor(k·sr/fps)"), "{text}");
+        assert!(!text.contains("hop 0"), "{text}");
+    }
 }

@@ -69,6 +69,7 @@ pub(super) fn reference_bins_to_bars(a: &SpectrumAnalyzer, fft_out: &[Complex<f3
                     for (b_idx, &norm_b) in norms[b_start..=b_end].iter().enumerate() {
                         let b = b_start + b_idx;
                         let w = match &a.bar_mapping {
+                            BarMappingMode::TrueCqt(_) => unreachable!("True CQT is not a live FFT route"),
                             BarMappingMode::FlatOverlap => {
                                 (fbin_hi.min(b as f32 + 1.0) - fbin_lo.max(b as f32)).max(0.0)
                             }

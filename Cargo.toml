@@ -1,6 +1,6 @@
 [package]
 name = "moosik"
-version = "1.5.4"
+version = "1.5.5"
 edition = "2024"
 
 [[bin]]
@@ -48,7 +48,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 ferrous-opencc = { version = "=0.4.0", default-features = false, features = ["s2t-conversion", "t2s-conversion"] }
 rtrb = "0.3.4"
 lz4_flex = "0.11"
-symphonia = { version = "0.5", features = ["flac", "mp3", "vorbis", "isomp4", "aac"] }
+symphonia = { version = "=0.5.5", features = ["flac", "mp3", "vorbis", "isomp4", "aac", "alac", "aiff", "caf", "moosik-opus"] }
 cpal = "0.15"
 # OS media-key / now-playing integration (MPRIS, SMTC, macOS MediaPlayer).
 # use_zbus = pure-Rust D-Bus on Linux, so no system libdbus-1-dev needed.
@@ -107,6 +107,10 @@ raw-window-handle = "0.6"
 # The vendored copy is the exact published archive plus one Windows-only,
 # opt-in policy; see vendor/eframe-0.31.1/PATCH.md.
 [patch.crates-io]
+rodio = { path = "vendor/rodio-0.20.1" }
+symphonia = { path = "vendor/symphonia-0.5.5" }
+symphonia-format-mkv = { path = "vendor/symphonia-format-mkv-0.5.5" }
+symphonia-format-ogg = { path = "vendor/symphonia-format-ogg-0.5.5" }
 eframe = { path = "vendor/eframe-0.31.1" }
 # rustfft 6.4.1 plus the requested-output (pruned) inverse entry points and
 # live-row column passes the production ASLT inverse uses (R10-R13); see

@@ -1,6 +1,17 @@
 pub mod eq;
 pub mod art;
 pub mod aslt;
+pub mod cqt;
+mod cqt_ui;
+mod cqt_pipeline;
+#[cfg(test)]
+mod cqt_integration_tests;
+#[cfg(test)]
+mod cqt_pair_bench;
+#[cfg(test)]
+mod bass_response;
+#[cfg(test)]
+mod audio_import_tests;
 pub mod gpu;
 pub mod gpu_calib;
 pub mod freq_scale;
@@ -24,6 +35,13 @@ mod fft_domain_tests;
 mod share_downstream_tests;
 #[cfg(test)]
 mod realtime_route_tests;
+#[cfg(test)]
+mod live_workspace_tests;
+#[cfg(test)]
+mod bar_capacity_tests;
+mod live_mapping;
+#[cfg(test)]
+mod realtime_padding_tests;
 // Round 13: sustained lifecycle soak and cache readback harnesses (ignored).
 #[cfg(test)]
 mod r13_soak_tests;
@@ -53,7 +71,7 @@ use art::{ArtFit, ArtSpectrumMode, ArtMaskMode, ArtDisplaySettings,
 pub const DEFAULT_FFT_SIZE: usize = 8192;
 pub const DEFAULT_BAR_COUNT: usize = 1024;
 pub const MIN_BAR_COUNT: usize = 16;
-pub const MAX_BAR_COUNT: usize = 1024;
+pub const MAX_BAR_COUNT: usize = 2048;
 /// Pre-process frame rate — how many rows a second the cached analysis holds.
 ///
 /// The renderer does **not** interpolate between rows; it holds the most
@@ -65,6 +83,12 @@ pub const MAX_BAR_COUNT: usize = 1024;
 pub const DEFAULT_PRE_FPS: f32 = 180.0;
 pub const DEFAULT_MIN_FREQ: f32 = 20.0;
 pub const DEFAULT_MAX_FREQ: f32 = 24_000.0;
+/// Separate from the pre-process padding (which can be much larger).
+pub const DEFAULT_REALTIME_PAD: usize = 2;
+
+fn realtime_pad(value: usize) -> usize {
+    if [1, 2, 4, 8].contains(&value) { value } else { DEFAULT_REALTIME_PAD }
+}
 /// Fallback ring depth, used only before a row rate is known.
 ///
 /// The depth is chosen at runtime from the wanted span and the rate rows are
@@ -121,6 +145,9 @@ pub enum BarMappingMode {
     /// its own cache key fields (bins per octave, window shape, hop policy);
     /// reusing `Cqt` or id 2 would let existing FFT caches be read as CQT ones.
     Cqt,
+    /// Genuine constant-Q filterbank: per-frequency centred windows, not FFT
+    /// bin weighting. Its configuration and cache identity are independent.
+    TrueCqt(cqt::Config),
     /// Adaptive Superlet Transform — not an FFT mapping at all, but a direct
     /// wavelet analysis of the time-domain signal (see [`aslt`]).
     ///
@@ -1330,11 +1357,18 @@ pub struct SpectrumAnalyzer {
     pub sample_buf: SampleBuf,
     window_coeffs: Vec<f32>,
     fft_plan: Arc<dyn rustfft::Fft<f32>>,
-    /// Lightweight plan for real-time display: always fft_size × 2.
-    /// The full fft_plan (fft_size × pad_factor) is used only for pre-process
-    /// (runs in a background thread). Keeping real-time at 2× ensures the
-    /// UI thread never spends more than ~0.5 ms on an FFT frame.
+    /// Bounded live plan, independent of the background pre-process plan.
     rt_fft_plan: Arc<dyn rustfft::Fft<f32>>,
+    /// Per-analyser live FFT workspace. The sample snapshot still leaves the
+    /// tap lock before windowing/FFT; only its allocation is reused.
+    rt_samples: Vec<f32>,
+    rt_work: Vec<Complex<f32>>,
+    rt_scratch: Vec<Complex<f32>>,
+    /// Channel norms must not overwrite the Mix norms used by other views.
+    /// One per side, each with the exact window it came from, so either side
+    /// can reuse its own transform; the complex scratch stays shared.
+    ch_norms: [Vec<f32>; 2],
+    ch_samples: [Vec<f32>; 2],
     pub magnitudes: Vec<f32>,
     smoothed: Vec<f32>,
     /// What peak-hold should consider this tick: the largest displayed value
@@ -1448,6 +1482,19 @@ pub struct SpectrumAnalyzer {
     /// compare the production tick's downstream state against it.
     #[cfg(test)]
     pub(crate) rt_reference: bool,
+    /// Timing control at 22ec591: existing norms, uncached overlap geometry.
+    #[cfg(test)]
+    rt_uncached_overlap: bool,
+    #[cfg(test)]
+    rt_disable_input_reuse: bool,
+    #[cfg(test)]
+    rt_fft_computations: u64,
+    #[cfg(test)]
+    rt_fft_reuses: u64,
+    #[cfg(test)]
+    ch_fft_reuses: u64,
+    #[cfg(test)]
+    rt_disable_channel_reuse: bool,
     /// Whether *future* analyses should also produce left and right.
     ///
     /// A persisted preference about generating data. It is deliberately not the
@@ -1578,6 +1625,8 @@ pub struct SpectrumAnalyzer {
     pub interp_mode: InterpolationMode,
     /// Zero-padding multiplier applied before the FFT (1 = off, 2/4/… = denser bins).
     pub pad_factor: usize,
+    /// Live-only padding. Does not participate in any stored-analysis identity.
+    pub rt_pad_factor: usize,
     /// Analysis window overlap (0.5 = 50%, 0.75 = 75%, 0.875 = 87.5%). Affects frame rate.
     pub overlap: f32,
     /// Multi-bin bar weighting strategy.
@@ -1651,6 +1700,7 @@ pub struct SpectrumAnalyzer {
     /// The constant-Q gather plan for the realtime Mix tick, and the geometry
     /// it was built for. Rebuilt only when that geometry changes.
     cqt_plan: Option<(CqtKey, Vec<CqtBar>)>,
+    overlap_plan: Option<live_mapping::Plan>,
     /// Test only: how many times the plan has been built.
     #[cfg(test)]
     pub(crate) cqt_plan_builds: usize,
@@ -1662,13 +1712,19 @@ impl SpectrumAnalyzer {
         const DEFAULT_PAD: usize = 16;
         let mut planner = FftPlanner::new();
         let fft_plan = planner.plan_fft_forward(fft_size * DEFAULT_PAD);
-        let rt_fft_plan = planner.plan_fft_forward(fft_size * 2);
+        let rt_fft_plan = planner.plan_fft_forward(fft_size * DEFAULT_REALTIME_PAD);
+        let rt_scratch = vec![Complex::default(); rt_fft_plan.get_inplace_scratch_len()];
         let window_coeffs = make_window(fft_size, &WindowFn::Hann);
         Self {
             sample_buf,
             window_coeffs,
             fft_plan,
             rt_fft_plan,
+            rt_samples: Vec::with_capacity(fft_size),
+            rt_work: vec![Complex::default(); fft_size * DEFAULT_REALTIME_PAD],
+            rt_scratch,
+            ch_norms: [Vec::new(), Vec::new()],
+            ch_samples: [Vec::new(), Vec::new()],
             magnitudes: vec![0.0f32; DEFAULT_BAR_COUNT],
             smoothed: vec![0.0f32; DEFAULT_BAR_COUNT],
             peak_input: vec![0.0f32; DEFAULT_BAR_COUNT],
@@ -1695,6 +1751,18 @@ impl SpectrumAnalyzer {
             calib_gate: gpu_calib::gate::ticket(),
             #[cfg(test)]
             rt_reference: false,
+            #[cfg(test)]
+            rt_uncached_overlap: false,
+            #[cfg(test)]
+            rt_disable_input_reuse: false,
+            #[cfg(test)]
+            rt_fft_computations: 0,
+            #[cfg(test)]
+            rt_fft_reuses: 0,
+            #[cfg(test)]
+            ch_fft_reuses: 0,
+            #[cfg(test)]
+            rt_disable_channel_reuse: false,
             pre_stereo_enabled: false,
             pre_stereo_request: None,
             #[cfg(test)]
@@ -1725,6 +1793,7 @@ impl SpectrumAnalyzer {
             eq_weights: Vec::new(),
             interp_mode: InterpolationMode::None,
             pad_factor: DEFAULT_PAD,
+            rt_pad_factor: DEFAULT_REALTIME_PAD,
             overlap: 0.875,
             bar_mapping: BarMappingMode::Cqt,
             dsd_rate: crate::dsd::decimate::DEFAULT_PREPROCESS_RATE,
@@ -1749,6 +1818,7 @@ impl SpectrumAnalyzer {
             waterfall_enabled: false,
             last_fft_norms: Vec::new(),
             cqt_plan: None,
+            overlap_plan: None,
             #[cfg(test)]
             cqt_plan_builds: 0,
         }
@@ -1758,16 +1828,36 @@ impl SpectrumAnalyzer {
     pub fn rebuild_fft(&mut self) {
         let mut planner = FftPlanner::new();
         self.fft_plan = planner.plan_fft_forward(self.pre_fft_size * self.pad_factor);
-        self.rt_fft_plan = planner.plan_fft_forward(self.fft_size * 2);
+        self.rebuild_realtime_fft();
+    }
+
+    fn realtime_padded_size(&self) -> usize {
+        self.fft_size * realtime_pad(self.rt_pad_factor)
+    }
+
+    /// Changing live padding must not replan, invalidate or restart a cached
+    /// pre-process analysis. All live consumers use this plan's actual size.
+    fn rebuild_realtime_fft(&mut self) {
+        self.rt_pad_factor = realtime_pad(self.rt_pad_factor);
+        self.rt_fft_plan = FftPlanner::new().plan_fft_forward(self.realtime_padded_size());
         self.window_coeffs = make_window(self.fft_size, &self.window_fn);
+        self.rt_samples.clear();
+        self.rt_samples.reserve(self.fft_size);
+        self.rt_work.resize(self.realtime_padded_size(), Complex::default());
+        self.rt_scratch.resize(self.rt_fft_plan.get_inplace_scratch_len(), Complex::default());
         // A different window length means a different number of bins behind
         // each bar, so the channel filter state no longer describes the same
         // measurement. The scratch is dropped with it rather than resized.
         self.reset_channels();
         self.ch_scratch = Vec::new();
+        self.ch_norms = [Vec::new(), Vec::new()];
+        self.ch_samples = [Vec::new(), Vec::new()];
     }
 
 
+    // The production Mix and channel paths already have the norms; this
+    // allocating wrapper remains for the frozen-route regression tests.
+    #[cfg(test)]
     fn bins_to_bars(&self, fft_out: &[Complex<f32>], sr: u32, n_bars: usize, padded_size: usize) -> Vec<f32> {
         let half = padded_size / 2;
         let norms: Vec<f32> = fft_out[..half].iter().map(|c| c.norm()).collect();
@@ -1777,6 +1867,7 @@ impl SpectrumAnalyzer {
     /// Everything `bins_to_bars` does after the norms pass, unchanged: the
     /// same code on the same values, so a caller that already holds the norms
     /// gets bit-identical bars by handing them over.
+    #[cfg(test)]
     fn bars_from_norms(&self, norms: &[f32], sr: u32, n_bars: usize, padded_size: usize) -> Vec<f32> {
         let fft_size = self.fft_size;
         let half = padded_size / 2;
@@ -1795,9 +1886,9 @@ impl SpectrumAnalyzer {
             .map(|bar| {
                 // Bar edges follow whichever scale the display is on, or the
                 // FFT bins would be gathered into bars that sit somewhere else.
-                let fscale = self.aslt_cfg.scale;
-                let (lo_hz, hi_hz) = (self.min_freq, self.max_freq);
-                let mag = if self.bar_mapping == BarMappingMode::Cqt {
+                let fscale = self.analysis_scale();
+                let (lo_hz, hi_hz) = (self.min_freq, self.live_mapping_max_freq(sr));
+                let mag = if self.live_uses_cqt_weighting() {
                     // CQT: centre-frequency Hann kernel with constant-Q bandwidth
                     let tc  = (bar as f32 + 0.5) / n_bars as f32;
                     let f_c = fscale.freq_at(tc, lo_hz, hi_hz);
@@ -1842,7 +1933,8 @@ impl SpectrumAnalyzer {
                                 }
                                 BarMappingMode::Gaussian
                                 | BarMappingMode::Cqt
-                                | BarMappingMode::Superlet => {
+                                | BarMappingMode::Superlet
+                                | BarMappingMode::TrueCqt(_) => {
                                     let center_b = b as f32 + 0.5;
                                     (-(center_b - bc).powi(2) / (2.0 * sigma * sigma)).exp()
                                 }
@@ -1860,7 +1952,7 @@ impl SpectrumAnalyzer {
 
     /// The constant-Q plan for this geometry, built if it is not the one held.
     fn ensure_cqt_plan(&mut self, sr: u32, n_bars: usize, padded_size: usize) {
-        let key = CqtKey::new(n_bars, padded_size, sr, self.min_freq, self.max_freq, self.aslt_cfg.scale);
+        let key = CqtKey::new(n_bars, padded_size, sr, self.min_freq, self.live_mapping_max_freq(sr), self.analysis_scale());
         if self.cqt_plan.as_ref().is_some_and(|(k, _)| *k == key) {
             return;
         }
@@ -1883,8 +1975,8 @@ impl SpectrumAnalyzer {
         let n_octaves = (log_max - log_min) / 2_f32.log10();
         let bins_per_oct = n_bars as f32 / n_octaves.max(0.1);
         let cqt_q = 1.0 / (2.0_f32.powf(1.0 / bins_per_oct) - 1.0);
-        let fscale = self.aslt_cfg.scale;
-        let (lo_hz, hi_hz) = (self.min_freq, self.max_freq);
+        let fscale = self.analysis_scale();
+        let (lo_hz, hi_hz) = (self.min_freq, self.live_mapping_max_freq(sr));
         (0..n_bars)
             .map(|bar| {
                 let tc = (bar as f32 + 0.5) / n_bars as f32;
@@ -1926,6 +2018,98 @@ impl SpectrumAnalyzer {
         ((corrected_db + 80.0) / 80.0).clamp(0.0, 1.0)
     }
 
+    /// Snapshot and transform one live frame, without mapping/presentation.
+    /// After warmup the FFT stage itself has no dynamic allocations. Mapping
+    /// and waterfall rows still have their own allocations; this is not a claim
+    /// that the entire accepted UI tick is allocation-free.
+    fn transform_realtime(&mut self) -> bool {
+        let fft_size = self.fft_size;
+        let padded = self.realtime_padded_size();
+        #[cfg(test)]
+        let reuse_allowed = !self.rt_disable_input_reuse;
+        #[cfg(not(test))]
+        let reuse_allowed = true;
+        {
+            let buf = match self.sample_buf.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if buf.len() < fft_size { return false; }
+            let start = buf.len().saturating_sub(fft_size);
+            // The source publishes batches, independently of display ticks.
+            // Identical window bits imply the identical FFT. Still run the
+            // mapper, smoothers, peak and history on every accepted tick.
+            // Rebuild clears rt_samples; length checks are not optional (an
+            // empty zip would otherwise claim an unchanged window).
+            if reuse_allowed && self.rt_samples.len() == fft_size
+                && self.rt_work.len() == padded && self.last_fft_norms.len() == padded / 2
+                && buf[start..].iter().zip(&self.rt_samples)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            {
+                #[cfg(test)]
+                { self.rt_fft_reuses += 1; }
+                return true;
+            }
+            self.rt_samples.clear();
+            self.rt_samples.extend_from_slice(&buf[start..]);
+        }
+        self.rt_work.resize(padded, Complex::default());
+        for (slot, (s, w)) in self.rt_work[..fft_size].iter_mut()
+            .zip(self.rt_samples.iter().zip(&self.window_coeffs))
+        {
+            *slot = Complex { re: s * w, im: 0.0 };
+        }
+        self.rt_work[fft_size..].fill(Complex::default());
+        self.rt_scratch.resize(self.rt_fft_plan.get_inplace_scratch_len(), Complex::default());
+        self.rt_fft_plan.process_with_scratch(&mut self.rt_work, &mut self.rt_scratch);
+        #[cfg(test)]
+        { self.rt_fft_computations += 1; }
+        self.last_fft_norms.clear();
+        self.last_fft_norms.extend(self.rt_work[..padded / 2].iter().map(|c| c.norm()));
+        true
+    }
+
+    /// The channel equivalent of `transform_realtime`, using the same plan and
+    /// scratch sequentially. Does not change `last_fft_norms` (the Mix).
+    ///
+    /// Like the Mix, a side whose whole window is bit-identical to the one its
+    /// norms came from keeps them. Each side compares only with itself. On
+    /// reuse `ch_scratch` may hold the other side's transform; only the norms
+    /// are this side's.
+    fn transform_channel(&mut self, side: usize, pcm: &[f32]) {
+        let fft_size = self.fft_size;
+        let padded = self.realtime_padded_size();
+        let start = pcm.len() - fft_size;
+        #[cfg(test)]
+        let reuse_allowed = !self.rt_disable_input_reuse && !self.rt_disable_channel_reuse
+            && !self.rt_reference;
+        #[cfg(not(test))]
+        let reuse_allowed = true;
+        if reuse_allowed && self.ch_samples[side].len() == fft_size
+            && self.ch_norms[side].len() == padded / 2
+            && pcm[start..].iter().zip(&self.ch_samples[side])
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        {
+            #[cfg(test)]
+            { self.ch_fft_reuses += 1; }
+            return;
+        }
+        self.ch_samples[side].clear();
+        self.ch_samples[side].extend_from_slice(&pcm[start..]);
+        self.ch_scratch.resize(padded, Complex::default());
+        for (slot, (x, w)) in self.ch_scratch[..fft_size].iter_mut()
+            .zip(pcm[start..].iter().zip(self.window_coeffs.iter()))
+        {
+            *slot = Complex { re: x * w, im: 0.0 };
+        }
+        self.ch_scratch[fft_size..].fill(Complex::default());
+        self.rt_scratch.resize(self.rt_fft_plan.get_inplace_scratch_len(), Complex::default());
+        self.rt_fft_plan.process_with_scratch(&mut self.ch_scratch, &mut self.rt_scratch);
+        self.ch_norms[side].clear();
+        self.ch_norms[side].extend(self.ch_scratch[..padded / 2].iter().map(|c| c.norm()));
+        self.channel_ffts = self.channel_ffts.saturating_add(1);
+    }
+
     /// Run one live FFT frame and fold it into the display.
     ///
     /// `dt` is the wall time since the *previous accepted* analyser tick, not
@@ -1934,36 +2118,24 @@ impl SpectrumAnalyzer {
     /// time. The first tick of a stream passes a very large `dt`, which
     /// correctly resolves to no smoothing at all.
     pub fn process_realtime(&mut self, dt: f64) {
-        let fft_size = self.fft_size;
-        // Real-time FFT uses 2× padding only — keeps the UI thread's per-frame
-        // work at ~16 K points instead of 131 K (pad=16), eliminating the CPU
-        // spike that caused audio buffer underruns when the spectrum was open.
-        // The high-quality padded plan is used only by the background pre-process.
-        let rt_padded = fft_size * 2;
+        if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) && !self.pre_frames.is_empty() {
+            // A completed CQT is never overwritten by its temporary preview.
+            return;
+        }
+        if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_))
+            && self.min_freq >= self.live_mapping_max_freq(self.live_rate)
+        {
+            self.clear_live_preview();
+            return;
+        }
+        let rt_padded = self.realtime_padded_size();
 
-        let samples: Vec<f32> = {
-            let buf = match self.sample_buf.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if buf.len() < fft_size {
-                return;
+        if !self.transform_realtime() {
+            if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                self.clear_live_preview();
             }
-            let start = buf.len().saturating_sub(fft_size);
-            buf[start..].to_vec()
-        };
-
-        let zero_pad = rt_padded - fft_size;
-        let mut buf: Vec<Complex<f32>> = samples
-            .iter()
-            .zip(self.window_coeffs.iter())
-            .map(|(s, w)| Complex { re: s * w, im: 0.0 })
-            .chain(std::iter::repeat_n(Complex { re: 0.0, im: 0.0 }, zero_pad))
-            .collect();
-        self.rt_fft_plan.process(&mut buf);
-
-        let half = rt_padded / 2;
-        self.last_fft_norms = buf[..half].iter().map(|c| c.norm()).collect();
+            return;
+        }
         let sr = self.live_rate;
         let n = self.bar_count;
         // The norms were just computed for `last_fft_norms`; `bins_to_bars`
@@ -1973,20 +2145,30 @@ impl SpectrumAnalyzer {
         let reference = self.rt_reference;
         #[cfg(not(test))]
         let reference = false;
+        #[cfg(test)]
+        let uncached_overlap = self.rt_uncached_overlap;
+        #[cfg(not(test))]
+        let uncached_overlap = false;
         let new_bars = if reference {
             #[cfg(test)]
-            { realtime_route_tests::reference_bins_to_bars(self, &buf, sr, n, rt_padded) }
+            { realtime_route_tests::reference_bins_to_bars(self, &self.rt_work, sr, n, rt_padded) }
             #[cfg(not(test))]
             { unreachable!() }
-        } else if self.bar_mapping == BarMappingMode::Cqt {
+        } else if self.live_uses_cqt_weighting() {
             // The constant-Q weights depend on the geometry alone, never on
             // the audio, so they are computed once per geometry rather than
             // once per bar per tick.
             self.ensure_cqt_plan(sr, n, rt_padded);
             let plan = &self.cqt_plan.as_ref().expect("built above").1;
             self.bars_from_plan(&self.last_fft_norms, plan, n)
+        } else if uncached_overlap {
+            #[cfg(test)]
+            { self.bars_from_norms(&self.last_fft_norms, sr, n, rt_padded) }
+            #[cfg(not(test))]
+            { unreachable!() }
         } else {
-            self.bars_from_norms(&self.last_fft_norms, sr, n, rt_padded)
+            self.ensure_overlap_plan(sr, n, rt_padded);
+            self.overlap_bars(&self.last_fft_norms)
         };
         if self.smoothed.len() != new_bars.len() {
             self.smoothed = vec![0.0; new_bars.len()];
@@ -2028,6 +2210,9 @@ impl SpectrumAnalyzer {
     /// under one lock. They are equal in length by construction — the tap only
     /// ever pushes complete pairs.
     pub fn process_channels(&mut self, left: &[f32], right: &[f32], dt: f64) {
+        if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) && !self.pre_frames.is_empty() {
+            return;
+        }
         let fft_size = self.fft_size;
         if left.len() < fft_size || right.len() < fft_size {
             // Not enough history yet. Leaving the previous bars in place would
@@ -2037,10 +2222,7 @@ impl SpectrumAnalyzer {
             self.bars_right.clear();
             return;
         }
-        let rt_padded = fft_size * 2;
-        if self.ch_scratch.len() != rt_padded {
-            self.ch_scratch = vec![Complex { re: 0.0, im: 0.0 }; rt_padded];
-        }
+        let rt_padded = self.realtime_padded_size();
         let n = self.bar_count;
         let sr = self.live_rate;
         // The Mix's decision for this frame, not a second one derived here: a
@@ -2055,38 +2237,35 @@ impl SpectrumAnalyzer {
 
         for side in 0..2 {
             let pcm = if side == 0 { left } else { right };
-            let start = pcm.len() - fft_size;
-            for (slot, (x, w)) in self.ch_scratch[..fft_size]
-                .iter_mut()
-                .zip(pcm[start..].iter().zip(self.window_coeffs.iter()))
-            {
-                *slot = Complex { re: x * w, im: 0.0 };
-            }
-            for slot in self.ch_scratch[fft_size..].iter_mut() {
-                *slot = Complex { re: 0.0, im: 0.0 };
-            }
-            self.rt_fft_plan.process(&mut self.ch_scratch);
-            self.channel_ffts = self.channel_ffts.saturating_add(1);
+            self.transform_channel(side, pcm);
             // The same mapping the mono path uses, so the three spectra share
             // one frequency axis and one dB scale and cannot drift apart.
             #[cfg(test)]
             let reference = self.rt_reference;
             #[cfg(not(test))]
             let reference = false;
+            #[cfg(test)]
+            let uncached_overlap = self.rt_uncached_overlap;
+            #[cfg(not(test))]
+            let uncached_overlap = false;
             let bars = if reference {
                 #[cfg(test)]
                 { realtime_route_tests::reference_bins_to_bars(self, &self.ch_scratch, sr, n, rt_padded) }
                 #[cfg(not(test))]
                 { unreachable!() }
-            } else if self.bar_mapping == BarMappingMode::Cqt {
+            } else if self.live_uses_cqt_weighting() {
                 // The Mix's plan: the same geometry, so the same gather.
                 self.ensure_cqt_plan(sr, n, rt_padded);
-                let norms: Vec<f32> =
-                    self.ch_scratch[..rt_padded / 2].iter().map(|c| c.norm()).collect();
                 let plan = &self.cqt_plan.as_ref().expect("built above").1;
-                self.bars_from_plan(&norms, plan, n)
+                self.bars_from_plan(&self.ch_norms[side], plan, n)
+            } else if uncached_overlap {
+                #[cfg(test)]
+                { self.bars_from_norms(&self.ch_norms[side], sr, n, rt_padded) }
+                #[cfg(not(test))]
+                { unreachable!() }
             } else {
-                self.bins_to_bars(&self.ch_scratch, sr, n, rt_padded)
+                self.ensure_overlap_plan(sr, n, rt_padded);
+                self.overlap_bars(&self.ch_norms[side])
             };
 
             let (smoothed, out) = if side == 0 {
@@ -2415,11 +2594,28 @@ impl SpectrumAnalyzer {
     /// Hop between pre-processed frames, in samples. Superlet states its frame
     /// rate directly; the FFT path derives it from window length and overlap.
     pub fn pre_hop(&self) -> usize {
-        if self.bar_mapping == BarMappingMode::Superlet {
+        if let BarMappingMode::TrueCqt(cfg) = &self.bar_mapping {
+            (self.sample_rate as f64 / cfg.frame_rate as f64).floor().max(1.0) as usize
+        } else if self.bar_mapping == BarMappingMode::Superlet {
             aslt::hop_for_fps(self.sample_rate, self.pre_fps)
         } else {
             ((self.pre_fft_size as f32 * (1.0 - self.overlap)).round() as usize).max(1)
         }
+    }
+
+    /// True CQT has a fractional sample clock; its rate must never be
+    /// reconstructed from the nominal integer `pre_hop`.
+    pub fn analysis_frame_rate(&self) -> f64 {
+        match &self.bar_mapping {
+            BarMappingMode::TrueCqt(cfg) => cfg.frame_rate as f64,
+            _ => self.sample_rate as f64 / self.pre_hop() as f64,
+        }
+    }
+
+    pub fn analysis_scale(&self) -> freq_scale::FreqScale {
+        if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+            freq_scale::FreqScale::Log
+        } else { self.aslt_cfg.scale }
     }
 
     /// Ask a running analysis to stop, and forget any request waiting behind
@@ -2458,7 +2654,7 @@ impl SpectrumAnalyzer {
     /// against when it is read.
     fn install_cached(&mut self, frames: cache::PreFrames, cache: CacheRef, record: Option<String>) {
         let _p = store::prof::span("install");
-        let rate = self.sample_rate as f64 / self.pre_hop() as f64;
+        let rate = self.analysis_frame_rate();
         let channels = cache.channels();
         if !frames.is_empty() {
             let wf_n = 1000usize;
@@ -2501,6 +2697,32 @@ impl SpectrumAnalyzer {
                 None
             }
         }
+    }
+
+    /// Only the temporary live preview uses FFT constant-Q weighting. This
+    /// does not change the selected analysis method or its cache descriptor.
+    fn live_uses_cqt_weighting(&self) -> bool {
+        matches!(self.bar_mapping, BarMappingMode::Cqt | BarMappingMode::TrueCqt(_))
+    }
+
+    fn live_mapping_max_freq(&self, sample_rate: u32) -> f32 {
+        if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+            self.max_freq.min(sample_rate as f32 / 2.0)
+        } else {
+            self.max_freq
+        }
+    }
+
+    /// A missing/retired PCM tap must not leave the previous preview frozen.
+    /// Kept allocation-free after the existing buffers have been allocated.
+    fn clear_live_preview(&mut self) {
+        self.magnitudes.fill(0.0);
+        self.smoothed.fill(0.0);
+        self.peak_input.fill(0.0);
+        self.last_fft_norms.clear();
+        self.reset_channels();
+        self.waterfall.clear();
+        self.waterfall_dirty = true;
     }
 
     /// The exact hit for `settings` at this rate: the head generation of its
@@ -2745,6 +2967,10 @@ impl SpectrumAnalyzer {
         #[cfg(test)]
         let analysis_hold = self.analysis_hold.clone();
         let mapping_dbg = format!("{:?}", self.bar_mapping);
+        let reported_fps = match &self.bar_mapping {
+            BarMappingMode::TrueCqt(cfg) => cfg.frame_rate,
+            _ => pre_fps,
+        };
         #[cfg(test)]
         let probe = self.lifecycle_probe.spawned();
         #[cfg(test)]
@@ -2792,7 +3018,7 @@ impl SpectrumAnalyzer {
             // invisible from the UI — the progress bar simply appears to restart.
             let t0 = Instant::now();
             crate::mlog!(
-                "[analysis] start {mapping_dbg} {} bars @ {pre_fps} fps — {}",
+                "[analysis] start {mapping_dbg} {} bars @ {reported_fps} fps — {}",
                 n_bars,
                 path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
             );
@@ -3136,6 +3362,11 @@ impl SpectrumAnalyzer {
         cache: Option<CacheRef>,
         frame_rate: f64,
     ) {
+        if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+            // The FFT preview is another producer, not an earlier CQT row.
+            // This also covers callers using the analyser without a window.
+            self.clear_live_preview();
+        }
         // Refuse a pair that does not describe this matrix rather than index
         // into it. Reaching here means a sidecar passed its own checks and then
         // met a different cache, which is a bug worth a line in the log.
@@ -3699,7 +3930,7 @@ fn settings_for(
         max_freq,
         mapping: bar_mapping.clone(),
         dsd_rate: crate::dsd::is_dsd_path(path).then_some(dsd_rate),
-        fft: (!slt).then(|| (
+        fft: (!slt && !matches!(bar_mapping, BarMappingMode::TrueCqt(_))).then(|| (
             fft_size, pad_factor, overlap, window_fn.clone(), interp_mode.clone(),
             aslt_cfg.scale,
         )),
@@ -3751,6 +3982,7 @@ fn legacy_key_for(
     let mapping_id: u8 = match bar_mapping {
         BarMappingMode::FlatOverlap => 0, BarMappingMode::Gaussian => 1,
         BarMappingMode::Cqt => 2, BarMappingMode::Superlet => 3,
+        BarMappingMode::TrueCqt(_) => 4,
     };
     let interp_id: u8 = if is_aslt { 0 } else { match interp_mode {
         InterpolationMode::None => 0, InterpolationMode::Linear => 1,
@@ -4490,6 +4722,18 @@ pub struct DoneMeta {
     pub store: Option<Arc<store::Store>>,
 }
 
+/// Match the unchanged reader envelope before expensive analysis, rather than
+/// publish a dense cache that this same build cannot load.
+fn validate_preprocess_capacity(rows: usize, bars: usize) -> Result<(), String> {
+    if rows == 0 || rows > cache::MAX_FRAMES || bars == 0 || bars > MAX_BAR_COUNT {
+        return Err(format!("Analysis dimensions {rows} x {bars} exceed supported cache dimensions. Reduce analysis frame rate or bars; no transform was run."));
+    }
+    if rows.checked_mul(bars).is_none_or(|cells| cells > cache::MAX_DECODED_CELLS) {
+        return Err(format!("Analysis dimensions {rows} x {bars} exceed the {}-cell cache memory limit. Reduce analysis frame rate or bars; no transform was run.", cache::MAX_DECODED_CELLS));
+    }
+    Ok(())
+}
+
 /// What a pre-process analysis should produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StereoRequest {
@@ -4774,7 +5018,10 @@ fn preprocess_file(
     // hop comes straight from the target frame rate instead of from
     // window × overlap.
     let is_aslt = *bar_mapping == BarMappingMode::Superlet;
-    let hop = if is_aslt {
+    let hop = if let BarMappingMode::TrueCqt(cfg) = bar_mapping {
+        if let Err(e) = cfg.validate() { return PreMessage::Error(e.to_string()); }
+        (sample_rate as f64 / cfg.frame_rate as f64).floor().max(1.0) as usize
+    } else if is_aslt {
         aslt::hop_for_fps(sample_rate, pre_fps)
     } else {
         ((fft_size as f32 * (1.0 - overlap)).round() as usize).max(1)
@@ -4787,9 +5034,23 @@ fn preprocess_file(
 
     // Superlet needs no particular window length, but the loudness/chroma pass
     // below still runs a 4096-point FFT, so that is the real floor.
-    let min_len = if is_aslt { CHROMA_FFT } else { fft_size };
+    let min_len = if is_aslt || matches!(bar_mapping, BarMappingMode::TrueCqt(_)) { CHROMA_FFT } else { fft_size };
     if all_mono.len() < min_len {
         return PreMessage::Error("audio too short for analysis".into());
+    }
+    // A wider display must not finish an analysis that the unchanged reader
+    // allocation envelope will refuse. Use the producer's exact row clock,
+    // before statistics, calibration or any transform work. Never truncate.
+    let rows = match bar_mapping {
+        BarMappingMode::TrueCqt(cfg) => match cqt::frame_count(all_mono.len(), sample_rate, cfg.frame_rate) {
+            Ok(rows) => rows,
+            Err(e) => return PreMessage::Error(e.to_string()),
+        },
+        BarMappingMode::Superlet => aslt::frame_count(all_mono.len(), hop),
+        _ => 1 + (all_mono.len() - fft_size) / hop,
+    };
+    if let Err(error) = validate_preprocess_capacity(rows, n_bars) {
+        return PreMessage::Error(error);
     }
     progress.store(PROG_DECODE_END + 1, Ordering::Relaxed);
 
@@ -4987,6 +5248,10 @@ fn preprocess_file(
             aslt::Input::Mono(s) => (s, None),
             aslt::Input::Joint { left, right } => (left, Some(right)),
         };
+        if let BarMappingMode::TrueCqt(cfg) = bar_mapping {
+            return cqt_pipeline::run(input, sample_rate, n_bars, min_freq, max_freq,
+                cfg, abort, progress, eta_secs, base, span);
+        }
     // ── Phase 2a: superlet ───────────────────────────────────────────────────
     // Wholly replaces the FFT pipeline — no bins, no window, no bar mapping.
     // The frame layout it produces is identical, so the cache format, the
@@ -5265,7 +5530,8 @@ fn preprocess_file(
                                     }
                                     BarMappingMode::Gaussian
                                     | BarMappingMode::Cqt
-                                    | BarMappingMode::Superlet => {
+                                    | BarMappingMode::Superlet
+                                    | BarMappingMode::TrueCqt(_) => {
                                         let center_b = b as f32 + 0.5;
                                         (-(center_b - bc).powi(2) / (2.0 * sigma * sigma)).exp()
                                     }
@@ -5375,7 +5641,10 @@ fn preprocess_file(
     drop(all_mono);
     drop(lr);
 
-    let frame_rate = sample_rate as f64 / hop as f64;
+    let frame_rate = match bar_mapping {
+        BarMappingMode::TrueCqt(cfg) => cfg.frame_rate as f64,
+        _ => sample_rate as f64 / hop as f64,
+    };
     // What the cache states about itself: the settings — built from exactly the
     // arguments this analysis ran with — and the rate this file actually
     // decoded at, which fixes the frame timing and the Nyquist clamp.
@@ -5633,6 +5902,15 @@ fn compute_spectral_ceiling(
 const SPEC_W: usize = 600; // time columns
 const SPEC_H: usize = 256; // frequency rows
 
+/// Frequency-bin geometry and level reference are different quantities.
+/// Preserve the shipped auxiliary displays' 2x-window level reference when
+/// selecting a denser live grid; changing padding must not dim the display.
+#[derive(Clone, Copy)]
+struct LiveFftGeometry {
+    padded: usize,
+    level_reference: usize,
+}
+
 struct Spectrogram {
     pixels: Vec<Color32>, // SPEC_H rows × SPEC_W cols, row-major
     col_head: usize,      // ring-buffer write pointer
@@ -5649,9 +5927,10 @@ impl Spectrogram {
     }
 
     /// Add one time-column from raw half-spectrum norms.
-    fn push_frame(&mut self, norms: &[f32], sr: u32, fft_size: usize, min_freq: f32, max_freq: f32, pal: &Palette) {
+    fn push_frame(&mut self, norms: &[f32], sr: u32, geometry: LiveFftGeometry, min_freq: f32, max_freq: f32, pal: &Palette) {
         let half  = norms.len();
-        let scale = fft_size as f32;
+        let fft_size = geometry.padded;
+        let scale = geometry.level_reference as f32;
         let log_min = min_freq.log10();
         let log_max = (sr as f32 / 2.0).min(max_freq).log10();
         for row in 0..SPEC_H {
@@ -5699,10 +5978,11 @@ const ISO_THIRD_OCTAVE: &[f32] = &[
 ];
 
 /// Compute per-band peak magnitude (0–1) from raw half-spectrum norms.
-fn octave_band_magnitudes(norms: &[f32], sr: u32, fft_size: usize) -> Vec<(f32, f32)> {
+fn octave_band_magnitudes(norms: &[f32], sr: u32, geometry: LiveFftGeometry) -> Vec<(f32, f32)> {
     let half    = norms.len();
     let nyquist = sr as f32 / 2.0;
-    let scale   = fft_size as f32;
+    let fft_size = geometry.padded;
+    let scale   = geometry.level_reference as f32;
     ISO_THIRD_OCTAVE.iter()
         .filter(|&&fc| fc < nyquist * 0.95)
         .map(|&fc| {
@@ -6877,8 +7157,11 @@ struct SpectrumSettings {
     #[serde(default)] max_freq:      f32,
     #[serde(default)] interp_mode:   InterpolationMode,
     #[serde(default)] pad_factor:    usize,
+    // A missing field restores the shipped 2x live path, never pre-process 16x.
+    #[serde(default = "def_rt_pad")] rt_pad_factor: usize,
     #[serde(default)] overlap:       f32,
     #[serde(default)] bar_mapping:   BarMappingMode,
+    #[serde(default)] last_true_cqt: Option<cqt::Config>,
     /// The PCM-fallback playback rate. Before 1.5.3 this one field drove the
     /// playback fallback *and* the preprocessing feed; it keeps its name and
     /// its playback meaning, so a file written by any version restores the
@@ -6920,6 +7203,7 @@ struct SpectrumSettings {
 }
 
 fn def_true() -> bool { true }
+fn def_rt_pad() -> usize { 2 }
 fn def_dsd_rate() -> u32 { crate::dsd::decimate::LEGACY_ANALYSIS_RATE }
 fn def_pre_fps() -> f32 { DEFAULT_PRE_FPS }
 fn def_cache_budget() -> f32 { DEFAULT_CACHE_BUDGET_GB }
@@ -7231,6 +7515,7 @@ pub struct SpectrumWindow {
     pub overlap: f32,
     pub bar_mapping: BarMappingMode,
     pub show_debug: bool,
+    last_true_cqt: cqt::Config,
     /// GPU policy for the pre-process, mirrored into `gpu_calib`'s global.
     pub gpu_mode: gpu_calib::GpuMode,
     /// Cores the pre-process may use; 0 = default. Mirrored the same way.
@@ -7510,6 +7795,7 @@ impl SpectrumWindow {
             overlap: 0.875,
             bar_mapping: BarMappingMode::Cqt,
             show_debug: false,
+            last_true_cqt: cqt::Config::default(),
             gpu_mode: gpu_calib::GpuMode::default(),
             worker_threads: 0,
             recalibrating: None,
@@ -7714,8 +8000,13 @@ impl SpectrumWindow {
             max_freq:      self.max_freq,
             interp_mode:   self.interp_mode.clone(),
             pad_factor:    self.pad_factor,
+            rt_pad_factor: self.analyzer.rt_pad_factor,
             overlap:       self.overlap,
             bar_mapping:   self.bar_mapping.clone(),
+            last_true_cqt: Some(match self.bar_mapping {
+                BarMappingMode::TrueCqt(cfg) => cfg,
+                _ => self.last_true_cqt,
+            }),
             dsd_rate:      self.dsd_fallback_rate,
             dsd_preprocess_rate: Some(self.analyzer.dsd_rate),
             aslt_preset:   self.analyzer.aslt_preset,
@@ -7767,8 +8058,15 @@ impl SpectrumWindow {
         self.max_freq      = s.max_freq;
         self.interp_mode   = s.interp_mode.clone();
         self.pad_factor    = s.pad_factor.clamp(1, 64);
+        self.analyzer.rt_pad_factor = realtime_pad(s.rt_pad_factor);
         self.overlap       = s.overlap;
         self.bar_mapping   = s.bar_mapping.clone();
+        self.last_true_cqt = s.last_true_cqt.filter(|c| c.validate().is_ok()).unwrap_or_default();
+        if let BarMappingMode::TrueCqt(cfg) = self.bar_mapping {
+            self.last_true_cqt = if cfg.validate().is_ok() { cfg } else { cqt::Config::default() };
+            self.bar_mapping = BarMappingMode::TrueCqt(self.last_true_cqt);
+            self.mode = SpectrumMode::PreProcess;
+        }
         // A stored preset wins over a stored config: if the ladder's numbers are
         // ever retuned, saved settings should follow the new ladder rather than
         // pin users to the old one. Custom (`None`) keeps its explicit config.
@@ -7840,8 +8138,8 @@ impl SpectrumWindow {
         self.analyzer.smoothing = self.smoothing;
         self.analyzer.pre_smoothing = self.pre_smoothing;
         self.analyzer.eq_weights = if self.loudness_mode == LoudnessMode::EqualLoudness {
-            compute_eq_weights(self.bar_count, self.min_freq, self.max_freq,
-                               self.analyzer.aslt_cfg.scale)
+            compute_eq_weights(self.bar_count, self.min_freq, self.analysis_max_freq(),
+                               self.analysis_scale())
         } else {
             Vec::new()
         };
@@ -7859,7 +8157,61 @@ impl SpectrumWindow {
     /// to the same file. Technically true, thoroughly misleading, so the
     /// indicator is suppressed instead.
     fn fft_knobs_apply(&self) -> bool {
-        self.bar_mapping != BarMappingMode::Superlet
+        !matches!(self.bar_mapping, BarMappingMode::Superlet | BarMappingMode::TrueCqt(_))
+    }
+
+    fn analysis_scale(&self) -> freq_scale::FreqScale { self.analyzer.analysis_scale() }
+
+    /// The pending CQT has no stored cells yet. Its ordinary plots can show a
+    /// distinctly labelled FFT preview; the whole-track view never can.
+    fn true_cqt_preview_pending(&self) -> bool {
+        self.mode == SpectrumMode::PreProcess
+            && matches!(self.bar_mapping, BarMappingMode::TrueCqt(_))
+            && self.analyzer.pre_frames.is_empty()
+    }
+
+    fn true_cqt_live_preview(&self) -> bool {
+        self.true_cqt_preview_pending() && !self.whole_track_shown()
+    }
+
+    fn preview_has_pcm_route(&self) -> bool {
+        self.live_tap.is_some()
+            && self.min_freq < self.analyzer.live_rate as f32 / 2.0
+    }
+
+    /// Rate of the spectrum actually being displayed, not of a pending
+    /// analysis that can use a different DSD decimation feed.
+    fn display_sample_rate(&self) -> u32 {
+        // Opening the whole-track viewer must not change the ordinary plot's
+        // pending-preview grid or its cached ISO weights. That viewer consumes
+        // its own stored Geometry; until CQT arrives it has no cells to draw.
+        if self.true_cqt_preview_pending() { self.analyzer.live_rate }
+        else { self.analyzer.sample_rate }
+    }
+
+    fn spectrum_source_note(&self) -> Option<String> {
+        if !matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) { return None; }
+        if !self.analyzer.pre_frames.is_empty() {
+            return Some(format!("TRUE CQT · pre-processed analysis · {:.2} frames/s",
+                self.analyzer.pre_frame_rate));
+        }
+        if self.whole_track_shown() {
+            return Some("TRUE CQT · whole-track view is waiting for completed analysis; no live FFT is stored here".into());
+        }
+        if !self.preview_has_pcm_route() {
+            return Some("LIVE FFT PREVIEW unavailable — no usable live PCM for this frequency range; true CQT is not ready".into());
+        }
+        if self.analyzer.last_fft_norms.is_empty() {
+            return Some("LIVE FFT PREVIEW · collecting live PCM; true CQT is not ready".into());
+        }
+        Some(format!("LIVE FFT PREVIEW · FFT constant-Q weighting (not a CQT) · {} Hz live PCM · switches to true CQT when ready",
+            self.analyzer.live_rate))
+    }
+
+    fn analysis_max_freq(&self) -> f32 {
+        if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+            self.max_freq.min(self.display_sample_rate() as f32 / 2.0)
+        } else { self.max_freq }
     }
 
     /// Three actions, kept apart, and one preference that is not an action.
@@ -8061,8 +8413,8 @@ impl SpectrumWindow {
 
     /// The FFT-only rows of the Analysis panel: size, window and
     /// interpolation, then — when `with_analysis_rows` — zero-padding and
-    /// overlap, which only an FFT pre-process analysis uses (the live FFT
-    /// pads 2× and has its own hop).
+    /// overlap, which only an FFT pre-process analysis uses. Live padding has
+    /// its own bounded control and does not change a stored-analysis identity.
     fn fft_rows(&mut self, ui: &mut egui::Ui, rebuild: &mut bool, with_analysis_rows: bool) {
         ui.horizontal(|ui| {
             ui.label("FFT size:");
@@ -8106,7 +8458,9 @@ impl SpectrumWindow {
                     self.auto_fft_size = 0;
                     self.sync_fft_sizes();
                     *rebuild = true;
-                    self.try_load_or_flag_reanalysis();
+                    if !matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                        self.try_load_or_flag_reanalysis();
+                    }
                 }
             }
         });
@@ -8147,11 +8501,13 @@ impl SpectrumWindow {
                 if self.window_fn != prev {
                     self.analyzer.window_fn = self.window_fn.clone();
                     *rebuild = true;
-                    self.try_load_or_flag_reanalysis();
+                    if !matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                        self.try_load_or_flag_reanalysis();
+                    }
                 }
             });
         }
-        {
+        if !matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
             let im_green = |im: InterpolationMode| -> egui::RichText {
                 let has = self.current_path.as_ref().map(|p| {
                     self.cache_file_set.contains(&cache_path_for(
@@ -8199,9 +8555,22 @@ impl SpectrumWindow {
                 }
             });
         }
-        if with_analysis_rows {
+        if !with_analysis_rows || self.mode == SpectrumMode::RealTime {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Live zero-padding:");
+                for pad in [1, 2, 4, 8] {
+                    if ui.selectable_label(self.analyzer.rt_pad_factor == pad, format!("{pad}×"))
+                        .on_hover_text("Denser samples of the same FFT, not finer independent frequency resolution. Higher factors cost more CPU. Only affects live FFT and its preview; stored analyses are unchanged.")
+                        .clicked()
+                    {
+                        self.set_realtime_padding(pad);
+                    }
+                }
+            });
+        }
+        if with_analysis_rows && self.mode == SpectrumMode::PreProcess {
             ui.horizontal(|ui| {
-                ui.label("Zero-padding:");
+                ui.label("Pre-process zero-padding:");
                 let prev_pad = self.pad_factor;
                 for &pf in &[1usize, 2, 4, 8, 16, 32, 64] {
                     let label_text = if pf == 1 { "1× (off)".to_string() } else { format!("{}×", pf) };
@@ -8243,7 +8612,7 @@ impl SpectrumWindow {
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("Overlap:");
+                ui.label("Pre-process overlap:");
                 for &(text, val) in &[("50%", 0.5f32), ("75%", 0.75), ("87.5%", 0.875)] {
                     let has_cache = self.current_path.as_ref().map(|p| {
                         self.cache_file_set.contains(&cache_path_for(
@@ -8274,6 +8643,26 @@ impl SpectrumWindow {
                     }
                 }
             });
+        }
+    }
+
+    fn set_realtime_padding(&mut self, pad: usize) {
+        let pad = realtime_pad(pad);
+        if self.analyzer.rt_pad_factor == pad { return; }
+        let live = self.mode == SpectrumMode::RealTime || self.true_cqt_live_preview()
+            || self.analyzer.pre_frames.is_empty();
+        // A completed paused cache is not the live FFT consumer. Replanning
+        // must not blank its resident Left/Right until playback starts again.
+        let cached_channels = (!live).then(|| self.analyzer.take_channel_frame());
+        self.analyzer.rt_pad_factor = pad;
+        self.analyzer.rebuild_realtime_fft();
+        if let Some(frame) = cached_channels {
+            self.analyzer.restore_channel_frame(frame);
+        }
+        // The old live history belongs to another bin grid. This deliberately
+        // leaves the cache, its identity and any producer in flight alone.
+        if live {
+            self.reset_presentation();
         }
     }
 
@@ -8380,8 +8769,19 @@ impl SpectrumWindow {
             return;
         }
         self.live_tap = tap;
+        // Keep the pending preview's grid ready even while Whole track hides
+        // it, so closing the viewer cannot reveal weights from another rate.
+        let preview = self.true_cqt_preview_pending();
+        if preview {
+            self.reset_presentation();
+            match self.sample_buf.lock() {
+                Ok(mut buf) => buf.clear(),
+                Err(p) => p.into_inner().clear(),
+            }
+        }
         let rate = tap.unwrap_or(self.analyzer.sample_rate);
         if rate == self.analyzer.live_rate {
+            if preview { self.sync_params(); }
             return;
         }
         self.analyzer.live_rate = rate;
@@ -8397,6 +8797,7 @@ impl SpectrumWindow {
         if let Some(frame) = cached {
             self.analyzer.restore_channel_frame(frame);
         }
+        if preview { self.sync_params(); }
     }
 
     /// The same track's route was reopened: snap to `seek_to` (where the
@@ -8447,7 +8848,7 @@ impl SpectrumWindow {
             // Via pre_hop(), not fft_size: a superlet cache is spaced by frame
             // rate, and using the FFT hop here would drift the spectrum against
             // playback for the whole track.
-            let rate = self.analyzer.sample_rate as f64 / self.analyzer.pre_hop() as f64;
+            let rate = self.analyzer.analysis_frame_rate();
             // Discovery is independent of the generation preference, as in
             // `start_preprocess`: a sidecar this track already has is found
             // whether or not future analyses are set to produce them.
@@ -9316,7 +9717,7 @@ impl SpectrumWindow {
             self.spectral_ceiling = compute_spectral_ceiling(
                 &self.analyzer.pre_frames, self.bar_count,
                 self.min_freq, self.max_freq.min(self.analyzer.sample_rate as f32 / 2.0),
-                self.analyzer.aslt_cfg.scale,
+                self.analysis_scale(),
             );
             self.spectral_ceiling_attempted = true;
         }
@@ -9345,6 +9746,12 @@ impl SpectrumWindow {
         }
         if revised {
             self.reset_presentation();
+            if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                // Preview and stored CQT may use different sample rates and
+                // frequency endpoints. Rebuild presentation weights once at
+                // that producer boundary, never on every live frame.
+                self.sync_params();
+            }
         }
         // A picture that arrived while paused (a finished analysis, or a cache
         // the settings now select) is drawn at the paused playhead. After the
@@ -9355,6 +9762,12 @@ impl SpectrumWindow {
         }
         self.reconcile_pre_channels(elapsed_secs);
         self.refresh_waterfall_depth();
+        if self.true_cqt_preview_pending()
+            && (!self.true_cqt_live_preview() || !self.preview_has_pcm_route())
+        {
+            self.analyzer.clear_live_preview();
+            self.discard_waterfall_texture();
+        }
         if !is_playing { return; }
 
         // Throttle FFT runs to max_fps
@@ -9411,21 +9824,24 @@ impl SpectrumWindow {
                 self.analyzer.process_realtime(tick_dt);
                 self.tick_channels(tick_dt);
                 // Feed spectrogram and octave bands from fresh FFT norms.
-                // Real-time uses 2× padding (not pad_factor) — match here.
+                // Use the live plan, never the independent pre-process padding.
                 if !self.analyzer.last_fft_norms.is_empty() {
-                    let eff_fft = self.analyzer.fft_size * 2;
+                    let geometry = LiveFftGeometry {
+                        padded: self.analyzer.realtime_padded_size(),
+                        level_reference: self.analyzer.fft_size * 2,
+                    };
                     let pal = Palette::new(self.palette_kind, self.palette_accent);
                     self.spectrogram.push_frame(
                         &self.analyzer.last_fft_norms,
                         self.analyzer.live_rate,
-                        eff_fft,
+                        geometry,
                         self.min_freq, self.max_freq,
                         &pal,
                     );
                     let raw = octave_band_magnitudes(
                         &self.analyzer.last_fft_norms,
                         self.analyzer.live_rate,
-                        eff_fft,
+                        geometry,
                     );
                     if self.octave_smoothed.len() != raw.len() {
                         self.octave_smoothed = vec![0.0; raw.len()];
@@ -9447,19 +9863,41 @@ impl SpectrumWindow {
                 }
             }
             SpectrumMode::PreProcess => {
-                // Demand was reconciled before the playback guard, so by here
-                // the request is either in flight, resident, or deliberately
-                // released. Nothing in this branch computes a transform: the
-                // rows were analysed when the cache was written.
-                if !self.analyzer.pre_channels_wanted
-                    || !self.analyzer.pre_channels_resident()
-                {
-                    // No view wants them, or none are in memory yet. Leaving
-                    // the previous values in place would freeze a Left from
-                    // another track or another view.
-                    self.analyzer.reset_channels();
+                if self.true_cqt_preview_pending() {
+                    if self.true_cqt_live_preview() && self.preview_has_pcm_route() {
+                        // The window serviced completions before resetting
+                        // presentation above. Do not install another producer
+                        // between that boundary and this frame's draw.
+                        self.analyzer.tick_pre_rows(elapsed_secs, tick_dt);
+                        self.tick_channels(tick_dt);
+                        if self.analyzer.last_fft_norms.is_empty() {
+                            self.discard_waterfall_texture();
+                        }
+                    } else {
+                        // A whole-track plot cannot show a live frame. Native
+                        // DSD/DoP has no live PCM; never reuse an old preview.
+                        self.analyzer.clear_live_preview();
+                        self.discard_waterfall_texture();
+                    }
+                } else {
+                    // Demand was reconciled before the playback guard, so by
+                    // here the request is in flight, resident, or released.
+                    // Completed CQT reads only its stored rows; other methods
+                    // retain their existing cached/live-fallback behavior.
+                    if !self.analyzer.pre_channels_wanted
+                        || !self.analyzer.pre_channels_resident()
+                    {
+                        // No view wants them, or none are in memory yet. Leaving
+                        // the previous values in place would freeze a Left from
+                        // another track or another view.
+                        self.analyzer.reset_channels();
+                    }
+                    if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                        self.analyzer.tick_pre_rows(elapsed_secs, tick_dt);
+                    } else {
+                        self.analyzer.tick_pre(elapsed_secs, tick_dt);
+                    }
                 }
-                self.analyzer.tick_pre(elapsed_secs, tick_dt);
             }
         }
 
@@ -9844,6 +10282,7 @@ impl SpectrumWindow {
     /// "showing channels" means.
     fn wants_pre_channels(&self) -> bool {
         self.mode == SpectrumMode::PreProcess
+            && !self.true_cqt_live_preview()
             && ((self.channel_view.needs_channels() && self.style_supports_channels())
                 || (self.whole_track_shown() && self.whole_track.wants_channels()))
     }
@@ -9916,9 +10355,13 @@ impl SpectrumWindow {
         // finished against a track that has since changed still has to be
         // thrown away.
         self.analyzer.poll_pre_channels();
-        let tap_channels = self.live_tap_channels();
+        let tap_channels = if self.true_cqt_live_preview() && !self.preview_has_pcm_route() {
+            channels::NO_LIVE_TAP
+        } else {
+            self.live_tap_channels()
+        };
         let avail = channels::availability(
-            self.mode == SpectrumMode::PreProcess,
+            self.mode == SpectrumMode::PreProcess && !self.true_cqt_live_preview(),
             self.analyzer.has_pre_channels(),
             self.style_supports_channels(),
             tap_channels,
@@ -10006,7 +10449,7 @@ impl SpectrumWindow {
         };
 
         let avail = channels::availability(
-            self.mode == SpectrumMode::PreProcess,
+            self.mode == SpectrumMode::PreProcess && !self.true_cqt_live_preview(),
             self.analyzer.has_pre_channels(),
             self.style_supports_channels(),
             tap_channels,
@@ -10148,7 +10591,9 @@ impl SpectrumWindow {
                 // the default size — the feature shipped unreachable.
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Mode:");
-                    ui.selectable_value(&mut self.mode, SpectrumMode::RealTime, "Real-time");
+                    ui.add_enabled_ui(!matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)), |ui| {
+                        ui.selectable_value(&mut self.mode, SpectrumMode::RealTime, "Real-time");
+                    }).response.on_hover_text("True CQT uses centred full windows and is pre-process only. Select an FFT method for live analysis.");
                     ui.selectable_value(&mut self.mode, SpectrumMode::PreProcess, "Pre-process");
                     // Spectro and Octave rely on live FFT norms — unavailable in pre-process
                     // mode (which replays compressed bar data, not raw bins). Auto-fall-back
@@ -10342,6 +10787,10 @@ The Mix is unaffected.                                  Analysing the track agai
                     }
                 });
 
+                if let Some(note) = self.spectrum_source_note() {
+                    ui.label(egui::RichText::new(note).color(txt_dim(ui.visuals().dark_mode)));
+                }
+
                 // ── Row 2: bar count (+ bar gap for Bars) ─────────────────
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Bars:");
@@ -10482,6 +10931,7 @@ The Mix is unaffected.                                  Analysing the track agai
                                     BarMappingMode::FlatOverlap => "FFT · flat",
                                     BarMappingMode::Gaussian    => "FFT · Gaussian",
                                     BarMappingMode::Cqt         => "FFT · constant-Q weighting",
+                                    BarMappingMode::TrueCqt(_)  => "True CQT",
                                     BarMappingMode::Superlet    => "Superlet (wavelets)",
                                 };
                                 if has { egui::RichText::new(name).color(txt_ok(ui.visuals().dark_mode)) }
@@ -10490,8 +10940,9 @@ The Mix is unaffected.                                  Analysing the track agai
                             let lbl_flat  = bm_green(BarMappingMode::FlatOverlap);
                             let lbl_gauss = bm_green(BarMappingMode::Gaussian);
                             let lbl_cqt   = bm_green(BarMappingMode::Cqt);
+                            let lbl_true_cqt = bm_green(BarMappingMode::TrueCqt(self.last_true_cqt));
                             let lbl_slt   = bm_green(BarMappingMode::Superlet);
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Analysis method:");
                                 let prev = self.bar_mapping.clone();
                                 ui.selectable_value(&mut self.bar_mapping, BarMappingMode::FlatOverlap, lbl_flat)
@@ -10507,6 +10958,8 @@ The Mix is unaffected.                                  Analysing the track agai
                                                                  constant-Q transform: the FFT underneath has one fixed \
                                                                  window for every frequency, so time and frequency resolution \
                                                                  are still the FFT's.");
+                                ui.selectable_value(&mut self.bar_mapping, BarMappingMode::TrueCqt(self.last_true_cqt), lbl_true_cqt)
+                                    .on_hover_text("A genuine constant-Q filterbank: each frequency has its own full centred window. Pre-process only. While it is not ready, live PCM can supply a clearly labelled FFT preview, never stored or described as CQT. Display bars and support Q are independent.");
                                 ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Superlet, lbl_slt)
                                     .on_hover_text(format!(
                                         "Adaptive Superlet Transform — a direct wavelet analysis, not an FFT mapping.\n\
@@ -10524,10 +10977,24 @@ The Mix is unaffected.                                  Analysing the track agai
                                         self.analyzer.pre_fps,
                                     ));
                                 if self.bar_mapping != prev {
+                                    if let BarMappingMode::TrueCqt(cfg) = prev { self.last_true_cqt = cfg; }
+                                    if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                                        self.mode = SpectrumMode::PreProcess;
+                                        if matches!(self.style, VizStyle::Spectrogram | VizStyle::OctaveBands) {
+                                            self.style = VizStyle::Waterfall;
+                                        }
+                                    }
                                     self.analyzer.bar_mapping = self.bar_mapping.clone();
+                                    self.sync_params();
                                     self.try_load_or_flag_reanalysis();
                                 }
                             });
+
+                            if self.true_cqt_settings_ui(ui) {
+                                self.analyzer.bar_mapping = self.bar_mapping.clone();
+                                self.sync_params();
+                                self.try_load_or_flag_reanalysis();
+                            }
 
                             // Superlet quality ladder — only meaningful while
                             // Superlet is the active mapping, so it stays hidden
@@ -10819,20 +11286,26 @@ The Mix is unaffected.                                  Analysing the track agai
                         // Under Superlet pre-process the FFT rows describe only the live
                         // preview, so they fold away rather than lead the panel. Values are
                         // kept either way; nothing here changes what is saved.
-                        if self.bar_mapping == BarMappingMode::Superlet && self.mode == SpectrumMode::PreProcess {
+                        if self.mode == SpectrumMode::PreProcess
+                            && (self.bar_mapping == BarMappingMode::Superlet || self.true_cqt_preview_pending())
+                        {
                             egui::CollapsingHeader::new("Live FFT preview")
                                 .id_salt("live_fft_preview")
                                 .default_open(false)
                                 .show(ui, |ui| {
-                                    ui.label(egui::RichText::new(
+                                    let note = if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                                        "These settings affect only the LIVE FFT PREVIEW (FFT constant-Q weighting), not true CQT or its cache. The preview uses live PCM and stops when true CQT is ready. Live zero-padding controls its bin density; pre-process padding and overlap do not apply. Interpolation does not apply to this weighting."
+                                    } else {
                                         "Superlet analyses the waveform directly, so these do not change \
                                          the analysis. They shape only the live FFT drawn until the \
-                                         analysis is ready. Zero-padding and overlap apply to FFT analyses \
-                                         only and are hidden here; their values are kept.")
+                                         analysis is ready. Live zero-padding controls the preview's bin \
+                                         density; pre-process padding and overlap are hidden here and kept."
+                                    };
+                                    ui.label(egui::RichText::new(note)
                                         .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
                                     self.fft_rows(ui, &mut rebuild, false);
                                 });
-                        } else {
+                        } else if self.fft_knobs_apply() {
                             self.fft_rows(ui, &mut rebuild, true);
                         }
                         ui.horizontal(|ui| {
@@ -11793,7 +12266,7 @@ The Mix is unaffected.                                  Analysing the track agai
                     let mags: &[f32] = if let Some((ref bands, sr, _)) = eq_snap {
                         if matches!(self.eq_overlay, EqOverlayMode::ApplyToBars | EqOverlayMode::Both) {
                             owned_mags = self.analyzer.magnitudes.iter().enumerate().map(|(i, &m)| {
-                                let freq = bar_center_freq(i, self.analyzer.magnitudes.len(), self.min_freq, self.max_freq);
+                                let freq = bar_center_freq(i, self.analyzer.magnitudes.len(), self.min_freq, self.analysis_max_freq());
                                 let gain = 10f32.powf(total_eq_response_db(bands, sr, freq) / 20.0);
                                 (m * gain).clamp(0.0, 1.0)
                             }).collect();
@@ -12038,8 +12511,8 @@ The Mix is unaffected.                                  Analysing the track agai
                     if drew_diff {
                         draw_diff_axes(
                             &painter, plot_rect, self.diff_layout,
-                            self.analyzer.sample_rate, self.min_freq, self.max_freq,
-                            self.analyzer.aslt_cfg.scale,
+                            self.display_sample_rate(), self.min_freq, self.analysis_max_freq(),
+                            self.analysis_scale(),
                         );
                     } else {
                         // Skip for spectrogram (its own freq axis is baked in),
@@ -12049,9 +12522,9 @@ The Mix is unaffected.                                  Analysing the track agai
                         }
                         if !matches!(self.style, VizStyle::Spectrogram | VizStyle::Phasescope) {
                             draw_freq_labels(
-                                &painter, plot_rect, self.analyzer.sample_rate,
-                                self.min_freq, self.max_freq,
-                                self.analyzer.aslt_cfg.scale,
+                                &painter, plot_rect, self.display_sample_rate(),
+                                self.min_freq, self.analysis_max_freq(),
+                                self.analysis_scale(),
                             );
                         }
                     }
@@ -12082,9 +12555,9 @@ The Mix is unaffected.                                  Analysing the track agai
                         };
                         let draw_curve = matches!(self.eq_overlay, EqOverlayMode::Curve | EqOverlayMode::Both);
                         draw_eq_overlay(&painter, &bands, sr, plot_rect,
-                            self.min_freq, self.max_freq, draw_curve,
+                            self.min_freq, self.analysis_max_freq(), draw_curve,
                             self.eq_hovered_node, self.eq_dragging_node,
-                            self.analyzer.aslt_cfg.scale);
+                            self.analysis_scale());
 
                         // Mouse hit-test: find nearest node within 14px
 
@@ -12092,8 +12565,8 @@ The Mix is unaffected.                                  Analysing the track agai
                             self.eq_hovered_node = None;
                             for (i, band) in bands.iter().enumerate() {
                                 if !band.enabled { continue; }
-                                let np = eq_node_pos(band, plot_rect, self.min_freq, self.max_freq,
-                                                     self.analyzer.aslt_cfg.scale);
+                                let np = eq_node_pos(band, plot_rect, self.min_freq, self.analysis_max_freq(),
+                                                     self.analysis_scale());
                                 if (np - ptr).length() < 14.0 {
                                     self.eq_hovered_node = Some(i);
                                     break;
@@ -12117,12 +12590,12 @@ The Mix is unaffected.                                  Analysing the track agai
                                     // Along whichever axis is on screen, so the
                                     // node tracks the pointer instead of
                                     // sliding away from it.
-                                    let fscale = self.analyzer.aslt_cfg.scale;
+                                    let fscale = self.analysis_scale();
                                     let t = fscale.position_of(
-                                        band.freq, self.min_freq, self.max_freq,
+                                        band.freq, self.min_freq, self.analysis_max_freq(),
                                     ) + delta.x / plot_rect.width();
                                     band.freq = fscale
-                                        .freq_at(t.clamp(0.0, 1.0), self.min_freq, self.max_freq)
+                                        .freq_at(t.clamp(0.0, 1.0), self.min_freq, self.analysis_max_freq())
                                         .clamp(20.0, 20_000.0);
                                     // Vertical → gain
                                     if band.kind.has_gain() {
@@ -12147,8 +12620,8 @@ The Mix is unaffected.                                  Analysing the track agai
                             && let Some(click) = spec_response.interact_pointer_pos()
                             && plot_rect.contains(click) {
                             let t = (click.x - plot_rect.left()) / plot_rect.width();
-                            let freq = self.analyzer.aslt_cfg.scale
-                                .freq_at(t, self.min_freq, self.max_freq)
+                            let freq = self.analysis_scale()
+                                .freq_at(t, self.min_freq, self.analysis_max_freq())
                                 .clamp(20.0, 20_000.0);
                             let db_per_px = EQ_DB_RANGE / (plot_rect.height() * 0.5);
                             let gain = ((plot_rect.center().y - click.y) * db_per_px).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
@@ -12248,10 +12721,14 @@ The Mix is unaffected.                                  Analysing the track agai
                         let mut lines = vec![
                             format!("── Spectrum Debug ──────────────────"),
                             format!("Mode:        {}", mode_name),
-                            format!("FFT size:    {}  pad: {}×  padded: {}", self.fft_size, self.pad_factor, self.fft_size * self.pad_factor),
-                            format!("Overlap:     {:.0}%  hop: {} smp ({:.1} fps)", self.overlap * 100.0,
-                                self.analyzer.pre_hop(),
-                                self.analyzer.sample_rate as f32 / self.analyzer.pre_hop() as f32),
+                            format!("Live FFT:    {}  pad: {}×  padded: {}", self.analyzer.fft_size, self.analyzer.rt_pad_factor, self.analyzer.realtime_padded_size()),
+                            format!("Pre FFT:     {}  pad: {}×  padded: {}", self.analyzer.pre_fft_size, self.pad_factor, self.analyzer.pre_fft_size * self.pad_factor),
+                            if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                                format!("CQT clock:   {:.2} fps, floor(k × sr / fps); FFT controls inactive", self.analyzer.analysis_frame_rate())
+                            } else {
+                                format!("Overlap:     {:.0}%  hop: {} smp ({:.1} fps)", self.overlap * 100.0,
+                                    self.analyzer.pre_hop(), self.analyzer.analysis_frame_rate())
+                            },
                             format!("Interp:      {}  mapping: {}", interp_name, mapping_name),
                             format!("Bars:        {}  analysis sr: {} Hz  live sr: {} Hz", self.bar_count, self.analyzer.sample_rate, self.analyzer.live_rate),
                             format!("freq range:  {:.0}–{:.0} Hz", self.min_freq, self.max_freq),

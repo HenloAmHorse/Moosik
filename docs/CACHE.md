@@ -4,6 +4,11 @@ Moosik keeps each finished Pre-process analysis on disk so a track you play agai
 
 The cache lives in your profile, in `.moosik/cache/`. Everything this version writes is in its subfolder `.moosik/cache/v2/`.
 
+1.5.5 adds a distinct **True CQT** analysis identity inside the
+same store. It does not change the namespace or retire matching 1.5.3/1.5.4
+FFT/Superlet caches. The old `Cqt` setting remains FFT constant-Q weighting;
+its cached results are not offered as exact True CQT hits. See [CQT.md](CQT.md).
+
 ## What changed, in one paragraph
 
 An earlier version knew a track only by its file path. If you replaced a file with different audio at the same path, it could show the old analysis for the new file. 1.5.3 also checks the file's size, its last-modified time and a sample of its contents. Each analysis is now published as a whole, in one step, so a crash cannot leave the spectrum and its Left/Right channels out of step. Something you are looking at, or that is still being read, is never deleted to make room.
