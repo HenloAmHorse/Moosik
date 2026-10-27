@@ -4531,7 +4531,7 @@ fn the_volume_lock_does_not_clobber_the_saved_preference() {
         1,
         "unexpected writes to the saved volume: {assigns:?}"
     );
-    let guarded = block(slider, "} else if vol_slider.changed() {", "let dsd_active");
+    let guarded = block(slider, "} else if vol_slider.changed() {", "ui.label(");
     assert!(
         guarded.contains("if applied {"),
         "the write must be gated on the engine having accepted it"

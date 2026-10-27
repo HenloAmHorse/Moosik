@@ -3,7 +3,8 @@
 The notices themselves are in [`THIRD_PARTY_NOTICES.txt`](../THIRD_PARTY_NOTICES.txt),
 with four companion files in [`third_party/`](../third_party). This page says what
 they cover and how the original open items were settled for 1.5.3, with
-the scope rechecked for 1.5.4 and regenerated for 1.5.5. It records license
+the scope rechecked for 1.5.4, regenerated for 1.5.5 and carried forward,
+checked, for 1.6.0. It records license
 information; it is not a legal opinion.
 
 **1.5.5:** the current locked Windows normal/build graph was enumerated
@@ -77,6 +78,20 @@ AGPL-3.0-only code, separately accounted for, not a 303rd third-party package.
 | `cmake` 0.1.58 (MIT OR Apache-2.0) | Build-time Cargo helper for bundled libopus; both license texts come from its verified package archive. The CMake executable is a build tool, not bundled in the player. |
 | Rust standard library | The toolchain's `COPYRIGHT-library.html`, unmodified, in `third_party/`. |
 | Microsoft Visual C++ runtime | The executable imports `VCRUNTIME140.dll` and the Universal CRT. **Neither is redistributed;** the release notes state that the Visual C++ 2015-2022 Redistributable (x64) is required. |
+
+## Items for 1.6.0
+
+`Cargo.lock` gains no package over 1.5.5 (the new `windows-sys` features only
+add API declarations), so the 1.5.5 notices were carried forward rather than
+regenerated: `research/v160/notices160.py` refuses to run unless the locked
+default Windows x86_64 normal/build graph is exactly the 302 packages the
+notices list, `Cargo.lock` differs from v1.5.5 only in Moosik's own version and
+the toolchain is the same rustc 1.94.0. It then changes the version lines and
+adds the one new item, as section 1.5 of the notices:
+
+| Item | Disposition |
+|---|---|
+| lv-chordia 1.1.0 (MIT, Copyright (c) 2023 Music X Lab) | **Ported code in the executable; weights not distributed.** `src/chords/` is a Rust port of its network, CQT front end and chord vocabulary. The upstream `LICENSE` from the pinned wheel (SHA-256 `292241f0…ee0cb0`) is reproduced byte for byte in `third_party/lv-chordia-1.1.0-LICENSE` (SHA-256 `24fe07e4…8e0512`). The five weight files are downloaded from that wheel only when the user asks, each checked against a pinned SHA-256; they are not in the release assets. |
 
 ## Regenerating
 

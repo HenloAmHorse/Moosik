@@ -1,3 +1,11 @@
+// Release builds on Windows open no console window; the "Debug console
+// window" setting opens one when wanted (see `set_console`).
+// Never for the test binary: its tests start child programs (tar, cmd, itself),
+// and each would get a console window of its own.
+#![cfg_attr(all(windows, not(debug_assertions), not(test)), windows_subsystem = "windows")]
+
+mod analysis;
+mod chords;
 mod audio_formats;
 mod audio_probe;
 #[cfg(test)]
@@ -149,6 +157,7 @@ mod frame_log;
 mod log;
 mod lyrics;
 mod media_controls;
+mod shell;
 mod spectrum;
 mod tags;
 
@@ -368,6 +377,24 @@ fn setup_fonts(ctx: &egui::Context, chosen: Option<&str>) {
     ctx.set_fonts(fonts);
 }
 
+/// The font for a title or name: a Chinese one is drawn in one Chinese face
+/// (see `lyrics::zh::family_for`).
+fn name_font(text: &str, size: f32) -> egui::FontId {
+    match lyrics::zh::family_for(text) {
+        Some(f) => egui::FontId::new(size, egui::FontFamily::Name(f.into())),
+        None => egui::FontId::proportional(size),
+    }
+}
+
+/// `text` on one line, cut with an ellipsis at `max_w`, left-centred at `pos`.
+fn paint_one_line(ui: &egui::Ui, pos: egui::Pos2, text: &str, font: egui::FontId, color: Color32, max_w: f32) {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(0.0));
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let top = egui::Pos2::new(pos.x, pos.y - galley.size().y / 2.0);
+    ui.painter().galley(top, galley, color);
+}
+
 /// A cohesive theme built from the app's own identity colors: the icon's
 /// **Eigengrau** (#16161d) background and **Kugelblitz** (#94b1ff) accent. Softer
 /// brand-tinted surfaces, gently rounded corners, and accent-coloured selection
@@ -495,13 +522,33 @@ fn raise_timer_resolution() {}
 /// smoothly as the display allows without the user having to bump it manually.
 #[cfg(windows)]
 fn monitor_refresh_hz() -> Option<f32> {
+    monitor_refresh_hz_at(None)
+}
+
+/// The refresh rate of the monitor holding `at` (physical pixels), or of the
+/// primary monitor.
+#[cfg(windows)]
+fn monitor_refresh_hz_at(at: Option<(i32, i32)>) -> Option<f32> {
+    use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::Graphics::Gdi::{
-        EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
+        EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromPoint, DEVMODEW, ENUM_CURRENT_SETTINGS,
+        MONITORINFOEXW, MONITOR_DEFAULTTOPRIMARY,
     };
+    // SAFETY: plain Win32 queries into zeroed structs sized as the API asks;
+    // the device name is NUL-terminated by GetMonitorInfoW.
     unsafe {
+        let mut device = std::ptr::null();
+        let mut info: MONITORINFOEXW = std::mem::zeroed();
+        if let Some((x, y)) = at {
+            let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTOPRIMARY);
+            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            if GetMonitorInfoW(mon, &mut info.monitorInfo) != 0 {
+                device = info.szDevice.as_ptr();
+            }
+        }
         let mut dm: DEVMODEW = std::mem::zeroed();
         dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-        if EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm) != 0 {
+        if EnumDisplaySettingsW(device, ENUM_CURRENT_SETTINGS, &mut dm) != 0 {
             let hz = dm.dmDisplayFrequency;
             // 0 or 1 mean "hardware default / unspecified" per the Win32 docs.
             if hz > 1 {
@@ -513,6 +560,40 @@ fn monitor_refresh_hz() -> Option<f32> {
 }
 #[cfg(not(windows))]
 fn monitor_refresh_hz() -> Option<f32> { None }
+#[cfg(not(windows))]
+fn monitor_refresh_hz_at(_at: Option<(i32, i32)>) -> Option<f32> { None }
+
+/// Wait out one frame of `target_fps` from `last`, ending on a refresh of the
+/// display, so every frame stays up for a whole number of refreshes.
+///
+/// A plain sleep ends at an arbitrary point of the refresh: at 170 fps on a
+/// 180 Hz screen, about ten frames a second were held for two refreshes, and
+/// 60 fps drifted between two and four. So: sleep to half a refresh short of
+/// the frame, then let DWM's next composition end the wait.
+#[cfg(windows)]
+fn pace_frame(last: Instant, target_fps: f32, refresh_hz: f32) {
+    let period = 1.0 / refresh_hz;
+    let k = (refresh_hz / target_fps).round().max(1.0);
+    let sleep_to = |secs: f32| {
+        let (want, dt) = (Duration::from_secs_f32(secs), last.elapsed());
+        if dt < want {
+            std::thread::sleep(want - dt);
+        }
+    };
+    sleep_to((k - 0.5) * period);
+    // SAFETY: takes nothing; blocks until DWM's next composition. It fails
+    // (and returns at once) without composition; then the sleep finishes the frame.
+    if unsafe { windows_sys::Win32::Graphics::Dwm::DwmFlush() } < 0 {
+        sleep_to(k * period);
+    }
+}
+#[cfg(not(windows))]
+fn pace_frame(last: Instant, target_fps: f32, _refresh_hz: f32) {
+    let (want, dt) = (Duration::from_secs_f32(1.0 / target_fps), last.elapsed());
+    if dt < want {
+        std::thread::sleep(want - dt);
+    }
+}
 
 /// Leave the audio thread room to run.
 ///
@@ -553,7 +634,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Moosik")
             .with_inner_size([800.0, 600.0])
-            .with_min_inner_size([600.0, 400.0])
+            .with_min_inner_size([720.0, 540.0])
             .with_icon(icon),
         ..Default::default()
     };
@@ -1164,6 +1245,10 @@ struct Engine {
     /// — so the stream is recreated before the next normal-mode sink, else the
     /// rodio path is silent forever after bit-perfect has run once.
     rodio_stream_dirty: bool,
+    /// The tap's claim count as last seen, and where the hand-off just read
+    /// off the tap put the next track (shared route).
+    tap_claims: u64,
+    handoff_at: Option<Duration>,
 }
 
 impl Engine {
@@ -1236,6 +1321,8 @@ impl Engine {
             native_audio_gen: 0,
             seek_failure: None,
             rodio_stream_dirty: false,
+            tap_claims: 0,
+            handoff_at: None,
         })
     }
 
@@ -2506,6 +2593,29 @@ fn open_pcm_route(
     /// `reported` is the rate the route reports for a PCM file. A DSD file on
     /// a device stream (DoP, native) feeds no PCM to the tap; on the shared
     /// mixer it plays as the fallback decimation, at the rate that produces.
+    /// Frames of the current track the shared mixer has actually pulled
+    /// since its tap claimed the display.
+    fn tap_played_frames(&self) -> u64 {
+        match self.stereo_buf.lock() {
+            Ok(g) => g.played.load(std::sync::atomic::Ordering::Relaxed),
+            Err(p) => p.into_inner().played.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn tap_played_secs(&self) -> f64 {
+        self.tap_played_frames() as f64 / self.last_sample_rate.max(1) as f64
+    }
+
+    /// Whether a tap has claimed since the last time this was asked. On the
+    /// shared route that is the moment a queued track's first samples are
+    /// pulled — the hand-off itself, which `rodio` reports no other way.
+    fn tap_claimed_since(&mut self) -> bool {
+        let Ok(v) = self.stereo_buf.try_lock() else { return false };
+        let c = v.claims;
+        drop(v);
+        std::mem::replace(&mut self.tap_claims, c) != c
+    }
+
     fn spectrum_live_rate(&self, path: &Path, reported: u32) -> Option<u32> {
         if !dsd::is_dsd_path(path) {
             return Some(reported);
@@ -3968,7 +4078,10 @@ fn completion(&self) -> bitperfect::Completion {
     /// Roll the normal-mode (wall-clock) position onto the next gapless track:
     /// carry any overflow past the old duration into the new track's elapsed.
     fn roll_normal_position(&mut self, next_duration: Option<Duration>) {
-        let over = self.elapsed().saturating_sub(self.current_duration.unwrap_or(Duration::ZERO));
+        // Read off the tap where it could be; otherwise the clock past the
+        // declared length, which drifts by whatever the tag is out by.
+        let over = self.handoff_at.take()
+            .unwrap_or_else(|| self.elapsed().saturating_sub(self.current_duration.unwrap_or(Duration::ZERO)));
         self.paused_elapsed = over;
         self.started_at = Some(Instant::now());
         self.current_duration = next_duration;
@@ -5828,6 +5941,10 @@ struct Appearance {
     /// rest of the appearance.
     #[serde(default = "default_lyrics_text_size", deserialize_with = "lenient_lyrics_text_size")]
     lyrics_text_size: f32,
+    /// The 1.6.0 shell: layout, mode, and how much it moves.
+    #[serde(default)] visual: shell::VisualSettings,
+    /// Open a console window showing Moosik's output, for debugging.
+    #[serde(default)] console: bool,
 }
 
 impl Default for Appearance {
@@ -5841,9 +5958,40 @@ impl Default for Appearance {
             ui_font: None,
             lyrics_translation: lyrics::zh::ChineseDisplay::Original,
             lyrics_text_size: lyrics::ui::TEXT_SIZE_DEFAULT,
+            visual: shell::VisualSettings::default(),
+            console: false,
         }
     }
 }
+
+/// Opens or closes the debug console. Moosik's prints reach it from the
+/// next write: the terminal it was started from if there is one, otherwise a
+/// window of its own, whose close button is removed because closing a
+/// console window ends the process attached to it.
+#[cfg(windows)]
+fn set_console(on: bool) {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole, FreeConsole, GetConsoleWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DeleteMenu, GetSystemMenu, MF_BYCOMMAND, SC_CLOSE};
+    // SAFETY: plain Win32 calls on this process's own console.
+    unsafe {
+        if !on {
+            FreeConsole();
+            return;
+        }
+        if !GetConsoleWindow().is_null() || AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            return;
+        }
+        if AllocConsole() != 0 {
+            let menu = GetSystemMenu(GetConsoleWindow(), 0);
+            if !menu.is_null() {
+                DeleteMenu(menu, SC_CLOSE, MF_BYCOMMAND);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn set_console(_on: bool) {}
 
 fn default_lyrics_text_size() -> f32 { lyrics::ui::TEXT_SIZE_DEFAULT }
 
@@ -5910,39 +6058,96 @@ fn fit_rect_preserve(container: egui::Rect, art_w: u32, art_h: u32) -> egui::Rec
 // ---------------------------------------------------------------------------
 
 enum ArtEntry {
+    /// Asked for; the decoder thread has it.
+    Pending,
     /// No embedded art found in this file.
     NoArt,
     /// Art decoded and uploaded to the GPU, plus a per-track UI accent derived
     /// from the cover (already blended toward the brand accent).
-    Loaded { texture: egui::TextureHandle, width: u32, height: u32, accent: Color32 },
+    Loaded { texture: egui::TextureHandle, width: u32, height: u32, accent: Color32,
+             /// A tiny blurred copy for the shell's backdrop, stretched on the GPU.
+             ambient: egui::TextureHandle },
 }
+
+/// A cover decoded off the UI thread, ready to upload.
+struct DecodedArt {
+    image: egui::ColorImage,
+    accent: Color32,
+    ambient: egui::ColorImage,
+}
+
+type ArtJob = (PathBuf, Option<DecodedArt>);
 
 struct ArtCache {
     entries: HashMap<PathBuf, ArtEntry>,
+    /// The decoder thread, started on first use. Decoding on the UI thread
+    /// stalled the first frame of any list full of covers.
+    worker: Option<(std::sync::mpsc::Sender<PathBuf>, std::sync::mpsc::Receiver<ArtJob>)>,
 }
 
 impl ArtCache {
-    fn new() -> Self { Self { entries: HashMap::new() } }
+    fn new() -> Self { Self { entries: HashMap::new(), worker: None } }
 
-    /// Returns `(TextureId, orig_width, orig_height)` if art is available,
-    /// loading and caching it on first call.  Returns `None` if the file has
-    /// no embedded art or decoding failed.
+    /// Returns `(TextureId, width, height)` if art is available. The first
+    /// call queues the file for decoding and returns `None`; a frame after it
+    /// lands has it. `None` also for a file with no embedded art.
     fn get_or_load(
         &mut self,
         path: &Path,
         ctx: &egui::Context,
     ) -> Option<(egui::TextureId, u32, u32)> {
+        self.poll(ctx);
         if !self.entries.contains_key(path) {
-            let entry = match Self::load_from_file(path, ctx) {
-                Some((tex, w, h, accent)) => ArtEntry::Loaded { texture: tex, width: w, height: h, accent },
-                None                      => ArtEntry::NoArt,
-            };
+            let (tx, _) = self.worker.get_or_insert_with(|| Self::spawn_worker(ctx.clone()));
+            let entry = if tx.send(path.to_path_buf()).is_ok() { ArtEntry::Pending } else { ArtEntry::NoArt };
             self.entries.insert(path.to_path_buf(), entry);
         }
         match self.entries.get(path)? {
             ArtEntry::Loaded { texture, width, height, .. } =>
                 Some((texture.id(), *width, *height)),
-            ArtEntry::NoArt => None,
+            ArtEntry::NoArt | ArtEntry::Pending => None,
+        }
+    }
+
+    // ponytail: one decoder thread, first come first served. Give the playing
+    // track priority if a long list ever delays its cover.
+    fn spawn_worker(ctx: egui::Context) -> (std::sync::mpsc::Sender<PathBuf>, std::sync::mpsc::Receiver<ArtJob>) {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<ArtJob>();
+        let spawned = std::thread::Builder::new().name("art-decode".into()).spawn(move || {
+            for path in req_rx {
+                let art = Self::decode(&path);
+                if done_tx.send((path, art)).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
+        if let Err(e) = spawned {
+            mlog!("art decoder thread failed to start: {e}");
+        }
+        (req_tx, done_rx)
+    }
+
+    /// Upload whatever the decoder has finished.
+    fn poll(&mut self, ctx: &egui::Context) {
+        let Some((_, rx)) = &self.worker else { return };
+        while let Ok((path, art)) = rx.try_recv() {
+            let entry = match art {
+                Some(d) => {
+                    let [w, h] = d.image.size;
+                    let name = path.to_string_lossy().into_owned();
+                    ArtEntry::Loaded {
+                        texture: ctx.load_texture(format!("art:{name}"), d.image, egui::TextureOptions::LINEAR),
+                        width: w as u32,
+                        height: h as u32,
+                        accent: d.accent,
+                        ambient: ctx.load_texture(format!("ambient:{name}"), d.ambient, egui::TextureOptions::LINEAR),
+                    }
+                }
+                None => ArtEntry::NoArt,
+            };
+            self.entries.insert(path, entry);
         }
     }
 
@@ -5951,7 +6156,15 @@ impl ArtCache {
     fn accent(&self, path: &Path) -> Option<Color32> {
         match self.entries.get(path)? {
             ArtEntry::Loaded { accent, .. } => Some(*accent),
-            ArtEntry::NoArt => None,
+            ArtEntry::NoArt | ArtEntry::Pending => None,
+        }
+    }
+
+    /// The blurred backdrop for a loaded cover.
+    fn ambient(&self, path: &Path) -> Option<egui::TextureId> {
+        match self.entries.get(path)? {
+            ArtEntry::Loaded { ambient, .. } => Some(ambient.id()),
+            ArtEntry::NoArt | ArtEntry::Pending => None,
         }
     }
 
@@ -5965,23 +6178,31 @@ impl ArtCache {
         matches!(self.entries.get(path), Some(ArtEntry::Loaded { .. }))
     }
 
-    fn load_from_file(path: &Path, ctx: &egui::Context)
-        -> Option<(egui::TextureHandle, u32, u32, Color32)>
-    {
+    fn decode(path: &Path) -> Option<DecodedArt> {
         let bytes = Self::extract_bytes(path)?;
-        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-        let (w, h) = img.dimensions();
+        let mut img = image::load_from_memory(&bytes).ok()?.to_rgba8();
         let accent = Self::vibrant_accent(&img);
+        // Nothing draws a cover much over 1000 px; a 3000 px scan costs nine
+        // times the upload for nothing.
+        let (w, h) = img.dimensions();
+        if w.max(h) > 1024 {
+            let k = 1024.0 / w.max(h) as f32;
+            img = image::imageops::resize(&img, ((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1),
+                image::imageops::FilterType::Triangle);
+        }
+        let (w, h) = img.dimensions();
         let pixels: Vec<egui::Color32> = img.pixels()
             .map(|p| egui::Color32::from_rgba_unmultiplied(p.0[0], p.0[1], p.0[2], p.0[3]))
             .collect();
-        let ci = egui::ColorImage { size: [w as usize, h as usize], pixels };
-        let tex = ctx.load_texture(
-            format!("art:{}", path.to_string_lossy()),
-            ci,
-            egui::TextureOptions::LINEAR,
-        );
-        Some((tex, w, h, accent))
+        let image = egui::ColorImage { size: [w as usize, h as usize], pixels };
+        // Blurred once here, at 40×40; the GPU's linear filter does the rest.
+        let small = image::imageops::resize(&img, 40, 40, image::imageops::FilterType::Triangle);
+        let soft = image::imageops::blur(&small, 4.0);
+        let pixels: Vec<egui::Color32> = soft.pixels()
+            .map(|p| egui::Color32::from_rgb(p.0[0], p.0[1], p.0[2]))
+            .collect();
+        let ambient = egui::ColorImage { size: [40, 40], pixels };
+        Some(DecodedArt { image, accent, ambient })
     }
 
     /// Derive a UI accent from cover art: sample the image, weight each pixel by
@@ -6094,6 +6315,9 @@ struct MoosikApp {
     bp_scan_rx: Option<std::sync::mpsc::Receiver<Vec<bitperfect::DeviceCaps>>>,
     // Frame limiter: wall-clock time the previous update() frame began.
     last_frame: Option<Instant>,
+    /// The monitor's refresh rate: the pace of the 1.6.0 shell's transitions.
+    refresh_hz: f32,
+    refresh_checked: Option<Instant>,
     // OS media controls (media keys + now-playing) and change-tracking so we
     // only push updates to the OS when something actually changes.
     media: media_controls::MediaOs,
@@ -6127,6 +6351,8 @@ struct MoosikApp {
     /// Substring filter for the font list — a machine can easily have a couple
     /// of hundred families, which is not a thing to scroll through.
     font_filter: String,
+    /// The 1.6.0 shell's animation state.
+    shell: shell::ShellState,
 }
 
 impl MoosikApp {
@@ -6146,6 +6372,9 @@ impl MoosikApp {
             }
         }
         let appearance = load_appearance(&moosik_dir());
+        if appearance.console {
+            set_console(true);
+        }
         apply_theme(&cc.egui_ctx, appearance.theme.is_dark());
         let mut spectrum_window = SpectrumWindow::new();
         let mut engine = Engine::new(spectrum_window.sample_buf.clone(), spectrum_window.stereo_buf.clone());
@@ -6225,6 +6454,8 @@ impl MoosikApp {
             // Kick off the device scan at startup so the picker is ready.
             bp_scan_rx: Some(bitperfect::spawn_device_scan()),
             last_frame: None,
+            refresh_hz: monitor_refresh_hz().unwrap_or(60.0).clamp(30.0, 240.0),
+            refresh_checked: None,
             media: media_controls::MediaOs::new(cc),
             media_last_index: None,
             media_last_state: None,
@@ -6238,6 +6469,7 @@ impl MoosikApp {
             gapless_tried: None,
             font_list: Vec::new(),
             font_filter: String::new(),
+            shell: shell::ShellState::default(),
         }
     }
 
@@ -6958,6 +7190,16 @@ impl MoosikApp {
             return;
         }
         let next_dur = self.playlist[next].duration;
+        // What the clock and the mixer each say at the hand-off. On this route
+        // the clock and a duration from the tag are all the UI goes by, so if
+        // the display drifts from the music across repeats, this is the line
+        // that shows by how much.
+        if let Some(e) = self.engine.as_ref() {
+            let route = if e.on_bp_stream() { "bit-perfect" } else { "shared" };
+            let declared = self.current_index.and_then(|i| self.playlist.get(i)).and_then(|t| t.duration);
+            mlog!("handoff {route}: clock {:.3}s (declared length {:?}), mixer {:.3}s into the next",
+                e.elapsed().as_secs_f64(), declared, e.tap_played_secs());
+        }
         // DoP (DSD) uses the same frame-boundary machinery as PCM bit-perfect;
         // DSD fallback does not, even with the global toggle on — it's really
         // on the rodio path (on_bp_stream(), not the raw flags, is the truth).
@@ -7080,6 +7322,17 @@ impl MoosikApp {
         }
     }
 
+    /// Next, asked for: under Repeat One it still moves on. Only the end of a
+    /// track repeats it.
+    fn skip_next(&mut self) {
+        if self.loop_mode != LoopMode::RepeatOne {
+            return self.next_track();
+        }
+        if let Some(i) = next_in_playlist(LoopMode::RepeatAll, self.current_index, self.playlist.len()) {
+            self.play_index(i);
+        }
+    }
+
     fn prev_track(&mut self) {
         if self.playlist.is_empty() {
             return;
@@ -7163,7 +7416,7 @@ impl MoosikApp {
                 E::Play => if self.play_state != PlayState::Playing { self.toggle_play_pause(); },
                 E::Pause => if self.play_state == PlayState::Playing { self.toggle_play_pause(); },
                 E::Toggle => self.toggle_play_pause(),
-                E::Next => self.next_track(),
+                E::Next => self.skip_next(),
                 E::Previous => self.prev_track(),
                 E::Stop => self.stop(),
                 E::Seek(dir) | E::SeekBy(dir, _) => {
@@ -7281,6 +7534,1706 @@ impl MoosikApp {
         let total = d.as_secs();
         format!("{:02}:{:02}", total / 60, total % 60)
     }
+
+    // ---------------------------------------------------------------
+    // Main-window sections, shared by the classic layout and the 1.6.0 shell
+    // ---------------------------------------------------------------
+
+    /// The seek row: waveform or plain track, time labels, A–B markers.
+    fn seek_bar_ui(&mut self, ui: &mut egui::Ui) {
+        // --- Seek bar (custom painter — full panel width, reliable click/drag) ---
+        let elapsed = self.elapsed();
+        let total = self.current_duration();
+        let elapsed_str = Self::format_duration(elapsed);
+        let total_str = total
+            .map(Self::format_duration)
+            .unwrap_or_else(|| "--:--".to_string());
+
+        // Allocate the full available width for the seek row.
+        let seek_bar_h = if self.spectrum_window.waveform.is_some() { 48.0_f32 } else { 22.0_f32 };
+        let (row_rect, seek_resp) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), seek_bar_h),
+            egui::Sense::click_and_drag(),
+        );
+
+        // Track geometry: leave room for time labels on each side.
+        let h_pad    = 10.0_f32;
+        let lbl_w    = 42.0_f32; // enough for "MM:SS" in monospace 11
+        let track_x0 = row_rect.left()  + h_pad + lbl_w + 6.0;
+        let track_x1 = row_rect.right() - h_pad - lbl_w - 6.0;
+        let track_y  = row_rect.center().y;
+
+        // 1. Sync seek_pos from engine when the user is not interacting.
+        if !self.seeking
+            && let Some(dur) = total
+            && dur.as_secs_f32() > 0.0 {
+            self.seek_pos =
+                (elapsed.as_secs_f32() / dur.as_secs_f32()).clamp(0.0, 1.0);
+        }
+
+        // 2. Override with pointer position while the user is dragging or clicking.
+        if (seek_resp.dragged() || seek_resp.clicked())
+            && let Some(ptr) = seek_resp.interact_pointer_pos() {
+            let span = (track_x1 - track_x0).max(1.0);
+            self.seek_pos = ((ptr.x - track_x0) / span).clamp(0.0, 1.0);
+        }
+        if seek_resp.dragged() {
+            self.seeking = true;
+        }
+
+        // 3. Draw the track.
+        let painter = ui.painter_at(row_rect);
+        let dark = ui.visuals().dark_mode;
+        let fill_x = (track_x0 + self.seek_pos * (track_x1 - track_x0))
+            .clamp(track_x0, track_x1);
+
+        if let Some(wf) = self.spectrum_window.waveform.as_deref() {
+            // Waveform seek bar
+            let n = wf.len();
+            let track_w = track_x1 - track_x0;
+            let cy = track_y;
+            let max_half_h = (row_rect.height() / 2.0 - 4.0).max(1.0);
+            for (i, &rms) in wf.iter().enumerate() {
+                let x0 = track_x0 + (i as f32 / n as f32) * track_w;
+                let x1 = (track_x0 + ((i + 1) as f32 / n as f32) * track_w).max(x0 + 1.0);
+                let half_h = (rms * max_half_h).max(1.0);
+                let col_frac = (i as f32 + 0.5) / n as f32;
+                let color = if col_frac <= self.seek_pos {
+                    self.track_accent
+                } else {
+                    pal::wave_unplayed(dark)
+                };
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::Pos2::new(x0, cy - half_h),
+                        egui::Pos2::new(x1, cy + half_h),
+                    ),
+                    0.0, color,
+                );
+            }
+            // Clip markers
+            if let Some(ref analysis) = self.spectrum_window.track_analysis {
+                let track_w = track_x1 - track_x0;
+                for &pos in &analysis.clip_positions {
+                    let x = track_x0 + pos * track_w;
+                    painter.line_segment(
+                        [egui::Pos2::new(x, row_rect.top() + 1.0),
+                         egui::Pos2::new(x, row_rect.bottom() - 1.0)],
+                        egui::Stroke::new(1.5, pal::warn(dark)),
+                    );
+                }
+            }
+            // Playhead line
+            painter.line_segment(
+                [egui::Pos2::new(fill_x, row_rect.top() + 2.0),
+                 egui::Pos2::new(fill_x, row_rect.bottom() - 2.0)],
+                egui::Stroke::new(2.0, self.track_accent_bright()),
+            );
+        } else {
+            // Fallback: thin bar
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::Pos2::new(track_x0, track_y - 2.0),
+                    egui::Pos2::new(track_x1, track_y + 2.0),
+                ),
+                2.0,
+                pal::track_bg(dark),
+            );
+            if fill_x > track_x0 {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::Pos2::new(track_x0, track_y - 2.0),
+                        egui::Pos2::new(fill_x,   track_y + 2.0),
+                    ),
+                    2.0,
+                    self.track_accent,
+                );
+            }
+            let hot = seek_resp.hovered() || seek_resp.dragged();
+            let handle_r = if hot { 8.0_f32 } else { 6.0_f32 };
+            painter.circle_filled(egui::Pos2::new(fill_x, track_y), handle_r,
+                if hot { self.track_accent_bright() } else { pal::text_strong(dark) });
+        }
+        // Time labels
+        painter.text(
+            egui::Pos2::new(row_rect.left() + h_pad, track_y),
+            egui::Align2::LEFT_CENTER,
+            &elapsed_str,
+            egui::FontId::monospace(11.0),
+            pal::text(dark),
+        );
+        painter.text(
+            egui::Pos2::new(row_rect.right() - h_pad, track_y),
+            egui::Align2::RIGHT_CENTER,
+            &total_str,
+            egui::FontId::monospace(11.0),
+            pal::text(dark),
+        );
+
+        // A-B repeat markers on the track.
+        if let Some(dur) = total {
+            let ds = dur.as_secs_f32().max(0.001);
+            let mark = |pos: Duration, label: &str, col: Color32| {
+                let t = (pos.as_secs_f32() / ds).clamp(0.0, 1.0);
+                let x = track_x0 + t * (track_x1 - track_x0);
+                painter.line_segment(
+                    [egui::Pos2::new(x, row_rect.top() + 3.0),
+                     egui::Pos2::new(x, row_rect.bottom() - 3.0)],
+                    egui::Stroke::new(2.0, col),
+                );
+                painter.text(egui::Pos2::new(x, row_rect.top() + 1.0),
+                    egui::Align2::CENTER_TOP, label, egui::FontId::monospace(9.0), col);
+            };
+            let ab_col = pal::amber(dark);
+            if let Some(a) = self.ab_a { mark(a, "A", ab_col); }
+            if let Some(b) = self.ab_b { mark(b, "B", ab_col); }
+        }
+
+        // 4. Commit seek on drag-release or click.
+        if seek_resp.drag_stopped() || seek_resp.clicked() {
+            if let (Some(dur), Some(_idx)) = (total, self.current_index) {
+                let target_secs = self.seek_pos * dur.as_secs_f32();
+                self.seek_to(Duration::from_secs_f32(target_secs));
+            }
+            self.seeking = false;
+        }
+    }
+
+    /// Transport buttons, volume and the classic toolbar with its popups.
+    fn transport_toolbar_ui(&mut self, ui: &mut egui::Ui) {
+        // --- Playback buttons + volume ---
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            self.tb_transport(ui, true);
+            ui.add_space(8.0);
+            self.tb_ab(ui);
+            self.tb_bookmarks(ui);
+            self.tb_sleep(ui);
+            ui.add_space(20.0);
+            self.tb_volume(ui);
+            self.tb_format(ui);
+
+            // Open files button pushed right
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(10.0);
+                self.tb_files(ui);
+                ui.add_space(8.0);
+                self.tb_spectrum(ui);
+                ui.add_space(8.0);
+                self.tb_windows(ui);
+                ui.add_space(8.0);
+                self.tb_bit_perfect(ui);
+                ui.add_space(8.0);
+                self.tb_rg(ui);
+                ui.add_space(8.0);
+                self.tb_log(ui);
+                self.tb_look(ui);
+            });
+        });
+    }
+
+    fn dsd_active(&self) -> bool {
+        self.engine.as_ref().is_some_and(|e| e.dsd_mode || e.dsd_native)
+    }
+
+    /// Previous, play, stop, next and the loop mode. The shell's player bar
+    /// has its own previous, play, next and stop, so it asks for loop only.
+    fn tb_transport(&mut self, ui: &mut egui::Ui, with_play: bool) {
+        let btn = |label: &str| egui::Button::new(RichText::new(label).size(18.0)).min_size(Vec2::new(40.0, 36.0));
+
+        if with_play && ui.add(btn("⏮")).clicked() {
+            self.prev_track();
+        }
+
+        let play_label = if self.play_state == PlayState::Playing { "⏸" } else { "▶" };
+        if with_play && ui.add(btn(play_label)).clicked() {
+            self.toggle_play_pause();
+        }
+
+        if with_play && ui.add(btn("⏹")).on_hover_text("Stop").clicked() {
+            self.stop();
+        }
+
+        if with_play && ui.add(btn("⏭")).clicked() {
+            self.skip_next();
+        }
+
+        ui.add_space(8.0);
+        let loop_icon = match self.loop_mode {
+            LoopMode::Sequential => "➡",
+            LoopMode::RepeatAll  => "🔁",
+            LoopMode::RepeatOne  => "🔂",
+        };
+        let loop_tip = match self.loop_mode {
+            LoopMode::Sequential => "Sequential (click for Repeat All)",
+            LoopMode::RepeatAll  => "Repeat All (click for Repeat One)",
+            LoopMode::RepeatOne  => "Repeat One (click for Sequential)",
+        };
+        if ui.add(btn(loop_icon)).on_hover_text(loop_tip).clicked() {
+            self.cycle_loop_mode();
+        }
+    }
+
+    /// Sequential, then Repeat All, then Repeat One.
+    fn cycle_loop_mode(&mut self) {
+        self.loop_mode = match self.loop_mode {
+            LoopMode::Sequential => LoopMode::RepeatAll,
+            LoopMode::RepeatAll  => LoopMode::RepeatOne,
+            LoopMode::RepeatOne  => LoopMode::Sequential,
+        };
+        // The queued gapless track may no longer be the right next.
+        self.flush_gapless();
+    }
+
+    /// A-B repeat.
+    fn tb_ab(&mut self, ui: &mut egui::Ui) {
+        // ── A-B repeat ───────────────────────────────────────────
+        let (ab_label, ab_on) = match (self.ab_a, self.ab_b) {
+            (None, _)          => ("A–B", false),
+            (Some(_), None)    => ("A‥",  true),
+            (Some(_), Some(_)) => ("A↔B", true),
+        };
+        let ab_txt = if ab_on {
+            RichText::new(ab_label).size(15.0).color(pal::accent(ui.visuals().dark_mode))
+        } else {
+            RichText::new(ab_label).size(15.0)
+        };
+        let ab_tip = match (self.ab_a, self.ab_b) {
+            (None, _) => "A-B repeat — click to set point A".to_string(),
+            (Some(a), None) => format!("A = {} — click to set B (or clear)",
+                Self::format_duration(a)),
+            (Some(a), Some(b)) => format!("Looping {}–{} — click to clear",
+                Self::format_duration(a), Self::format_duration(b)),
+        };
+        if ui.add_enabled(self.current_index.is_some(),
+            egui::Button::new(ab_txt).min_size(Vec2::new(46.0, 36.0)))
+            .on_hover_text(ab_tip).clicked() {
+            self.cycle_ab_repeat();
+        }
+    }
+
+    /// Bookmarks for the current track.
+    fn tb_bookmarks(&mut self, ui: &mut egui::Ui) {
+        // ── Bookmarks ────────────────────────────────────────────
+        ui.menu_button(RichText::new("🔖").size(16.0), |ui| self.bookmarks_ui(ui))
+            .response.on_hover_text("Bookmarks for the current track");
+    }
+
+    /// Add, jump to and remove the current track's bookmarks.
+    pub(crate) fn bookmarks_ui(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        let cur = self.current_index.map(|i| self.playlist[i].path.clone());
+        if ui.add_enabled(cur.is_some(),
+            egui::Button::new("＋ Bookmark current position")).clicked() {
+            if let Some(ref p) = cur {
+                self.bookmarks.add(p, self.elapsed().as_secs_f32());
+                self.bookmarks.save(&moosik_dir());
+            }
+            ui.close_menu();
+        }
+        if let Some(ref p) = cur
+            && let Some(marks) = self.bookmarks.for_track(p).cloned()
+            && !marks.is_empty() {
+            ui.separator();
+            let mut jump: Option<f32> = None;
+            let mut remove: Option<f32> = None;
+            for m in marks {
+                ui.horizontal(|ui| {
+                    if ui.button(format!("↪ {}",
+                        Self::format_duration(Duration::from_secs_f32(m)))).clicked() {
+                        jump = Some(m);
+                    }
+                    if ui.small_button("✕").on_hover_text("Remove").clicked() {
+                        remove = Some(m);
+                    }
+                });
+            }
+            if let Some(m) = jump {
+                self.seek_to(Duration::from_secs_f32(m));
+                ui.close_menu();
+            }
+            if let Some(m) = remove {
+                self.bookmarks.remove(p, m);
+                self.bookmarks.save(&moosik_dir());
+            }
+        }
+    }
+
+    /// Sleep timer.
+    fn tb_sleep(&mut self, ui: &mut egui::Ui) {
+        // ── Sleep timer ──────────────────────────────────────────
+        let sleep_on = self.sleep_deadline.is_some() || self.sleep_end_of_track;
+        let sleep_txt = if sleep_on {
+            RichText::new("💤").size(16.0).color(pal::accent(ui.visuals().dark_mode))
+        } else {
+            RichText::new("💤").size(16.0)
+        };
+        let sleep_tip = if let Some(dl) = self.sleep_deadline {
+            format!("Sleep in {}", Self::format_duration(dl.saturating_duration_since(Instant::now())))
+        } else if self.sleep_end_of_track {
+            "Sleep at end of track".to_string()
+        } else {
+            "Sleep timer".to_string()
+        };
+        ui.menu_button(sleep_txt, |ui| self.sleep_ui(ui)).response.on_hover_text(sleep_tip);
+    }
+
+    /// Off, a number of minutes, or the end of the track.
+    pub(crate) fn sleep_ui(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(150.0);
+        let sleep_on = self.sleep_deadline.is_some() || self.sleep_end_of_track;
+        if ui.selectable_label(!sleep_on, "Off").clicked() {
+            self.sleep_deadline = None;
+            self.sleep_end_of_track = false;
+            ui.close_menu();
+        }
+        for mins in [15u64, 30, 45, 60, 90] {
+            if ui.selectable_label(false, format!("{mins} minutes")).clicked() {
+                self.sleep_deadline = Some(Instant::now() + Duration::from_secs(mins * 60));
+                self.sleep_end_of_track = false;
+                ui.close_menu();
+            }
+        }
+        if ui.selectable_label(self.sleep_end_of_track, "End of track").clicked() {
+            self.sleep_end_of_track = true;
+            self.sleep_deadline = None;
+            ui.close_menu();
+        }
+        if let Some(dl) = self.sleep_deadline {
+            ui.separator();
+            ui.label(RichText::new(format!("⏳ {} left",
+                Self::format_duration(dl.saturating_duration_since(Instant::now()))))
+                .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+        }
+    }
+
+    /// Volume, locked while an exact route is open.
+    fn tb_volume(&mut self, ui: &mut egui::Ui) {
+        // Volume.
+        //
+        // Disabled outright while an exact route is open. There is no
+        // gain on that path to move — no multiply exists between the
+        // decoder and the device — so a slider that appeared to work
+        // was reporting a state the audio could not be in. The saved
+        // preference is untouched and comes back the moment normal
+        // playback resumes.
+        let lock = self.engine.as_ref()
+            .map(|e| (e.bp_state.volume_locked(), e.bp_state.volume_lock_reason()))
+            .unwrap_or((false, None));
+        let (vol_locked, lock_reason) = lock;
+        ui.label(RichText::new("🔊").size(16.0));
+        let mut shown = if vol_locked { 1.0 } else { self.volume };
+        let vol_slider = ui.add_enabled(
+            !vol_locked,
+            Slider::new(&mut shown, 0.0..=1.0)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        if vol_locked {
+            vol_slider.on_disabled_hover_text(
+                lock_reason.unwrap_or_else(|| "Volume is locked on this route".into()));
+        } else if vol_slider.changed() {
+            // `set_volume` owns the predicate and refuses if the route
+            // has no gain stage, so the saved value cannot be moved by
+            // a control that would have no effect.
+            let applied = self.engine.as_mut().is_some_and(|e| e.set_volume(shown));
+            if applied {
+                self.volume = shown;
+            }
+        }
+        ui.label(
+            RichText::new(if vol_locked {
+                              "100% · locked on this route".to_string()
+                          } else {
+                              format!("{}%", (self.volume * 100.0) as u32)
+                          })
+                .size(12.0)
+                .color(pal::text_dim(ui.visuals().dark_mode)),
+        );
+    }
+
+    /// Sample rate and bitrate (or the DSD route), and momentary loudness.
+    fn tb_format(&mut self, ui: &mut egui::Ui) {
+        let dsd_active = self.dsd_active();
+        // Sample rate + PCM bitrate indicator (or DSD/DoP equivalent)
+        if self.play_state != PlayState::Stopped {
+            let sr = self.engine.as_ref().map(|e| e.last_sample_rate).unwrap_or(0);
+            let dsd_fallback = self.engine.as_ref().is_some_and(|e| e.dsd_fallback);
+            if dsd_active || dsd_fallback {
+                let dsd_label = self.engine.as_ref()
+                    .and_then(|e| e.dsd_label.clone())
+                    .unwrap_or_else(|| "DSD".to_string());
+                let native = self.engine.as_ref().is_some_and(|e| e.dsd_native);
+                let text = if native {
+                    let backend = if cfg!(windows) { "ASIO" } else { "ALSA" };
+                    format!("{dsd_label} native ({backend})")
+                } else if dsd_active {
+                    format!("{dsd_label} via DoP · {}", fmt_hz(sr))
+                } else {
+                    format!("{dsd_label} → {} PCM (no DoP)", fmt_hz(sr))
+                };
+                ui.add_space(8.0);
+                ui.label(RichText::new(text)
+                    .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+            } else if sr > 0 {
+                let pcm = self.current_index.and_then(|i| {
+                    let t = &self.playlist[i];
+                    Some(sr * t.channels? as u32 * t.bit_depth? as u32 / 1000)
+                });
+                let label = match pcm {
+                    Some(kbps) => format!("{}  ·  {}kbps", fmt_hz(sr), kbps),
+                    None       => fmt_hz(sr),
+                };
+                ui.add_space(8.0);
+                ui.label(RichText::new(label).size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+            }
+        }
+
+        if self.play_state != PlayState::Stopped {
+            let lufs = self.spectrum_window.momentary_lufs;
+            if lufs.is_finite() {
+                ui.add_space(6.0);
+                ui.label(RichText::new(format!("{:.1} LUFS", lufs))
+                    .size(11.0).color(pal::ok(ui.visuals().dark_mode)));
+            }
+        }
+    }
+
+    /// Add Files and Load Folder (right to left).
+    fn tb_files(&mut self, ui: &mut egui::Ui) {
+        if ui.button(RichText::new("+ Add Files").size(13.0)).clicked() {
+            self.add_files();
+        }
+        ui.add_space(4.0);
+        if ui.button(RichText::new("📁 Load Folder").size(13.0)).clicked() {
+            self.add_folder();
+        }
+    }
+
+    /// The analyser toggle.
+    fn tb_spectrum(&mut self, ui: &mut egui::Ui) {
+        let spectrum_label = if self.spectrum_window.open {
+            RichText::new("📊 Spectrum").size(13.0).color(pal::accent(ui.visuals().dark_mode))
+        } else {
+            RichText::new("📊 Spectrum").size(13.0)
+        };
+        if ui.button(spectrum_label).clicked() {
+            self.spectrum_window.open = !self.spectrum_window.open;
+        }
+    }
+
+    /// Info, Lyrics and Tags (right to left).
+    fn tb_windows(&mut self, ui: &mut egui::Ui) {
+        let info_enabled = self.current_index.is_some();
+        let info_label = if self.info_open {
+            RichText::new("ℹ Info").size(13.0).color(pal::accent(ui.visuals().dark_mode))
+        } else {
+            RichText::new("ℹ Info").size(13.0)
+        };
+        if ui.add_enabled(info_enabled, egui::Button::new(info_label)).clicked() {
+            self.info_open = !self.info_open;
+        }
+        ui.add_space(8.0);
+        let lyr_label = if self.lyrics_window.is_open() {
+            RichText::new("🎤 Lyrics").size(13.0).color(pal::accent(ui.visuals().dark_mode))
+        } else {
+            RichText::new("🎤 Lyrics").size(13.0)
+        };
+        if ui.add_enabled(info_enabled, egui::Button::new(lyr_label))
+            .on_hover_text(
+                "Lyrics for the playing track.\n\nReads a .lrc beside the file \
+                 or the file's own tags, and can look the track up on LRCLIB. \
+                 Saved lyrics go to a .lrc — the audio file is never modified.")
+            .clicked()
+        {
+            self.lyrics_window.toggle();
+        }
+        ui.add_space(8.0);
+        let tag_label = if self.tag_window.open {
+            RichText::new("🏷 Tags").size(13.0).color(pal::accent(ui.visuals().dark_mode))
+        } else {
+            RichText::new("🏷 Tags").size(13.0)
+        };
+        if ui.add_enabled(info_enabled, egui::Button::new(tag_label))
+            .on_hover_text(
+                "Edit the playing track's tags, and see every tag it carries.\n\n\
+                 Writes go to a copy which then replaces the original, and are \
+                 read back and checked. DSD files are read-only here.")
+            .clicked()
+        {
+            self.tag_window.open = !self.tag_window.open;
+        }
+    }
+
+    /// The bit-perfect toggle and its output-device menu.
+    fn tb_bit_perfect(&mut self, ui: &mut egui::Ui) {
+        let dsd_active = self.dsd_active();
+        // ── Bit-perfect: device picker (▾) + toggle ─────────────
+        // right_to_left layout: the toggle is added first so it
+        // sits to the right of the picker.
+        // Every visible surface derives from one presentation
+        // object. The glyph and the words carry the state as well
+        // as the colour does, so it survives a monochrome
+        // screenshot and a colour-blind reader — and "requested"
+        // can never render as "achieved".
+        let mut present = self.engine.as_ref()
+            .map(|e| e.bp_state.presentation())
+            .unwrap_or_else(|| {
+                bitperfect::state::OutputSessionState::default().presentation()
+            });
+        // The backend's own account of the open stream — driver
+        // name, dropout count — as one more *detail* line. It
+        // answers "what is this stream", never "is it exact", and
+        // was previously the source of four hard-coded diamonds
+        // because those two questions were not separated.
+        if let Some(desc) = self.engine.as_ref().and_then(|e| e.bp_describe()) {
+            present.detail.push(desc);
+        }
+        let dark = ui.visuals().dark_mode;
+        let tint = match present.badge {
+            bitperfect::state::Badge::PayloadExact => Some(pal::ok(dark)),
+            bitperfect::state::Badge::Pending => Some(pal::text_dim(dark)),
+            bitperfect::state::Badge::ValueExact => Some(pal::accent(dark)),
+            bitperfect::state::Badge::Processed
+            | bitperfect::state::Badge::Unverified
+            | bitperfect::state::Badge::Faulted
+            | bitperfect::state::Badge::Failed => Some(pal::warn(dark)),
+            bitperfect::state::Badge::Off
+            | bitperfect::state::Badge::Requested => None,
+        };
+        let caption = format!("{} Bit-Perfect", present.badge.glyph());
+        let bp_label = match tint {
+            Some(c) => RichText::new(caption).size(13.0).color(c),
+            None => RichText::new(caption).size(13.0),
+        };
+
+        let mut hover = present.headline.clone();
+        for line in &present.detail {
+            hover.push('\n');
+            hover.push_str(line);
+        }
+        if dsd_active {
+            hover.push_str(
+                "\n\nDSD always takes a dedicated route — this toggle only affects \
+                 PCM tracks.");
+        }
+        hover.push_str(
+            "\n\nExactness is claimed only as far as the audio driver. What the \
+             USB link and the DAC do after that is not observable from here.");
+
+        if ui.add_enabled(!dsd_active, egui::Button::new(bp_label))
+            .on_hover_text(hover).clicked() {
+            self.toggle_bit_perfect();
+        }
+
+        ui.menu_button(RichText::new("🔈▾").size(13.0), |ui| self.bp_route_ui(ui))
+            .response.on_hover_text("Choose the output device for bit-perfect playback");
+    }
+
+    /// The output policy and the bit-perfect device, with native DSD where
+    /// built in. Classic shows it as a menu, the shell inside the badge.
+    pub(crate) fn bp_route_ui(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(320.0);
+        // What to do when an exact route is impossible. The
+        // choice is the user's, it is per-track in effect, and
+        // it never changes the bit-perfect request itself.
+        ui.label(RichText::new("When exact output is impossible")
+            .strong().size(12.0));
+        let current = self.engine.as_ref()
+            .map(|e| e.bp_state.policy)
+            .unwrap_or_default();
+        let mut chosen = current;
+        for p in [bitperfect::state::OutputPolicy::StrictExact,
+                  bitperfect::state::OutputPolicy::PreferExact,
+                  bitperfect::state::OutputPolicy::HqProcessed] {
+            ui.radio_value(&mut chosen, p, p.label())
+                .on_hover_text(p.describe());
+        }
+        if chosen != current {
+            if let Some(ref mut e) = self.engine {
+                // A policy change is an explicit user action and
+                // is persisted; it starts applying at the next
+                // track rather than reopening under playback.
+                e.bp_state.policy = chosen;
+            }
+            self.save_bp_settings();
+        }
+        ui.separator();
+
+        ui.label(RichText::new("Bit-perfect output device").strong().size(12.0));
+        ui.separator();
+
+        let track_sr = self.current_index
+            .and_then(|i| self.playlist.get(i))
+            .and_then(|t| t.sample_rate);
+
+        let mut pick: Option<Option<String>> = None;
+        if ui.selectable_label(self.bp_device.is_none(), "System default").clicked() {
+            pick = Some(None);
+            ui.close_menu();
+        }
+        match self.bp_devices {
+            None => { ui.add_space(2.0); ui.spinner(); ui.label(RichText::new("Scanning devices…").size(11.0)); }
+            Some(ref devs) if devs.is_empty() => {
+                ui.label(RichText::new("No output devices found").size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+            }
+            Some(ref devs) => {
+                for d in devs {
+                    let selected = self.bp_device.as_deref() == Some(d.name.as_str());
+                    let mut name = d.name.clone();
+                    if d.is_default { name.push_str("  (default)"); }
+                    // Flag devices that can't do the current track's rate.
+                    let caps = match track_sr {
+                        Some(sr) if !d.supports_rate(sr) =>
+                            format!("{}   ⚠ no {}", d.summary(), fmt_hz(sr)),
+                        _ => d.summary(),
+                    };
+                    let resp = ui.selectable_label(selected, name)
+                        .on_hover_text(&caps);
+                    ui.label(RichText::new(caps).size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
+                    if resp.clicked() {
+                        pick = Some(Some(d.name.clone()));
+                        ui.close_menu();
+                    }
+                }
+            }
+        }
+        ui.separator();
+        if ui.button(RichText::new("⟳ Rescan").size(12.0)).clicked() {
+            self.bp_devices = None;
+            self.bp_scan_rx = Some(bitperfect::spawn_device_scan());
+        }
+        if let Some(dev) = pick {
+            self.select_bp_device(dev);
+        }
+
+        // ── Native DSD via ASIO (asio-dsd builds) ─────────
+        #[cfg(all(windows, feature = "asio-dsd"))]
+        {
+            ui.separator();
+            ui.label(RichText::new("Native DSD (ASIO)").strong().size(12.0));
+            let current = self.engine.as_ref().and_then(|e| e.asio_driver.clone());
+            let mut pick_asio: Option<Option<String>> = None;
+            if ui.selectable_label(current.is_none(), "Off — DSD plays via DoP")
+                .clicked() {
+                pick_asio = Some(None);
+                ui.close_menu();
+            }
+            let drivers = bitperfect::asio_dsd::list_asio_drivers();
+            if drivers.is_empty() {
+                ui.label(RichText::new("No ASIO drivers installed")
+                    .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+            }
+            let mut probe: Option<String> = None;
+            for d in &drivers {
+                let sel = current.as_deref() == Some(d.as_str());
+                if ui.selectable_label(sel, d)
+                    .on_hover_text("Route DSD tracks as raw native DSD through \
+                                    this ASIO driver — bit-perfect up to DSD512, \
+                                    no DoP carrier-rate ceiling.")
+                    .clicked() {
+                    pick_asio = Some(Some(d.clone()));
+                    ui.close_menu();
+                }
+            }
+
+            // A diagnostic, and labelled as one.
+            //
+            // Moosik does not play PCM over ASIO: there is no
+            // renderer, so there is no setting, no transport
+            // and no claim. What there is, is an answer to
+            // "what would this driver take?" that comes from
+            // the driver rather than from guesswork — which is
+            // the question that has to be settled before a
+            // renderer is worth writing. It opens the driver,
+            // asks, and closes it again.
+            if !drivers.is_empty() {
+                ui.separator();
+                ui.label(
+                    RichText::new("PCM capability probe (diagnostic)")
+                        .size(11.0)
+                        .color(pal::text_dim(ui.visuals().dark_mode)),
+                );
+                for d in &drivers {
+                    if ui
+                        .small_button(format!("Probe {d}"))
+                        .on_hover_text(
+                            "Ask this driver what it can do with ordinary PCM \
+                             and write the answer to the log.\n\nMoosik does \
+                             not play PCM over ASIO — this changes nothing \
+                             about playback.",
+                        )
+                        .clicked()
+                    {
+                        probe = Some(d.clone());
+                        ui.close_menu();
+                    }
+                }
+            }
+            if let Some(d) = probe {
+                // A probe result is a message, not a claim
+                // about what is playing. Written straight to
+                // the text, it inherited whatever owner was
+                // there — including the now-playing line's —
+                // and the next tick regenerated it away.
+                let line = match bitperfect::asio_dsd::probe_pcm(&d) {
+                        Ok(caps) => {
+                            let line = caps.describe();
+                            crate::mlog!("[asio-pcm] {line}");
+                            format!("ASIO PCM probe — {line}")
+                        }
+                        Err(e) => {
+                            crate::mlog!("[asio-pcm] probe failed: {e}");
+                            format!("ASIO PCM probe failed: {e}")
+                        }
+                };
+                self.set_transient(line);
+            }
+            if let Some(sel) = pick_asio {
+                let old = self.engine.as_ref()
+                    .and_then(|e| e.asio_driver.clone());
+                if let Some(e) = self.engine.as_mut() { e.asio_driver = sel.clone(); }
+                self.save_bp_settings();
+                self.set_transient(match &sel {
+                    Some(n) => format!("Native DSD via ASIO: {n}"),
+                    None => "DSD output: DoP".to_string(),
+                });
+                self.switch_native_output("Native DSD", move |e| {
+                    e.asio_driver = old;
+                });
+            }
+        }
+
+        // ── Native DSD via ALSA (alsa-dsd builds) ─────────
+        #[cfg(all(target_os = "linux", feature = "alsa-dsd"))]
+        {
+            ui.separator();
+            ui.label(RichText::new("Native DSD (ALSA)").strong().size(12.0));
+            let current = self.engine.as_ref().and_then(|e| e.alsa_dsd_device.clone());
+            let mut pick_alsa: Option<Option<String>> = None;
+            if ui.selectable_label(current.is_none(), "Off — DSD plays via DoP")
+                .clicked() {
+                pick_alsa = Some(None);
+                ui.close_menu();
+            }
+            let devices = bitperfect::alsa_dsd::list_dsd_devices();
+            if devices.is_empty() {
+                ui.label(RichText::new("No direct hw: playback devices found")
+                    .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+            }
+            for d in devices {
+                let sel = current.as_deref() == Some(d.id.as_str());
+                let resp = ui.selectable_label(sel, &d.id)
+                    .on_hover_text("Route DSD tracks as raw native DSD \
+                                    (DSD_U32_BE/U16/U8) through this device — \
+                                    no DoP carrier-rate ceiling. Needs a card \
+                                    whose driver advertises DSD formats, and \
+                                    exclusive hw: access.");
+                if !d.desc.is_empty() {
+                    ui.label(RichText::new(&d.desc).size(10.0)
+                        .color(pal::text_faint(ui.visuals().dark_mode)));
+                }
+                if resp.clicked() {
+                    pick_alsa = Some(Some(d.id.clone()));
+                    ui.close_menu();
+                }
+            }
+            if ui.button(RichText::new("⟳ Rescan").size(12.0)).clicked() {
+                bitperfect::alsa_dsd::rescan_devices();
+            }
+            if let Some(sel) = pick_alsa {
+                let old = self.engine.as_ref()
+                    .and_then(|e| e.alsa_dsd_device.clone());
+                if let Some(e) = self.engine.as_mut() { e.alsa_dsd_device = sel.clone(); }
+                self.save_bp_settings();
+                self.set_transient(match &sel {
+                    Some(n) => format!("Native DSD via ALSA: {n}"),
+                    None => "DSD output: DoP".to_string(),
+                });
+                self.switch_native_output("Native DSD", move |e| {
+                    e.alsa_dsd_device = old;
+                });
+            }
+        }
+    }
+
+    /// ReplayGain.
+    fn tb_rg(&mut self, ui: &mut egui::Ui) {
+        // ── ReplayGain (loudness normalization) ─────────────────
+        let rg_active = self.rg.mode != RgMode::Off;
+        let rg_label = if rg_active {
+            RichText::new(format!("🔊 RG {}", self.rg.mode.label()))
+                .size(13.0).color(pal::ok(ui.visuals().dark_mode))
+        } else {
+            RichText::new("🔊 RG").size(13.0)
+        };
+        // Reflects the *active session's* routing, not just the global
+        // toggle — a DSD track that fell back to PCM plays on the
+        // ordinary sink and gets RG even with 💎 on for PCM tracks.
+        let on_bp_stream = self.engine.as_ref().is_some_and(|e| e.on_bp_stream());
+        let rg_hover = if on_bp_stream && rg_active {
+            "ReplayGain is bypassed on the bit-perfect device stream — a gain change breaks bit-perfectness.".to_string()
+        } else if rg_active {
+            format!("Loudness normalization: {} · currently {:+.1} dB", self.rg.mode.label(), self.rg_applied_db())
+        } else {
+            "Loudness normalization (off) — plays original levels".to_string()
+        };
+        ui.menu_button(rg_label, |ui| {
+            ui.set_min_width(250.0);
+            self.rg_ui(ui);
+        }).response.on_hover_text(rg_hover);
+    }
+
+    /// ReplayGain's choices: in the toolbar's menu, and in the shell's
+    /// settings.
+    pub(crate) fn rg_ui(&mut self, ui: &mut egui::Ui) {
+        let on_bp_stream = self.engine.as_ref().is_some_and(|e| e.on_bp_stream());
+        ui.label(RichText::new("ReplayGain — loudness normalization").strong().size(12.0));
+        // A device stream has no gain stage, which is a fact
+        // about the *route* and true whether or not the route
+        // is exact. The diamond is a fact about the
+        // *fidelity*, so this line states the first and lets
+        // the presentation decide the second.
+        if on_bp_stream {
+            let exact = self
+                .engine
+                .as_ref()
+                .is_some_and(|e| e.bp_state.shows_diamond());
+            let (glyph, colour) = if exact {
+                ("\u{1F48E}", pal::ok(ui.visuals().dark_mode))
+            } else {
+                ("\u{25C7}", pal::text_dim(ui.visuals().dark_mode))
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{glyph} Bypassed on the output device stream"
+                ))
+                .size(11.0)
+                .color(colour),
+            );
+        }
+        ui.separator();
+        let mut changed = false;
+        for mode in [RgMode::Off, RgMode::Track, RgMode::Album] {
+            if ui.selectable_label(self.rg.mode == mode, mode.label()).clicked() {
+                self.rg.mode = mode;
+                changed = true;
+            }
+        }
+        ui.separator();
+        if ui.checkbox(&mut self.rg.prevent_clip, "Prevent clipping (cap gain by peak)").changed() {
+            changed = true;
+        }
+        ui.separator();
+        if self.rg.mode == RgMode::Off {
+            ui.label(RichText::new("Off — original file levels")
+                .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+        } else {
+            let src = self.current_index.and_then(|i| self.playlist.get(i)).map(|t| {
+                let tagged = match self.rg.mode {
+                    RgMode::Album => t.rg_album_gain.or(t.rg_track_gain),
+                    _ => t.rg_track_gain.or(t.rg_album_gain),
+                }.is_some();
+                if tagged { "from ReplayGain tag" } else { "from measured loudness" }
+            }).unwrap_or("—");
+            ui.label(RichText::new(format!("Applied: {:+.1} dB  ({src})", self.rg_applied_db()))
+                .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+            ui.label(RichText::new(format!("Untagged target: {:.0} LUFS", RG_TARGET_LUFS))
+                .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
+        }
+        if changed {
+            save_rg_settings(&moosik_dir(), &self.rg);
+        }
+    }
+
+    /// The session log.
+    fn tb_log(&mut self, ui: &mut egui::Ui) {
+        // ── Session log ─────────────────────────────────────────
+        // Reachable without a console, because the build that most
+        // needs it is the one someone double-clicked. A bug report
+        // that can attach this file is worth more than any amount
+        // of asking what happened.
+        // Gated on a file actually existing, not on the absence of
+        // a recorded error — those are only the same thing while
+        // every failure path remembers to record one.
+        let log_ok = log::path().is_some();
+        // Two tooltip paths, not one: egui only shows
+        // `on_hover_text` on an *enabled* widget, so hanging the
+        // failure reason there meant the disabled button explained
+        // nothing at all.
+        let log_tip = match log::path() {
+            Some(p) => format!("Open this session's log
+{}", p.display()),
+            None => "Open the log folder".to_string(),
+        };
+        let log_why = match log::error() {
+            Some(e) => format!("No log file this session — {e}"),
+            None => "No log file this session".to_string(),
+        };
+        if ui.add_enabled(log_ok, egui::Button::new(RichText::new("🗎 Log").size(13.0)))
+            .on_hover_text(log_tip)
+            .on_disabled_hover_text(log_why)
+            .clicked()
+        {
+            let dir = log::dir();
+            let _ = std::fs::create_dir_all(&dir);
+            #[cfg(windows)]
+            // Never while a local translation runtime's pipe ends are
+            // inheritable, or Explorer could hold them open.
+            let _ = crate::lyrics::local_ai::contain::ordinary_spawn(
+                std::process::Command::new("explorer").arg(&dir));
+            #[cfg(target_os = "macos")]
+            let _ = std::process::Command::new("open").arg(&dir).spawn();
+            #[cfg(all(unix, not(target_os = "macos")))]
+            let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+        }
+    }
+
+    /// The Look menu.
+    fn tb_look(&mut self, ui: &mut egui::Ui) {
+        // ── Appearance (text size · accent) ─────────────────────
+        // The spectrum palette lives in the spectrum window itself
+        // (next to the View controls), since it only affects that view.
+        ui.menu_button(RichText::new("🎨 Look").size(13.0), |ui| {
+            ui.set_min_width(230.0);
+            ui.label(RichText::new("Appearance").strong().size(12.0));
+            ui.separator();
+            self.look_ui(ui);
+        }).response.on_hover_text("Palette, text size, and accent — all optional");
+    }
+
+    /// Theme, font, text size and accent: in the Look menu, and in the
+    /// shell's settings.
+    pub(crate) fn look_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        let mut changed = false;
+
+        changed |= ui.checkbox(&mut self.appearance.visual.modern,
+            "1.6.0 layout (off = classic)").changed();
+        ui.add_space(4.0);
+
+        ui.label(RichText::new("Theme")
+            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+        ui.horizontal(|ui| {
+            for tm in [ThemeMode::Dark, ThemeMode::Light] {
+                if ui.selectable_label(self.appearance.theme == tm, tm.label()).clicked()
+                    && self.appearance.theme != tm
+                {
+                    self.appearance.theme = tm;
+                    apply_theme(ctx, tm.is_dark());
+                    changed = true;
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(RichText::new("Font")
+            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+        // Enumerating every system font means reading a few
+        // hundred files, so it happens once, when the menu is
+        // first opened, rather than every frame.
+        if self.font_list.is_empty() { self.font_list = fonts::list(); }
+        let current = self.appearance.ui_font.clone();
+        let mut pick: Option<Option<String>> = None;
+        // A plain scrolling list, not a ComboBox. A ComboBox
+        // popup is its own egui Area, so a click inside it reads
+        // as a click *outside* this menu — the menu closes and
+        // swallows the click, and the font silently never
+        // changed. Widgets placed directly in the menu do not
+        // have that problem.
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.font_filter)
+                   .desired_width(150.0).hint_text("filter…"));
+            if ui.small_button("✖").clicked() { self.font_filter.clear(); }
+        });
+        egui::ScrollArea::vertical().max_height(190.0)
+            .id_salt("ui_font_list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if ui.selectable_label(current.is_none(), "Default").clicked() {
+                    pick = Some(None);
+                }
+                ui.separator();
+                let needle = self.font_filter.to_lowercase();
+                for f in &self.font_list {
+                    if !needle.is_empty()
+                        && !f.family.to_lowercase().contains(&needle) { continue; }
+                    let sel = current.as_deref() == Some(f.family.as_str());
+                    if ui.selectable_label(sel, &f.family).clicked() {
+                        pick = Some(Some(f.family.clone()));
+                    }
+                }
+            });
+        if let Some(choice) = pick {
+            self.appearance.ui_font = choice;
+            // Rebuild the whole set: the CJK fallbacks have to be
+            // reinstalled behind the new primary, or Japanese
+            // tags turn to tofu the moment a Latin font is picked.
+            setup_fonts(ctx, self.appearance.ui_font.as_deref());
+            changed = true;
+        }
+        ui.label(RichText::new(
+            "CJK fallbacks stay active whatever you pick")
+            .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(RichText::new("Text size")
+            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+        // Edit a draft, then commit on Apply — a live zoom change
+        // mid-drag resizes the menu under the cursor.
+        ui.add(
+            Slider::new(&mut self.ui_scale_draft, UI_SCALE_MIN..=UI_SCALE_MAX)
+                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                .custom_parser(|s| {
+                    s.trim().trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)
+                }),
+        );
+        ui.horizontal(|ui| {
+            let pending = (self.ui_scale_draft - self.appearance.ui_scale).abs() > 1e-3;
+            if ui.add_enabled(pending, egui::Button::new("Apply")).clicked() {
+                self.appearance.ui_scale =
+                    self.ui_scale_draft.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+                save_appearance(&moosik_dir(), &self.appearance);
+            }
+            if ui.small_button("Reset").clicked() {
+                self.ui_scale_draft = 1.0;
+                self.appearance.ui_scale = 1.0;
+                save_appearance(&moosik_dir(), &self.appearance);
+            }
+            ui.label(RichText::new(format!("now {:.0}%", self.appearance.ui_scale * 100.0))
+                .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
+        if ui.checkbox(&mut self.appearance.art_accent,
+            "Tint UI with album-art accent").changed() {
+            changed = true;
+        }
+        ui.label(RichText::new("Off → fixed brand accent")
+            .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
+
+        ui.add_space(6.0);
+        ui.separator();
+        if ui.checkbox(&mut self.appearance.show_play_count,
+            "Show play counts in playlist").changed() {
+            changed = true;
+        }
+        #[cfg(windows)]
+        if ui.checkbox(&mut self.appearance.console, "Debug console window")
+            .on_hover_text("Shows what Moosik prints while it runs, as earlier versions did.                             Its close button is off: closing a console would close Moosik too.")
+            .changed() {
+            set_console(self.appearance.console);
+            changed = true;
+        }
+
+        if changed {
+            save_appearance(&moosik_dir(), &self.appearance);
+        }
+    }
+
+    /// The negotiated output and the transient status line.
+    fn status_lines_ui(&mut self, ui: &mut egui::Ui) {
+        // The negotiated output, kept where a transient status message
+        // cannot reach it.
+        //
+        // Until 1.4.3 there was one `status_msg` and everything wrote to
+        // it, so "playing at 24-bit through WASAPI exclusive" survived
+        // until the next tag save or cache eviction wanted to say something
+        // — and the state that matters most is exactly the one you want to
+        // still be able to read a minute later.
+        let present = self.engine.as_ref().map(|e| e.bp_state.presentation());
+        if let Some(present) = present
+            && self.play_state != PlayState::Stopped
+        {
+            let dark = ui.visuals().dark_mode;
+            let head = match present.badge {
+                bitperfect::state::Badge::PayloadExact => pal::ok(dark),
+                bitperfect::state::Badge::ValueExact => pal::accent(dark),
+                bitperfect::state::Badge::Processed
+                | bitperfect::state::Badge::Unverified
+                | bitperfect::state::Badge::Faulted
+                | bitperfect::state::Badge::Failed => pal::warn(dark),
+                _ => pal::text_dim(dark),
+            };
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(RichText::new(&present.headline).size(11.0).color(head));
+            });
+            for line in &present.detail {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(line).size(11.0).color(pal::text_dim(dark)));
+                });
+            }
+        }
+
+        if !self.status.text().is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(RichText::new(self.status.text()).size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
+            });
+        }
+    }
+
+    /// Playlist store bar, filter, sort and the playlist itself.
+    /// Loads saved playlist `i` in place of the queue.
+    pub(crate) fn load_saved_playlist(&mut self, i: usize) {
+        let paths = self.playlist_store[i].paths.clone();
+        self.stop();
+        self.playlist = paths.into_iter().map(Track::load).collect();
+        self.current_index = None;
+        self.selected.clear();
+        self.last_clicked = None;
+        self.active_saved_playlist = Some(i);
+        self.show_save_playlist_input = false;
+    }
+
+    /// Saves the queue under the typed name; nothing for an empty name.
+    pub(crate) fn save_named_playlist(&mut self) {
+        let name = self.playlist_name_buf.trim().to_string();
+        if !name.is_empty() {
+            let paths = self.playlist.iter().map(|t| t.path.clone()).collect();
+            self.playlist_store.push(SavedPlaylist { name, paths });
+            self.active_saved_playlist = Some(self.playlist_store.len() - 1);
+            save_playlist_store(&self.playlist_store);
+            self.show_save_playlist_input = false;
+            self.playlist_name_buf.clear();
+        }
+    }
+
+    fn playlist_ui(&mut self, ui: &mut egui::Ui) {
+        // ── Playlist store bar ──────────────────────────────────────
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            let selected_text = self.active_saved_playlist
+                .and_then(|i| self.playlist_store.get(i))
+                .map(|p| p.name.as_str())
+                .unwrap_or("— unsaved —")
+                .to_string();
+            egui::ComboBox::from_id_salt("pl_combo")
+                .selected_text(&selected_text)
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(self.active_saved_playlist.is_none(), "— unsaved —").clicked() {
+                        self.active_saved_playlist = None;
+                    }
+                    for i in 0..self.playlist_store.len() {
+                        let name = self.playlist_store[i].name.clone();
+                        let is_sel = self.active_saved_playlist == Some(i);
+                        if ui.selectable_label(is_sel, &name).clicked() {
+                            self.load_saved_playlist(i);
+                        }
+                    }
+                });
+            ui.add_space(4.0);
+            if let Some(idx) = self.active_saved_playlist {
+                if !self.playlist.is_empty()
+                    && ui.small_button("🔄 Update").on_hover_text("Overwrite saved playlist").clicked()
+                {
+                    let paths: Vec<PathBuf> = self.playlist.iter().map(|t| t.path.clone()).collect();
+                    self.playlist_store[idx].paths = paths;
+                    save_playlist_store(&self.playlist_store);
+                }
+                ui.add_space(2.0);
+                if ui.small_button(RichText::new("🗑").color(Color32::from_rgb(200, 80, 80)))
+                    .on_hover_text("Delete saved playlist").clicked()
+                {
+                    self.playlist_store.remove(idx);
+                    self.active_saved_playlist = None;
+                    save_playlist_store(&self.playlist_store);
+                }
+                ui.add_space(4.0);
+            }
+            if !self.playlist.is_empty() {
+                let btn_label = if self.show_save_playlist_input { "✕" } else { "💾 Save As" };
+                if ui.small_button(btn_label).clicked() {
+                    self.show_save_playlist_input = !self.show_save_playlist_input;
+                    if self.show_save_playlist_input && self.playlist_name_buf.is_empty() {
+                        self.playlist_name_buf = "My Playlist".to_string();
+                    }
+                }
+            }
+        });
+
+        if self.show_save_playlist_input {
+            let mut do_save = false;
+            let mut do_cancel = false;
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label("Name:");
+                let te = ui.add(
+                    egui::TextEdit::singleline(&mut self.playlist_name_buf).desired_width(140.0)
+                );
+                if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    do_save = true;
+                }
+                if ui.small_button("Save").clicked() { do_save = true; }
+                if ui.small_button("Cancel").clicked() { do_cancel = true; }
+            });
+            if do_save {
+                self.save_named_playlist();
+            }
+            if do_cancel {
+                self.show_save_playlist_input = false;
+            }
+        }
+
+        self.playlist_list_ui(ui);
+    }
+
+    /// The list itself: header, filter, sort and rows.
+    pub(crate) fn playlist_list_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        ui.add_space(2.0);
+
+        // ── Playlist header ─────────────────────────────────────────
+        let n_sel = self.selected.len();
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(RichText::new(format!("Playlist  ({} tracks)", self.playlist.len()))
+                .size(13.0).color(pal::text_dim(ui.visuals().dark_mode)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                if !self.playlist.is_empty()
+                    && ui.small_button(RichText::new("Clear All").color(Color32::from_rgb(200, 80, 80))).clicked()
+                {
+                    self.stop();
+                    self.shell_playlist_cleared();
+                    self.playlist.clear();
+                    self.current_index = None;
+                    self.selected.clear();
+                    self.active_saved_playlist = None;
+                }
+                if n_sel > 0 {
+                    ui.add_space(4.0);
+                    let del_label = format!("Delete {n_sel} selected");
+                    if ui.small_button(RichText::new(del_label).color(Color32::from_rgb(220, 100, 60))).clicked() {
+                        let current_removed = self.current_index
+                            .map(|ci| self.selected.contains(&ci)).unwrap_or(false);
+                        let mut to_remove: Vec<usize> = self.selected.drain().collect();
+                        to_remove.sort_unstable_by(|a, b| b.cmp(a)); // descending: safe in-place removal
+                        for &idx in &to_remove {
+                            self.playlist.remove(idx);
+                        }
+                        if current_removed {
+                            self.stop();
+                            self.current_index = None;
+                        } else if let Some(ci) = self.current_index {
+                            let removed_before = to_remove.iter().filter(|&&r| r < ci).count();
+                            self.current_index = Some(ci - removed_before);
+                        }
+                        self.last_clicked = None;
+                    }
+                }
+            });
+        });
+        ui.separator();
+
+        // ── Drag / selection tracking ────────────────────────────────
+        let dragging = self.drag_src.is_some();
+        let pointer_released = ctx.input(|i| i.pointer.primary_released());
+        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        let shift_held = ctx.input(|i| i.modifiers.shift);
+
+        let mut play_requested: Option<usize> = None;
+        let mut drag_started_at: Option<usize> = None;
+        let mut click_action: Option<(usize, bool, bool)> = None;
+
+        let n = self.playlist.len();
+        const ROW_H: f32 = 32.0;
+        let mut new_drop_row = n;
+        let mut last_row_bottom: Option<(f32, f32, f32)> = None; // (left, right, y)
+
+        // ── Search / filter ─────────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.label("🔍");
+            ui.add(egui::TextEdit::singleline(&mut self.filter_query)
+                .id(egui::Id::new("playlist_filter"))
+                .hint_text(RichText::new("Filter by title, artist, or album…  (Ctrl+F)")
+                    .color(pal::text_faint(ui.visuals().dark_mode)))
+                // Narrow, it gives way to the sort row instead of running under it.
+                .desired_width((ui.available_width() - 340.0).clamp(80.0, 240.0)));
+            if !self.filter_query.is_empty()
+                && ui.small_button("✕").on_hover_text("Clear filter (Esc)").clicked() {
+                self.filter_query.clear();
+            }
+
+            // ── Sort columns (pushed to the right) ───────────────────
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut sort_click: Option<SortKey> = None;
+                // right_to_left: add in reverse so they read Title→Time.
+                for key in SortKey::ALL.iter().rev() {
+                    let active = self.sort_key == Some(*key);
+                    let arrow = if active { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
+                    if ui.selectable_label(active,
+                        RichText::new(format!("{}{}", key.label(), arrow)).size(12.0))
+                        .on_hover_text("Sort by this column (click again to reverse)")
+                        .clicked()
+                    {
+                        sort_click = Some(*key);
+                    }
+                }
+                ui.label(RichText::new("Sort:").size(11.0)
+                    .color(pal::text_faint(ui.visuals().dark_mode)));
+                if let Some(k) = sort_click { self.sort_playlist(k); }
+            });
+        });
+        ui.add_space(2.0);
+
+        // Real playlist indices to display: all rows, or only those matching
+        // the filter. Filtering disables drag-reorder (an ambiguous op on a
+        // subset), so with no filter this is the identity 0..n and every
+        // path below behaves exactly as before.
+        let q = self.filter_query.trim().to_lowercase();
+        let filtering = !q.is_empty();
+        let visible: Vec<usize> = if filtering {
+            (0..n).filter(|&i| {
+                let t = &self.playlist[i];
+                t.title.to_lowercase().contains(&q)
+                    || t.artist.to_lowercase().contains(&q)
+                    || t.album.to_lowercase().contains(&q)
+            }).collect()
+        } else {
+            (0..n).collect()
+        };
+        let vn = visible.len();
+
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, vn, |ui, rows| {
+            if self.playlist.is_empty() {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("No tracks loaded").size(15.0).color(pal::text_faint(ui.visuals().dark_mode)));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Click \"+ Add Files\" to get started").size(12.0).color(pal::text_faint(ui.visuals().dark_mode)));
+                });
+                return;
+            }
+            if visible.is_empty() {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new(format!("No tracks match “{}”", self.filter_query.trim()))
+                        .size(14.0).color(pal::text_faint(ui.visuals().dark_mode)));
+                });
+                return;
+            }
+
+            let available_w = ui.available_width();
+
+            // A drag can only target rows that are on screen (there is no
+            // auto-scroll), so scanning the visible range is sufficient.
+            // If the pointer is above the first visible row, drop there.
+            if dragging
+                && let Some(pp) = pointer_pos
+                && pp.y < ui.max_rect().top() {
+                new_drop_row = rows.start;
+            }
+            let rows_end = rows.end;
+
+            for row in rows {
+                let i = visible[row];
+                let track_title  = self.playlist[i].display_title().to_string();
+                let track_artist = self.playlist[i].artist.clone();
+                let track_dur    = self.playlist[i].duration;
+                let play_count   = self.stats.get(&self.playlist[i].path).map(|s| s.count).unwrap_or(0);
+                let show_count   = self.appearance.show_play_count;
+                let is_current        = self.current_index == Some(i);
+                let is_selected       = self.selected.contains(&i);
+                let is_being_dragged  = self.drag_src == Some(i);
+                let dark = ui.visuals().dark_mode;
+
+                let base_color = if is_selected {
+                    pal::row_selected(dark)
+                } else if is_current {
+                    pal::row_current(dark)
+                } else if i % 2 == 0 {
+                    pal::row_even(dark)
+                } else {
+                    pal::row_odd(dark)
+                };
+
+                let (rect, response) = ui.allocate_exact_size(
+                    Vec2::new(available_w, ROW_H),
+                    egui::Sense::click_and_drag(),
+                );
+
+                // Determine drop position: first row whose center is below pointer
+                if dragging
+                    && let Some(pp) = pointer_pos
+                    && pp.y <= rect.center().y && new_drop_row == n {
+                    new_drop_row = i;
+                }
+
+                // Insertion line before this row
+                if dragging {
+                    let src = self.drag_src;
+                    let no_op = src == Some(i) || src.map(|s| s + 1) == Some(i);
+                    if self.drag_over_row == Some(i) && !no_op {
+                        ui.painter().line_segment(
+                            [egui::Pos2::new(rect.left(), rect.top()),
+                             egui::Pos2::new(rect.right(), rect.top())],
+                            egui::Stroke::new(2.0, pal::accent(dark)),
+                        );
+                    }
+                }
+
+                if ui.is_rect_visible(rect) {
+                    let alpha = if is_being_dragged { 80u8 } else { 255u8 };
+                    let c = base_color;
+                    ui.painter().rect_filled(
+                        rect, 0.0,
+                        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha),
+                    );
+                    // A slim accent bar marks the track that's playing.
+                    if is_current {
+                        let bar = egui::Rect::from_min_max(
+                            rect.left_top(),
+                            egui::Pos2::new(rect.left() + 3.0, rect.bottom()),
+                        );
+                        ui.painter().rect_filled(bar, 0.0, self.track_accent);
+                    }
+
+                    let inner = rect.shrink2(Vec2::new(10.0, 0.0));
+                    let cy = rect.center().y;
+
+                    // Drag handle — 2×3 dot grid, no font dependency. The
+                    // shell has the playing row dance there instead.
+                    if !(is_current && self.shell_row_eq(ui.painter(), egui::Pos2::new(inner.min.x + 6.0, cy))) {
+                        for col in [0.0f32, 4.0] {
+                            for row in [-4.0f32, 0.0, 4.0] {
+                                ui.painter().circle_filled(
+                                    egui::Pos2::new(inner.min.x + 4.0 + col, cy + row),
+                                    1.5,
+                                    Color32::from_gray(75),
+                                );
+                            }
+                        }
+                    }
+
+                    // ── Album art thumbnail ───────────────────────────
+                    let show_art = self.spectrum_window.art_settings.playlist_show;
+                    let art_offset = if show_art { 34.0f32 } else { 0.0 };
+                    if show_art {
+                        let thumb_size = 28.0;
+                        let thumb_x = inner.min.x + 14.0;
+                        let thumb_y = cy - thumb_size / 2.0;
+                        let thumb_rect = egui::Rect::from_min_size(
+                            egui::Pos2::new(thumb_x, thumb_y),
+                            Vec2::splat(thumb_size),
+                        );
+                        let track_path = &self.playlist[i].path;
+                        let art = self.art_cache.get_or_load(track_path, ctx);
+                        if let Some((tex_id, art_w, art_h)) = art {
+                            let art_rect = fit_rect_preserve(thumb_rect, art_w, art_h);
+                            ui.painter().image(
+                                tex_id, art_rect,
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+
+                            // Hover detection — show full art after 1s
+                            let over = ctx.pointer_hover_pos()
+                                .map_or(false, |p| thumb_rect.contains(p));
+                            if over {
+                                match self.art_hover {
+                                    Some((idx, _)) if idx == i => {}
+                                    _ => self.art_hover = Some((i, Instant::now())),
+                                }
+                                // Keep repainting so the timer fires without needing mouse movement
+                                ctx.request_repaint();
+                            } else if self.art_hover.map_or(false, |(idx, _)| idx == i) {
+                                self.art_hover = None;
+                            }
+
+                            if let Some((hi, since)) = self.art_hover {
+                                if hi == i && since.elapsed().as_secs_f32() >= 1.0 {
+                                    let max_dim = 512.0f32;
+                                    let aspect = art_w as f32 / art_h.max(1) as f32;
+                                    let (pw, ph) = if aspect >= 1.0 {
+                                        (max_dim, max_dim / aspect)
+                                    } else {
+                                        (max_dim * aspect, max_dim)
+                                    };
+                                    let screen = ctx.screen_rect();
+                                    let px = (thumb_rect.right() + 8.0)
+                                        .min(screen.right() - pw - 4.0);
+                                    let py = (thumb_rect.center().y - ph / 2.0)
+                                        .clamp(screen.top() + 4.0, screen.bottom() - ph - 4.0);
+                                    egui::Area::new(egui::Id::new("art_hover_popup"))
+                                        .fixed_pos(egui::Pos2::new(px, py))
+                                        .order(egui::Order::Tooltip)
+                                        .interactable(false)
+                                        .show(ctx, |ui| {
+                                            let (_, r) = ui.allocate_space(Vec2::new(pw, ph));
+                                            ui.painter().rect_filled(r.expand(2.0), 3.0, Color32::from_black_alpha(100));
+                                            ui.painter().image(
+                                                tex_id, r,
+                                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                                                Color32::WHITE,
+                                            );
+                                        });
+                                }
+                            }
+                        } else if self.spectrum_window.art_settings.playlist_placeholder {
+                            ui.painter().rect_filled(thumb_rect, 3.0, Color32::from_gray(35));
+                            ui.painter().text(
+                                thumb_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "♪",
+                                egui::FontId::proportional(14.0),
+                                Color32::from_gray(70),
+                            );
+                        }
+                    }
+
+                    // Track number
+                    ui.painter().text(
+                        egui::Pos2::new(inner.min.x + 24.0 + art_offset, cy),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{}", i + 1),
+                        egui::FontId::proportional(12.0),
+                        if is_current { self.track_accent } else { pal::text_faint(dark) },
+                    );
+
+                    // Title
+                    let title_x = inner.min.x + 42.0 + art_offset;
+                    let title_w = (inner.width() * 0.45 - art_offset).max(0.0);
+                    paint_one_line(ui, egui::Pos2::new(title_x, cy), &track_title,
+                        name_font(&track_title, 13.0),
+                        if is_current { pal::text_strong(dark) } else { pal::text(dark) }, title_w);
+
+                    // Play count (optional) — sits left of the duration.
+                    let dur_right = if show_count { inner.max.x - 52.0 } else { inner.max.x - 8.0 };
+
+                    // Artist, up to the duration.
+                    let artist_x = title_x + title_w + 8.0;
+                    paint_one_line(ui, egui::Pos2::new(artist_x, cy), &track_artist,
+                        name_font(&track_artist, 12.0), pal::text_dim(dark), dur_right - 48.0 - artist_x);
+                    if show_count {
+                        ui.painter().text(
+                            egui::Pos2::new(inner.max.x - 8.0, cy),
+                            egui::Align2::RIGHT_CENTER,
+                            if play_count > 0 { format!("▶{play_count}") } else { "–".to_string() },
+                            egui::FontId::proportional(11.0),
+                            if play_count > 0 { pal::text_dim(dark) } else { pal::text_faint(dark) },
+                        );
+                    }
+
+                    // Duration
+                    if let Some(dur) = track_dur {
+                        ui.painter().text(
+                            egui::Pos2::new(dur_right, cy),
+                            egui::Align2::RIGHT_CENTER,
+                            Self::format_duration(dur),
+                            egui::FontId::monospace(12.0),
+                            pal::text_faint(dark),
+                        );
+                    }
+
+                    if response.hovered() && !is_being_dragged {
+                        let hl = if dark {
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 8)
+                        } else {
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 12)
+                        };
+                        ui.painter().rect_filled(rect, 0.0, hl);
+                    }
+                }
+
+                // Drag start (reorder is disabled while filtering — a subset
+                // has no unambiguous drop position in the full list).
+                if response.drag_started() && !dragging && !filtering {
+                    drag_started_at = Some(i);
+                }
+
+                // Click (only when not starting a drag)
+                if !dragging && !response.drag_started() {
+                    if response.double_clicked() {
+                        play_requested = Some(i);
+                    } else if response.clicked() {
+                        click_action = Some((i, ctrl_held, shift_held));
+                    }
+                }
+
+                last_row_bottom = Some((rect.left(), rect.right(), rect.bottom()));
+            }
+
+            // Pointer below every visible row's center → the drop target is
+            // the first row just past the visible range (matches the old
+            // full-scan behavior; equals n when scrolled to the bottom).
+            if dragging && pointer_pos.is_some() && new_drop_row == n && rows_end < n {
+                new_drop_row = rows_end;
+            }
+
+            // Insertion line at end of list
+            if dragging
+                && let (Some((rx0, rx1, ry)), Some(drop)) = (last_row_bottom, self.drag_over_row) {
+                let src = self.drag_src;
+                let no_op = src.map(|s| s + 1) == Some(n);
+                if drop == n && !no_op {
+                    ui.painter().line_segment(
+                        [egui::Pos2::new(rx0, ry), egui::Pos2::new(rx1, ry)],
+                        egui::Stroke::new(2.0, pal::accent(ui.visuals().dark_mode)),
+                    );
+                }
+            }
+        });
+
+        // ── Apply drag start ─────────────────────────────────────────
+        if let Some(i) = drag_started_at {
+            self.drag_src = Some(i);
+            self.selected.clear();
+        }
+        if dragging {
+            self.drag_over_row = Some(new_drop_row);
+        }
+
+        // ── Finalize drag on release ──────────────────────────────────
+        if dragging && pointer_released {
+            let src = self.drag_src.take().unwrap_or(0);
+            let dst = self.drag_over_row.take().unwrap_or(n);
+            if src != dst && src + 1 != dst && dst <= n {
+                let track = self.playlist.remove(src);
+                let insert_at = if dst > src { dst - 1 } else { dst };
+                self.playlist.insert(insert_at, track);
+                self.current_index = self.current_index.map(|ci| {
+                    if ci == src              { insert_at }
+                    else if src < ci && ci < dst { ci - 1 }
+                    else if dst <= ci && ci < src { ci + 1 }
+                    else                      { ci }
+                });
+            }
+        }
+
+        // ── Apply click selection ─────────────────────────────────────
+        if let Some(idx) = play_requested {
+            self.play_index(idx);
+        }
+        if let Some((i, ctrl, shift)) = click_action {
+            if ctrl {
+                if self.selected.contains(&i) { self.selected.remove(&i); }
+                else { self.selected.insert(i); }
+                self.last_clicked = Some(i);
+            } else if shift {
+                let anchor = self.last_clicked.unwrap_or(i);
+                let (lo, hi) = if anchor <= i { (anchor, i) } else { (i, anchor) };
+                for j in lo..=hi { self.selected.insert(j); }
+                self.last_clicked = Some(i);
+            } else {
+                self.selected.clear();
+                self.selected.insert(i);
+                self.last_clicked = Some(i);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7338,81 +9291,93 @@ fn load_playlist_store() -> Vec<SavedPlaylist> {
         .unwrap_or_default()
 }
 
-fn row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(egui::RichText::new(label).color(pal::text_dim(ui.visuals().dark_mode)).size(12.0));
-    ui.label(egui::RichText::new(value).size(12.0));
+fn row(ui: &mut egui::Ui, modern: bool, label: &str, value: &str) {
+    let size = if modern { 12.5 } else { 12.0 };
+    ui.label(egui::RichText::new(label).color(pal::text_dim(ui.visuals().dark_mode)).size(size));
+    ui.label(egui::RichText::new(value).size(size));
     ui.end_row();
 }
 
-fn section(ui: &mut egui::Ui, heading: &str) {
-    ui.separator();
-    ui.label(egui::RichText::new(heading).strong().size(13.0).color(pal::accent(ui.visuals().dark_mode)));
+/// A heading in the Info grid: the 1.6.0 look sets it like the settings
+/// drawer's (small capitals, spaced), the classic one as an accent rule.
+fn section(ui: &mut egui::Ui, modern: bool, heading: &str) {
+    if modern {
+        ui.vertical(|ui| {
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new(heading.to_uppercase()).size(11.0).strong()
+                .color(pal::text_dim(ui.visuals().dark_mode)).extra_letter_spacing(0.8));
+        });
+    } else {
+        ui.separator();
+        ui.label(egui::RichText::new(heading).strong().size(13.0).color(pal::accent(ui.visuals().dark_mode)));
+    }
     ui.end_row();
 }
 
-fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectral_ceiling: Option<SpectralCeiling>, analysis: Option<&TrackAnalysis>) {
+fn show_track_info(ui: &mut egui::Ui, modern: bool, t: &Track, stat: Option<PlayStat>, spectral_ceiling: Option<SpectralCeiling>, analysis: Option<&TrackAnalysis>) {
     use egui::Grid;
 
     let codec  = t.codec;
     let lossy  = t.lossless != Some(true);
     let fname  = t.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
 
-    Grid::new("info_grid").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
+    let spacing = if modern { [20.0, 6.0] } else { [12.0, 4.0] };
+    Grid::new("info_grid").num_columns(2).spacing(spacing).striped(!modern).show(ui, |ui| {
         // ── File ────────────────────────────────────────────────────────
-        section(ui, "File");
-        row(ui, "Filename", fname);
-        row(ui, "Size",     &fmt_size(t.file_size));
-        row(ui, "Format",   codec);
-        row(ui, "Lossless", match t.lossless { Some(true) => "Yes", Some(false) => "No (lossy)", None => "Unknown" });
+        section(ui, modern, "File");
+        row(ui, modern, "Filename", fname);
+        row(ui, modern, "Size",     &fmt_size(t.file_size));
+        row(ui, modern, "Format",   codec);
+        row(ui, modern, "Lossless", match t.lossless { Some(true) => "Yes", Some(false) => "No (lossy)", None => "Unknown" });
 
         // ── History ─────────────────────────────────────────────────────
-        section(ui, "History");
+        section(ui, modern, "History");
         let s = stat.unwrap_or_default();
-        row(ui, "Play count", &s.count.to_string());
-        row(ui, "Last played", &if s.count == 0 { "Never".to_string() } else { fmt_ago(s.last) });
+        row(ui, modern, "Play count", &s.count.to_string());
+        row(ui, modern, "Last played", &if s.count == 0 { "Never".to_string() } else { fmt_ago(s.last) });
 
         // ── Stream ──────────────────────────────────────────────────────
-        section(ui, "Stream");
+        section(ui, modern, "Stream");
         let is_dsd = t.bit_depth == Some(1);
-        row(ui, "Sample Rate", &t.sample_rate.map(|sr| if is_dsd {
+        row(ui, modern, "Sample Rate", &t.sample_rate.map(|sr| if is_dsd {
                                     format!("{} Hz  ({} — {})", sr, dsd::rate_label(sr), dsd::fmt_mhz(sr))
                                 } else {
                                     format!("{} Hz  ({})", sr, fmt_hz(sr))
                                 }).unwrap_or_else(|| "Unknown".into()));
-        row(ui, "Bit Depth",   &t.bit_depth.map(|b| if is_dsd { format!("{b} bit  (DSD)") }
+        row(ui, modern, "Bit Depth",   &t.bit_depth.map(|b| if is_dsd { format!("{b} bit  (DSD)") }
                                                     else { format!("{b} bit") })
                                             .unwrap_or_else(|| "Unknown".into()));
-        row(ui, "Channels",    &t.channels.map(|c| format!("{c}  ({})", channel_layout(c)))
+        row(ui, modern, "Channels",    &t.channels.map(|c| format!("{c}  ({})", channel_layout(c)))
                                            .unwrap_or_else(|| "Unknown".into()));
-        row(ui, "Duration",    &t.duration.map(|d| {
+        row(ui, modern, "Duration",    &t.duration.map(|d| {
                                     let s = d.as_secs();
                                     format!("{:02}:{:02}", s / 60, s % 60)
                                 }).unwrap_or_else(|| "--:--".into()));
-        row(ui, "Avg Bitrate", &t.bitrate.map(|b| format!("{b} kbps"))
+        row(ui, modern, "Avg Bitrate", &t.bitrate.map(|b| format!("{b} kbps"))
                                           .unwrap_or_else(|| "Unknown".into()));
 
         // ── Tags ────────────────────────────────────────────────────────
-        section(ui, "Tags");
-        row(ui, "Title",    &t.title);
-        row(ui, "Artist",   &t.artist);
-        row(ui, "Album",    &t.album);
-        row(ui, "Year",     &t.year.map(|y| y.to_string()).unwrap_or_else(|| "—".into()));
-        row(ui, "Genre",    t.genre.as_deref().unwrap_or("—"));
-        row(ui, "Track #",  &t.track_number.map(|n| n.to_string()).unwrap_or_else(|| "—".into()));
+        section(ui, modern, "Tags");
+        row(ui, modern, "Title",    &t.title);
+        row(ui, modern, "Artist",   &t.artist);
+        row(ui, modern, "Album",    &t.album);
+        row(ui, modern, "Year",     &t.year.map(|y| y.to_string()).unwrap_or_else(|| "—".into()));
+        row(ui, modern, "Genre",    t.genre.as_deref().unwrap_or("—"));
+        row(ui, modern, "Track #",  &t.track_number.map(|n| n.to_string()).unwrap_or_else(|| "—".into()));
 
         // ── Inferred ────────────────────────────────────────────────────
-        section(ui, "Inferred");
+        section(ui, modern, "Inferred");
 
         // Raw stream throughput
         if let (Some(sr), Some(ch), Some(bd)) = (t.sample_rate, t.channels, t.bit_depth) {
             let kbps = sr as u64 * ch as u64 * bd as u64 / 1000;
-            row(ui, if is_dsd { "DSD throughput" } else { "PCM throughput" },
+            row(ui, modern, if is_dsd { "DSD throughput" } else { "PCM throughput" },
                 &format!("{kbps} kbps  ({sr} × {ch} ch × {bd} bit)"));
         }
 
         // Nyquist
         if let Some(sr) = t.sample_rate {
-            row(ui, "Nyquist limit", &format!("{} Hz", sr / 2));
+            row(ui, modern, "Nyquist limit", &format!("{} Hz", sr / 2));
         }
 
         // Lossless-only: uncompressed size + compression ratio
@@ -7422,20 +9387,20 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectra
         {
             // Bit-based so 1-bit DSD doesn't truncate to zero.
             let uncompressed = sr as u64 * ch as u64 * bd as u64 * dur.as_secs() / 8;
-            row(ui, "Uncompressed", &fmt_size(uncompressed));
+            row(ui, modern, "Uncompressed", &fmt_size(uncompressed));
             if uncompressed > 0 && t.file_size > 0 {
                 let ratio = t.file_size as f64 / uncompressed as f64 * 100.0;
-                row(ui, "Compression ratio", &format!("{ratio:.1}%  of uncompressed"));
+                row(ui, modern, "Compression ratio", &format!("{ratio:.1}%  of uncompressed"));
             }
         }
 
         // Spectral ceiling + rolloff analysis
         match spectral_ceiling {
-            None => { row(ui, "Spectral ceiling", "Analyzing…"); }
+            None => { row(ui, modern, "Spectral ceiling", "Analyzing…"); }
             Some(sc) => {
                 let hz_str = if sc.hz >= 1000.0 { format!("{:.1} kHz", sc.hz / 1000.0) }
                              else { format!("{:.0} Hz", sc.hz) };
-                row(ui, "Spectral ceiling", &hz_str);
+                row(ui, modern, "Spectral ceiling", &hz_str);
 
                 let rolloff_str = if sc.rolloff_octaves.is_finite() {
                     if sc.rolloff_octaves < 0.35 {
@@ -7448,7 +9413,7 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectra
                 } else {
                     "No clear cutoff  —  gradual".to_string()
                 };
-                row(ui, "Rolloff shape", &rolloff_str);
+                row(ui, modern, "Rolloff shape", &rolloff_str);
 
                 // Upsampling verdict — only flag when rolloff is steep AND ceiling
                 // matches a standard Nyquist AND the file's SR is higher than that.
@@ -7465,32 +9430,32 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectra
                 } else {
                     "OK — natural rolloff".to_string()
                 };
-                row(ui, "Hi-res check", &verdict);
+                row(ui, modern, "Hi-res check", &verdict);
             }
         }
 
         // ── Loudness & Dynamics ─────────────────────────────────────────
         if let Some(a) = analysis {
-            section(ui, "Loudness & Dynamics");
+            section(ui, modern, "Loudness & Dynamics");
             let lufs_str = if a.integrated_lufs.is_finite() {
                 format!("{:.1} LUFS", a.integrated_lufs)
             } else { "—".to_string() };
-            row(ui, "Integrated loudness", &lufs_str);
-            row(ui, "DR score", &format!("DR {:02}", a.dr_score));
-            row(ui, "Peak level", &format!("{:.1} dBFS", a.peak_dbfs));
+            row(ui, modern, "Integrated loudness", &lufs_str);
+            row(ui, modern, "DR score", &format!("DR {:02}", a.dr_score));
+            row(ui, modern, "Peak level", &format!("{:.1} dBFS", a.peak_dbfs));
             let clip_str = if a.clip_count == 0 {
                 "None".to_string()
             } else {
                 format!("{} sample{}", a.clip_count, if a.clip_count == 1 { "" } else { "s" })
             };
-            row(ui, "Clipping", &clip_str);
+            row(ui, modern, "Clipping", &clip_str);
 
             // ── Musical ─────────────────────────────────────────────────
-            section(ui, "Musical");
+            section(ui, modern, "Musical");
             let bpm_str = if a.bpm > 0.0 { format!("{:.0} BPM", a.bpm) } else { "—".to_string() };
-            row(ui, "Estimated BPM", &bpm_str);
+            row(ui, modern, "Estimated BPM", &bpm_str);
             let key_str = if a.key_name.is_empty() { "—".to_string() } else { a.key_name.clone() };
-            row(ui, "Detected key", &key_str);
+            row(ui, modern, "Detected key", &key_str);
         }
     });
 
@@ -7498,8 +9463,14 @@ fn show_track_info(ui: &mut egui::Ui, t: &Track, stat: Option<PlayStat>, spectra
     if let Some(a) = analysis
         && !a.loudness_history.is_empty() {
         ui.add_space(8.0);
-            ui.label(egui::RichText::new("Loudness History (per second)")
-                .size(12.0).color(pal::accent(ui.visuals().dark_mode)));
+            if modern {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("LOUDNESS HISTORY (PER SECOND)").size(11.0).strong()
+                    .color(pal::text_dim(ui.visuals().dark_mode)).extra_letter_spacing(0.8));
+            } else {
+                ui.label(egui::RichText::new("Loudness History (per second)")
+                    .size(12.0).color(pal::accent(ui.visuals().dark_mode)));
+            }
             ui.add_space(4.0);
 
             let plot_h = 60.0_f32;
@@ -7619,19 +9590,32 @@ impl eframe::App for MoosikApp {
             || self.spectrum_window.analyzer.analysis_active();
         // Drive frames while anything is animating (incl. a pending background
         // seek), or just to cap the spin of an open (but idle) spectrum viewport.
-        let want_frames = animating || spectrum_open;
+        // A shell transition in flight (as of the last pass) runs at the
+        // monitor's rate. Uncapped, it ran at ~1800 fps while paused: no
+        // vsync, so the frames reached the screen unevenly.
+        let shell_anim = self.appearance.visual.modern && self.shell.animating;
+        let want_frames = animating || spectrum_open || shell_anim;
         if want_frames {
             let target_fps = match (spectrum_open, animating) {
                 (true, true)  => self.spectrum_window.max_fps.max(1.0), // live spectrum
                 (true, false) => 30.0,  // open but static — just cap the spin
                 (false, _)    => 60.0,  // main-window seek bar / progress
             };
-            let frame_time = Duration::from_secs_f32(1.0 / target_fps);
-            if let Some(last) = self.last_frame {
-                let dt = last.elapsed();
-                if dt < frame_time {
-                    std::thread::sleep(frame_time - dt);
+            let target_fps = if shell_anim { target_fps.max(self.refresh_hz) } else { target_fps };
+            // The screen the window is on now: it may have been dragged to
+            // another one, or the rate changed in Windows' settings.
+            if self.refresh_checked.is_none_or(|t| t.elapsed().as_secs_f32() > 1.0) {
+                self.refresh_checked = Some(Instant::now());
+                let at = ctx.input(|i| i.viewport().outer_rect.map(|r| {
+                    let c = r.center() * i.pixels_per_point;
+                    (c.x as i32, c.y as i32)
+                }));
+                if let Some(hz) = monitor_refresh_hz_at(at) {
+                    self.refresh_hz = hz.clamp(30.0, 240.0);
                 }
+            }
+            if let Some(last) = self.last_frame {
+                pace_frame(last, target_fps, self.refresh_hz);
             }
             self.last_frame = Some(Instant::now());
             // Keep the loop running at our paced rate. We've already slept, so
@@ -7692,7 +9676,7 @@ impl eframe::App for MoosikApp {
 
             if space       { self.toggle_play_pause(); }
             if ctrl_left   { self.prev_track(); }
-            if ctrl_right  { self.next_track(); }
+            if ctrl_right  { self.skip_next(); }
             if arrow_left  {
                 let pos = self.elapsed().saturating_sub(Duration::from_secs(5));
                 if self.current_index.is_some() {
@@ -7829,9 +9813,14 @@ impl eframe::App for MoosikApp {
         if self.play_state == PlayState::Playing {
             // A-B repeat keeps playback inside the current track: loop back to A
             // at B, and skip all advance / gapless logic while it's active.
+            // Read every tick, so a claim made while nothing was waiting for one
+            // (an A-B loop, a seek) is never taken later for a hand-off.
+            let shared = self.engine.as_ref().map(|e| !e.on_bp_stream()).unwrap_or(false);
+            let claimed = shared && self.engine.as_mut().is_some_and(|e| e.tap_claimed_since());
             if let (Some(a), Some(b)) = (self.ab_a, self.ab_b) {
                 if self.elapsed() >= b {
                     self.seek_to(a);
+                    self.shell.ab_laps += 1;
                 }
             } else {
                 // Bit-perfect: the device reports exact frame boundaries as it
@@ -7858,14 +9847,34 @@ impl eframe::App for MoosikApp {
                 // here that could notice. The bit-perfect path is different in
                 // kind: it counts frames the device has actually taken and the
                 // render thread crosses at the sample.
-                let normal_crossed = self.gapless_next.is_some()
-                    && self.engine.as_ref().map(|e| !e.on_bp_stream()).unwrap_or(false)
-                    && self.current_index
-                        .and_then(|i| self.playlist.get(i)).and_then(|t| t.duration)
-                        .map(|d| self.elapsed() >= d).unwrap_or(false);
-                if normal_crossed {
+                //
+                // So the hand-off is now read off the tap where it can be: a
+                // queued track's tap claims when the mixer first pulls from
+                // it, and counts the frames pulled since. The declared length
+                // only stands in if no claim ever comes. Timed by the tag
+                // alone, every lap of Repeat One added the tag's error to the
+                // clock, and the spectrum drifted away from the music.
+                let overdue = self.current_index
+                    .and_then(|i| self.playlist.get(i)).and_then(|t| t.duration)
+                    .is_some_and(|d| self.elapsed() >= d + Duration::from_secs(5));
+                if let Some(next) = self.gapless_next
+                    && shared
+                    && (claimed || overdue)
+                {
+                    if claimed {
+                        let sr = self.playlist.get(next).and_then(|t| t.sample_rate)
+                            .or_else(|| self.engine.as_ref().map(|e| e.last_sample_rate))
+                            .unwrap_or(44_100);
+                        if let Some(e) = self.engine.as_mut() {
+                            let frames = e.tap_played_frames();
+                            e.handoff_at = Some(Duration::from_secs_f64(frames as f64 / sr.max(1) as f64));
+                        }
+                    } else {
+                        mlog!("handoff shared: no claim from the queued track; going by the declared length");
+                    }
                     self.gapless_rollover();
                 }
+
 
                 // A stream that reached the end of its source advances —
                 // unless the sleep timer is set to stop at the end of this
@@ -7954,6 +9963,7 @@ impl eframe::App for MoosikApp {
         // (incl. the spectrogram fed inside tick()) use the selected palette.
         self.spectrum_window.palette_kind = self.appearance.spectrum_palette;
         self.spectrum_window.palette_accent = self.track_accent;
+        self.shell_prepare_spectrum();
         self.spectrum_window.tick(elapsed_secs, is_playing);
         // Update current art for the spectrum window (loads it if needed), then
         // refresh the per-track accent now that the art is available.
@@ -7993,9 +10003,9 @@ impl eframe::App for MoosikApp {
                     close = true;
                     return;
                 }
-                egui::CentralPanel::default().show(vp_ctx, |ui| {
+                egui::CentralPanel::default().frame(self.window_frame(vp_ctx)).show(vp_ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        show_track_info(ui, &track, self.stats.get(&track.path).cloned(), self.spectrum_window.spectral_ceiling.clone(), self.spectrum_window.track_analysis.as_ref());
+                        show_track_info(ui, self.appearance.visual.modern, &track, self.stats.get(&track.path).cloned(), self.spectrum_window.spectral_ceiling.clone(), self.spectrum_window.track_analysis.as_ref());
                     });
                 });
             });
@@ -8015,6 +10025,7 @@ impl eframe::App for MoosikApp {
                 }
             });
             // The window never touches playback; it reports what it wants.
+            self.lyrics_window.page_fill = self.page_fill();
             if let lyrics::ui::LyricsAction::Seek(to) =
                 self.lyrics_window.ui(ctx, tref, pos)
             {
@@ -8043,1636 +10054,73 @@ impl eframe::App for MoosikApp {
             && let Some(i) = self.current_index
         {
             let (path, title) = (self.playlist[i].path.clone(), self.playlist[i].title.clone());
+            self.tag_window.page_fill = self.page_fill();
             if self.tag_window.ui(ctx, Some(&path), &title) {
                 // Tags changed on disk — the playlist row is now stale.
                 self.playlist[i] = Track::load(path);
             }
         }
 
-        // ---------------------------------------------------------------
-        // Top panel – now playing metadata
-        // ---------------------------------------------------------------
-        egui::TopBottomPanel::top("now_playing").min_height(70.0).show(ctx, |ui| {
-            ui.add_space(8.0);
-            if let Some(idx) = self.current_index {
-                let track = &self.playlist[idx];
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    let dark = ui.visuals().dark_mode;
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&track.title).size(18.0).strong().color(pal::text_strong(dark)));
-                        ui.label(
-                            RichText::new(format!("{} — {}", track.artist, track.album))
-                                .size(13.0)
-                                .color(pal::text_dim(dark)),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if self.appearance.visual.modern {
+            self.shell_ui(ctx);
+        } else {
+            // ---------------------------------------------------------------
+            // Top panel – now playing metadata
+            // ---------------------------------------------------------------
+            egui::TopBottomPanel::top("now_playing").min_height(70.0).show(ctx, |ui| {
+                ui.add_space(8.0);
+                if let Some(idx) = self.current_index {
+                    let track = &self.playlist[idx];
+                    ui.horizontal(|ui| {
                         ui.add_space(12.0);
                         let dark = ui.visuals().dark_mode;
-                        let (state_icon, state_col) = match self.play_state {
-                            PlayState::Playing => ("▶ Playing", self.track_accent),
-                            PlayState::Paused  => ("⏸ Paused",  pal::amber(dark)),
-                            PlayState::Stopped => ("⏹ Stopped", pal::muted(dark)),
-                        };
-                        ui.label(RichText::new(state_icon).size(13.0).color(state_col));
-                    });
-                });
-            } else {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("No track loaded").size(16.0).color(pal::text_faint(ui.visuals().dark_mode)));
-                });
-            }
-            ui.add_space(8.0);
-        });
-
-        // ---------------------------------------------------------------
-        // Bottom panel – controls + seek + volume
-        // ---------------------------------------------------------------
-        let panel_min_h = if self.spectrum_window.waveform.is_some() { 138.0 } else { 110.0 };
-        egui::TopBottomPanel::bottom("controls").min_height(panel_min_h).show(ctx, |ui| {
-            ui.add_space(10.0);
-
-            // --- Seek bar (custom painter — full panel width, reliable click/drag) ---
-            let elapsed = self.elapsed();
-            let total = self.current_duration();
-            let elapsed_str = Self::format_duration(elapsed);
-            let total_str = total
-                .map(Self::format_duration)
-                .unwrap_or_else(|| "--:--".to_string());
-
-            // Allocate the full available width for the seek row.
-            let seek_bar_h = if self.spectrum_window.waveform.is_some() { 48.0_f32 } else { 22.0_f32 };
-            let (row_rect, seek_resp) = ui.allocate_exact_size(
-                Vec2::new(ui.available_width(), seek_bar_h),
-                egui::Sense::click_and_drag(),
-            );
-
-            // Track geometry: leave room for time labels on each side.
-            let h_pad    = 10.0_f32;
-            let lbl_w    = 42.0_f32; // enough for "MM:SS" in monospace 11
-            let track_x0 = row_rect.left()  + h_pad + lbl_w + 6.0;
-            let track_x1 = row_rect.right() - h_pad - lbl_w - 6.0;
-            let track_y  = row_rect.center().y;
-
-            // 1. Sync seek_pos from engine when the user is not interacting.
-            if !self.seeking
-                && let Some(dur) = total
-                && dur.as_secs_f32() > 0.0 {
-                self.seek_pos =
-                    (elapsed.as_secs_f32() / dur.as_secs_f32()).clamp(0.0, 1.0);
-            }
-
-            // 2. Override with pointer position while the user is dragging or clicking.
-            if (seek_resp.dragged() || seek_resp.clicked())
-                && let Some(ptr) = seek_resp.interact_pointer_pos() {
-                let span = (track_x1 - track_x0).max(1.0);
-                self.seek_pos = ((ptr.x - track_x0) / span).clamp(0.0, 1.0);
-            }
-            if seek_resp.dragged() {
-                self.seeking = true;
-            }
-
-            // 3. Draw the track.
-            let painter = ui.painter_at(row_rect);
-            let dark = ui.visuals().dark_mode;
-            let fill_x = (track_x0 + self.seek_pos * (track_x1 - track_x0))
-                .clamp(track_x0, track_x1);
-
-            if let Some(wf) = self.spectrum_window.waveform.as_deref() {
-                // Waveform seek bar
-                let n = wf.len();
-                let track_w = track_x1 - track_x0;
-                let cy = track_y;
-                let max_half_h = (row_rect.height() / 2.0 - 4.0).max(1.0);
-                for (i, &rms) in wf.iter().enumerate() {
-                    let x0 = track_x0 + (i as f32 / n as f32) * track_w;
-                    let x1 = (track_x0 + ((i + 1) as f32 / n as f32) * track_w).max(x0 + 1.0);
-                    let half_h = (rms * max_half_h).max(1.0);
-                    let col_frac = (i as f32 + 0.5) / n as f32;
-                    let color = if col_frac <= self.seek_pos {
-                        self.track_accent
-                    } else {
-                        pal::wave_unplayed(dark)
-                    };
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::Pos2::new(x0, cy - half_h),
-                            egui::Pos2::new(x1, cy + half_h),
-                        ),
-                        0.0, color,
-                    );
-                }
-                // Clip markers
-                if let Some(ref analysis) = self.spectrum_window.track_analysis {
-                    let track_w = track_x1 - track_x0;
-                    for &pos in &analysis.clip_positions {
-                        let x = track_x0 + pos * track_w;
-                        painter.line_segment(
-                            [egui::Pos2::new(x, row_rect.top() + 1.0),
-                             egui::Pos2::new(x, row_rect.bottom() - 1.0)],
-                            egui::Stroke::new(1.5, pal::warn(dark)),
-                        );
-                    }
-                }
-                // Playhead line
-                painter.line_segment(
-                    [egui::Pos2::new(fill_x, row_rect.top() + 2.0),
-                     egui::Pos2::new(fill_x, row_rect.bottom() - 2.0)],
-                    egui::Stroke::new(2.0, self.track_accent_bright()),
-                );
-            } else {
-                // Fallback: thin bar
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::Pos2::new(track_x0, track_y - 2.0),
-                        egui::Pos2::new(track_x1, track_y + 2.0),
-                    ),
-                    2.0,
-                    pal::track_bg(dark),
-                );
-                if fill_x > track_x0 {
-                    painter.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::Pos2::new(track_x0, track_y - 2.0),
-                            egui::Pos2::new(fill_x,   track_y + 2.0),
-                        ),
-                        2.0,
-                        self.track_accent,
-                    );
-                }
-                let hot = seek_resp.hovered() || seek_resp.dragged();
-                let handle_r = if hot { 8.0_f32 } else { 6.0_f32 };
-                painter.circle_filled(egui::Pos2::new(fill_x, track_y), handle_r,
-                    if hot { self.track_accent_bright() } else { pal::text_strong(dark) });
-            }
-            // Time labels
-            painter.text(
-                egui::Pos2::new(row_rect.left() + h_pad, track_y),
-                egui::Align2::LEFT_CENTER,
-                &elapsed_str,
-                egui::FontId::monospace(11.0),
-                pal::text(dark),
-            );
-            painter.text(
-                egui::Pos2::new(row_rect.right() - h_pad, track_y),
-                egui::Align2::RIGHT_CENTER,
-                &total_str,
-                egui::FontId::monospace(11.0),
-                pal::text(dark),
-            );
-
-            // A-B repeat markers on the track.
-            if let Some(dur) = total {
-                let ds = dur.as_secs_f32().max(0.001);
-                let mark = |pos: Duration, label: &str, col: Color32| {
-                    let t = (pos.as_secs_f32() / ds).clamp(0.0, 1.0);
-                    let x = track_x0 + t * (track_x1 - track_x0);
-                    painter.line_segment(
-                        [egui::Pos2::new(x, row_rect.top() + 3.0),
-                         egui::Pos2::new(x, row_rect.bottom() - 3.0)],
-                        egui::Stroke::new(2.0, col),
-                    );
-                    painter.text(egui::Pos2::new(x, row_rect.top() + 1.0),
-                        egui::Align2::CENTER_TOP, label, egui::FontId::monospace(9.0), col);
-                };
-                let ab_col = pal::amber(dark);
-                if let Some(a) = self.ab_a { mark(a, "A", ab_col); }
-                if let Some(b) = self.ab_b { mark(b, "B", ab_col); }
-            }
-
-            // 4. Commit seek on drag-release or click.
-            if seek_resp.drag_stopped() || seek_resp.clicked() {
-                if let (Some(dur), Some(_idx)) = (total, self.current_index) {
-                    let target_secs = self.seek_pos * dur.as_secs_f32();
-                    self.seek_to(Duration::from_secs_f32(target_secs));
-                }
-                self.seeking = false;
-            }
-
-            ui.add_space(6.0);
-
-            // --- Playback buttons + volume ---
-            ui.horizontal(|ui| {
-                ui.add_space(10.0);
-
-                let btn = |label: &str| egui::Button::new(RichText::new(label).size(18.0)).min_size(Vec2::new(40.0, 36.0));
-
-                if ui.add(btn("⏮")).clicked() {
-                    self.prev_track();
-                }
-
-                let play_label = if self.play_state == PlayState::Playing { "⏸" } else { "▶" };
-                if ui.add(btn(play_label)).clicked() {
-                    self.toggle_play_pause();
-                }
-
-                if ui.add(btn("⏹")).clicked() {
-                    self.stop();
-                }
-
-                if ui.add(btn("⏭")).clicked() {
-                    self.next_track();
-                }
-
-                ui.add_space(8.0);
-                let loop_icon = match self.loop_mode {
-                    LoopMode::Sequential => "➡",
-                    LoopMode::RepeatAll  => "🔁",
-                    LoopMode::RepeatOne  => "🔂",
-                };
-                let loop_tip = match self.loop_mode {
-                    LoopMode::Sequential => "Sequential (click for Repeat All)",
-                    LoopMode::RepeatAll  => "Repeat All (click for Repeat One)",
-                    LoopMode::RepeatOne  => "Repeat One (click for Sequential)",
-                };
-                if ui.add(btn(loop_icon)).on_hover_text(loop_tip).clicked() {
-                    self.loop_mode = match self.loop_mode {
-                        LoopMode::Sequential => LoopMode::RepeatAll,
-                        LoopMode::RepeatAll  => LoopMode::RepeatOne,
-                        LoopMode::RepeatOne  => LoopMode::Sequential,
-                    };
-                    // The queued gapless track may no longer be the right next.
-                    self.flush_gapless();
-                }
-
-                ui.add_space(8.0);
-
-                // ── A-B repeat ───────────────────────────────────────────
-                let (ab_label, ab_on) = match (self.ab_a, self.ab_b) {
-                    (None, _)          => ("A–B", false),
-                    (Some(_), None)    => ("A‥",  true),
-                    (Some(_), Some(_)) => ("A↔B", true),
-                };
-                let ab_txt = if ab_on {
-                    RichText::new(ab_label).size(15.0).color(pal::accent(ui.visuals().dark_mode))
-                } else {
-                    RichText::new(ab_label).size(15.0)
-                };
-                let ab_tip = match (self.ab_a, self.ab_b) {
-                    (None, _) => "A-B repeat — click to set point A".to_string(),
-                    (Some(a), None) => format!("A = {} — click to set B (or clear)",
-                        Self::format_duration(a)),
-                    (Some(a), Some(b)) => format!("Looping {}–{} — click to clear",
-                        Self::format_duration(a), Self::format_duration(b)),
-                };
-                if ui.add_enabled(self.current_index.is_some(),
-                    egui::Button::new(ab_txt).min_size(Vec2::new(46.0, 36.0)))
-                    .on_hover_text(ab_tip).clicked() {
-                    self.cycle_ab_repeat();
-                }
-
-                // ── Bookmarks ────────────────────────────────────────────
-                ui.menu_button(RichText::new("🔖").size(16.0), |ui| {
-                    ui.set_min_width(200.0);
-                    let cur = self.current_index.map(|i| self.playlist[i].path.clone());
-                    if ui.add_enabled(cur.is_some(),
-                        egui::Button::new("＋ Bookmark current position")).clicked() {
-                        if let Some(ref p) = cur {
-                            self.bookmarks.add(p, self.elapsed().as_secs_f32());
-                            self.bookmarks.save(&moosik_dir());
-                        }
-                        ui.close_menu();
-                    }
-                    if let Some(ref p) = cur
-                        && let Some(marks) = self.bookmarks.for_track(p).cloned()
-                        && !marks.is_empty() {
-                        ui.separator();
-                        let mut jump: Option<f32> = None;
-                        let mut remove: Option<f32> = None;
-                        for m in marks {
-                            ui.horizontal(|ui| {
-                                if ui.button(format!("↪ {}",
-                                    Self::format_duration(Duration::from_secs_f32(m)))).clicked() {
-                                    jump = Some(m);
-                                }
-                                if ui.small_button("✕").on_hover_text("Remove").clicked() {
-                                    remove = Some(m);
-                                }
-                            });
-                        }
-                        if let Some(m) = jump {
-                            self.seek_to(Duration::from_secs_f32(m));
-                            ui.close_menu();
-                        }
-                        if let Some(m) = remove {
-                            self.bookmarks.remove(p, m);
-                            self.bookmarks.save(&moosik_dir());
-                        }
-                    }
-                }).response.on_hover_text("Bookmarks for the current track");
-
-                // ── Sleep timer ──────────────────────────────────────────
-                let sleep_on = self.sleep_deadline.is_some() || self.sleep_end_of_track;
-                let sleep_txt = if sleep_on {
-                    RichText::new("💤").size(16.0).color(pal::accent(ui.visuals().dark_mode))
-                } else {
-                    RichText::new("💤").size(16.0)
-                };
-                let sleep_tip = if let Some(dl) = self.sleep_deadline {
-                    format!("Sleep in {}", Self::format_duration(dl.saturating_duration_since(Instant::now())))
-                } else if self.sleep_end_of_track {
-                    "Sleep at end of track".to_string()
-                } else {
-                    "Sleep timer".to_string()
-                };
-                ui.menu_button(sleep_txt, |ui| {
-                    ui.set_min_width(150.0);
-                    if ui.selectable_label(!sleep_on, "Off").clicked() {
-                        self.sleep_deadline = None;
-                        self.sleep_end_of_track = false;
-                        ui.close_menu();
-                    }
-                    for mins in [15u64, 30, 45, 60, 90] {
-                        if ui.selectable_label(false, format!("{mins} minutes")).clicked() {
-                            self.sleep_deadline = Some(Instant::now() + Duration::from_secs(mins * 60));
-                            self.sleep_end_of_track = false;
-                            ui.close_menu();
-                        }
-                    }
-                    if ui.selectable_label(self.sleep_end_of_track, "End of track").clicked() {
-                        self.sleep_end_of_track = true;
-                        self.sleep_deadline = None;
-                        ui.close_menu();
-                    }
-                    if let Some(dl) = self.sleep_deadline {
-                        ui.separator();
-                        ui.label(RichText::new(format!("⏳ {} left",
-                            Self::format_duration(dl.saturating_duration_since(Instant::now()))))
-                            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                    }
-                }).response.on_hover_text(sleep_tip);
-
-                ui.add_space(20.0);
-
-                // Volume.
-                //
-                // Disabled outright while an exact route is open. There is no
-                // gain on that path to move — no multiply exists between the
-                // decoder and the device — so a slider that appeared to work
-                // was reporting a state the audio could not be in. The saved
-                // preference is untouched and comes back the moment normal
-                // playback resumes.
-                let lock = self.engine.as_ref()
-                    .map(|e| (e.bp_state.volume_locked(), e.bp_state.volume_lock_reason()))
-                    .unwrap_or((false, None));
-                let (vol_locked, lock_reason) = lock;
-                ui.label(RichText::new("🔊").size(16.0));
-                let mut shown = if vol_locked { 1.0 } else { self.volume };
-                let vol_slider = ui.add_enabled(
-                    !vol_locked,
-                    Slider::new(&mut shown, 0.0..=1.0)
-                        .show_value(false)
-                        .trailing_fill(true),
-                );
-                if vol_locked {
-                    vol_slider.on_disabled_hover_text(
-                        lock_reason.unwrap_or_else(|| "Volume is locked on this route".into()));
-                } else if vol_slider.changed() {
-                    // `set_volume` owns the predicate and refuses if the route
-                    // has no gain stage, so the saved value cannot be moved by
-                    // a control that would have no effect.
-                    let applied = self.engine.as_mut().is_some_and(|e| e.set_volume(shown));
-                    if applied {
-                        self.volume = shown;
-                    }
-                }
-                let dsd_active = self.engine.as_ref().is_some_and(|e| e.dsd_mode || e.dsd_native);
-                ui.label(
-                    RichText::new(if vol_locked {
-                                      "100% · locked on this route".to_string()
-                                  } else {
-                                      format!("{}%", (self.volume * 100.0) as u32)
-                                  })
-                        .size(12.0)
-                        .color(pal::text_dim(ui.visuals().dark_mode)),
-                );
-
-                // Sample rate + PCM bitrate indicator (or DSD/DoP equivalent)
-                if self.play_state != PlayState::Stopped {
-                    let sr = self.engine.as_ref().map(|e| e.last_sample_rate).unwrap_or(0);
-                    let dsd_fallback = self.engine.as_ref().is_some_and(|e| e.dsd_fallback);
-                    if dsd_active || dsd_fallback {
-                        let dsd_label = self.engine.as_ref()
-                            .and_then(|e| e.dsd_label.clone())
-                            .unwrap_or_else(|| "DSD".to_string());
-                        let native = self.engine.as_ref().is_some_and(|e| e.dsd_native);
-                        let text = if native {
-                            let backend = if cfg!(windows) { "ASIO" } else { "ALSA" };
-                            format!("{dsd_label} native ({backend})")
-                        } else if dsd_active {
-                            format!("{dsd_label} via DoP · {}", fmt_hz(sr))
-                        } else {
-                            format!("{dsd_label} → {} PCM (no DoP)", fmt_hz(sr))
-                        };
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(text)
-                            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                    } else if sr > 0 {
-                        let pcm = self.current_index.and_then(|i| {
-                            let t = &self.playlist[i];
-                            Some(sr * t.channels? as u32 * t.bit_depth? as u32 / 1000)
-                        });
-                        let label = match pcm {
-                            Some(kbps) => format!("{}  ·  {}kbps", fmt_hz(sr), kbps),
-                            None       => fmt_hz(sr),
-                        };
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(label).size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                    }
-                }
-
-                if self.play_state != PlayState::Stopped {
-                    let lufs = self.spectrum_window.momentary_lufs;
-                    if lufs.is_finite() {
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(format!("{:.1} LUFS", lufs))
-                            .size(11.0).color(pal::ok(ui.visuals().dark_mode)));
-                    }
-                }
-
-                // Open files button pushed right
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(10.0);
-                    if ui.button(RichText::new("+ Add Files").size(13.0)).clicked() {
-                        self.add_files();
-                    }
-                    ui.add_space(4.0);
-                    if ui.button(RichText::new("📁 Load Folder").size(13.0)).clicked() {
-                        self.add_folder();
-                    }
-                    ui.add_space(8.0);
-                    let spectrum_label = if self.spectrum_window.open {
-                        RichText::new("📊 Spectrum").size(13.0).color(pal::accent(ui.visuals().dark_mode))
-                    } else {
-                        RichText::new("📊 Spectrum").size(13.0)
-                    };
-                    if ui.button(spectrum_label).clicked() {
-                        self.spectrum_window.open = !self.spectrum_window.open;
-                    }
-                    ui.add_space(8.0);
-                    let info_enabled = self.current_index.is_some();
-                    let info_label = if self.info_open {
-                        RichText::new("ℹ Info").size(13.0).color(pal::accent(ui.visuals().dark_mode))
-                    } else {
-                        RichText::new("ℹ Info").size(13.0)
-                    };
-                    if ui.add_enabled(info_enabled, egui::Button::new(info_label)).clicked() {
-                        self.info_open = !self.info_open;
-                    }
-                    ui.add_space(8.0);
-                    let lyr_label = if self.lyrics_window.is_open() {
-                        RichText::new("🎤 Lyrics").size(13.0).color(pal::accent(ui.visuals().dark_mode))
-                    } else {
-                        RichText::new("🎤 Lyrics").size(13.0)
-                    };
-                    if ui.add_enabled(info_enabled, egui::Button::new(lyr_label))
-                        .on_hover_text(
-                            "Lyrics for the playing track.\n\nReads a .lrc beside the file \
-                             or the file's own tags, and can look the track up on LRCLIB. \
-                             Saved lyrics go to a .lrc — the audio file is never modified.")
-                        .clicked()
-                    {
-                        self.lyrics_window.toggle();
-                    }
-                    ui.add_space(8.0);
-                    let tag_label = if self.tag_window.open {
-                        RichText::new("🏷 Tags").size(13.0).color(pal::accent(ui.visuals().dark_mode))
-                    } else {
-                        RichText::new("🏷 Tags").size(13.0)
-                    };
-                    if ui.add_enabled(info_enabled, egui::Button::new(tag_label))
-                        .on_hover_text(
-                            "Edit the playing track's tags, and see every tag it carries.\n\n\
-                             Writes go to a copy which then replaces the original, and are \
-                             read back and checked. DSD files are read-only here.")
-                        .clicked()
-                    {
-                        self.tag_window.open = !self.tag_window.open;
-                    }
-                    ui.add_space(8.0);
-
-                    // ── Bit-perfect: device picker (▾) + toggle ─────────────
-                    // right_to_left layout: the toggle is added first so it
-                    // sits to the right of the picker.
-                    // Every visible surface derives from one presentation
-                    // object. The glyph and the words carry the state as well
-                    // as the colour does, so it survives a monochrome
-                    // screenshot and a colour-blind reader — and "requested"
-                    // can never render as "achieved".
-                    let mut present = self.engine.as_ref()
-                        .map(|e| e.bp_state.presentation())
-                        .unwrap_or_else(|| {
-                            bitperfect::state::OutputSessionState::default().presentation()
-                        });
-                    // The backend's own account of the open stream — driver
-                    // name, dropout count — as one more *detail* line. It
-                    // answers "what is this stream", never "is it exact", and
-                    // was previously the source of four hard-coded diamonds
-                    // because those two questions were not separated.
-                    if let Some(desc) = self.engine.as_ref().and_then(|e| e.bp_describe()) {
-                        present.detail.push(desc);
-                    }
-                    let dark = ui.visuals().dark_mode;
-                    let tint = match present.badge {
-                        bitperfect::state::Badge::PayloadExact => Some(pal::ok(dark)),
-                        bitperfect::state::Badge::Pending => Some(pal::text_dim(dark)),
-                        bitperfect::state::Badge::ValueExact => Some(pal::accent(dark)),
-                        bitperfect::state::Badge::Processed
-                        | bitperfect::state::Badge::Unverified
-                        | bitperfect::state::Badge::Faulted
-                        | bitperfect::state::Badge::Failed => Some(pal::warn(dark)),
-                        bitperfect::state::Badge::Off
-                        | bitperfect::state::Badge::Requested => None,
-                    };
-                    let caption = format!("{} Bit-Perfect", present.badge.glyph());
-                    let bp_label = match tint {
-                        Some(c) => RichText::new(caption).size(13.0).color(c),
-                        None => RichText::new(caption).size(13.0),
-                    };
-
-                    let mut hover = present.headline.clone();
-                    for line in &present.detail {
-                        hover.push('\n');
-                        hover.push_str(line);
-                    }
-                    if dsd_active {
-                        hover.push_str(
-                            "\n\nDSD always takes a dedicated route — this toggle only affects \
-                             PCM tracks.");
-                    }
-                    hover.push_str(
-                        "\n\nExactness is claimed only as far as the audio driver. What the \
-                         USB link and the DAC do after that is not observable from here.");
-
-                    if ui.add_enabled(!dsd_active, egui::Button::new(bp_label))
-                        .on_hover_text(hover).clicked() {
-                        self.toggle_bit_perfect();
-                    }
-
-                    ui.menu_button(RichText::new("🔈▾").size(13.0), |ui| {
-                        ui.set_min_width(320.0);
-                        // What to do when an exact route is impossible. The
-                        // choice is the user's, it is per-track in effect, and
-                        // it never changes the bit-perfect request itself.
-                        ui.label(RichText::new("When exact output is impossible")
-                            .strong().size(12.0));
-                        let current = self.engine.as_ref()
-                            .map(|e| e.bp_state.policy)
-                            .unwrap_or_default();
-                        let mut chosen = current;
-                        for p in [bitperfect::state::OutputPolicy::StrictExact,
-                                  bitperfect::state::OutputPolicy::PreferExact,
-                                  bitperfect::state::OutputPolicy::HqProcessed] {
-                            ui.radio_value(&mut chosen, p, p.label())
-                                .on_hover_text(p.describe());
-                        }
-                        if chosen != current {
-                            if let Some(ref mut e) = self.engine {
-                                // A policy change is an explicit user action and
-                                // is persisted; it starts applying at the next
-                                // track rather than reopening under playback.
-                                e.bp_state.policy = chosen;
-                            }
-                            self.save_bp_settings();
-                        }
-                        ui.separator();
-
-                        ui.label(RichText::new("Bit-perfect output device").strong().size(12.0));
-                        ui.separator();
-
-                        let track_sr = self.current_index
-                            .and_then(|i| self.playlist.get(i))
-                            .and_then(|t| t.sample_rate);
-
-                        let mut pick: Option<Option<String>> = None;
-                        if ui.selectable_label(self.bp_device.is_none(), "System default").clicked() {
-                            pick = Some(None);
-                            ui.close_menu();
-                        }
-                        match self.bp_devices {
-                            None => { ui.add_space(2.0); ui.spinner(); ui.label(RichText::new("Scanning devices…").size(11.0)); }
-                            Some(ref devs) if devs.is_empty() => {
-                                ui.label(RichText::new("No output devices found").size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                            }
-                            Some(ref devs) => {
-                                for d in devs {
-                                    let selected = self.bp_device.as_deref() == Some(d.name.as_str());
-                                    let mut name = d.name.clone();
-                                    if d.is_default { name.push_str("  (default)"); }
-                                    // Flag devices that can't do the current track's rate.
-                                    let caps = match track_sr {
-                                        Some(sr) if !d.supports_rate(sr) =>
-                                            format!("{}   ⚠ no {}", d.summary(), fmt_hz(sr)),
-                                        _ => d.summary(),
-                                    };
-                                    let resp = ui.selectable_label(selected, name)
-                                        .on_hover_text(&caps);
-                                    ui.label(RichText::new(caps).size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
-                                    if resp.clicked() {
-                                        pick = Some(Some(d.name.clone()));
-                                        ui.close_menu();
-                                    }
-                                }
-                            }
-                        }
-                        ui.separator();
-                        if ui.button(RichText::new("⟳ Rescan").size(12.0)).clicked() {
-                            self.bp_devices = None;
-                            self.bp_scan_rx = Some(bitperfect::spawn_device_scan());
-                        }
-                        if let Some(dev) = pick {
-                            self.select_bp_device(dev);
-                        }
-
-                        // ── Native DSD via ASIO (asio-dsd builds) ─────────
-                        #[cfg(all(windows, feature = "asio-dsd"))]
-                        {
-                            ui.separator();
-                            ui.label(RichText::new("Native DSD (ASIO)").strong().size(12.0));
-                            let current = self.engine.as_ref().and_then(|e| e.asio_driver.clone());
-                            let mut pick_asio: Option<Option<String>> = None;
-                            if ui.selectable_label(current.is_none(), "Off — DSD plays via DoP")
-                                .clicked() {
-                                pick_asio = Some(None);
-                                ui.close_menu();
-                            }
-                            let drivers = bitperfect::asio_dsd::list_asio_drivers();
-                            if drivers.is_empty() {
-                                ui.label(RichText::new("No ASIO drivers installed")
-                                    .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                            }
-                            let mut probe: Option<String> = None;
-                            for d in &drivers {
-                                let sel = current.as_deref() == Some(d.as_str());
-                                if ui.selectable_label(sel, d)
-                                    .on_hover_text("Route DSD tracks as raw native DSD through \
-                                                    this ASIO driver — bit-perfect up to DSD512, \
-                                                    no DoP carrier-rate ceiling.")
-                                    .clicked() {
-                                    pick_asio = Some(Some(d.clone()));
-                                    ui.close_menu();
-                                }
-                            }
-
-                            // A diagnostic, and labelled as one.
-                            //
-                            // Moosik does not play PCM over ASIO: there is no
-                            // renderer, so there is no setting, no transport
-                            // and no claim. What there is, is an answer to
-                            // "what would this driver take?" that comes from
-                            // the driver rather than from guesswork — which is
-                            // the question that has to be settled before a
-                            // renderer is worth writing. It opens the driver,
-                            // asks, and closes it again.
-                            if !drivers.is_empty() {
-                                ui.separator();
-                                ui.label(
-                                    RichText::new("PCM capability probe (diagnostic)")
-                                        .size(11.0)
-                                        .color(pal::text_dim(ui.visuals().dark_mode)),
-                                );
-                                for d in &drivers {
-                                    if ui
-                                        .small_button(format!("Probe {d}"))
-                                        .on_hover_text(
-                                            "Ask this driver what it can do with ordinary PCM \
-                                             and write the answer to the log.\n\nMoosik does \
-                                             not play PCM over ASIO — this changes nothing \
-                                             about playback.",
-                                        )
-                                        .clicked()
-                                    {
-                                        probe = Some(d.clone());
-                                        ui.close_menu();
-                                    }
-                                }
-                            }
-                            if let Some(d) = probe {
-                                // A probe result is a message, not a claim
-                                // about what is playing. Written straight to
-                                // the text, it inherited whatever owner was
-                                // there — including the now-playing line's —
-                                // and the next tick regenerated it away.
-                                let line = match bitperfect::asio_dsd::probe_pcm(&d) {
-                                        Ok(caps) => {
-                                            let line = caps.describe();
-                                            crate::mlog!("[asio-pcm] {line}");
-                                            format!("ASIO PCM probe — {line}")
-                                        }
-                                        Err(e) => {
-                                            crate::mlog!("[asio-pcm] probe failed: {e}");
-                                            format!("ASIO PCM probe failed: {e}")
-                                        }
-                                };
-                                self.set_transient(line);
-                            }
-                            if let Some(sel) = pick_asio {
-                                let old = self.engine.as_ref()
-                                    .and_then(|e| e.asio_driver.clone());
-                                if let Some(e) = self.engine.as_mut() { e.asio_driver = sel.clone(); }
-                                self.save_bp_settings();
-                                self.set_transient(match &sel {
-                                    Some(n) => format!("Native DSD via ASIO: {n}"),
-                                    None => "DSD output: DoP".to_string(),
-                                });
-                                self.switch_native_output("Native DSD", move |e| {
-                                    e.asio_driver = old;
-                                });
-                            }
-                        }
-
-                        // ── Native DSD via ALSA (alsa-dsd builds) ─────────
-                        #[cfg(all(target_os = "linux", feature = "alsa-dsd"))]
-                        {
-                            ui.separator();
-                            ui.label(RichText::new("Native DSD (ALSA)").strong().size(12.0));
-                            let current = self.engine.as_ref().and_then(|e| e.alsa_dsd_device.clone());
-                            let mut pick_alsa: Option<Option<String>> = None;
-                            if ui.selectable_label(current.is_none(), "Off — DSD plays via DoP")
-                                .clicked() {
-                                pick_alsa = Some(None);
-                                ui.close_menu();
-                            }
-                            let devices = bitperfect::alsa_dsd::list_dsd_devices();
-                            if devices.is_empty() {
-                                ui.label(RichText::new("No direct hw: playback devices found")
-                                    .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                            }
-                            for d in devices {
-                                let sel = current.as_deref() == Some(d.id.as_str());
-                                let resp = ui.selectable_label(sel, &d.id)
-                                    .on_hover_text("Route DSD tracks as raw native DSD \
-                                                    (DSD_U32_BE/U16/U8) through this device — \
-                                                    no DoP carrier-rate ceiling. Needs a card \
-                                                    whose driver advertises DSD formats, and \
-                                                    exclusive hw: access.");
-                                if !d.desc.is_empty() {
-                                    ui.label(RichText::new(&d.desc).size(10.0)
-                                        .color(pal::text_faint(ui.visuals().dark_mode)));
-                                }
-                                if resp.clicked() {
-                                    pick_alsa = Some(Some(d.id.clone()));
-                                    ui.close_menu();
-                                }
-                            }
-                            if ui.button(RichText::new("⟳ Rescan").size(12.0)).clicked() {
-                                bitperfect::alsa_dsd::rescan_devices();
-                            }
-                            if let Some(sel) = pick_alsa {
-                                let old = self.engine.as_ref()
-                                    .and_then(|e| e.alsa_dsd_device.clone());
-                                if let Some(e) = self.engine.as_mut() { e.alsa_dsd_device = sel.clone(); }
-                                self.save_bp_settings();
-                                self.set_transient(match &sel {
-                                    Some(n) => format!("Native DSD via ALSA: {n}"),
-                                    None => "DSD output: DoP".to_string(),
-                                });
-                                self.switch_native_output("Native DSD", move |e| {
-                                    e.alsa_dsd_device = old;
-                                });
-                            }
-                        }
-                    }).response.on_hover_text("Choose the output device for bit-perfect playback");
-
-                    ui.add_space(8.0);
-
-                    // ── ReplayGain (loudness normalization) ─────────────────
-                    let rg_active = self.rg.mode != RgMode::Off;
-                    let rg_label = if rg_active {
-                        RichText::new(format!("🔊 RG {}", self.rg.mode.label()))
-                            .size(13.0).color(pal::ok(ui.visuals().dark_mode))
-                    } else {
-                        RichText::new("🔊 RG").size(13.0)
-                    };
-                    // Reflects the *active session's* routing, not just the global
-                    // toggle — a DSD track that fell back to PCM plays on the
-                    // ordinary sink and gets RG even with 💎 on for PCM tracks.
-                    let on_bp_stream = self.engine.as_ref().is_some_and(|e| e.on_bp_stream());
-                    let rg_hover = if on_bp_stream && rg_active {
-                        "ReplayGain is bypassed on the bit-perfect device stream — a gain change breaks bit-perfectness.".to_string()
-                    } else if rg_active {
-                        format!("Loudness normalization: {} · currently {:+.1} dB", self.rg.mode.label(), self.rg_applied_db())
-                    } else {
-                        "Loudness normalization (off) — plays original levels".to_string()
-                    };
-                    ui.menu_button(rg_label, |ui| {
-                        ui.set_min_width(250.0);
-                        ui.label(RichText::new("ReplayGain — loudness normalization").strong().size(12.0));
-                        // A device stream has no gain stage, which is a fact
-                        // about the *route* and true whether or not the route
-                        // is exact. The diamond is a fact about the
-                        // *fidelity*, so this line states the first and lets
-                        // the presentation decide the second.
-                        if on_bp_stream {
-                            let exact = self
-                                .engine
-                                .as_ref()
-                                .is_some_and(|e| e.bp_state.shows_diamond());
-                            let (glyph, colour) = if exact {
-                                ("\u{1F48E}", pal::ok(ui.visuals().dark_mode))
-                            } else {
-                                ("\u{25C7}", pal::text_dim(ui.visuals().dark_mode))
-                            };
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&track.title).font(name_font(&track.title, 18.0)).strong().color(pal::text_strong(dark)));
                             ui.label(
-                                RichText::new(format!(
-                                    "{glyph} Bypassed on the output device stream"
-                                ))
-                                .size(11.0)
-                                .color(colour),
+                                RichText::new(format!("{} — {}", track.artist, track.album))
+                                    .size(13.0)
+                                    .color(pal::text_dim(dark)),
                             );
-                        }
-                        ui.separator();
-                        let mut changed = false;
-                        for mode in [RgMode::Off, RgMode::Track, RgMode::Album] {
-                            if ui.selectable_label(self.rg.mode == mode, mode.label()).clicked() {
-                                self.rg.mode = mode;
-                                changed = true;
-                            }
-                        }
-                        ui.separator();
-                        if ui.checkbox(&mut self.rg.prevent_clip, "Prevent clipping (cap gain by peak)").changed() {
-                            changed = true;
-                        }
-                        ui.separator();
-                        if self.rg.mode == RgMode::Off {
-                            ui.label(RichText::new("Off — original file levels")
-                                .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                        } else {
-                            let src = self.current_index.and_then(|i| self.playlist.get(i)).map(|t| {
-                                let tagged = match self.rg.mode {
-                                    RgMode::Album => t.rg_album_gain.or(t.rg_track_gain),
-                                    _ => t.rg_track_gain.or(t.rg_album_gain),
-                                }.is_some();
-                                if tagged { "from ReplayGain tag" } else { "from measured loudness" }
-                            }).unwrap_or("—");
-                            ui.label(RichText::new(format!("Applied: {:+.1} dB  ({src})", self.rg_applied_db()))
-                                .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                            ui.label(RichText::new(format!("Untagged target: {:.0} LUFS", RG_TARGET_LUFS))
-                                .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
-                        }
-                        if changed {
-                            save_rg_settings(&moosik_dir(), &self.rg);
-                        }
-                    }).response.on_hover_text(rg_hover);
-
-                    ui.add_space(8.0);
-
-                    // ── Appearance (text size · accent) ─────────────────────
-                    // The spectrum palette lives in the spectrum window itself
-                    // (next to the View controls), since it only affects that view.
-                    // ── Session log ─────────────────────────────────────────
-                    // Reachable without a console, because the build that most
-                    // needs it is the one someone double-clicked. A bug report
-                    // that can attach this file is worth more than any amount
-                    // of asking what happened.
-                    // Gated on a file actually existing, not on the absence of
-                    // a recorded error — those are only the same thing while
-                    // every failure path remembers to record one.
-                    let log_ok = log::path().is_some();
-                    // Two tooltip paths, not one: egui only shows
-                    // `on_hover_text` on an *enabled* widget, so hanging the
-                    // failure reason there meant the disabled button explained
-                    // nothing at all.
-                    let log_tip = match log::path() {
-                        Some(p) => format!("Open this session's log
-{}", p.display()),
-                        None => "Open the log folder".to_string(),
-                    };
-                    let log_why = match log::error() {
-                        Some(e) => format!("No log file this session — {e}"),
-                        None => "No log file this session".to_string(),
-                    };
-                    if ui.add_enabled(log_ok, egui::Button::new(RichText::new("🗎 Log").size(13.0)))
-                        .on_hover_text(log_tip)
-                        .on_disabled_hover_text(log_why)
-                        .clicked()
-                    {
-                        let dir = log::dir();
-                        let _ = std::fs::create_dir_all(&dir);
-                        #[cfg(windows)]
-                        // Never while a local translation runtime's pipe ends are
-                        // inheritable, or Explorer could hold them open.
-                        let _ = crate::lyrics::local_ai::contain::ordinary_spawn(
-                            std::process::Command::new("explorer").arg(&dir));
-                        #[cfg(target_os = "macos")]
-                        let _ = std::process::Command::new("open").arg(&dir).spawn();
-                        #[cfg(all(unix, not(target_os = "macos")))]
-                        let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
-                    }
-
-                    ui.menu_button(RichText::new("🎨 Look").size(13.0), |ui| {
-                        ui.set_min_width(230.0);
-                        ui.label(RichText::new("Appearance").strong().size(12.0));
-                        ui.separator();
-                        let mut changed = false;
-
-                        ui.label(RichText::new("Theme")
-                            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                        ui.horizontal(|ui| {
-                            for tm in [ThemeMode::Dark, ThemeMode::Light] {
-                                if ui.selectable_label(self.appearance.theme == tm, tm.label()).clicked()
-                                    && self.appearance.theme != tm
-                                {
-                                    self.appearance.theme = tm;
-                                    apply_theme(ctx, tm.is_dark());
-                                    changed = true;
-                                }
-                            }
                         });
-
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.label(RichText::new("Font")
-                            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                        // Enumerating every system font means reading a few
-                        // hundred files, so it happens once, when the menu is
-                        // first opened, rather than every frame.
-                        if self.font_list.is_empty() { self.font_list = fonts::list(); }
-                        let current = self.appearance.ui_font.clone();
-                        let mut pick: Option<Option<String>> = None;
-                        // A plain scrolling list, not a ComboBox. A ComboBox
-                        // popup is its own egui Area, so a click inside it reads
-                        // as a click *outside* this menu — the menu closes and
-                        // swallows the click, and the font silently never
-                        // changed. Widgets placed directly in the menu do not
-                        // have that problem.
-                        ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut self.font_filter)
-                                   .desired_width(150.0).hint_text("filter…"));
-                            if ui.small_button("✖").clicked() { self.font_filter.clear(); }
-                        });
-                        egui::ScrollArea::vertical().max_height(190.0)
-                            .id_salt("ui_font_list")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                if ui.selectable_label(current.is_none(), "Default").clicked() {
-                                    pick = Some(None);
-                                }
-                                ui.separator();
-                                let needle = self.font_filter.to_lowercase();
-                                for f in &self.font_list {
-                                    if !needle.is_empty()
-                                        && !f.family.to_lowercase().contains(&needle) { continue; }
-                                    let sel = current.as_deref() == Some(f.family.as_str());
-                                    if ui.selectable_label(sel, &f.family).clicked() {
-                                        pick = Some(Some(f.family.clone()));
-                                    }
-                                }
-                            });
-                        if let Some(choice) = pick {
-                            self.appearance.ui_font = choice;
-                            // Rebuild the whole set: the CJK fallbacks have to be
-                            // reinstalled behind the new primary, or Japanese
-                            // tags turn to tofu the moment a Latin font is picked.
-                            setup_fonts(ctx, self.appearance.ui_font.as_deref());
-                            changed = true;
-                        }
-                        ui.label(RichText::new(
-                            "CJK fallbacks stay active whatever you pick")
-                            .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
-
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.label(RichText::new("Text size")
-                            .size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                        // Edit a draft, then commit on Apply — a live zoom change
-                        // mid-drag resizes the menu under the cursor.
-                        ui.add(
-                            Slider::new(&mut self.ui_scale_draft, UI_SCALE_MIN..=UI_SCALE_MAX)
-                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                                .custom_parser(|s| {
-                                    s.trim().trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)
-                                }),
-                        );
-                        ui.horizontal(|ui| {
-                            let pending = (self.ui_scale_draft - self.appearance.ui_scale).abs() > 1e-3;
-                            if ui.add_enabled(pending, egui::Button::new("Apply")).clicked() {
-                                self.appearance.ui_scale =
-                                    self.ui_scale_draft.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
-                                save_appearance(&moosik_dir(), &self.appearance);
-                            }
-                            if ui.small_button("Reset").clicked() {
-                                self.ui_scale_draft = 1.0;
-                                self.appearance.ui_scale = 1.0;
-                                save_appearance(&moosik_dir(), &self.appearance);
-                            }
-                            ui.label(RichText::new(format!("now {:.0}%", self.appearance.ui_scale * 100.0))
-                                .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
-                        });
-
-                        ui.add_space(6.0);
-                        ui.separator();
-                        if ui.checkbox(&mut self.appearance.art_accent,
-                            "Tint UI with album-art accent").changed() {
-                            changed = true;
-                        }
-                        ui.label(RichText::new("Off → fixed brand accent")
-                            .size(10.0).color(pal::text_faint(ui.visuals().dark_mode)));
-
-                        ui.add_space(6.0);
-                        ui.separator();
-                        if ui.checkbox(&mut self.appearance.show_play_count,
-                            "Show play counts in playlist").changed() {
-                            changed = true;
-                        }
-
-                        if changed {
-                            save_appearance(&moosik_dir(), &self.appearance);
-                        }
-                    }).response.on_hover_text("Palette, text size, and accent — all optional");
-                });
-            });
-
-            // The negotiated output, kept where a transient status message
-            // cannot reach it.
-            //
-            // Until 1.4.3 there was one `status_msg` and everything wrote to
-            // it, so "playing at 24-bit through WASAPI exclusive" survived
-            // until the next tag save or cache eviction wanted to say something
-            // — and the state that matters most is exactly the one you want to
-            // still be able to read a minute later.
-            let present = self.engine.as_ref().map(|e| e.bp_state.presentation());
-            if let Some(present) = present
-                && self.play_state != PlayState::Stopped
-            {
-                let dark = ui.visuals().dark_mode;
-                let head = match present.badge {
-                    bitperfect::state::Badge::PayloadExact => pal::ok(dark),
-                    bitperfect::state::Badge::ValueExact => pal::accent(dark),
-                    bitperfect::state::Badge::Processed
-                    | bitperfect::state::Badge::Unverified
-                    | bitperfect::state::Badge::Faulted
-                    | bitperfect::state::Badge::Failed => pal::warn(dark),
-                    _ => pal::text_dim(dark),
-                };
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    ui.label(RichText::new(&present.headline).size(11.0).color(head));
-                });
-                for line in &present.detail {
-                    ui.horizontal(|ui| {
-                        ui.add_space(10.0);
-                        ui.label(RichText::new(line).size(11.0).color(pal::text_dim(dark)));
-                    });
-                }
-            }
-
-            if !self.status.text().is_empty() {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    ui.label(RichText::new(self.status.text()).size(11.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                });
-            }
-
-            ui.add_space(6.0);
-        });
-
-        // ---------------------------------------------------------------
-        // Central panel – playlist store + playlist
-        // ---------------------------------------------------------------
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // ── Playlist store bar ──────────────────────────────────────
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                let selected_text = self.active_saved_playlist
-                    .and_then(|i| self.playlist_store.get(i))
-                    .map(|p| p.name.as_str())
-                    .unwrap_or("— unsaved —")
-                    .to_string();
-                egui::ComboBox::from_id_salt("pl_combo")
-                    .selected_text(&selected_text)
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(self.active_saved_playlist.is_none(), "— unsaved —").clicked() {
-                            self.active_saved_playlist = None;
-                        }
-                        for i in 0..self.playlist_store.len() {
-                            let name = self.playlist_store[i].name.clone();
-                            let is_sel = self.active_saved_playlist == Some(i);
-                            if ui.selectable_label(is_sel, &name).clicked() {
-                                let paths = self.playlist_store[i].paths.clone();
-                                self.stop();
-                                self.playlist = paths.into_iter().map(Track::load).collect();
-                                self.current_index = None;
-                                self.selected.clear();
-                                self.last_clicked = None;
-                                self.active_saved_playlist = Some(i);
-                                self.show_save_playlist_input = false;
-                            }
-                        }
-                    });
-                ui.add_space(4.0);
-                if let Some(idx) = self.active_saved_playlist {
-                    if !self.playlist.is_empty()
-                        && ui.small_button("🔄 Update").on_hover_text("Overwrite saved playlist").clicked()
-                    {
-                        let paths: Vec<PathBuf> = self.playlist.iter().map(|t| t.path.clone()).collect();
-                        self.playlist_store[idx].paths = paths;
-                        save_playlist_store(&self.playlist_store);
-                    }
-                    ui.add_space(2.0);
-                    if ui.small_button(RichText::new("🗑").color(Color32::from_rgb(200, 80, 80)))
-                        .on_hover_text("Delete saved playlist").clicked()
-                    {
-                        self.playlist_store.remove(idx);
-                        self.active_saved_playlist = None;
-                        save_playlist_store(&self.playlist_store);
-                    }
-                    ui.add_space(4.0);
-                }
-                if !self.playlist.is_empty() {
-                    let btn_label = if self.show_save_playlist_input { "✕" } else { "💾 Save As" };
-                    if ui.small_button(btn_label).clicked() {
-                        self.show_save_playlist_input = !self.show_save_playlist_input;
-                        if self.show_save_playlist_input && self.playlist_name_buf.is_empty() {
-                            self.playlist_name_buf = "My Playlist".to_string();
-                        }
-                    }
-                }
-            });
-
-            if self.show_save_playlist_input {
-                let mut do_save = false;
-                let mut do_cancel = false;
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.label("Name:");
-                    let te = ui.add(
-                        egui::TextEdit::singleline(&mut self.playlist_name_buf).desired_width(140.0)
-                    );
-                    if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        do_save = true;
-                    }
-                    if ui.small_button("Save").clicked() { do_save = true; }
-                    if ui.small_button("Cancel").clicked() { do_cancel = true; }
-                });
-                if do_save {
-                    let name = self.playlist_name_buf.trim().to_string();
-                    if !name.is_empty() {
-                        let paths = self.playlist.iter().map(|t| t.path.clone()).collect();
-                        self.playlist_store.push(SavedPlaylist { name, paths });
-                        self.active_saved_playlist = Some(self.playlist_store.len() - 1);
-                        save_playlist_store(&self.playlist_store);
-                        self.show_save_playlist_input = false;
-                        self.playlist_name_buf.clear();
-                    }
-                }
-                if do_cancel {
-                    self.show_save_playlist_input = false;
-                }
-            }
-
-            ui.add_space(2.0);
-
-            // ── Playlist header ─────────────────────────────────────────
-            let n_sel = self.selected.len();
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new(format!("Playlist  ({} tracks)", self.playlist.len()))
-                    .size(13.0).color(pal::text_dim(ui.visuals().dark_mode)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(8.0);
-                    if !self.playlist.is_empty()
-                        && ui.small_button(RichText::new("Clear All").color(Color32::from_rgb(200, 80, 80))).clicked()
-                    {
-                        self.stop();
-                        self.playlist.clear();
-                        self.current_index = None;
-                        self.selected.clear();
-                        self.active_saved_playlist = None;
-                    }
-                    if n_sel > 0 {
-                        ui.add_space(4.0);
-                        let del_label = format!("Delete {n_sel} selected");
-                        if ui.small_button(RichText::new(del_label).color(Color32::from_rgb(220, 100, 60))).clicked() {
-                            let current_removed = self.current_index
-                                .map(|ci| self.selected.contains(&ci)).unwrap_or(false);
-                            let mut to_remove: Vec<usize> = self.selected.drain().collect();
-                            to_remove.sort_unstable_by(|a, b| b.cmp(a)); // descending: safe in-place removal
-                            for &idx in &to_remove {
-                                self.playlist.remove(idx);
-                            }
-                            if current_removed {
-                                self.stop();
-                                self.current_index = None;
-                            } else if let Some(ci) = self.current_index {
-                                let removed_before = to_remove.iter().filter(|&&r| r < ci).count();
-                                self.current_index = Some(ci - removed_before);
-                            }
-                            self.last_clicked = None;
-                        }
-                    }
-                });
-            });
-            ui.separator();
-
-            // ── Drag / selection tracking ────────────────────────────────
-            let dragging = self.drag_src.is_some();
-            let pointer_released = ctx.input(|i| i.pointer.primary_released());
-            let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
-            let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
-            let shift_held = ctx.input(|i| i.modifiers.shift);
-
-            let mut play_requested: Option<usize> = None;
-            let mut drag_started_at: Option<usize> = None;
-            let mut click_action: Option<(usize, bool, bool)> = None;
-
-            let n = self.playlist.len();
-            const ROW_H: f32 = 32.0;
-            let mut new_drop_row = n;
-            let mut last_row_bottom: Option<(f32, f32, f32)> = None; // (left, right, y)
-
-            // ── Search / filter ─────────────────────────────────────────
-            ui.horizontal(|ui| {
-                ui.label("🔍");
-                ui.add(egui::TextEdit::singleline(&mut self.filter_query)
-                    .id(egui::Id::new("playlist_filter"))
-                    .hint_text(RichText::new("Filter by title, artist, or album…  (Ctrl+F)")
-                        .color(pal::text_faint(ui.visuals().dark_mode)))
-                    .desired_width(240.0));
-                if !self.filter_query.is_empty()
-                    && ui.small_button("✕").on_hover_text("Clear filter (Esc)").clicked() {
-                    self.filter_query.clear();
-                }
-
-                // ── Sort columns (pushed to the right) ───────────────────
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut sort_click: Option<SortKey> = None;
-                    // right_to_left: add in reverse so they read Title→Time.
-                    for key in SortKey::ALL.iter().rev() {
-                        let active = self.sort_key == Some(*key);
-                        let arrow = if active { if self.sort_asc { " ▲" } else { " ▼" } } else { "" };
-                        if ui.selectable_label(active,
-                            RichText::new(format!("{}{}", key.label(), arrow)).size(12.0))
-                            .on_hover_text("Sort by this column (click again to reverse)")
-                            .clicked()
-                        {
-                            sort_click = Some(*key);
-                        }
-                    }
-                    ui.label(RichText::new("Sort:").size(11.0)
-                        .color(pal::text_faint(ui.visuals().dark_mode)));
-                    if let Some(k) = sort_click { self.sort_playlist(k); }
-                });
-            });
-            ui.add_space(2.0);
-
-            // Real playlist indices to display: all rows, or only those matching
-            // the filter. Filtering disables drag-reorder (an ambiguous op on a
-            // subset), so with no filter this is the identity 0..n and every
-            // path below behaves exactly as before.
-            let q = self.filter_query.trim().to_lowercase();
-            let filtering = !q.is_empty();
-            let visible: Vec<usize> = if filtering {
-                (0..n).filter(|&i| {
-                    let t = &self.playlist[i];
-                    t.title.to_lowercase().contains(&q)
-                        || t.artist.to_lowercase().contains(&q)
-                        || t.album.to_lowercase().contains(&q)
-                }).collect()
-            } else {
-                (0..n).collect()
-            };
-            let vn = visible.len();
-
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_H, vn, |ui, rows| {
-                if self.playlist.is_empty() {
-                    ui.add_space(40.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("No tracks loaded").size(15.0).color(pal::text_faint(ui.visuals().dark_mode)));
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Click \"+ Add Files\" to get started").size(12.0).color(pal::text_faint(ui.visuals().dark_mode)));
-                    });
-                    return;
-                }
-                if visible.is_empty() {
-                    ui.add_space(40.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(format!("No tracks match “{}”", self.filter_query.trim()))
-                            .size(14.0).color(pal::text_faint(ui.visuals().dark_mode)));
-                    });
-                    return;
-                }
-
-                let available_w = ui.available_width();
-
-                // A drag can only target rows that are on screen (there is no
-                // auto-scroll), so scanning the visible range is sufficient.
-                // If the pointer is above the first visible row, drop there.
-                if dragging
-                    && let Some(pp) = pointer_pos
-                    && pp.y < ui.max_rect().top() {
-                    new_drop_row = rows.start;
-                }
-                let rows_end = rows.end;
-
-                for row in rows {
-                    let i = visible[row];
-                    let track_title  = self.playlist[i].display_title().to_string();
-                    let track_artist = self.playlist[i].artist.clone();
-                    let track_dur    = self.playlist[i].duration;
-                    let play_count   = self.stats.get(&self.playlist[i].path).map(|s| s.count).unwrap_or(0);
-                    let show_count   = self.appearance.show_play_count;
-                    let is_current        = self.current_index == Some(i);
-                    let is_selected       = self.selected.contains(&i);
-                    let is_being_dragged  = self.drag_src == Some(i);
-                    let dark = ui.visuals().dark_mode;
-
-                    let base_color = if is_selected {
-                        pal::row_selected(dark)
-                    } else if is_current {
-                        pal::row_current(dark)
-                    } else if i % 2 == 0 {
-                        pal::row_even(dark)
-                    } else {
-                        pal::row_odd(dark)
-                    };
-
-                    let (rect, response) = ui.allocate_exact_size(
-                        Vec2::new(available_w, ROW_H),
-                        egui::Sense::click_and_drag(),
-                    );
-
-                    // Determine drop position: first row whose center is below pointer
-                    if dragging
-                        && let Some(pp) = pointer_pos
-                        && pp.y <= rect.center().y && new_drop_row == n {
-                        new_drop_row = i;
-                    }
-
-                    // Insertion line before this row
-                    if dragging {
-                        let src = self.drag_src;
-                        let no_op = src == Some(i) || src.map(|s| s + 1) == Some(i);
-                        if self.drag_over_row == Some(i) && !no_op {
-                            ui.painter().line_segment(
-                                [egui::Pos2::new(rect.left(), rect.top()),
-                                 egui::Pos2::new(rect.right(), rect.top())],
-                                egui::Stroke::new(2.0, pal::accent(dark)),
-                            );
-                        }
-                    }
-
-                    if ui.is_rect_visible(rect) {
-                        let alpha = if is_being_dragged { 80u8 } else { 255u8 };
-                        let c = base_color;
-                        ui.painter().rect_filled(
-                            rect, 0.0,
-                            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha),
-                        );
-                        // A slim accent bar marks the track that's playing.
-                        if is_current {
-                            let bar = egui::Rect::from_min_max(
-                                rect.left_top(),
-                                egui::Pos2::new(rect.left() + 3.0, rect.bottom()),
-                            );
-                            ui.painter().rect_filled(bar, 0.0, self.track_accent);
-                        }
-
-                        let inner = rect.shrink2(Vec2::new(10.0, 0.0));
-                        let cy = rect.center().y;
-
-                        // Drag handle — 2×3 dot grid, no font dependency
-                        for col in [0.0f32, 4.0] {
-                            for row in [-4.0f32, 0.0, 4.0] {
-                                ui.painter().circle_filled(
-                                    egui::Pos2::new(inner.min.x + 4.0 + col, cy + row),
-                                    1.5,
-                                    Color32::from_gray(75),
-                                );
-                            }
-                        }
-
-                        // ── Album art thumbnail ───────────────────────────
-                        let show_art = self.spectrum_window.art_settings.playlist_show;
-                        let art_offset = if show_art { 34.0f32 } else { 0.0 };
-                        if show_art {
-                            let thumb_size = 28.0;
-                            let thumb_x = inner.min.x + 14.0;
-                            let thumb_y = cy - thumb_size / 2.0;
-                            let thumb_rect = egui::Rect::from_min_size(
-                                egui::Pos2::new(thumb_x, thumb_y),
-                                Vec2::splat(thumb_size),
-                            );
-                            let track_path = &self.playlist[i].path;
-                            let art = self.art_cache.get_or_load(track_path, ctx);
-                            if let Some((tex_id, art_w, art_h)) = art {
-                                let art_rect = fit_rect_preserve(thumb_rect, art_w, art_h);
-                                ui.painter().image(
-                                    tex_id, art_rect,
-                                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-                                    Color32::WHITE,
-                                );
-
-                                // Hover detection — show full art after 1s
-                                let over = ctx.pointer_hover_pos()
-                                    .map_or(false, |p| thumb_rect.contains(p));
-                                if over {
-                                    match self.art_hover {
-                                        Some((idx, _)) if idx == i => {}
-                                        _ => self.art_hover = Some((i, Instant::now())),
-                                    }
-                                    // Keep repainting so the timer fires without needing mouse movement
-                                    ctx.request_repaint();
-                                } else if self.art_hover.map_or(false, |(idx, _)| idx == i) {
-                                    self.art_hover = None;
-                                }
-
-                                if let Some((hi, since)) = self.art_hover {
-                                    if hi == i && since.elapsed().as_secs_f32() >= 1.0 {
-                                        let max_dim = 512.0f32;
-                                        let aspect = art_w as f32 / art_h.max(1) as f32;
-                                        let (pw, ph) = if aspect >= 1.0 {
-                                            (max_dim, max_dim / aspect)
-                                        } else {
-                                            (max_dim * aspect, max_dim)
-                                        };
-                                        let screen = ctx.screen_rect();
-                                        let px = (thumb_rect.right() + 8.0)
-                                            .min(screen.right() - pw - 4.0);
-                                        let py = (thumb_rect.center().y - ph / 2.0)
-                                            .clamp(screen.top() + 4.0, screen.bottom() - ph - 4.0);
-                                        egui::Area::new(egui::Id::new("art_hover_popup"))
-                                            .fixed_pos(egui::Pos2::new(px, py))
-                                            .order(egui::Order::Tooltip)
-                                            .interactable(false)
-                                            .show(ctx, |ui| {
-                                                let (_, r) = ui.allocate_space(Vec2::new(pw, ph));
-                                                ui.painter().rect_filled(r.expand(2.0), 3.0, Color32::from_black_alpha(100));
-                                                ui.painter().image(
-                                                    tex_id, r,
-                                                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-                                                    Color32::WHITE,
-                                                );
-                                            });
-                                    }
-                                }
-                            } else if self.spectrum_window.art_settings.playlist_placeholder {
-                                ui.painter().rect_filled(thumb_rect, 3.0, Color32::from_gray(35));
-                                ui.painter().text(
-                                    thumb_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "♪",
-                                    egui::FontId::proportional(14.0),
-                                    Color32::from_gray(70),
-                                );
-                            }
-                        }
-
-                        // Track number
-                        ui.painter().text(
-                            egui::Pos2::new(inner.min.x + 24.0 + art_offset, cy),
-                            egui::Align2::CENTER_CENTER,
-                            format!("{}", i + 1),
-                            egui::FontId::proportional(12.0),
-                            if is_current { self.track_accent } else { pal::text_faint(dark) },
-                        );
-
-                        // Title
-                        let title_x = inner.min.x + 42.0 + art_offset;
-                        let title_w = (inner.width() * 0.45 - art_offset).max(0.0);
-                        ui.painter().text(
-                            egui::Pos2::new(title_x, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &track_title,
-                            egui::FontId::proportional(13.0),
-                            if is_current { pal::text_strong(dark) } else { pal::text(dark) },
-                        );
-
-                        // Artist
-                        ui.painter().text(
-                            egui::Pos2::new(title_x + title_w + 8.0, cy),
-                            egui::Align2::LEFT_CENTER,
-                            &track_artist,
-                            egui::FontId::proportional(12.0),
-                            pal::text_dim(dark),
-                        );
-
-                        // Play count (optional) — sits left of the duration.
-                        let dur_right = if show_count { inner.max.x - 52.0 } else { inner.max.x - 8.0 };
-                        if show_count {
-                            ui.painter().text(
-                                egui::Pos2::new(inner.max.x - 8.0, cy),
-                                egui::Align2::RIGHT_CENTER,
-                                if play_count > 0 { format!("▶{play_count}") } else { "–".to_string() },
-                                egui::FontId::proportional(11.0),
-                                if play_count > 0 { pal::text_dim(dark) } else { pal::text_faint(dark) },
-                            );
-                        }
-
-                        // Duration
-                        if let Some(dur) = track_dur {
-                            ui.painter().text(
-                                egui::Pos2::new(dur_right, cy),
-                                egui::Align2::RIGHT_CENTER,
-                                Self::format_duration(dur),
-                                egui::FontId::monospace(12.0),
-                                pal::text_faint(dark),
-                            );
-                        }
-
-                        if response.hovered() && !is_being_dragged {
-                            let hl = if dark {
-                                Color32::from_rgba_unmultiplied(255, 255, 255, 8)
-                            } else {
-                                Color32::from_rgba_unmultiplied(0, 0, 0, 12)
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            let dark = ui.visuals().dark_mode;
+                            let (state_icon, state_col) = match self.play_state {
+                                PlayState::Playing => ("▶ Playing", self.track_accent),
+                                PlayState::Paused  => ("⏸ Paused",  pal::amber(dark)),
+                                PlayState::Stopped => ("⏹ Stopped", pal::muted(dark)),
                             };
-                            ui.painter().rect_filled(rect, 0.0, hl);
-                        }
-                    }
-
-                    // Drag start (reorder is disabled while filtering — a subset
-                    // has no unambiguous drop position in the full list).
-                    if response.drag_started() && !dragging && !filtering {
-                        drag_started_at = Some(i);
-                    }
-
-                    // Click (only when not starting a drag)
-                    if !dragging && !response.drag_started() {
-                        if response.double_clicked() {
-                            play_requested = Some(i);
-                        } else if response.clicked() {
-                            click_action = Some((i, ctrl_held, shift_held));
-                        }
-                    }
-
-                    last_row_bottom = Some((rect.left(), rect.right(), rect.bottom()));
-                }
-
-                // Pointer below every visible row's center → the drop target is
-                // the first row just past the visible range (matches the old
-                // full-scan behavior; equals n when scrolled to the bottom).
-                if dragging && pointer_pos.is_some() && new_drop_row == n && rows_end < n {
-                    new_drop_row = rows_end;
-                }
-
-                // Insertion line at end of list
-                if dragging
-                    && let (Some((rx0, rx1, ry)), Some(drop)) = (last_row_bottom, self.drag_over_row) {
-                    let src = self.drag_src;
-                    let no_op = src.map(|s| s + 1) == Some(n);
-                    if drop == n && !no_op {
-                        ui.painter().line_segment(
-                            [egui::Pos2::new(rx0, ry), egui::Pos2::new(rx1, ry)],
-                            egui::Stroke::new(2.0, pal::accent(ui.visuals().dark_mode)),
-                        );
-                    }
-                }
-            });
-
-            // ── Apply drag start ─────────────────────────────────────────
-            if let Some(i) = drag_started_at {
-                self.drag_src = Some(i);
-                self.selected.clear();
-            }
-            if dragging {
-                self.drag_over_row = Some(new_drop_row);
-            }
-
-            // ── Finalize drag on release ──────────────────────────────────
-            if dragging && pointer_released {
-                let src = self.drag_src.take().unwrap_or(0);
-                let dst = self.drag_over_row.take().unwrap_or(n);
-                if src != dst && src + 1 != dst && dst <= n {
-                    let track = self.playlist.remove(src);
-                    let insert_at = if dst > src { dst - 1 } else { dst };
-                    self.playlist.insert(insert_at, track);
-                    self.current_index = self.current_index.map(|ci| {
-                        if ci == src              { insert_at }
-                        else if src < ci && ci < dst { ci - 1 }
-                        else if dst <= ci && ci < src { ci + 1 }
-                        else                      { ci }
+                            ui.label(RichText::new(state_icon).size(13.0).color(state_col));
+                        });
+                    });
+                } else {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("No track loaded").size(16.0).color(pal::text_faint(ui.visuals().dark_mode)));
                     });
                 }
-            }
+                ui.add_space(8.0);
+            });
 
-            // ── Apply click selection ─────────────────────────────────────
-            if let Some(idx) = play_requested {
-                self.play_index(idx);
-            }
-            if let Some((i, ctrl, shift)) = click_action {
-                if ctrl {
-                    if self.selected.contains(&i) { self.selected.remove(&i); }
-                    else { self.selected.insert(i); }
-                    self.last_clicked = Some(i);
-                } else if shift {
-                    let anchor = self.last_clicked.unwrap_or(i);
-                    let (lo, hi) = if anchor <= i { (anchor, i) } else { (i, anchor) };
-                    for j in lo..=hi { self.selected.insert(j); }
-                    self.last_clicked = Some(i);
-                } else {
-                    self.selected.clear();
-                    self.selected.insert(i);
-                    self.last_clicked = Some(i);
-                }
-            }
-        });
+            // ---------------------------------------------------------------
+            // Bottom panel – controls + seek + volume
+            // ---------------------------------------------------------------
+            let panel_min_h = if self.spectrum_window.waveform.is_some() { 138.0 } else { 110.0 };
+            egui::TopBottomPanel::bottom("controls").min_height(panel_min_h).show(ctx, |ui| {
+                ui.add_space(10.0);
+                self.seek_bar_ui(ui);
+                ui.add_space(6.0);
+                self.transport_toolbar_ui(ui);
+                self.status_lines_ui(ui);
+                ui.add_space(6.0);
+            });
+
+            // ---------------------------------------------------------------
+            // Central panel – playlist store + playlist
+            // ---------------------------------------------------------------
+            egui::CentralPanel::default().show(ctx, |ui| self.playlist_ui(ui));
+        }
 
         // Reflect final playback state of this frame to the OS controls.
         self.sync_media_os();

@@ -17,16 +17,17 @@ professional-grade spectrum analyzer, and a parametric EQ, built in Rust.
 
 ## Build
 
-**Current release: [1.5.5](https://github.com/HenloAmHorse/Moosik-Player/releases/tag/v1.5.5).**
+**Current release: [1.6.0](https://github.com/HenloAmHorse/Moosik-Player/releases/tag/v1.6.0).**
 Download the Windows x86_64 `.exe` and the accompanying notices. There is no
 installer; local translation models are optional, separate downloads.
 
-1.5.5 adds a genuine pre-processed [CQT](docs/CQT.md) with a Responsive
-variable-Q bass option, 2048-bar spectra,
-[independent live padding and exact live FFT reuse](docs/REALTIME_FFT.md), and
-more [audio formats](docs/AUDIO_FORMATS.md), including native Opus. The existing
-FFT constant-Q weighting and Superlet remain separate choices, with their old
-caches preserved.
+1.6.0 redesigns the interface as one window with three modes (Listen,
+Library, Analyze) and adds live [Stereo and Harmony](docs/HARMONY.md) panels,
+with chords from an optional downloaded model that shows how sure it is and
+takes your corrections. The analyser itself is drawn exactly as before, and
+the classic layout is one switch away. 1.5.5 added a genuine pre-processed
+[CQT](docs/CQT.md), 2048-bar spectra and more
+[audio formats](docs/AUDIO_FORMATS.md), including native Opus.
 
 Requires Rust (stable, edition 2024). Tagged releases attach a prebuilt Windows
 x86_64 executable (it needs the Microsoft Visual C++ 2015-2022 Redistributable,
@@ -92,6 +93,14 @@ first build so the compiled dictionary is kept there, and later build with
   of step; what is on screen is never deleted to make room. Analyses from older
   versions are kept and offered only as labelled alternatives. The guarantees
   and their limits are in [docs/CACHE.md](docs/CACHE.md)
+- **One window, three modes** (1.6.0) — Listen, Library and Analyze share
+  one player bar; the classic layout is one switch away. The analyser is drawn
+  in Analyze exactly as in its own window
+- **Stereo and Harmony** (1.6.0) — a mid/side scope with width, balance,
+  correlation and octave bands; the chord now and next, the key and a note
+  wheel. Chords come from an optional downloaded model (lv-chordia, MIT) that
+  shows how sure it is and takes your corrections, or from a live guess
+  ([docs/HARMONY.md](docs/HARMONY.md))
 - **Parametric EQ** — up to 16 bands, dragged directly on the spectrum, with
   global and per-song presets
 - **Lyrics** — synced `.lrc`, read from the file or looked up online, with a
@@ -138,7 +147,8 @@ describes what the current release does.
 
 | | |
 |---|---|
-| **1.6.0** | Professional audio-analysis features. Harmonic and pitch analysis, time-frequency inspection and channel-analysis tools are candidate directions. |
+| **1.6.1** | A YouTube / YouTube Music source through an optional yt-dlp component. |
+| **1.6.2** | Pro audio tools: fake-lossless and fake-hi-res detection, true peak, loudness range, DR, clipping, headphone EQ and crossfeed, room correction, A/B and ABX, tempo and sections. See [docs/ROADMAP.md](docs/ROADMAP.md). |
 
 Principles that work is meant to hold to:
 

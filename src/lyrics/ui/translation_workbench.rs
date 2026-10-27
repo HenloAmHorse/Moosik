@@ -92,7 +92,7 @@ impl LyricsWindow {
                         if ui.button(label).clicked() { l.preferences.feedback = feedback.into(); }
                     }
                 });
-                reroll = ui.button("🎲 Draw another").on_hover_text("Changes the seed, then explicitly starts a new local request. Locked/unselected rows stay unchanged.").clicked();
+                reroll = ui.button(crate::shell::plain(self.page_fill, "🎲 Draw another")).on_hover_text("Changes the seed, then explicitly starts a new local request. Locked/unselected rows stay unchanged.").clicked();
                 if reroll { l.preferences.reroll(); }
             });
         });

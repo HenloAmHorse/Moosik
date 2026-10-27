@@ -27,16 +27,72 @@ The owner fixed the next three versions. Each is a scope, not a date.
   bars; independent live padding; exact live FFT buffer, geometry and window
   reuse; common audio formats with native Opus. [Scope and limitations](CQT.md).
 
-## 1.6.0 — stereo and polyphonic analysis (not started)
+## 1.6.0 — redesigned interface, stereo and polyphonic analysis (released 2026-10-27)
 
-- Stereo / spatial analysis.
-- Polyphonic pitch, harmonic and chord analysis.
-- Keep tools inside Spectrum with progressively disclosed controls rather
-  than adding another top-level analysis window. These are plans, not shipped
-  harmonic/chord or physical-room reconstruction features.
+A large release in two parts.
 
-1.6.0 remains unimplemented. No chord/spatial framework is added in anticipation
-of it; the CQT display cache contains level codes, not retained complex phase.
+**Interface.** A designed look and motion for the whole player: one player
+with three modes (Listen, Library, Analyze). Analyze keeps the spectrum's full
+resolution (up to 2048 bars, Superlet, CQT) and its existing colour ramps; the
+redesign changes the frame around it, never the rendering. Done in this
+order:
+
+1. Inventory the current interface: every window, control and state, a
+   screenshot matrix across languages and widths, CJK font issues, and a
+   baseline of per-frame CPU/GPU cost.
+2. Choose a visual direction, then a design system (colour, type, spacing,
+   components, motion timings), then high-fidelity key screens.
+3. Build one screen in egui, compare it with the design and measure it.
+4. Only if measurement shows a need: research partial redraw on the vendored
+   egui/eframe (cached layers for unchanged regions, dirty-rectangle
+   presentation). A player must stay light on resources.
+5. Apply the design screen by screen.
+
+It stays native: egui first, Slint only if an egui prototype fails; no web UI.
+Animation runs while something is interacting or already redrawing; an idle
+window does not redraw.
+
+**Analysis.**
+
+- **Done:** a Stereo panel (mid/side scope, width, balance, correlation and
+  ten octave bands) and a Harmony panel (chord now and next, key, note wheel)
+  inside Analyze, not another top-level window. Chords come from a Rust port
+  of lv-chordia, downloaded on request, with confidence and user correction;
+  without it the panel guesses live. See [HARMONY.md](HARMONY.md).
+- **Not in 1.6.0:** note-by-note (polyphonic pitch) transcription. A
+  fine-tuned note model exists in research but is not shipped; publishing its
+  weights needs the owner's decision. Score transcription (chord charts,
+  MIDI, MusicXML, tabs) is deferred until recognition is solid. No
+  physical-room reconstruction is claimed.
+- The owner accepted the chord model's accuracy for this release and is not
+  pursuing more of it for now.
+
+## 1.6.1 — YouTube source (planned, timing open)
+
+- Search, stream and download from YouTube and YouTube Music through yt-dlp,
+  installed as an optional component the user downloads, with one-click
+  updates (YouTube changes often break it).
+- Audio stays as delivered (Opus or AAC, lossy) and is labelled lossy; Moosik
+  already decodes both natively.
+- The 1.6.0 Library design reserves a place for sources; nothing is built for
+  YouTube in 1.6.0.
+
+## 1.6.2 — Pro audio tools (planned)
+
+- **What a file really is:** lossy-transcode ("fake lossless") detection from
+  the spectrum's cut-off, upsampled ("fake hi-res") and padded ("fake 24-bit")
+  detection, and FLAC MD5 verification of the decoded audio.
+- **Measurement:** true peak (ITU-R BS.1770, oversampled), loudness range,
+  PLR/PSR, DR and crest factor, clipping and inter-sample over counts marked on
+  the timeline, a goniometer beside the correlation meter (the 1.6.0 Stereo
+  panel already has a mid/side scope), DC offset and polarity.
+- **Listening:** headphone EQ from AutoEq profiles into the parametric EQ,
+  crossfeed, and room correction from REW or FIR files. All off unless switched
+  on; with them off, output stays bit-perfect.
+- **Comparing:** level-matched A/B, ABX blind tests with their statistics, and
+  a spectrum difference between two masters of one song.
+- **Musical tools**, once recognition is solid: tempo and beats, sections, and
+  speed or pitch change for practice.
 
 ## Internal batch numbers
 

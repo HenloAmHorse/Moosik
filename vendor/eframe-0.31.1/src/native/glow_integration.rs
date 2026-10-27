@@ -99,6 +99,11 @@ struct GlutinWindowContext {
     window_from_viewport: ViewportIdMap<WindowId>,
 
     focused_viewport: Option<ViewportId>,
+
+    /// Moosik local patch: lets child viewports get their own AccessKit
+    /// adapter, not only the root. See `PATCH.md`.
+    #[cfg(all(feature = "accesskit", feature = "moosik_child_accesskit"))]
+    accesskit_proxy: Option<EventLoopProxy<UserEvent>>,
 }
 
 /// Moosik local patch: exposes this backend's viewport map to the shared
@@ -317,7 +322,11 @@ impl<'app> GlowWinitApp<'app> {
                 ..
             } = viewport
             {
-                egui_winit.init_accesskit(window, event_loop_proxy);
+                egui_winit.init_accesskit(window, event_loop_proxy.clone());
+            }
+            #[cfg(feature = "moosik_child_accesskit")]
+            {
+                glutin.accesskit_proxy = Some(event_loop_proxy);
             }
         }
 
@@ -1150,6 +1159,8 @@ impl GlutinWindowContext {
             max_texture_side: None,
             window_from_viewport,
             focused_viewport: Some(ViewportId::ROOT),
+            #[cfg(all(feature = "accesskit", feature = "moosik_child_accesskit"))]
+            accesskit_proxy: None,
         };
 
         slf.initialize_window(ViewportId::ROOT, event_loop)?;
@@ -1186,6 +1197,8 @@ impl GlutinWindowContext {
             .get_mut(&viewport_id)
             .expect("viewport doesn't exist");
 
+        #[cfg(all(feature = "accesskit", feature = "moosik_child_accesskit"))]
+        let new_child = viewport_id != ViewportId::ROOT && viewport.egui_winit.is_none();
         let window = if let Some(window) = &mut viewport.window {
             window
         } else {
@@ -1223,6 +1236,13 @@ impl GlutinWindowContext {
                 self.max_texture_side,
             )
         });
+
+        #[cfg(all(feature = "accesskit", feature = "moosik_child_accesskit"))]
+        if new_child {
+            if let (Some(proxy), Some(egui_winit)) = (&self.accesskit_proxy, &mut viewport.egui_winit) {
+                egui_winit.init_accesskit(window, proxy.clone());
+            }
+        }
 
         if viewport.gl_surface.is_none() {
             log::debug!("Creating a gl_surface for viewport {viewport_id:?}");

@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 #[derive(Default)]
 pub struct TagWindow {
     pub open: bool,
+    /// The 1.6.0 page colour (set by the app each frame); None is the classic look.
+    pub page_fill: Option<egui::Color32>,
     loaded_for: Option<PathBuf>,
     /// Values as they are on disk, for change detection and Revert.
     original: Edits,
@@ -54,11 +56,11 @@ impl TagWindow {
             if vctx.input(|i| i.viewport().close_requested()) { close = true; return; }
             let dark = vctx.style().visuals.dark_mode;
 
-            egui::TopBottomPanel::bottom("tag_bot").show(vctx, |ui| {
+            egui::TopBottomPanel::bottom("tag_bot").frame(crate::shell::bar_frame(self.page_fill, &vctx.style())).show_separator_line(self.page_fill.is_none()).show(vctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let can_save = self.locked.is_none() && self.dirty();
-                    if ui.add_enabled(can_save, egui::Button::new("💾 Save"))
+                    if ui.add_enabled(can_save, egui::Button::new(crate::shell::plain(self.page_fill, "💾 Save")))
                         .on_hover_text(
                             "Writes to a copy and renames it over the original, so an \
                              interrupted write cannot damage the file. The result is \
@@ -76,7 +78,7 @@ impl TagWindow {
                             Err(e) => self.status = e,
                         }
                     }
-                    if ui.add_enabled(self.dirty(), egui::Button::new("↩ Revert")).clicked() {
+                    if ui.add_enabled(self.dirty(), egui::Button::new(crate::shell::plain(self.page_fill, "↩ Revert"))).clicked() {
                         self.edits = self.original.clone();
                         self.status.clear();
                     }
@@ -92,7 +94,7 @@ impl TagWindow {
                 ui.add_space(4.0);
             });
 
-            egui::CentralPanel::default().show(vctx, |ui| {
+            egui::CentralPanel::default().frame(crate::shell::page_frame(self.page_fill, &vctx.style())).show(vctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if let Some(why) = &self.locked {
                         ui.horizontal_wrapped(|ui| {
@@ -109,14 +111,27 @@ impl TagWindow {
 
                     let editable = self.locked.is_none();
                     egui::Grid::new("tag_edit").num_columns(2).spacing([10.0, 5.0])
-                        .striped(true).show(ui, |ui| {
+                        .striped(self.page_fill.is_none()).show(ui, |ui| {
+                        let changed = |s: &Self, i: usize| s.edits.values[i] != s.original.values[i];
+                        let tint = |c: bool| if c { pal::accent(dark) } else { pal::text_dim(dark) };
                         for (i, (_, label)) in EDITABLE.iter().enumerate() {
-                            let changed = self.edits.values[i] != self.original.values[i];
-                            let lbl = RichText::new(*label).size(12.0)
-                                .color(if changed { pal::accent(dark) } else { pal::text_dim(dark) });
-                            ui.label(lbl);
-                            ui.add_enabled(editable, egui::TextEdit::singleline(
-                                &mut self.edits.values[i]).desired_width(f32::INFINITY));
+                            // "of" shares its number's row: Track # [1] of [12].
+                            if *label == "of" {
+                                continue;
+                            }
+                            let total = EDITABLE.get(i + 1).is_some_and(|(_, l)| *l == "of");
+                            let c = changed(self, i) || (total && changed(self, i + 1));
+                            ui.label(RichText::new(*label).size(12.0).color(tint(c)));
+                            if total {
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled(editable, egui::TextEdit::singleline(&mut self.edits.values[i]).desired_width(56.0));
+                                    ui.label(RichText::new("of").size(12.0).color(tint(changed(self, i + 1))));
+                                    ui.add_enabled(editable, egui::TextEdit::singleline(&mut self.edits.values[i + 1]).desired_width(56.0));
+                                });
+                            } else {
+                                ui.add_enabled(editable, egui::TextEdit::singleline(
+                                    &mut self.edits.values[i]).desired_width(f32::INFINITY));
+                            }
                             ui.end_row();
                         }
                     });
@@ -130,7 +145,7 @@ impl TagWindow {
                             .size(10.5).color(pal::text_faint(dark)));
                         ui.add_space(4.0);
                         egui::Grid::new("tag_all").num_columns(2).spacing([10.0, 3.0])
-                            .striped(true).show(ui, |ui| {
+                            .striped(self.page_fill.is_none()).show(ui, |ui| {
                             for (k, v) in &self.all {
                                 ui.label(RichText::new(k).size(11.0).monospace()
                                          .color(pal::text_faint(dark)));

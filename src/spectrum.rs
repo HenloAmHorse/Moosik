@@ -57,7 +57,7 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use rodio::Source;
 use std::f32::consts::PI;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -609,11 +609,11 @@ mod iso226_tests {
 // Chromagram, key detection, BPM
 // ---------------------------------------------------------------------------
 
-const NOTE_NAMES: &[&str] = &["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+pub(crate) const NOTE_NAMES: &[&str] = &["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 
 /// Krumhansl-Schmuckler key profiles (major / minor).
-const KS_MAJOR: [f32; 12] = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88];
-const KS_MINOR: [f32; 12] = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
+pub(crate) const KS_MAJOR: [f32; 12] = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88];
+pub(crate) const KS_MINOR: [f32; 12] = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
 
 /// Convert FFT half-spectrum → 12-bin chromagram (pitch-class energy sums).
 /// Feeds key detection (`detect_key`).
@@ -625,7 +625,7 @@ const KS_MINOR: [f32; 12] = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3
 ///   contribution across octaves; without this, bass bins dominate.
 /// - Returns unnormalised values so callers can accumulate across multiple
 ///   frames (energy-weighted) before normalising.
-fn compute_chroma(norms: &[f32], sr: u32, fft_size: usize) -> [f32; 12] {
+pub(crate) fn compute_chroma(norms: &[f32], sr: u32, fft_size: usize) -> [f32; 12] {
     let mut chroma = [0.0f32; 12];
     let scale = fft_size as f32;
     for (i, &v) in norms.iter().enumerate().skip(1) {
@@ -639,7 +639,7 @@ fn compute_chroma(norms: &[f32], sr: u32, fft_size: usize) -> [f32; 12] {
     chroma
 }
 
-fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -786,6 +786,13 @@ pub struct StereoTapBuf {
     /// started in the meantime — a claim is unconditional by construction, so
     /// generation alone cannot refuse it.
     pub route_epoch: u64,
+    /// Frames the mixer has pulled from the tap that owns the buffer, since
+    /// it claimed it: what has actually been played of that track.
+    pub played: Arc<AtomicU64>,
+    /// Claims ever made. On the shared route a queued track claims when its
+    /// first samples are pulled, which makes this the hand-off's only exact
+    /// signal there.
+    pub claims: u64,
 }
 
 pub type StereoBuf = Arc<Mutex<StereoTapBuf>>;
@@ -796,6 +803,8 @@ pub fn new_stereo_buf() -> StereoBuf {
         channels: channels::NO_LIVE_TAP,
         generation: 0,
         route_epoch: 0,
+        played: Arc::new(AtomicU64::new(0)),
+        claims: 0,
     }))
 }
 
@@ -995,6 +1004,7 @@ fn claim_locked(v: &mut StereoTapBuf, channels: u16) -> u64 {
     v.frames.clear();
     v.channels = channels;
     v.generation = v.generation.wrapping_add(1);
+    v.claims = v.claims.wrapping_add(1);
     v.generation
 }
 
@@ -1160,6 +1170,7 @@ where
     frame_sum: f32,
     sample_batch: Vec<f32>,
     stereo_batch: Vec<[f32; 2]>,
+    played: Arc<AtomicU64>,
 }
 
 impl<S> SpectrumSource<S>
@@ -1177,7 +1188,12 @@ where
         // while the previous track is still playing, and taking the display
         // from it two seconds early is exactly the bug this ordering avoids.
         let route_epoch = prepare_live_tap(&stereo_buf, &buf);
+        let played = match stereo_buf.lock() {
+            Ok(g) => Arc::clone(&g.played),
+            Err(p) => Arc::clone(&p.into_inner().played),
+        };
         Self {
+            played,
             inner, buf, stereo_buf, claim: TapClaim::Pending, route_epoch, channels,
             ch_idx: 0, pending_l: 0.0, frame_sum: 0.0,
             // Both batches fill at one entry per *frame* and are flushed on the
@@ -1217,7 +1233,10 @@ where
                 try_claim_stereo_stream(&self.stereo_buf, self.channels, self.route_epoch);
             self.claim = match attempt {
                 StereoClaim::Busy => TapClaim::Pending,
-                StereoClaim::Claimed(g) => TapClaim::Owned(g),
+                StereoClaim::Claimed(g) => {
+                    self.played.store(0, Ordering::Relaxed);
+                    TapClaim::Owned(g)
+                }
                 StereoClaim::Stale => TapClaim::Disabled,
             };
         }
@@ -1247,6 +1266,7 @@ where
         self.frame_sum += f;
         self.ch_idx += 1;
         if self.ch_idx >= ch {
+            self.played.fetch_add(1, Ordering::Relaxed);
             self.sample_batch.push(self.frame_sum / ch as f32);
             self.frame_sum = 0.0;
             self.ch_idx = 0;
@@ -1674,6 +1694,9 @@ pub struct SpectrumAnalyzer {
     /// spawned until its completion has been consumed or discarded **and** its
     /// thread has exited. At most one: a second worker never starts beside it.
     analysis_job: Option<AnalysisJob>,
+    /// Set when a pre-process analysis finishes computing (not a cache hit);
+    /// the shell takes it and celebrates.
+    pub celebrate: bool,
     /// The newest request made while a job was owned. At most one — a newer
     /// request replaces it — so obsolete requests never start, and a request
     /// made while busy is never lost.
@@ -1809,6 +1832,7 @@ impl SpectrumAnalyzer {
             pre_frames: std::sync::Arc::new(cache::PreFrames::default()),
             pre_frame_rate: 60.0,
             analysis_job: None,
+            celebrate: false,
             pending_request: None,
             is_analyzing: Arc::new(AtomicBool::new(false)),
             analysis_progress: Arc::new(AtomicUsize::new(0)),
@@ -3258,6 +3282,7 @@ impl SpectrumAnalyzer {
             frames.len(),
             if stereo.is_some() { " (with channels)" } else { "" },
         );
+        self.celebrate = true;
         // The publisher's pin becomes the installed generation's pin: the
         // generation is protected continuously from its commit, through the
         // queued message, to the display.
@@ -7454,6 +7479,12 @@ pub struct SpectrumWindow {
     current_path: Option<PathBuf>,
     status_msg: String,
     pub max_fps: f32,
+    /// Drawn inside the main window (1.6.0 Analyze mode) rather than in
+    /// its own viewport.
+    pub embedded: bool,
+    /// Where the last pass drew the spectrum itself (below the controls), for
+    /// the shell to draw over.
+    pub canvas: Option<Rect>,
     last_fft_time: Option<Instant>,
     current_fps: f32,
     /// Instrumentation: wall-clock time of the previous show() call, the
@@ -7761,6 +7792,8 @@ impl SpectrumWindow {
             current_path: None,
             status_msg: String::new(),
             max_fps: 60.0,
+            embedded: false,
+            canvas: None,
             last_fft_time: None,
             current_fps: 0.0,
             last_show_time: None,
@@ -10543,6 +10576,10 @@ impl SpectrumWindow {
 
     /// Render the spectrum as a separate OS window via `show_viewport_immediate`.
     pub fn show(&mut self, ctx: &egui::Context) {
+        // Drawn by the main window instead (see `embedded_ui`).
+        if self.embedded {
+            return;
+        }
         if !self.open {
             // Closed by the main toolbar between ticks: release now as well.
             self.whole_track.retire();
@@ -10580,2255 +10617,7 @@ impl SpectrumWindow {
             if vp_ctx.input(|i| i.key_pressed(egui::Key::F3)) {
                 self.show_debug = !self.show_debug;
             }
-            egui::CentralPanel::default().show(vp_ctx, |ui| {
-                // ── Row 1: mode + view + channels + loudness ──────────────
-                //
-                // Wrapped, not clipped. This is one row of about a dozen
-                // controls and the window opens at 700 px with a 380 px
-                // minimum; a plain `horizontal` runs the tail of it off the
-                // right edge with nothing to say it is there. The Channels
-                // group was added to the end of it and was simply invisible at
-                // the default size — the feature shipped unreachable.
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Mode:");
-                    ui.add_enabled_ui(!matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)), |ui| {
-                        ui.selectable_value(&mut self.mode, SpectrumMode::RealTime, "Real-time");
-                    }).response.on_hover_text("True CQT uses centred full windows and is pre-process only. Select an FFT method for live analysis.");
-                    ui.selectable_value(&mut self.mode, SpectrumMode::PreProcess, "Pre-process");
-                    // Spectro and Octave rely on live FFT norms — unavailable in pre-process
-                    // mode (which replays compressed bar data, not raw bins). Auto-fall-back
-                    // to Waterfall so the display isn't blank.
-                    if self.mode == SpectrumMode::PreProcess
-                        && matches!(self.style, VizStyle::Spectrogram | VizStyle::OctaveBands)
-                    {
-                        self.style = VizStyle::Waterfall;
-                    }
-                    ui.separator();
-                    ui.label("View:");
-                    ui.selectable_value(&mut self.style, VizStyle::Bars, "Bars");
-                    ui.selectable_value(&mut self.style, VizStyle::Line, "Line");
-                    ui.selectable_value(&mut self.style, VizStyle::FilledArea, "Filled");
-                    ui.selectable_value(&mut self.style, VizStyle::Waterfall, "Waterfall");
-                    // Spectro and Octave are real-time only — hide buttons in pre-process mode.
-                    if self.mode == SpectrumMode::RealTime {
-                        ui.selectable_value(&mut self.style, VizStyle::Spectrogram, "Spectro");
-                        ui.selectable_value(&mut self.style, VizStyle::OctaveBands, "Octave");
-                    }
-                    ui.selectable_value(&mut self.style, VizStyle::Phasescope, "Phase");
-                    // The whole-track view replaces the plot while it is on and
-                    // leaves the views above exactly as they were. It reads a
-                    // finished analysis, so it exists only in Pre-process.
-                    if self.mode == SpectrumMode::PreProcess {
-                        let was = self.whole_track.open;
-                        ui.toggle_value(&mut self.whole_track.open, "Whole track")
-                            .on_hover_text(
-                                "The whole analysed track as a time–frequency picture: \
-                                 zoom with the wheel (Shift+wheel for frequency), drag to \
-                                 pan, click to seek, middle-click to fit.\n\nIt shows the \
-                                 stored analysis cells — no smoothing, no ISO 226 — and \
-                                 never starts an analysis by being opened.",
-                            );
-                        if was && !self.whole_track.open {
-                            self.whole_track.close();
-                        }
-                    } else {
-                        // Another mode keeps the preference and releases the
-                        // data; returning to Pre-process shows it again.
-                        self.whole_track.retire();
-                    }
-                    ui.separator();
-                    // ── Channel view ────────────────────────────────────────
-                    // Mix is always offered. The rest are enabled only when a
-                    // live two-channel PCM tap is feeding the analyser, and the
-                    // reason they are not is on the disabled buttons rather
-                    // than discovered by clicking one and seeing nothing change.
-                    let ch_reason = self.channel_availability.reason();
-                    ui.label("Channels:");
-                    for view in channels::ChannelView::ALL {
-                        if view == channels::ChannelView::Mix {
-                            ui.selectable_value(&mut self.channel_view, view, view.label())
-                                .on_hover_text(
-                                    "Every channel averaged to one spectrum, \
-                                     before the transform — which is not the \
-                                     same as averaging the two finished spectra. \
-                                     In a stereo analysis the mix is derived \
-                                     from the two channels' complex responses, \
-                                     at the point where that difference still \
-                                     exists.",
-                                );
-                            continue;
-                        }
-                        let enabled = ch_reason.is_none();
-                        let btn = ui.add_enabled(
-                            enabled,
-                            egui::SelectableLabel::new(self.channel_view == view, view.label()),
-                        );
-                        if enabled {
-                            if btn.clicked() {
-                                self.channel_view = view;
-                            }
-                            btn.on_hover_text(match view {
-                                channels::ChannelView::Left => "Left channel only.",
-                                channels::ChannelView::Right => "Right channel only.",
-                                channels::ChannelView::Split =>
-                                    "Left above right, sharing one frequency \
-                                     and dB scale.",
-                                channels::ChannelView::Diff =>
-                                    "Per band, the right channel's level minus \
-                                     the left channel's, in dB, about a centre \
-                                     line at 0 and full-scale at \u{b1}20 dB. \
-                                     Magenta means right is louder in that band, \
-                                     cyan means left. It is a difference of two \
-                                     measured levels, not a subtraction of the \
-                                     waveforms and not the M/S Side signal — \
-                                     two bands can cancel acoustically and still \
-                                     read zero here. Arrangement is under \
-                                     Settings.",
-                                _ => "Both channels in one plot: cyan is left, \
-                                      magenta is right.",
-                            });
-                        } else if let Some(ref why) = ch_reason {
-                            btn.on_hover_text(why.as_str());
-                        }
-                    }
-                    // Shown whenever the group is disabled, not only once a
-                    // channel view has been selected — which could not happen,
-                    // because selecting one requires the buttons this explains
-                    // the absence of. The reason was reachable only by hovering
-                    // a greyed-out button, which is not a thing anyone does.
-                    if let Some(ref why) = ch_reason {
-                        let short = match self.channel_availability {
-                            channels::ChannelAvailability::PreProcessMono => "no channels cached",
-                            channels::ChannelAvailability::UnsupportedStyle => "Bars/Line/Filled only",
-                            channels::ChannelAvailability::Mono => "mono track",
-                            channels::ChannelAvailability::Multichannel(n) => {
-                                &*format!("{n}-channel track")
-                            }
-                            _ => "no live PCM",
-                        };
-                        ui.label(
-                            egui::RichText::new(format!("({short})"))
-                                .size(11.0)
-                                .color(txt_faint(ui.visuals().dark_mode)),
-                        )
-                        .on_hover_text(why.as_str());
-                    }
-                    // Obtainable is not resident. The buttons are live while a
-                    // sidecar is being read, and the plot shows the Mix in the
-                    // meantime — so say which of those is happening, or a
-                    // second or two of apparently ignored clicks looks like a
-                    // bug.
-                    if self.mode == SpectrumMode::PreProcess
-                        && let Some(note) = self.analyzer.pre_channels().note()
-                    {
-                        let label = ui.label(
-                            egui::RichText::new(format!("({note})"))
-                                .size(11.0)
-                                .color(txt_faint(ui.visuals().dark_mode)),
-                        );
-                        if let PreChannels::Refused(why) = self.analyzer.pre_channels() {
-                            label.on_hover_text(format!(
-                                "The channel file beside this track's cache could                                  not be read:
-{why}
-
-The Mix is unaffected.                                  Analysing the track again will rewrite it."
-                            ));
-                        }
-                    }
-                    // Only in Pre-process, and next to the buttons it governs:
-                    // this is where someone who wanted Left/Right and could not
-                    // have it is already looking.
-                    if self.mode == SpectrumMode::PreProcess {
-                        self.stereo_intent_ui(ui);
-                    }
-                    ui.separator();
-                    ui.label("Loudness:");
-                    let prev_loudness = self.loudness_mode.clone();
-                    ui.selectable_value(&mut self.loudness_mode, LoudnessMode::Flat, "Flat");
-                    ui.selectable_value(&mut self.loudness_mode, LoudnessMode::EqualLoudness, "ISO 226");
-                    if self.loudness_mode != prev_loudness {
-                        self.sync_params();
-                    }
-                    ui.separator();
-                    ui.label("Palette:");
-                    egui::ComboBox::from_id_salt("spectrum_palette")
-                        .selected_text(self.palette_kind.label())
-                        .show_ui(ui, |ui| {
-                            for p in SpectrumPalette::ALL {
-                                let selected = self.palette_kind == p;
-                                let clicked = ui.horizontal(|ui| {
-                                    paint_palette_swatch(
-                                        ui, &Palette::new(p, self.palette_accent),
-                                        egui::vec2(34.0, 13.0),
-                                    );
-                                    ui.selectable_label(selected, p.label()).clicked()
-                                }).inner;
-                                if clicked { self.palette_kind = p; }
-                            }
-                        });
-                    ui.separator();
-                    let dark = ui.visuals().dark_mode;
-                    let eq_label = egui::RichText::new("🎛 EQ")
-                        .color(if self.show_eq { txt_accent(dark) } else { txt_faint(dark) });
-                    if ui.selectable_label(self.show_eq, eq_label)
-                        .on_hover_text("Toggle parametric EQ panel.\nClick on spectrum to add bands.\nDrag nodes to adjust.\nRight-click node to remove.")
-                        .clicked()
-                    {
-                        self.show_eq = !self.show_eq;
-                    }
-                    ui.separator();
-                    let dbg_label = egui::RichText::new("🐛 Debug")
-                        .color(if self.show_debug { txt_warn(dark) } else { txt_faint(dark) });
-                    if ui.selectable_label(self.show_debug, dbg_label)
-                        .on_hover_text("Toggle debug overlay (F3)")
-                        .clicked()
-                    {
-                        self.show_debug = !self.show_debug;
-                    }
-                });
-
-                if let Some(note) = self.spectrum_source_note() {
-                    ui.label(egui::RichText::new(note).color(txt_dim(ui.visuals().dark_mode)));
-                }
-
-                // ── Row 2: bar count (+ bar gap for Bars) ─────────────────
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Bars:");
-                    let r = ui.add(egui::Slider::new(&mut self.bar_count,
-                            MIN_BAR_COUNT..=MAX_BAR_COUNT)
-                        .logarithmic(true).integer().suffix(" bars"));
-                    let commit = r.drag_stopped() || (r.changed() && !r.dragged());
-                    if commit {
-                        self.bar_count = snap_pow2(self.bar_count);
-                        self.analyzer.set_bar_count(self.bar_count);
-                        self.sync_params();
-                        self.try_load_or_flag_reanalysis();
-                    }
-                    // FFT bin spacing, where an FFT is what is drawn. Under
-                    // Superlet pre-process there are no bins in the analysis,
-                    // and quoting the live preview's here read as if there were.
-                    if self.fft_knobs_apply() || self.mode == SpectrumMode::RealTime {
-                        // The live preview's FFT runs on the tap; an FFT
-                        // pre-process on the analysis feed.
-                        let (sr, size) = if self.mode == SpectrumMode::RealTime {
-                            (self.analyzer.live_rate, self.analyzer.fft_size)
-                        } else {
-                            (self.analyzer.sample_rate, self.fft_size)
-                        };
-                        ui.label(format!(
-                            "  (FFT bins {:.1} Hz apart)",
-                            sr as f32 / size.max(1) as f32
-                        ));
-                    }
-                    // Bar gap lives here (only meaningful for Bars), so it no
-                    // longer needs a row of its own.
-                    if self.style == VizStyle::Bars {
-                        ui.separator();
-                        ui.label("Gap:");
-                        ui.add(egui::Slider::new(&mut self.bar_gap, 0.0..=12.0)
-                            .step_by(1.0).suffix(" px"))
-                            .on_hover_text(
-                                "Physical-pixel gap between bars.\n\
-                                 0 = no gap (solid fill). Higher values give a more separated look."
-                            );
-                    }
-                });
-
-                // ── Settings sections ─────────────────────────────────────
-                // One wrap-around row of toggles instead of three stacked
-                // collapsibles, so the plot keeps its height. Each section's
-                // body renders full-width below when its toggle is on; the row
-                // wraps to more lines only when the window is too narrow.
-                ui.horizontal_wrapped(|ui| {
-                    let dark = ui.visuals().dark_mode;
-                    let mut chip = |open: &mut bool, text: &str| {
-                        let col = if *open { txt_accent(dark) } else { txt_dim(dark) };
-                        if ui.selectable_label(*open, egui::RichText::new(text).color(col))
-                            .clicked()
-                        {
-                            *open = !*open;
-                        }
-                    };
-                    chip(&mut self.show_fft_settings, "⚙ Analysis");
-                    if self.style == VizStyle::Bars {
-                        chip(&mut self.show_peak_settings, "📌 Peak Hold");
-                    }
-                    chip(&mut self.show_art_settings, "🖼 Album Art");
-                    if self.mode == SpectrumMode::PreProcess {
-                        chip(&mut self.show_cache_settings, "🗄 Cache");
-                    }
-                });
-
-                // ── FFT params ────────────────────────────────────────────
-                if self.show_fft_settings { ui.group(|ui| {
-                        let mut rebuild = false;
-                        // DSD decimation — only meaningful when a DSD track is
-                        // loaded. Two settings: the preprocessing feed
-                        // (analysis only) and the PCM fallback (audio).
-                        if self.current_path.as_deref().is_some_and(crate::dsd::is_dsd_path) {
-                            let file_rate = self.current_path.as_deref()
-                                .and_then(|p| crate::dsd::parse_file(p).ok())
-                                .map(|i| i.sample_rate);
-                            let khz = khz_label;
-                            ui.horizontal(|ui| {
-                                ui.label("DSD preprocessing rate:").on_hover_text(
-                                    "The rate DSD is decimated to for the pre-process analysis.                                      Analysis only: it does not change what you hear, the output                                      rate or the device. Superlet keeps its configured frame rate                                      at every rate. A lower rate analyses fewer samples with                                      shorter kernels — faster, smaller memory — and every rate                                      here covers the 24 kHz analysis band; a different rate gives                                      a close but not identical picture, so each rate keeps its                                      own cache.");
-                                let mut chosen = None;
-                                for &rate in &crate::dsd::decimate::PREPROCESS_RATES {
-                                    let produced = file_rate
-                                        .map(|f| crate::dsd::decimate::analysis_rate_for(f, rate));
-                                    let name = dsd_rate_choice_label(rate, produced);
-                                    let has = self.dsd_rate_cache_exists(rate);
-                                    let label = if has {
-                                        egui::RichText::new(&name).color(txt_ok(ui.visuals().dark_mode))
-                                    } else {
-                                        egui::RichText::new(&name)
-                                    };
-                                    let hover = match rate {
-                                        r if r > 176_400 => "Most samples and the longest kernels: the slowest analysis and the largest memory.",
-                                        r if r < 176_400 => "Fewest samples: the fastest analysis. Covers the 24 kHz band; the picture differs slightly from the higher rates.",
-                                        _ => "The rate every version before 1.5.3 analysed at.",
-                                    };
-                                    if ui.selectable_label(self.analyzer.dsd_rate == rate, label)
-                                        .on_hover_text(hover).clicked()
-                                        && self.analyzer.dsd_rate != rate {
-                                        chosen = Some(rate);
-                                    }
-                                }
-                                if let Some(rate) = chosen {
-                                    // Pre-process only: `sync_fft_sizes` leaves the
-                                    // live transform alone, so nothing to rebuild.
-                                    self.set_dsd_preprocess_rate(rate);
-                                }
-                            });
-                            if self.analyzer.sample_rate != self.analyzer.live_rate {
-                                ui.label(egui::RichText::new(format!(
-                                    "Analysis feed {} · live view {} (the playback fallback's rate)",
-                                    khz(self.analyzer.sample_rate), khz(self.analyzer.live_rate),
-                                )).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label("DSD PCM fallback (playback):").on_hover_text(
-                                    "Audio, not analysis: the rate DSD is decimated to for playback                                      when neither native DSD nor DoP can carry it. Takes effect                                      from the next track started.");
-                                for &rate in &crate::dsd::decimate::FALLBACK_RATES {
-                                    if ui.selectable_label(self.dsd_fallback_rate == rate, khz(rate)).clicked() {
-                                        self.dsd_fallback_rate = rate;
-                                    }
-                                }
-                            });
-                        }
-                        {
-                            let bm_green = |bm: BarMappingMode| -> egui::RichText {
-                                let has = self.current_path.as_ref().map(|p| {
-                                    self.cache_file_set.contains(&cache_path_for(
-                                        &self.analyzer.cache_dir(),
-                                        p, self.bar_count, self.fft_size, self.pad_factor,
-                                        self.overlap, &self.window_fn, self.min_freq, self.max_freq,
-                                        &bm, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
-                                    ))
-                                }).unwrap_or(false);
-                                let name = match bm {
-                                    BarMappingMode::FlatOverlap => "FFT · flat",
-                                    BarMappingMode::Gaussian    => "FFT · Gaussian",
-                                    BarMappingMode::Cqt         => "FFT · constant-Q weighting",
-                                    BarMappingMode::TrueCqt(_)  => "True CQT",
-                                    BarMappingMode::Superlet    => "Superlet (wavelets)",
-                                };
-                                if has { egui::RichText::new(name).color(txt_ok(ui.visuals().dark_mode)) }
-                                else   { egui::RichText::new(name) }
-                            };
-                            let lbl_flat  = bm_green(BarMappingMode::FlatOverlap);
-                            let lbl_gauss = bm_green(BarMappingMode::Gaussian);
-                            let lbl_cqt   = bm_green(BarMappingMode::Cqt);
-                            let lbl_true_cqt = bm_green(BarMappingMode::TrueCqt(self.last_true_cqt));
-                            let lbl_slt   = bm_green(BarMappingMode::Superlet);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Analysis method:");
-                                let prev = self.bar_mapping.clone();
-                                ui.selectable_value(&mut self.bar_mapping, BarMappingMode::FlatOverlap, lbl_flat)
-                                    .on_hover_text("An FFT, with each bar the equal-weight average of the FFT bins in its \
-                                                                 frequency range.");
-                                ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Gaussian, lbl_gauss)
-                                    .on_hover_text("An FFT, with each bar a Gaussian-weighted average of the FFT bins in \
-                                                                 its range — bins near the bar's centre count most.");
-                                ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Cqt, lbl_cqt)
-                                    .on_hover_text("FFT-based constant-Q weighting: each bar weights the FFT's bins \
-                                                                 with a Hann kernel whose width grows with frequency, so every \
-                                                                 bar spans the same fraction of an octave.\n\nNot a true \
-                                                                 constant-Q transform: the FFT underneath has one fixed \
-                                                                 window for every frequency, so time and frequency resolution \
-                                                                 are still the FFT's.");
-                                ui.selectable_value(&mut self.bar_mapping, BarMappingMode::TrueCqt(self.last_true_cqt), lbl_true_cqt)
-                                    .on_hover_text("A genuine constant-Q filterbank: each frequency has its own full centred window. Pre-process only. While it is not ready, live PCM can supply a clearly labelled FFT preview, never stored or described as CQT. Display bars and support Q are independent.");
-                                ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Superlet, lbl_slt)
-                                    .on_hover_text(format!(
-                                        "Adaptive Superlet Transform — a direct wavelet analysis, not an FFT mapping.\n\
-                                         Pre-processing takes much longer than an FFT; how long depends on these\n\
-                                         settings and the track's length.\n\
-                                         Pre-process only; live view keeps using the FFT.\n\n\
-                                         Current: {} — bass window {:.2} s, grid Q {:.0} @ {:.0} fps",
-                                        self.analyzer.aslt_preset.map(|p| p.label()).unwrap_or("Custom"),
-                                        aslt::window_seconds_at(
-                                            self.min_freq,
-                                            aslt::grid_q(self.bar_count, self.min_freq, self.max_freq),
-                                            &self.analyzer.aslt_cfg,
-                                        ),
-                                        aslt::grid_q(self.bar_count, self.min_freq, self.max_freq),
-                                        self.analyzer.pre_fps,
-                                    ));
-                                if self.bar_mapping != prev {
-                                    if let BarMappingMode::TrueCqt(cfg) = prev { self.last_true_cqt = cfg; }
-                                    if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
-                                        self.mode = SpectrumMode::PreProcess;
-                                        if matches!(self.style, VizStyle::Spectrogram | VizStyle::OctaveBands) {
-                                            self.style = VizStyle::Waterfall;
-                                        }
-                                    }
-                                    self.analyzer.bar_mapping = self.bar_mapping.clone();
-                                    self.sync_params();
-                                    self.try_load_or_flag_reanalysis();
-                                }
-                            });
-
-                            if self.true_cqt_settings_ui(ui) {
-                                self.analyzer.bar_mapping = self.bar_mapping.clone();
-                                self.sync_params();
-                                self.try_load_or_flag_reanalysis();
-                            }
-
-                            // Superlet quality ladder — only meaningful while
-                            // Superlet is the active mapping, so it stays hidden
-                            // otherwise rather than sitting there greyed out.
-                            if self.bar_mapping == BarMappingMode::Superlet {
-                                // The grid Q the readouts quote has to be the
-                                // one at the frequency being quoted: under ERB
-                                // it varies along the spectrum, and a single
-                                // number would describe a display that is not
-                                // on screen.
-                                let n_bars = self.bar_count;
-                                let (lo_hz, hi_hz) = (self.min_freq, self.max_freq);
-                                let grid_at_hz = |sc: freq_scale::FreqScale, f: f32| {
-                                    // Straight inversion, not a search. Scanning
-                                    // every bar for the nearest centre meant a
-                                    // thousand `bar_center` calls per lookup, and
-                                    // on a blended scale each of those is a
-                                    // bisection — about a third of a million
-                                    // evaluations per frame with this panel open,
-                                    // which is what dropped the frame rate while
-                                    // it was.
-                                    let t = sc.position_of(f, lo_hz, hi_hz);
-                                    let bar = (t * n_bars as f32 - 0.5)
-                                        .round()
-                                        .clamp(0.0, n_bars.saturating_sub(1) as f32)
-                                        as usize;
-                                    sc.grid_q_at(bar, n_bars, lo_hz, hi_hz)
-                                };
-                                // What the transform is competing against, so the
-                                // labels can say "better than the FFT" and mean it.
-                                let fft_sigma = aslt::fft_sigma_hz(
-                                    self.analyzer.sample_rate, self.fft_size);
-                                let mut retune: Option<(Option<aslt::AsltPreset>, aslt::AsltConfig)> = None;
-                                ui.horizontal(|ui| {
-                                    ui.label("Quality:");
-                                    for p in [
-                                        aslt::AsltPreset::Fast, aslt::AsltPreset::Standard,
-                                        aslt::AsltPreset::High, aslt::AsltPreset::Ultra,
-                                        aslt::AsltPreset::Extreme,
-                                    ] {
-                                        let cfg = p.config();
-                                        let selected = self.analyzer.aslt_preset == Some(p);
-                                        let beats_fft = 60.0 / aslt::effective_q_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg)
-                                            < fft_sigma;
-                                        if ui.selectable_label(selected, p.label())
-                                            .on_hover_text(format!(
-                                                "Bass window {:.2} s, Q {:.0} at 60 Hz.\n{}",
-                                                aslt::window_seconds_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
-                                                aslt::effective_q_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
-                                                if beats_fft {
-                                                    "Resolves bass detail the FFT cannot reach."
-                                                } else {
-                                                    "Below FFT resolution in the bass; still much faster in the treble."
-                                                },
-                                            ))
-                                            .clicked() && !selected
-                                        {
-                                            retune = Some((Some(p), cfg));
-                                        }
-                                    }
-                                    let custom = self.analyzer.aslt_preset.is_none();
-                                    if ui.selectable_label(custom, "Custom")
-                                        .on_hover_text("Set the window budget and wavelet spread by hand.")
-                                        .clicked() && !custom
-                                    {
-                                        retune = Some((None, self.analyzer.aslt_cfg.clone()));
-                                    }
-                                });
-                                if self.analyzer.aslt_preset.is_none() {
-                                    let mut cfg = self.analyzer.aslt_cfg.clone();
-                                    let before = cfg.clone();
-                                    ui.horizontal(|ui| {
-                                        ui.label("Max window:");
-                                        ui.add(egui::Slider::new(&mut cfg.max_window_s, aslt::MAX_WINDOW_RANGE)
-                                            .logarithmic(true).suffix(" s"))
-                                            .on_hover_text(
-                                                "Longest analysis window. This is the bass trade: \
-                                                 constant-Q at 20 Hz needs ~10 s, so whatever you \
-                                                 set here is where bass detail stops. Never binds \
-                                                 above ~1 kHz.");
-                                        // The same setting stated as what it
-                                        // actually decides. Both are live and
-                                        // either can be driven — the seconds are
-                                        // the cost, the hertz are the result,
-                                        // and which one someone thinks in is
-                                        // their business.
-                                        ui.label("= target sharpness above:");
-                                        let mut hz = aslt::full_detail_above(grid_at_hz(cfg.scale, 1000.0), &cfg);
-                                        if ui.add(egui::DragValue::new(&mut hz)
-                                            .range(30.0..=8000.0).speed(5.0).suffix(" Hz"))
-                                            .on_hover_text(
-                                                "The lowest frequency at which the window cap does \
-                                                 not limit the transform, so it reaches the Sharpness \
-                                                 target. That is not one bar of visible width: at \
-                                                 Sharpness 1.0 a tone's peak is about 2.4 bars wide \
-                                                 at half amplitude. Below this frequency the cap \
-                                                 binds and the peak widens further — that is the \
-                                                 uncertainty principle, not a defect, and no setting \
-                                                 removes it. Driving this sets the window above.")
-                                            .changed()
-                                        {
-                                            cfg.max_window_s = aslt::window_for_full_detail_above(
-                                                hz, grid_at_hz(cfg.scale, hz), &cfg,
-                                            ).clamp(0.1, 8.0);
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Sharpness:");
-                                        ui.add(egui::Slider::new(&mut cfg.q_ratio, aslt::Q_RATIO_RANGE)
-                                            .suffix("× grid"))
-                                            .on_hover_text(
-                                                "Target Q as a multiple of the bar grid. At 1.0 a \
-                                                 tone's σ is one bar spacing and its peak is about \
-                                                 2.4 bars wide at half amplitude; 2.0 brings that to \
-                                                 about 1.2 bars. 1.0 is not the limit of what the \
-                                                 display can show. Sharper costs time resolution \
-                                                 (a longer window) and reads tones between bar \
-                                                 centres lower.");
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Wavelets:");
-                                        ui.add(egui::Slider::new(&mut cfg.n_wavelets, aslt::N_WAVELETS_RANGE))
-                                            .on_hover_text(
-                                                "Members per superlet. 1 is a plain wavelet transform \
-                                                 — sharpest peak, no cross-checking. More suppress \
-                                                 energy the set disagrees about.");
-                                        ui.label("Spread:");
-                                        ui.add(egui::Slider::new(&mut cfg.spread, aslt::SPREAD_RANGE))
-                                            .on_hover_text(
-                                                "Shortest member as a fraction of the longest. 0 is \
-                                                 the paper's layout and costs 1.73× resolution for \
-                                                 the same time; ~0.5 keeps most of the cross-checking \
-                                                 for 1.31×.");
-                                    });
-                                    let (lens_hz, lens_oct, lens_gain) =
-                                        cfg.scale.lens().unwrap_or((1000.0, 2.0, 0.0));
-                                    ui.horizontal(|ui| {
-                                        ui.label("Bass width:");
-                                        let mut tilt = cfg.scale.tilt();
-                                        // Reversed range so dragging right
-                                        // widens the bass, which is the
-                                        // direction the label promises.
-                                        let r = ui.add(
-                                            egui::Slider::new(&mut tilt, 1.0..=-1.0)
-                                                .step_by(0.05)
-                                                .custom_formatter(|v, _| match v {
-                                                    v if v == 0.0 => "log".into(),
-                                                    v if v == 1.0 => "ERB".into(),
-                                                    v if v > 0.0 => format!("-{:.0}%", v * 100.0),
-                                                    v => format!("+{:.0}%", -v * 100.0),
-                                                }))
-                                            .on_hover_text(
-                                                "How much of the display the bass gets. 'log' is \
-                                                 constant bars per octave, the classic analyser \
-                                                 axis. 'ERB' is constant bars per auditory filter \
-                                                 (Glasberg & Moore 1990) — the bass narrows and \
-                                                 the treble opens up. Past log, the bass keeps \
-                                                 widening.\n\nThis is taste, not accuracy. A tone's \
-                                                 blur and a bassline's travel both scale with bar \
-                                                 density, so the ratio between them is the same \
-                                                 everywhere on this slider — what changes is how \
-                                                 much screen the bass gets to move across. And \
-                                                 while the window cap is binding down there, \
-                                                 which it is at any setting below about 1 s, \
-                                                 widening the bass costs no extra compute at all.\
-                                                 \n\nEach setting caches separately, so moving \
-                                                 back and forth is free after the first analysis.");
-                                        if r.changed() {
-                                            cfg.scale = freq_scale::FreqScale::from_parts(
-                                                tilt, lens_hz, lens_oct, lens_gain);
-                                        }
-                                        if ui.small_button("log").clicked() {
-                                            cfg.scale = freq_scale::FreqScale::from_parts(
-                                                0.0, lens_hz, lens_oct, lens_gain);
-                                        }
-                                        if ui.small_button("ERB").clicked() {
-                                            cfg.scale = freq_scale::FreqScale::from_parts(
-                                                1.0, lens_hz, lens_oct, lens_gain);
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Zoom:");
-                                        let mut on = lens_gain > 0.0;
-                                        if ui.checkbox(&mut on, "").changed() {
-                                            cfg.scale = freq_scale::FreqScale::from_parts(
-                                                cfg.scale.tilt(), lens_hz, lens_oct,
-                                                if on { 2.0 } else { 0.0 },
-                                            );
-                                        }
-                                        let mut hz = lens_hz;
-                                        let mut oct = lens_oct;
-                                        let mut gain = lens_gain;
-                                        let e = ui.add_enabled_ui(on, |ui| {
-                                            let a = ui.add(egui::DragValue::new(&mut hz)
-                                                .range(20.0..=20_000.0).speed(10.0).suffix(" Hz"))
-                                                .on_hover_text("Where the extra detail goes.");
-                                            let b = ui.add(egui::Slider::new(&mut oct, 0.25..=6.0)
-                                                .suffix(" oct").text(""))
-                                                .on_hover_text("How wide the magnified region is.");
-                                            let c = ui.add(egui::Slider::new(&mut gain, 0.5..=8.0)
-                                                .text("×"))
-                                                .on_hover_text(
-                                                    "How much extra detail at the centre. Bars are \
-                                                     taken from the rest of the spectrum to pay \
-                                                     for it — the count never changes.");
-                                            a.changed() || b.changed() || c.changed()
-                                        }).inner;
-                                        if e {
-                                            cfg.scale = freq_scale::FreqScale::from_parts(
-                                                cfg.scale.tilt(), hz, oct, gain);
-                                        }
-                                    });
-                                    // Zooming above the bass is not free: nothing
-                                    // caps the window up there, so packing bars in
-                                    // raises the resolution actually demanded.
-                                    // Quoted as a ratio against the same settings
-                                    // with the lens off, because a multiplier on a
-                                    // twelve-minute analysis is the part that
-                                    // matters.
-                                    if cfg.scale.lens().is_some() {
-                                        let mut flat = cfg.clone();
-                                        flat.scale =
-                                            freq_scale::FreqScale::from_tilt(cfg.scale.tilt());
-                                        let cost = |c: &aslt::AsltConfig| -> f64 {
-                                            aslt::bar_taps_per_frame(
-                                                self.analyzer.sample_rate, self.bar_count,
-                                                self.min_freq, self.max_freq, c,
-                                            ).iter().sum()
-                                        };
-                                        let (a, b) = (cost(&cfg), cost(&flat));
-                                        let ratio = if b > 0.0 { a / b } else { 1.0 };
-                                        let msg = format!("zoom costs {ratio:.2}x the analysis time");
-                                        let col = if ratio > 1.5 {
-                                            txt_warn(ui.visuals().dark_mode)
-                                        } else {
-                                            txt_dim(ui.visuals().dark_mode)
-                                        };
-                                        ui.label(egui::RichText::new(msg).size(10.0).color(col));
-                                    }
-                                    ui.label(egui::RichText::new(format!(
-                                        "60 Hz: σ {:.2} Hz, window {:.2} s  ·  FFT: σ {fft_sigma:.2} Hz, window {:.0} ms  ·  10 kHz: window {:.0} ms (windows are full support, not a temporal width)",
-                                        60.0 / aslt::effective_q_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
-                                        aslt::window_seconds_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
-                                        1000.0 * self.fft_size as f32 / self.analyzer.sample_rate as f32,
-                                        1000.0 * aslt::window_seconds_at(10_000.0, grid_at_hz(cfg.scale, 10_000.0), &cfg),
-                                    )).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
-                                    // How wide a single bass tone will actually
-                                    // draw, which is the thing people notice
-                                    // first and the hardest to predict from a
-                                    // window length in seconds.
-                                    // σ in bar spacings, from the model, and
-                                    // the amplitude FWHM that σ implies
-                                    // (2√(2 ln 2) σ ≈ 2.355σ). The superlet's
-                                    // measured peaks are a few per cent wider.
-                                    let sigma_bars = |f: f32| {
-                                        let g = grid_at_hz(cfg.scale, f);
-                                        g / aslt::effective_q_at(f, g, &cfg)
-                                    };
-                                    const FWHM_PER_SIGMA: f32 = 2.354_82;
-                                    ui.label(egui::RichText::new(format!(
-                                        "a pure tone's peak, at half amplitude: ≈{:.1} bars wide at 60 Hz, \
-                                         ≈{:.1} at 200 Hz (σ {:.2} / {:.2} bars); the window cap stops \
-                                         limiting it above {:.0} Hz",
-                                        FWHM_PER_SIGMA * sigma_bars(60.0), FWHM_PER_SIGMA * sigma_bars(200.0),
-                                        sigma_bars(60.0), sigma_bars(200.0),
-                                        aslt::full_detail_above(grid_at_hz(cfg.scale, 1000.0), &cfg),
-                                    )).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
-                                    if cfg != before { retune = Some((None, cfg)); }
-                                }
-                                ui.horizontal(|ui| {
-                                    ui.label("Frame rate:");
-                                    let mut fps = self.analyzer.pre_fps;
-                                    if ui.add(egui::Slider::new(&mut fps, 30.0..=240.0).step_by(30.0).suffix(" fps"))
-                                        .on_hover_text("Pre-processed frames per second. Cost scales linearly, and so does cache size.")
-                                        .changed()
-                                    {
-                                        self.analyzer.pre_fps = fps;
-                                        self.try_load_or_flag_reanalysis();
-                                    }
-                                });
-                                self.compute_budget_ui(ui);
-                                if let Some((preset, cfg)) = retune {
-                                    self.analyzer.aslt_preset = preset;
-                                    self.analyzer.aslt_cfg = cfg;
-                                    self.try_load_or_flag_reanalysis();
-                                }
-                            }
-                        }
-                        // Under Superlet pre-process the FFT rows describe only the live
-                        // preview, so they fold away rather than lead the panel. Values are
-                        // kept either way; nothing here changes what is saved.
-                        if self.mode == SpectrumMode::PreProcess
-                            && (self.bar_mapping == BarMappingMode::Superlet || self.true_cqt_preview_pending())
-                        {
-                            egui::CollapsingHeader::new("Live FFT preview")
-                                .id_salt("live_fft_preview")
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    let note = if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
-                                        "These settings affect only the LIVE FFT PREVIEW (FFT constant-Q weighting), not true CQT or its cache. The preview uses live PCM and stops when true CQT is ready. Live zero-padding controls its bin density; pre-process padding and overlap do not apply. Interpolation does not apply to this weighting."
-                                    } else {
-                                        "Superlet analyses the waveform directly, so these do not change \
-                                         the analysis. They shape only the live FFT drawn until the \
-                                         analysis is ready. Live zero-padding controls the preview's bin \
-                                         density; pre-process padding and overlap are hidden here and kept."
-                                    };
-                                    ui.label(egui::RichText::new(note)
-                                        .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                                    self.fft_rows(ui, &mut rebuild, false);
-                                });
-                        } else if self.fft_knobs_apply() {
-                            self.fft_rows(ui, &mut rebuild, true);
-                        }
-                        ui.horizontal(|ui| {
-                            // One control, whichever mode is showing — but two
-                            // values, persisted apart. They are not the same
-                            // quantity: Real-time is retention per accepted
-                            // tick, Pre-process is retention at a 60 Hz
-                            // reference converted for the source interval.
-                            // Sharing one number made a fast display change what
-                            // Real-time meant.
-                            let pre = self.mode == SpectrumMode::PreProcess;
-                            ui.label(if pre { "Smoothing (cached):" } else { "Smoothing (live):" });
-                            let value = if pre { &mut self.pre_smoothing } else { &mut self.smoothing };
-                            let r = ui.add(
-                                egui::Slider::new(value, 0.0..=0.97).step_by(0.01),
-                            );
-                            // Quoted in milliseconds, because that is the thing
-                            // being chosen and the retention figure hides it:
-                            // 0.75 is 174 ms, seven times what 0.125 gives, and
-                            // nothing on screen used to say so.
-                            let hint = if pre {
-                                let v = self.pre_smoothing;
-                                if v <= 0.0 {
-                                    "Off — each cached row is shown exactly as analysed.".to_string()
-                                } else {
-                                    format!(
-                                        "Cached playback. A step reaches 95% in {:.0} ms, the same \
-                                         on every machine and at every analysis rate. Default {:.3} \
-                                         is {:.0} ms.",
-                                        timing::step_response_95_secs(v) * 1000.0,
-                                        timing::DEFAULT_PRE_SMOOTHING,
-                                        timing::step_response_95_secs(timing::DEFAULT_PRE_SMOOTHING)
-                                            * 1000.0,
-                                    )
-                                }
-                            } else {
-                                "Live analysis. Retention per analyser tick, so the response \
-                                 follows Max FPS — the behaviour this control has always had."
-                                    .to_string()
-                            };
-                            r.on_hover_text(hint);
-                            self.analyzer.smoothing = self.smoothing;
-                            self.analyzer.pre_smoothing = self.pre_smoothing;
-                        });
-                        if self.channel_view == channels::ChannelView::Diff {
-                            ui.horizontal(|ui| {
-                                ui.label("Diff layout:");
-                                for o in [
-                                    channels::DiffOrientation::Horizontal,
-                                    channels::DiffOrientation::Vertical,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut self.diff_layout.orientation,
-                                        o,
-                                        o.label(),
-                                    );
-                                }
-                                ui.separator();
-                                let (pos, neg) = self.diff_layout.end_labels();
-                                let swap = if self.diff_layout.orientation
-                                    == channels::DiffOrientation::Vertical
-                                {
-                                    format!("{neg} ◀ ▶ {pos}")
-                                } else {
-                                    format!("{pos} ▲ ▼ {neg}")
-                                };
-                                ui.checkbox(&mut self.diff_layout.flip_channels, "Swap L/R")
-                                    .on_hover_text(format!(
-                                        "Which channel sits on which side. Currently {swap}. \
-                                         Convention, not fact — the label moves with it, so the \
-                                         plot cannot end up saying the opposite of what it shows."
-                                    ));
-                                ui.checkbox(&mut self.diff_layout.flip_frequency, "Flip freq")
-                                    .on_hover_text(
-                                        "Run the frequency axis the other way — high to low \
-                                         instead of low to high, or bottom to top instead of \
-                                         top to bottom.",
-                                    );
-                            });
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label("Waterfall history:");
-                            let r = ui.add(
-                                egui::Slider::new(
-                                    &mut self.waterfall_secs,
-                                    timing::WATERFALL_SECS_RANGE,
-                                )
-                                .step_by(0.01)
-                                .suffix(" s"),
-                            );
-                            // The row count is what it costs, and it follows
-                            // the row rate rather than the slider, so it is
-                            // worth showing rather than leaving to be guessed.
-                            // So is whether that rate is measured or requested,
-                            // and whether a bound moved the span off the slider.
-                            let (hz, nominal) = self.waterfall_row_rate();
-                            let rows = timing::waterfall_rows_for(self.waterfall_secs, hz);
-                            let span = timing::waterfall_span_secs(rows, hz);
-                            let bounded = (span - self.waterfall_secs as f64).abs() > 0.01;
-                            let mut shown = if nominal {
-                                format!("{rows} rows @ up to {hz:.0}/s (nominal)")
-                            } else {
-                                format!("{rows} rows @ {hz:.0}/s")
-                            };
-                            if bounded {
-                                let which = if rows <= timing::WATERFALL_MIN_ROWS {
-                                    "min"
-                                } else {
-                                    "max"
-                                };
-                                shown.push_str(&format!(
-                                    " — {which} {rows} rows, so {span:.2} s"
-                                ));
-                            }
-                            ui.label(
-                                egui::RichText::new(shown)
-                                    .size(10.0)
-                                    .color(txt_faint(ui.visuals().dark_mode)),
-                            );
-                            r.on_hover_text(if nominal {
-                                "How much of the rolling waterfall's past to keep. \
-                                 The waterfall advances once per analysis update and \
-                                 the ring is a fixed number of rows, so the span is \
-                                 rows divided by the rate they arrive at.\n\n\
-                                 In Real-time that rate is taken from Max FPS, which \
-                                 is a ceiling the analyser is asked to respect rather \
-                                 than a rate anything has measured — so this duration \
-                                 is nominal. If the machine delivers fewer updates a \
-                                 second than Max FPS asks for, the same rows cover \
-                                 more time and the history reaches further back than \
-                                 the slider says.\n\n\
-                                 The ring is held between 32 and 2048 rows. Where a \
-                                 bound binds it, the span it actually covers is shown \
-                                 beside the slider instead of the value requested."
-                            } else {
-                                "How much of the rolling waterfall's past to keep. \
-                                 The waterfall advances once per cached row consumed \
-                                 and the ring is a fixed number of rows, so the span \
-                                 is rows divided by the cache's frame rate. Every \
-                                 cached row is consumed, so this duration is measured \
-                                 rather than nominal.\n\n\
-                                 The ring is held between 32 and 2048 rows. Where a \
-                                 bound binds it, the span it actually covers is shown \
-                                 beside the slider instead of the value requested."
-                            });
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Min Hz:");
-                            let r = ui.add(egui::DragValue::new(&mut self.min_freq)
-                                .range(10.0..=500.0).speed(1.0).suffix(" Hz"));
-                            ui.label("Max Hz:");
-                            let r2 = ui.add(egui::DragValue::new(&mut self.max_freq)
-                                .range(1000.0..=24000.0).speed(10.0).suffix(" Hz"));
-                            if r.changed() || r2.changed() {
-                                self.sync_params();
-                                self.try_load_or_flag_reanalysis();
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Max FPS:");
-                            ui.add(egui::Slider::new(&mut self.max_fps, 1.0..=240.0)
-                                .step_by(1.0).suffix(" fps"));
-                        });
-                        if rebuild {
-                            self.analyzer.rebuild_fft();
-                        }
-                    }); }
-
-                // ── Pre-process cache ─────────────────────────────────────
-                // Warning banner and the stats refresh stay live; the actual
-                // management controls tuck into the 🗄 Cache chip so they don't
-                // eat plot height when unused.
-                if self.mode == SpectrumMode::PreProcess {
-                    // Banner when settings changed and no matching cache exists
-                    if self.needs_reanalysis && self.current_path.is_some() {
-                        ui.horizontal(|ui| {
-                            let analyzing = self.analyzer.analysis_busy();
-                            let label = if analyzing {
-                                "⚠ No cache for current settings — waiting for analysis to finish…"
-                            } else {
-                                "⚠ No cache for current settings."
-                            };
-                            ui.label(egui::RichText::new(label)
-                                .size(11.0).color(txt_warn(ui.visuals().dark_mode)));
-                            let has_path = self.current_path.is_some();
-                            if ui.add_enabled(has_path && self.cache_controls_free(),
-                                egui::Button::new("🔄 Re-analyze now")).clicked() {
-                                self.reanalyze();
-                            }
-                        });
-                    }
-                    self.alternates_ui(ui);
-
-                    // Refresh cache stats + file set (no UI). Must run even when
-                    // the Cache chip is closed — the FFT-size / window / padding
-                    // buttons colour green from cache_file_set to show which
-                    // combinations are already analysed.
-                    let stale = self.cache_stats_at
-                        .map(|t| t.elapsed().as_secs_f32() > 2.0)
-                        .unwrap_or(true);
-                    if stale {
-                        let dir = self.analyzer.cache_dir();
-                        self.cache_stats = cache_usage(&dir);
-                        // Unit (head) paths: this set answers "is there an
-                        // analysis of this track at those settings", a hint for
-                        // the settings buttons. Whether it is an exact hit for
-                        // the file as it is now is decided when it is used.
-                        self.cache_file_set = cached_units(&dir);
-                        self.cache_stats_at = Some(Instant::now());
-                    }
-
-                    if self.show_cache_settings { ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            let analyzing = self.analyzer.analysis_busy();
-                            let has_path  = self.current_path.is_some();
-                            let free = self.cache_controls_free();
-                            if ui.add_enabled(has_path && free,
-                                egui::Button::new("🗑 Clear Cache")).clicked() {
-                                self.clear_cache();
-                            }
-                            if ui.add_enabled(has_path && free,
-                                egui::Button::new("🔄 Re-analyze")).clicked() {
-                                self.reanalyze();
-                            }
-                            if analyzing {
-                                let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
-                                let eta = self.analyzer.eta_secs.load(Ordering::Relaxed);
-                                ui.spinner();
-                                // The ETA lives here rather than only on the plot
-                                // overlay: that overlay is gated on the plot being
-                                // silent, so during normal PCM playback — the live
-                                // FFT still drawing — it never appears at all.
-                                ui.label(egui::RichText::new(format!(
-                                    "{} {}%{}",
-                                    phase_label(pct), pct,
-                                    if eta == usize::MAX {
-                                        String::new()
-                                    } else {
-                                        format!(" — about {} left", fmt_eta(eta))
-                                    },
-                                )).size(11.0).color(txt_dim(ui.visuals().dark_mode)));
-                                if ui.add(egui::Button::new("✖ Abort").small()).clicked() {
-                                    self.analyzer.abort_preprocess();
-                                    self.status_msg = "Analysis aborted.".into();
-                                }
-                            } else if !self.status_msg.is_empty() {
-                                ui.label(egui::RichText::new(&self.status_msg)
-                                    .size(11.0).color(txt_dim(ui.visuals().dark_mode)));
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Budget:");
-                            let mut unlimited = self.analyzer.cache_budget_gb <= 0.0;
-                            if ui.checkbox(&mut unlimited, "Unlimited")
-                                .on_hover_text("No eviction — the cache grows until you clear it.")
-                                .changed()
-                            {
-                                self.analyzer.cache_budget_gb =
-                                    if unlimited { 0.0 } else { DEFAULT_CACHE_BUDGET_GB };
-                            }
-                            if !unlimited {
-                                let mut gb = self.analyzer.cache_budget_gb;
-                                // Logarithmic: the useful range runs from a
-                                // couple of superlet tracks to a whole library,
-                                // which linear steps cannot cover usefully.
-                                let changed = ui.add(egui::Slider::new(&mut gb, 0.1..=500.0)
-                                    .logarithmic(true)
-                                    .suffix(" GB")
-                                    .custom_formatter(|v, _| if v < 1.0 {
-                                        format!("{:.0} MB", v * 1000.0)
-                                    } else {
-                                        format!("{v:.1}")
-                                    }))
-                                    .on_hover_text(
-                                        "Ceiling on the whole cache directory. Least-recently-used \
-                                         files are evicted after each analysis to stay under it. \
-                                         Type a number here to set it exactly.\n\nA superlet track \
-                                         at 180 fps costs 45–80 MB and cannot be packed much \
-                                         smaller — the low byte of every stored value is \
-                                         quantisation noise, so no lossless coder beats ~12 %. \
-                                         Bounding the total is the real control.")
-                                    .changed();
-                                if changed { self.analyzer.cache_budget_gb = gb.max(0.05); }
-                                // What that budget actually holds, in the units
-                                // the user is spending it in.
-                                let per_track = 60.0; // MB, typical superlet track
-                                ui.label(egui::RichText::new(format!(
-                                    "≈ {:.0} superlet tracks", gb * 1000.0 / per_track,
-                                )).size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                            }
-                            // Any worker still able to write, cancelled or not.
-                            let busy = self.analyzer.analysis_active();
-                            if ui.add_enabled(
-                                self.analyzer.cache_budget_gb > 0.0 && !busy,
-                                egui::Button::new("Trim now").small(),
-                            ).on_hover_text("Evict least-recently-used caches down to the budget.")
-                                .clicked()
-                            {
-                                self.status_msg = self.trim_now();
-                            }
-                        });
-                        let CacheUsage { analyses: count, bytes, legacy_files, legacy_bytes } = self.cache_stats;
-                        let size_str = if bytes >= 1_000_000_000 {
-                            format!("{:.1} GB", bytes as f64 / 1e9)
-                        } else if bytes >= 1_000_000 {
-                            format!("{:.1} MB", bytes as f64 / 1e6)
-                        } else {
-                            format!("{:.0} KB", bytes as f64 / 1e3)
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(
-                                format!("Cache: {} analys{} — {}", count, if count == 1 { "is" } else { "es" }, size_str))
-                                .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                            if legacy_files > 0 {
-                                ui.label(egui::RichText::new(format!(
-                                    "· older versions: {} file{} — {} (kept)",
-                                    legacy_files, if legacy_files == 1 { "" } else { "s" },
-                                    alt_cache::fmt_bytes(legacy_bytes),
-                                )).size(10.0).color(txt_faint(ui.visuals().dark_mode)))
-                                .on_hover_text(LEGACY_KEPT);
-                            }
-                            let over = self.analyzer.cache_budget_gb > 0.0
-                                && bytes as f64 > self.analyzer.cache_budget_gb as f64 * 1e9;
-                            if over {
-                                ui.label(egui::RichText::new("over budget")
-                                    .size(10.0).color(Color32::from_rgb(220, 160, 60)));
-                            }
-                            if ui.add_enabled(count > 0 && self.cache_controls_free(),
-                                egui::Button::new("🗑 Clear All").small()).clicked() {
-                                self.clear_all_caches();
-                            }
-                        });
-                    }); }
-                }
-
-                // ── Peak Hold settings (Bars only) ────────────────────────
-                if self.style == VizStyle::Bars && self.show_peak_settings {
-                    ui.group(|ui| {
-                            ui.checkbox(&mut self.peak_config.enabled, "Enabled");
-                            ui.add_enabled_ui(self.peak_config.enabled, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("Hold time:");
-                                    ui.add(egui::Slider::new(&mut self.peak_config.hold_ms, 10.0..=1000.0)
-                                        .suffix(" ms"))
-                                        .on_hover_text("How long the peak line freezes before it starts to decay.");
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Decay mode:");
-                                    ui.selectable_value(&mut self.peak_config.decay_mode, PeakDecayMode::Linear,  "Linear")
-                                        .on_hover_text("Peak falls at a constant speed.");
-                                    ui.selectable_value(&mut self.peak_config.decay_mode, PeakDecayMode::Gravity, "Gravity")
-                                        .on_hover_text("Peak accelerates as it falls — feels physical.");
-                                    ui.selectable_value(&mut self.peak_config.decay_mode, PeakDecayMode::FadeOut, "Fade Out")
-                                        .on_hover_text("Peak stays in place but fades to transparent.");
-                                });
-                                let speed_label = match self.peak_config.decay_mode {
-                                    PeakDecayMode::FadeOut => "Fade speed:",
-                                    _                      => "Fall speed:",
-                                };
-                                ui.horizontal(|ui| {
-                                    ui.label(speed_label);
-                                    ui.add(egui::Slider::new(&mut self.peak_config.fall_speed, 0.05..=5.0)
-                                        .logarithmic(true))
-                                        .on_hover_text("Initial decay rate (normalized units/sec). For Fade Out this controls how fast the line disappears.");
-                                });
-                                if self.peak_config.decay_mode == PeakDecayMode::Gravity {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Acceleration:");
-                                        ui.add(egui::Slider::new(&mut self.peak_config.acceleration, 0.5..=20.0)
-                                            .logarithmic(true))
-                                            .on_hover_text("How quickly the fall accelerates. Higher values make it feel heavier.");
-                                    });
-                                }
-                                ui.horizontal(|ui| {
-                                    ui.label("Thickness:");
-                                    let mut t = self.peak_config.peak_thickness as i32;
-                                    if ui.add(egui::Slider::new(&mut t, 1..=6).suffix(" px"))
-                                        .on_hover_text("Height of the peak marker in physical pixels.")
-                                        .changed()
-                                    {
-                                        self.peak_config.peak_thickness = t as u8;
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Color:");
-                                    let mut rgb = [
-                                        self.peak_config.color.r(),
-                                        self.peak_config.color.g(),
-                                        self.peak_config.color.b(),
-                                    ];
-                                    if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                        self.peak_config.color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                                    }
-                                });
-                            });
-                        });
-                }
-
-                // ── Album Art settings ────────────────────────────────────
-                if self.show_art_settings { ui.group(|ui| {
-                        let has_art   = self.current_art.is_some();
-                        let has_track = self.current_path.is_some();
-                        // Disable spectrum art controls when a track is loaded with no art
-                        let art_enabled = has_art || !has_track;
-                        let track_key = self.current_path.as_ref()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-
-                        // ── Playlist thumbnails ──────────────────────────
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.art_settings.playlist_show, "Playlist thumbnails");
-                            ui.add_space(6.0);
-                            ui.add_enabled(
-                                self.art_settings.playlist_show,
-                                egui::Checkbox::new(
-                                    &mut self.art_settings.playlist_placeholder,
-                                    "Placeholder when no art",
-                                ),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.checkbox(
-                                &mut self.art_settings.spectrum_placeholder,
-                                "Spectrum placeholder (no art)",
-                            );
-                        });
-
-                        ui.separator();
-
-                        // ── Spectrum scope: global vs per-track ──────────
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Spectrum:").size(11.0)
-                                .color(txt_dim(ui.visuals().dark_mode)));
-                            if !track_key.is_empty() {
-                                let has_override = self.art_settings.has_override(&track_key);
-                                let btn = if has_override { "This track ★" } else { "Global" };
-                                let tip = if has_override {
-                                    "Per-track override active. Click to revert to global."
-                                } else {
-                                    "Using global settings. Click to create a per-track override."
-                                };
-                                if ui.small_button(btn).on_hover_text(tip).clicked() {
-                                    if has_override {
-                                        self.art_settings.reset_to_global(&track_key);
-                                    } else {
-                                        self.art_settings.make_per_track(&track_key);
-                                    }
-                                }
-                            }
-                        });
-
-                        // Resolve which config block to mutate
-                        let use_per_track = !track_key.is_empty()
-                            && self.art_settings.has_override(&track_key);
-                        let cfg: &mut ArtDisplaySettings = if use_per_track {
-                            self.art_settings.per_track.get_mut(&track_key).unwrap()
-                        } else {
-                            &mut self.art_settings.global
-                        };
-
-                        ui.add_enabled_ui(art_enabled, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Mode:");
-                                ui.selectable_value(
-                                    &mut cfg.spectrum_mode, ArtSpectrumMode::Hidden, "Hidden");
-                                ui.selectable_value(
-                                    &mut cfg.spectrum_mode, ArtSpectrumMode::Transparent, "Transparent")
-                                    .on_hover_text("Art behind bars at reduced opacity");
-                                ui.selectable_value(
-                                    &mut cfg.spectrum_mode, ArtSpectrumMode::Mask, "Mask")
-                                    .on_hover_text("Art visible only inside bar columns\n(Bars mode only)");
-                            });
-
-                            if cfg.spectrum_mode != ArtSpectrumMode::Hidden {
-                                ui.horizontal(|ui| {
-                                    ui.label("Fit:");
-                                    ui.selectable_value(&mut cfg.fit, ArtFit::Preserve, "Preserve ratio");
-                                    ui.selectable_value(&mut cfg.fit, ArtFit::Stretch, "Stretch to fill");
-                                });
-                            }
-
-                            match cfg.spectrum_mode {
-                                ArtSpectrumMode::Transparent => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Opacity:");
-                                        ui.add(egui::Slider::new(&mut cfg.transparency, 0.0..=1.0)
-                                            .step_by(0.01));
-                                    });
-                                }
-                                ArtSpectrumMode::Mask => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Brightness:");
-                                        ui.selectable_value(
-                                            &mut cfg.mask_mode, ArtMaskMode::Dynamic, "Dynamic")
-                                            .on_hover_text("Bar amplitude drives art brightness");
-                                        ui.selectable_value(
-                                            &mut cfg.mask_mode, ArtMaskMode::Fixed, "Fixed")
-                                            .on_hover_text("Fixed brightness level, set by slider");
-                                    });
-                                    if cfg.mask_mode == ArtMaskMode::Fixed {
-                                        ui.horizontal(|ui| {
-                                            ui.label("Level:");
-                                            ui.add(egui::Slider::new(&mut cfg.mask_brightness, 0.0..=1.0)
-                                                .step_by(0.01));
-                                        });
-                                    }
-                                }
-                                ArtSpectrumMode::Hidden => {}
-                            }
-                        });
-
-                        if has_track && !has_art {
-                            ui.label(egui::RichText::new("ℹ No embedded art in this track.")
-                                .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                        }
-                    }); }
-
-                // ── EQ panel ──────────────────────────────────────────────
-                if self.show_eq {
-                    egui::CollapsingHeader::new("🎛 Parametric EQ")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            // EQ is bypassed whenever the session is on an
-                            // output device stream. That is a routing fact,
-                            // and it is what `bit_perfect` carries here — the
-                            // app sets it from `on_bp_stream()`, not from the
-                            // toggle.
-                            //
-                            // Whether the route is *exact* is a different
-                            // question with its own answer, and drawing a
-                            // green diamond for the first while claiming the
-                            // second is the defect. This says only what it
-                            // knows.
-                            if self.bit_perfect {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "\u{25C7} EQ is bypassed — this track plays on an \
-                                             output device stream with no processing in the path",
-                                        )
-                                        .size(12.0)
-                                        .color(txt_faint(ui.visuals().dark_mode)),
-                                    );
-                                });
-                                ui.separator();
-                            }
-
-                            // Global controls row
-                            ui.horizontal(|ui| {
-                                let eq_on = { self.eq_state.lock().unwrap().enabled };
-                                let on_label = egui::RichText::new(if eq_on { "ON" } else { "OFF" })
-                                    .color(if eq_on { txt_ok(ui.visuals().dark_mode) } else { txt_faint(ui.visuals().dark_mode) });
-                                if ui.selectable_label(eq_on, on_label)
-                                    .on_hover_text("Bypass all EQ bands").clicked()
-                                {
-                                    let mut eq = self.eq_state.lock().unwrap();
-                                    eq.enabled = !eq.enabled;
-                                    eq.bump();
-                                }
-                                ui.separator();
-                                ui.label("Overlay:");
-                                ui.selectable_value(&mut self.eq_overlay, EqOverlayMode::Curve,       "Curve")
-                                    .on_hover_text("Draw EQ response curve on top of spectrum bars");
-                                ui.selectable_value(&mut self.eq_overlay, EqOverlayMode::ApplyToBars, "Apply")
-                                    .on_hover_text("Apply EQ gain to bar heights — bars show the EQ'd spectrum");
-                                ui.selectable_value(&mut self.eq_overlay, EqOverlayMode::Both,        "Both")
-                                    .on_hover_text("Draw curve AND apply EQ gain to bars");
-                            });
-
-                            ui.separator();
-
-                            // ── Preset bar ──────────────────────────────────
-                            {
-                                // Collect lists first (avoid borrow conflicts)
-                                let global_presets: Vec<(u64, String, bool)> = self.preset_library.global
-                                    .iter()
-                                    .map(|p| (p.id, p.name.clone(), self.preset_library.default_id == Some(p.id)))
-                                    .collect();
-                                let local_presets: Vec<(u64, String)> = self.track_key()
-                                    .map(|key| self.preset_library.local_presets(&key)
-                                        .iter().map(|p| (p.id, p.name.clone())).collect())
-                                    .unwrap_or_default();
-
-                                // Refresh modified flag (happens every frame, cheap)
-                                self.refresh_preset_modified();
-
-                                // ── Pending-switch prompt (Save / Discard / Cancel) ──
-                                if let Some(pending) = self.pending_preset_switch.clone() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new("⚠ Unsaved changes — ").color(txt_warn(ui.visuals().dark_mode)));
-                                        if ui.button("Save & switch").clicked() {
-                                            self.overwrite_active_preset();
-                                            let p = pending.clone();
-                                            self.apply_preset_ref(p);
-                                            self.pending_preset_switch = None;
-                                        }
-                                        if ui.button("Discard & switch").clicked() {
-                                            let p = pending.clone();
-                                            self.apply_preset_ref(p);
-                                            self.pending_preset_switch = None;
-                                        }
-                                        if ui.button("Cancel").clicked() {
-                                            self.pending_preset_switch = None;
-                                        }
-                                    });
-                                    ui.separator();
-                                }
-
-                                // Helper: display name for active preset
-                                let active_label = |lib: &EqPresetLibrary, active: &Option<PresetRef>, modified: bool| -> String {
-                                    match active {
-                                        None => if modified { "(custom) *".into() } else { "(none)".into() },
-                                        Some(r) => {
-                                            let key_str = lib.per_track.keys().next().map(|s| s.as_str()).unwrap_or("");
-                                            let name = lib.find(r, Some(key_str))
-                                                .map(|p| p.name.clone())
-                                                .unwrap_or_else(|| "?".into());
-                                            if modified { format!("{} *", name) } else { name }
-                                        }
-                                    }
-                                };
-
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("Preset:").size(11.0).color(txt_dim(ui.visuals().dark_mode)));
-
-                                    // ── Global preset dropdown ──
-                                    let global_label = {
-                                        let is_global = self.active_preset.as_ref().map(|r| r.scope == PresetScope::Global).unwrap_or(false);
-                                        if is_global {
-                                            active_label(&self.preset_library, &self.active_preset, self.preset_modified)
-                                        } else {
-                                            "Global…".into()
-                                        }
-                                    };
-                                    egui::ComboBox::from_id_salt("eq_preset_global")
-                                        .selected_text(global_label)
-                                        .width(130.0)
-                                        .show_ui(ui, |ui| {
-                                            for (id, name, is_default) in &global_presets {
-                                                let display = if *is_default { format!("★ {}", name) } else { name.clone() };
-                                                let is_active = self.active_preset.as_ref()
-                                                    .map(|r| r.scope == PresetScope::Global && r.id == *id)
-                                                    .unwrap_or(false);
-                                                let r = PresetRef { scope: PresetScope::Global, id: *id };
-                                                if ui.selectable_label(is_active, display).clicked() {
-                                                    if self.preset_modified {
-                                                        self.pending_preset_switch = Some(r);
-                                                    } else {
-                                                        self.apply_preset_ref(r);
-                                                    }
-                                                }
-                                            }
-                                        });
-
-                                    // ── Local (song) preset dropdown ──
-                                    if !local_presets.is_empty() || self.current_path.is_some() {
-                                        let local_label = {
-                                            let is_local = self.active_preset.as_ref().map(|r| r.scope == PresetScope::Local).unwrap_or(false);
-                                            if is_local {
-                                                active_label(&self.preset_library, &self.active_preset, self.preset_modified)
-                                            } else {
-                                                "Song…".into()
-                                            }
-                                        };
-                                        egui::ComboBox::from_id_salt("eq_preset_local")
-                                            .selected_text(local_label)
-                                            .width(120.0)
-                                            .show_ui(ui, |ui| {
-                                                for (id, name) in &local_presets {
-                                                    let is_active = self.active_preset.as_ref()
-                                                        .map(|r| r.scope == PresetScope::Local && r.id == *id)
-                                                        .unwrap_or(false);
-                                                    let r = PresetRef { scope: PresetScope::Local, id: *id };
-                                                    if ui.selectable_label(is_active, name).clicked() {
-                                                        if self.preset_modified {
-                                                            self.pending_preset_switch = Some(r);
-                                                        } else {
-                                                            self.apply_preset_ref(r);
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                    }
-
-                                    // ── Modified action buttons ──
-                                    if self.preset_modified && self.pending_preset_switch.is_none() {
-                                        if self.active_preset.is_some()
-                                            && ui.small_button("Update").on_hover_text("Overwrite active preset with current bands").clicked() {
-                                            self.overwrite_active_preset();
-                                        }
-                                        if ui.small_button("Discard").on_hover_text("Revert bands to saved preset").clicked() {
-                                            if let Some(r) = self.active_preset.clone() {
-                                                self.apply_preset_ref(r);
-                                            } else {
-                                                let mut eq = self.eq_state.lock().unwrap();
-                                                eq.bands.clear(); eq.bump();
-                                                self.preset_modified = false;
-                                            }
-                                        }
-                                    }
-
-                                    // ── Save As New toggle ──
-                                    let save_new_label = if self.eq_save_new_open { "▾ Save As New" } else { "▸ Save As New" };
-                                    if ui.small_button(save_new_label).clicked() {
-                                        if !self.eq_save_new_open {
-                                            // Pre-fill a sensible name
-                                            let track_key = self.track_key();
-                                            self.eq_save_name_buf = self.preset_library.auto_name(&self.eq_save_new_scope, track_key.as_deref());
-                                        }
-                                        self.eq_save_new_open = !self.eq_save_new_open;
-                                    }
-                                });
-
-                                // ── Save As New expanded row ──
-                                if self.eq_save_new_open {
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new("Name:").size(11.0));
-                                        ui.add(egui::TextEdit::singleline(&mut self.eq_save_name_buf).desired_width(140.0));
-                                        ui.label(egui::RichText::new("Scope:").size(11.0));
-                                        ui.selectable_value(&mut self.eq_save_new_scope, PresetScope::Global, "Global");
-                                        if self.current_path.is_some() {
-                                            ui.selectable_value(&mut self.eq_save_new_scope, PresetScope::Local, "Song");
-                                        }
-                                        let name_ok = !self.eq_save_name_buf.trim().is_empty();
-                                        if ui.add_enabled(name_ok, egui::Button::new("💾 Save")).clicked() {
-                                            let name = self.eq_save_name_buf.trim().to_string();
-                                            let scope = self.eq_save_new_scope.clone();
-                                            self.save_as_new_preset(name, scope);
-                                            self.eq_save_new_open = false;
-                                            self.eq_save_name_buf.clear();
-                                        }
-                                        if ui.small_button("✕").clicked() {
-                                            self.eq_save_new_open = false;
-                                        }
-                                    });
-                                }
-
-                                // ── Per-preset actions (Rename, Duplicate, Delete, Set Default) ──
-                                if let Some(active_ref) = self.active_preset.clone() {
-                                    // Rename state
-                                    if let Some((ref rename_ref, ref mut rename_buf)) = self.eq_rename_state.clone()
-                                        && *rename_ref == active_ref {
-                                        ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new("Rename:").size(11.0));
-                                                // We need mutable access — pull from field
-                                                if let Some((_, ref mut buf)) = self.eq_rename_state {
-                                                    ui.add(egui::TextEdit::singleline(buf).desired_width(140.0));
-                                                }
-                                                let new_name = rename_buf.trim().to_string();
-                                                let ok = !new_name.is_empty();
-                                                if ui.add_enabled(ok, egui::Button::new("✓")).clicked() {
-                                                    let key = self.track_key();
-                                                    if let Some(p) = self.preset_library.find_mut(&active_ref, key.as_deref()) { p.name = new_name; }
-                                                    self.preset_library.save();
-                                                    self.eq_rename_state = None;
-                                                }
-                                                if ui.small_button("✕").clicked() {
-                                                    self.eq_rename_state = None;
-                                                }
-                                            });
-                                    }
-
-                                    ui.horizontal(|ui| {
-                                        // Rename button
-                                        if (self.eq_rename_state.is_none() || self.eq_rename_state.as_ref().map(|(r,_)| r) != Some(&active_ref))
-                                            && ui.small_button("✏ Rename").clicked() {
-                                            let key = self.track_key();
-                                            let cur_name = self.preset_library.find(&active_ref, key.as_deref())
-                                                .map(|p| p.name.clone()).unwrap_or_default();
-                                            self.eq_rename_state = Some((active_ref.clone(), cur_name));
-                                        }
-
-                                        // Duplicate
-                                        if ui.small_button("⧉ Duplicate").on_hover_text("Save a copy as a new preset").clicked() {
-                                            let key = self.track_key();
-                                            let (cur_name, cur_bands) = self.preset_library.find(&active_ref, key.as_deref())
-                                                .map(|p| (format!("{} copy", p.name), p.bands.clone()))
-                                                .unwrap_or_else(|| (self.preset_library.auto_name(&active_ref.scope, key.as_deref()), self.eq_state.lock().unwrap().bands.clone()));
-                                            let id = self.preset_library.alloc_id();
-                                            let new_preset = EqPreset { id, name: cur_name, bands: cur_bands };
-                                            let scope = active_ref.scope.clone();
-                                            match &scope {
-                                                PresetScope::Global => self.preset_library.global.push(new_preset),
-                                                PresetScope::Local => {
-                                                    let k = key.unwrap_or_default();
-                                                    self.preset_library.per_track.entry(k).or_default().push(new_preset);
-                                                }
-                                            }
-                                            self.preset_library.save();
-                                            self.active_preset = Some(PresetRef { scope, id });
-                                            self.preset_modified = false;
-                                        }
-
-                                        // Set as Default (global only)
-                                        if active_ref.scope == PresetScope::Global {
-                                            let is_default = self.preset_library.default_id == Some(active_ref.id);
-                                            let default_label = if is_default { "★ Default" } else { "☆ Set Default" };
-                                            if ui.small_button(default_label).on_hover_text("Use this preset for tracks that have no last-used preset").clicked() {
-                                                if is_default {
-                                                    self.preset_library.default_id = None;
-                                                } else {
-                                                    self.preset_library.default_id = Some(active_ref.id);
-                                                }
-                                                self.preset_library.save();
-                                            }
-                                        }
-
-                                        // Delete / confirm-delete
-                                        if self.eq_confirm_delete.as_ref() == Some(&active_ref) {
-                                            ui.label(egui::RichText::new("Delete?").color(Color32::from_rgb(240, 80, 80)));
-                                            if ui.small_button("Yes").clicked() {
-                                                let key = self.track_key();
-                                                self.preset_library.delete(&active_ref, key.as_deref());
-                                                self.preset_library.save();
-                                                self.active_preset = None;
-                                                self.preset_modified = !self.eq_state.lock().unwrap().bands.is_empty();
-                                                self.eq_confirm_delete = None;
-                                            }
-                                            if ui.small_button("No").clicked() {
-                                                self.eq_confirm_delete = None;
-                                            }
-                                        } else if ui.small_button("🗑 Delete").clicked() {
-                                            self.eq_confirm_delete = Some(active_ref.clone());
-                                        }
-                                    });
-                                }
-                            }
-
-                            ui.separator();
-
-                            // Band table
-                            let bands_snap: Vec<EqBand> = self.eq_state.lock().unwrap().bands.clone();
-                            let sr = self.eq_state.lock().unwrap().sample_rate;
-
-                            egui::Grid::new("eq_band_grid")
-                                .num_columns(8)
-                                .striped(true)
-                                .spacing([4.0, 2.0])
-                                .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("#").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                                    ui.label(egui::RichText::new("Type").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                                    ui.label(egui::RichText::new("Freq (Hz)").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                                    ui.label(egui::RichText::new("Gain (dB)").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                                    ui.label(egui::RichText::new("Q").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                                    ui.label(egui::RichText::new("On").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                                    ui.label(egui::RichText::new("Del").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                                    ui.end_row();
-
-                                    let mut remove_idx: Option<usize> = None;
-                                    for (i, _) in bands_snap.iter().enumerate() {
-                                        let col = eq_band_color(i);
-                                        ui.label(egui::RichText::new(format!("{}", i + 1)).color(col).size(11.0));
-
-                                        // Band kind selector
-                                        let mut eq = self.eq_state.lock().unwrap();
-                                        let kind = eq.bands[i].kind.clone();
-                                        egui::ComboBox::from_id_salt(format!("eq_kind_{}", i))
-                                            .selected_text(kind.label())
-                                            .width(58.0)
-                                            .show_ui(ui, |ui| {
-                                                let mut changed = false;
-                                                for k in [BandKind::Peaking, BandKind::LowShelf, BandKind::HighShelf, BandKind::HighPass, BandKind::LowPass, BandKind::Notch] {
-                                                    let sel = ui.selectable_value(&mut eq.bands[i].kind, k.clone(), k.label()).changed();
-                                                    if sel { changed = true; }
-                                                }
-                                                if changed { eq.bump(); }
-                                            });
-
-                                        // Freq
-                                        let freq_changed = ui.add(egui::DragValue::new(&mut eq.bands[i].freq)
-                                            .range(20.0..=20_000.0).speed(1.0).suffix(" Hz")).changed();
-                                        if freq_changed { eq.bump(); }
-
-                                        // Gain (only for band types that have gain)
-                                        if eq.bands[i].kind.has_gain() {
-                                            let g_changed = ui.add(egui::DragValue::new(&mut eq.bands[i].gain_db)
-                                                .range(-EQ_DB_RANGE..=EQ_DB_RANGE).speed(0.1).suffix(" dB")).changed();
-                                            if g_changed { eq.bump(); }
-                                        } else {
-                                            ui.label("—");
-                                        }
-
-                                        // Q
-                                        let q_changed = ui.add(egui::DragValue::new(&mut eq.bands[i].q)
-                                            .range(0.1..=10.0).speed(0.01)).changed();
-                                        if q_changed { eq.bump(); }
-
-                                        // Enable toggle
-                                        let en_changed = ui.checkbox(&mut eq.bands[i].enabled, "").changed();
-                                        if en_changed { eq.bump(); }
-
-                                        drop(eq);
-
-                                        // Delete
-                                        if ui.small_button("✕").clicked() {
-                                            remove_idx = Some(i);
-                                        }
-
-                                        ui.end_row();
-                                    }
-
-                                    if let Some(idx) = remove_idx {
-                                        let mut eq = self.eq_state.lock().unwrap();
-                                        if idx < eq.bands.len() { eq.bands.remove(idx); eq.bump(); }
-                                    }
-                                });
-
-                            ui.horizontal(|ui| {
-                                if ui.button("➕ Add band").on_hover_text("Add a new peaking band at 1 kHz.\nYou can also click on the spectrum to add a band there.").clicked() {
-                                    let mut eq = self.eq_state.lock().unwrap();
-                                    if eq.bands.len() < 16 {
-                                        eq.bands.push(EqBand::default_peak(1000.0));
-                                        eq.bump();
-                                    }
-                                }
-                                let band_count = self.eq_state.lock().unwrap().bands.len();
-                                if band_count > 0 && ui.button("🗑 Clear all").clicked() {
-                                    let mut eq = self.eq_state.lock().unwrap();
-                                    eq.bands.clear();
-                                    eq.bump();
-                                }
-                                ui.label(egui::RichText::new(format!("{}/16 bands", band_count))
-                                    .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
-                            });
-
-                            let _ = sr; // used in overlay, suppress warning
-                        });
-                }
-
-                ui.separator();
-
-                if self.whole_track.open && self.mode == SpectrumMode::PreProcess {
-                    self.whole_track_ui(ui);
-                    return;
-                }
-
-                let avail = ui.available_size();
-                let sense = if self.show_eq { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
-                let (rect, spec_response) = ui.allocate_exact_size(avail, sense);
-                if ui.is_rect_visible(rect) {
-                    let painter = ui.painter_at(rect);
-                    painter.rect_filled(rect, 2.0, Color32::from_rgb(8, 10, 16));
-                    // Inset plot area to make room for axis labels
-                    let plot_rect = Rect::from_min_max(
-                        Pos2::new(rect.left() + DB_MARGIN, rect.top()),
-                        Pos2::new(rect.right(), rect.bottom() - FREQ_MARGIN),
-                    );
-
-                    // ── EQ bar modification (apply EQ gain to displayed bars) ──
-                    // Skipped in bit-perfect mode: EQ is not in the audio path, so
-                    // the spectrum correctly shows what you hear without modification.
-                    let eq_snap = if self.show_eq && !self.bit_perfect {
-                        let eq = self.eq_state.lock().unwrap();
-                        if eq.is_active() { Some((eq.bands.clone(), eq.sample_rate, eq.enabled)) } else { None }
-                    } else { None };
-
-                    let owned_mags: Vec<f32>;
-                    let mags: &[f32] = if let Some((ref bands, sr, _)) = eq_snap {
-                        if matches!(self.eq_overlay, EqOverlayMode::ApplyToBars | EqOverlayMode::Both) {
-                            owned_mags = self.analyzer.magnitudes.iter().enumerate().map(|(i, &m)| {
-                                let freq = bar_center_freq(i, self.analyzer.magnitudes.len(), self.min_freq, self.analysis_max_freq());
-                                let gain = 10f32.powf(total_eq_response_db(bands, sr, freq) / 20.0);
-                                (m * gain).clamp(0.0, 1.0)
-                            }).collect();
-                            &owned_mags
-                        } else {
-                            &self.analyzer.magnitudes
-                        }
-                    } else {
-                        &self.analyzer.magnitudes
-                    };
-
-                    // ── Album art background / placeholder ───────────────
-                    let track_key = self.current_path.as_ref()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let art_cfg = self.art_settings.settings_for(&track_key).clone();
-                    let has_art = self.current_art.is_some();
-
-                    if has_art {
-                        if let Some((tex_id, art_w, art_h)) = self.current_art {
-                            match &art_cfg.spectrum_mode {
-                                ArtSpectrumMode::Transparent => {
-                                    let alpha = (art_cfg.transparency * 255.0) as u8;
-                                    let art_rect = art_dest_rect(plot_rect, art_w, art_h, &art_cfg.fit);
-                                    painter.image(
-                                        tex_id, art_rect,
-                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                        Color32::from_white_alpha(alpha),
-                                    );
-                                }
-                                ArtSpectrumMode::Hidden | ArtSpectrumMode::Mask => {}
-                            }
-                        }
-                    } else if self.art_settings.spectrum_placeholder {
-                        painter.rect_filled(plot_rect, 4.0, Color32::from_gray(14));
-                        painter.text(
-                            plot_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "♪",
-                            egui::FontId::proportional(56.0),
-                            Color32::from_gray(28),
-                        );
-                    }
-
-                    let pal = Palette::new(self.palette_kind, self.palette_accent);
-
-                    // Channel views take over the plot when they are both
-                    // selected and possible. `effective_view` returns Mix
-                    // whenever they are not, and `draw_channel_view` returns
-                    // false if the frame it was handed lacks a channel it
-                    // needs — so a missing channel falls back rather than
-                    // drawing something that is not it.
-                    // The corner readouts share one strip and have to be
-                    // measured before any of them is drawn, because the legend
-                    // sits between the other two and its start depends on how
-                    // wide the LUFS number happens to be.
-                    // Read before the row is planned: the badge is part of it,
-                    // and it is only drawn when the plot is not already saying
-                    // the same thing in the middle. A pure read of analyser
-                    // state, so moving it earlier changes nothing else.
-                    let plot_is_silent = self.analyzer.channel_frame().is_silent();
-                    let analysis_text = (self.analyzer.analysis_busy() && !plot_is_silent)
-                        .then(|| {
-                            let pct =
-                                self.analyzer.analysis_progress.load(Ordering::Relaxed);
-                            let eta = self.analyzer.eta_secs.load(Ordering::Relaxed);
-                            if eta == usize::MAX {
-                                format!("analysing {pct}%")
-                            } else {
-                                format!("analysing {pct}%  ~{}", fmt_eta(eta))
-                            }
-                        });
-                    let lufs_text = (self.style != VizStyle::Phasescope).then(|| {
-                        if self.momentary_lufs.is_finite() {
-                            format!("{:.1} LUFS", self.momentary_lufs)
-                        } else {
-                            "— LUFS".to_string()
-                        }
-                    });
-                    let fps_text = format!("{:.0} fps", self.current_fps);
-                    let top_row = TopRow::plan(
-                        &painter,
-                        plot_rect,
-                        lufs_text.as_deref(),
-                        &fps_text,
-                        analysis_text.as_deref(),
-                    );
-
-                    let ch_view = channels::effective_view(
-                        self.channel_view, &self.channel_availability,
-                    );
-                    let drew_channels = ch_view != channels::ChannelView::Mix && {
-                        let frame = self.analyzer.channel_frame();
-                        self.draw_channel_view(&painter, ch_view, &frame, plot_rect, &pal, top_row)
-                    };
-                    let drew_diff = uses_diff_axes(ch_view, drew_channels);
-
-                    match self.style {
-                        _ if drew_channels => {}
-                        VizStyle::Bars => {
-                            if has_art && matches!(art_cfg.spectrum_mode, ArtSpectrumMode::Mask) {
-                                if let Some((tex_id, art_w, art_h)) = self.current_art {
-                                    draw_bars_art_mask(
-                                        &painter, mags, plot_rect, self.bar_gap,
-                                        tex_id, art_w, art_h, &art_cfg.fit,
-                                        &art_cfg.mask_mode, art_cfg.mask_brightness,
-                                    );
-                                } else {
-                                    draw_bars(&painter, mags, plot_rect, self.bar_gap, &pal);
-                                }
-                            } else {
-                                draw_bars(&painter, mags, plot_rect, self.bar_gap, &pal);
-                            }
-                            if self.peak_config.enabled && !self.peak_vals.is_empty() {
-                                draw_peak_hold(
-                                    &painter, &self.peak_vals, &self.peak_alphas,
-                                    plot_rect, self.bar_gap, &self.peak_config,
-                                );
-                            }
-                        }
-                        VizStyle::Line       => draw_line(&painter, mags, plot_rect, pal.line()),
-                        VizStyle::FilledArea => draw_filled(&painter, mags, plot_rect, &pal),
-                        VizStyle::Waterfall  => {
-                            self.update_waterfall_texture(vp_ctx, &pal);
-                            self.draw_waterfall(&painter, plot_rect);
-                        },
-                        VizStyle::Spectrogram => {
-                            if self.spectrogram.dirty {
-                                let img = self.spectrogram.to_color_image();
-                                if let Some(ref mut th) = self.spectrogram_texture {
-                                    th.set(img, egui::TextureOptions::LINEAR);
-                                } else {
-                                    let th = vp_ctx.load_texture(
-                                        "moosik_spectrogram", img,
-                                        egui::TextureOptions::LINEAR,
-                                    );
-                                    self.spectrogram_texture = Some(th);
-                                }
-                                self.spectrogram.dirty = false;
-                            }
-                            if let Some(ref th) = self.spectrogram_texture {
-                                painter.image(
-                                    th.id(), plot_rect,
-                                    egui::Rect::from_min_max(
-                                        egui::Pos2::ZERO,
-                                        egui::Pos2::new(1.0, 1.0),
-                                    ),
-                                    Color32::WHITE,
-                                );
-                            }
-                        }
-                        VizStyle::OctaveBands => {
-                            draw_octave_bands(
-                                &painter, &self.octave_bands, plot_rect,
-                                self.analyzer.live_rate, self.min_freq, self.max_freq, &pal,
-                            );
-                        }
-                        VizStyle::Phasescope => {
-                            // Use the snapshot captured in tick() — no lock or clone here
-                            draw_phasescope(&painter, &self.phasescope_frames, plot_rect, self.correlation);
-                        }
-                    }
-                    // ── Analysis-status overlay ───────────────────────────
-                    // Shown only when the plot is genuinely dead. DSD is the
-                    // main case: playback is a DoP carrier or raw native DSD,
-                    // not analysable PCM, so there
-                    // is no live signal to fall back on and the first analysis
-                    // of a track would otherwise be an unexplained blank panel.
-                    if plot_is_silent && !matches!(self.style, VizStyle::Phasescope) {
-                        let analyzing = self.analyzer.analysis_busy();
-                        let is_dsd = self.current_path.as_deref().is_some_and(crate::dsd::is_dsd_path);
-                        if self.mode == SpectrumMode::PreProcess
-                            && analyzing && self.analyzer.pre_frames.is_empty()
-                        {
-                            let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
-                            let label = if is_dsd {
-                                format!("Analyzing DSD…  {pct}%")
-                            } else {
-                                format!("Analyzing…  {pct}%")
-                            };
-                            let center = plot_rect.center();
-                            painter.text(
-                                Pos2::new(center.x, center.y - 14.0),
-                                egui::Align2::CENTER_CENTER,
-                                label,
-                                egui::FontId::proportional(15.0),
-                                Color32::from_gray(200),
-                            );
-                            // Slim progress bar under the text.
-                            let bar_w = 220.0_f32.min(plot_rect.width() * 0.6);
-                            let bar = Rect::from_center_size(
-                                Pos2::new(center.x, center.y + 10.0),
-                                egui::Vec2::new(bar_w, 6.0),
-                            );
-                            painter.rect_filled(bar, 3.0, Color32::from_gray(30));
-                            let fill_w = bar_w * (pct.min(100) as f32 / 100.0);
-                            if fill_w > 1.0 {
-                                let fill = Rect::from_min_size(bar.min, egui::Vec2::new(fill_w, 6.0));
-                                painter.rect_filled(fill, 3.0, pal.line());
-                            }
-                            // Superlet analyses run for minutes, not seconds, so
-                            // the wait needs a number attached to it and a way
-                            // out. Both are shown for every mode — an ETA is
-                            // just as welcome on a fast one.
-                            let eta = self.analyzer.eta_secs.load(Ordering::Relaxed);
-                            painter.text(
-                                Pos2::new(center.x, center.y + 26.0),
-                                egui::Align2::CENTER_CENTER,
-                                if eta == usize::MAX {
-                                    "estimating…".to_string()
-                                } else {
-                                    format!("about {} remaining", fmt_eta(eta))
-                                },
-                                egui::FontId::proportional(11.0),
-                                Color32::from_gray(140),
-                            );
-                            let abort_rect = Rect::from_center_size(
-                                Pos2::new(center.x, center.y + 48.0),
-                                egui::Vec2::new(76.0, 22.0),
-                            );
-                            if ui.put(abort_rect, egui::Button::new(
-                                egui::RichText::new("Abort").size(11.0)
-                            )).clicked() {
-                                self.analyzer.abort_preprocess();
-                            }
-                        } else if is_dsd && self.mode == SpectrumMode::RealTime {
-                            painter.text(
-                                plot_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "Real-time FFT isn't available for DSD (playback is DoP, not PCM) — switch to Pre-Process mode",
-                                egui::FontId::proportional(13.0),
-                                Color32::from_gray(150),
-                            );
-                        }
-                    }
-
-                    // Axis labels. The Diff view has its own pair, because
-                    // neither of its axes is what the ordinary ones describe —
-                    // see `draw_diff_axes`. This keys off `drew_diff`, not off
-                    // the *requested* view, so a Diff selection that fell back
-                    // to Mix gets the ordinary axes it is actually showing.
-                    if drew_diff {
-                        draw_diff_axes(
-                            &painter, plot_rect, self.diff_layout,
-                            self.display_sample_rate(), self.min_freq, self.analysis_max_freq(),
-                            self.analysis_scale(),
-                        );
-                    } else {
-                        // Skip for spectrogram (its own freq axis is baked in),
-                        // octave bands (draws its own labels below bars), and phasescope.
-                        if !matches!(self.style, VizStyle::Spectrogram | VizStyle::OctaveBands | VizStyle::Phasescope) {
-                            draw_db_labels(&painter, plot_rect);
-                        }
-                        if !matches!(self.style, VizStyle::Spectrogram | VizStyle::Phasescope) {
-                            draw_freq_labels(
-                                &painter, plot_rect, self.display_sample_rate(),
-                                self.min_freq, self.analysis_max_freq(),
-                                self.analysis_scale(),
-                            );
-                        }
-                    }
-                    // The EQ overlay is a curve in gain-against-frequency drawn
-                    // on the plot's own coordinates, and its draggable nodes are
-                    // hit-tested in them. Diff has neither of those axes, so the
-                    // curve would be meaningless and every node would sit at the
-                    // wrong frequency and gain. Rotating the interaction to suit
-                    // is a larger piece of work than this change; until then the
-                    // overlay stands down and says so. Nothing about the EQ
-                    // itself changes — the bands, their gains and the EQ panel
-                    // are all untouched.
-                    if self.show_eq && drew_diff {
-                        painter.text(
-                            Pos2::new(plot_rect.left() + 6.0, plot_rect.bottom() - 4.0),
-                            egui::Align2::LEFT_BOTTOM,
-                            "EQ overlay off in Diff — this plot is not dB against frequency. \
-                             EQ settings are unchanged; edit them in the EQ panel.",
-                            egui::FontId::proportional(10.0),
-                            Color32::from_gray(105),
-                        );
-                    }
-                    // ── EQ overlay and node interaction ──────────────────────
-                    if self.show_eq && !drew_diff && !matches!(self.style, VizStyle::Phasescope | VizStyle::Waterfall | VizStyle::Spectrogram) {
-                        let (bands, sr) = {
-                            let eq = self.eq_state.lock().unwrap();
-                            (eq.bands.clone(), eq.sample_rate)
-                        };
-                        let draw_curve = matches!(self.eq_overlay, EqOverlayMode::Curve | EqOverlayMode::Both);
-                        draw_eq_overlay(&painter, &bands, sr, plot_rect,
-                            self.min_freq, self.analysis_max_freq(), draw_curve,
-                            self.eq_hovered_node, self.eq_dragging_node,
-                            self.analysis_scale());
-
-                        // Mouse hit-test: find nearest node within 14px
-
-                        if let Some(ptr) = spec_response.hover_pos() {
-                            self.eq_hovered_node = None;
-                            for (i, band) in bands.iter().enumerate() {
-                                if !band.enabled { continue; }
-                                let np = eq_node_pos(band, plot_rect, self.min_freq, self.analysis_max_freq(),
-                                                     self.analysis_scale());
-                                if (np - ptr).length() < 14.0 {
-                                    self.eq_hovered_node = Some(i);
-                                    break;
-                                }
-                            }
-                        }
-
-                        if spec_response.drag_started() {
-                            self.eq_dragging_node = self.eq_hovered_node;
-                        }
-                        if spec_response.drag_stopped() {
-                            self.eq_dragging_node = None;
-                        }
-
-                        if let Some(drag_idx) = self.eq_dragging_node {
-                            let delta = spec_response.drag_delta();
-                            if delta != egui::Vec2::ZERO {
-                                let mut eq = self.eq_state.lock().unwrap();
-                                if let Some(band) = eq.bands.get_mut(drag_idx) {
-                                    // Horizontal → frequency (log scale)
-                                    // Along whichever axis is on screen, so the
-                                    // node tracks the pointer instead of
-                                    // sliding away from it.
-                                    let fscale = self.analysis_scale();
-                                    let t = fscale.position_of(
-                                        band.freq, self.min_freq, self.analysis_max_freq(),
-                                    ) + delta.x / plot_rect.width();
-                                    band.freq = fscale
-                                        .freq_at(t.clamp(0.0, 1.0), self.min_freq, self.analysis_max_freq())
-                                        .clamp(20.0, 20_000.0);
-                                    // Vertical → gain
-                                    if band.kind.has_gain() {
-                                        let db_per_px = EQ_DB_RANGE / (plot_rect.height() * 0.5);
-                                        band.gain_db = (band.gain_db - delta.y * db_per_px).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
-                                    }
-                                    eq.bump();
-                                }
-                            }
-                        }
-
-                        // Right-click on node → remove
-                        if spec_response.secondary_clicked()
-                            && let Some(idx) = self.eq_hovered_node {
-                            let mut eq = self.eq_state.lock().unwrap();
-                            if idx < eq.bands.len() { eq.bands.remove(idx); eq.bump(); }
-                            self.eq_hovered_node = None;
-                        }
-
-                        // Left-click on empty space → add band (up to 16)
-                        if spec_response.clicked() && self.eq_hovered_node.is_none() && self.eq_dragging_node.is_none()
-                            && let Some(click) = spec_response.interact_pointer_pos()
-                            && plot_rect.contains(click) {
-                            let t = (click.x - plot_rect.left()) / plot_rect.width();
-                            let freq = self.analysis_scale()
-                                .freq_at(t, self.min_freq, self.analysis_max_freq())
-                                .clamp(20.0, 20_000.0);
-                            let db_per_px = EQ_DB_RANGE / (plot_rect.height() * 0.5);
-                            let gain = ((plot_rect.center().y - click.y) * db_per_px).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
-                            let mut eq = self.eq_state.lock().unwrap();
-                            if eq.bands.len() < 16 {
-                                let mut band = EqBand::default_peak(freq);
-                                band.gain_db = gain;
-                                eq.bands.push(band);
-                                eq.bump();
-                            }
-                        }
-                    }
-
-                    // The two fixed readouts, in the strip planned above and
-                    // drawn last so they sit over the bars. Both are inside the
-                    // plot rather than in the dB margin, which a Diff plot uses
-                    // for its own axis labels.
-                    painter.text(
-                        Pos2::new(top_row.fps_x, top_row.y),
-                        egui::Align2::RIGHT_TOP,
-                        &fps_text,
-                        readout_font(),
-                        Color32::from_rgba_unmultiplied(180, 180, 180, 120),
-                    );
-                    if let Some(lufs) = &lufs_text {
-                        painter.text(
-                            Pos2::new(top_row.lufs_x, top_row.y),
-                            egui::Align2::LEFT_TOP,
-                            lufs,
-                            readout_font(),
-                            Color32::from_rgba_unmultiplied(180, 220, 180, 160),
-                        );
-                    }
-                    // Analysis progress, wherever the plot happens to be.
-                    //
-                    // The centred "Analyzing..." text below only appears when
-                    // there is nothing else to draw, so re-analysing a track
-                    // that already has frames on screen used to show no
-                    // progress at all unless the Cache panel was open — which
-                    // is not somewhere anyone would think to look for it.
-                    // Anywhere the centred notice is not already saying it.
-                    //
-                    // This used to require `!pre_frames.is_empty()`, to pair with
-                    // the centred notice's `pre_frames.is_empty()`. That looked
-                    // like a clean split and was not: a *first* analysis clears
-                    // pre_frames, and the live-FFT fallback keeps drawing bars,
-                    // so the plot is not silent either — the centred notice was
-                    // ruled out by the plot and this one by the frames, and the
-                    // most important case in the app showed no progress at all.
-                    // The real condition is the plot, which is what the centred
-                    // notice actually keys on.
-                    if let Some(text) = &analysis_text {
-                        let dark = ui.visuals().dark_mode;
-                        let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
-                        // The same string the row was planned around, so the
-                        // space reserved is the space used. Re-reading the
-                        // atomics here would let the text grow past its slot
-                        // between the two reads and land on the frame rate
-                        // again, which is the bug this is fixing.
-                        let pos = Pos2::new(top_row.analysis_x, top_row.y + 2.0);
-                        let gal = painter.layout_no_wrap(
-                            text.clone(), badge_font(), txt_accent(dark),
-                        );
-                        let bg = egui::Rect::from_min_size(
-                            Pos2::new(pos.x - gal.size().x - BADGE_PAD, pos.y - 3.0),
-                            gal.size() + egui::vec2(2.0 * BADGE_PAD, 6.0),
-                        );
-                        painter.rect_filled(
-                            bg, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 120));
-                        // A bar under the text, so the rate is readable at a
-                        // glance without reading the number.
-                        let track = egui::Rect::from_min_size(
-                            Pos2::new(bg.left() + 4.0, bg.bottom() + 2.0),
-                            egui::vec2(bg.width() - 8.0, 2.0),
-                        );
-                        painter.rect_filled(
-                            track, 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40));
-                        let done = egui::Rect::from_min_size(
-                            track.min,
-                            egui::vec2(track.width() * (pct as f32 / 100.0).clamp(0.0, 1.0), 2.0),
-                        );
-                        painter.rect_filled(done, 1.0, txt_accent(dark));
-                        painter.galley(
-                            Pos2::new(bg.left() + BADGE_PAD, bg.top() + 3.0),
-                            gal,
-                            txt_accent(dark),
-                        );
-                    }
-
-                    // Debug overlay (F3)
-                    if self.show_debug {
-                        let interp_name = format!("{:?}", self.interp_mode);
-                        let mapping_name = format!("{:?}", self.bar_mapping);
-                        let mode_name = format!("{:?}", self.mode);
-                        let analyzing = self.analyzer.analysis_busy();
-                        let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
-                        let mut lines = vec![
-                            format!("── Spectrum Debug ──────────────────"),
-                            format!("Mode:        {}", mode_name),
-                            format!("Live FFT:    {}  pad: {}×  padded: {}", self.analyzer.fft_size, self.analyzer.rt_pad_factor, self.analyzer.realtime_padded_size()),
-                            format!("Pre FFT:     {}  pad: {}×  padded: {}", self.analyzer.pre_fft_size, self.pad_factor, self.analyzer.pre_fft_size * self.pad_factor),
-                            if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
-                                format!("CQT clock:   {:.2} fps, floor(k × sr / fps); FFT controls inactive", self.analyzer.analysis_frame_rate())
-                            } else {
-                                format!("Overlap:     {:.0}%  hop: {} smp ({:.1} fps)", self.overlap * 100.0,
-                                    self.analyzer.pre_hop(), self.analyzer.analysis_frame_rate())
-                            },
-                            format!("Interp:      {}  mapping: {}", interp_name, mapping_name),
-                            format!("Bars:        {}  analysis sr: {} Hz  live sr: {} Hz", self.bar_count, self.analyzer.sample_rate, self.analyzer.live_rate),
-                            format!("freq range:  {:.0}–{:.0} Hz", self.min_freq, self.max_freq),
-                            format!("── Pre-process ─────────────────────"),
-                            format!("Analyzing:   {}  progress: {}%", analyzing, pct),
-                            format!("Frames:      {}  frame_rate: {:.2} fps", self.analyzer.pre_frames.len(), self.analyzer.pre_frame_rate),
-                            format!("── Runtime ─────────────────────────"),
-                            format!("Tick rate:   {:.1}/s (max {:.0}) — analyser, not frames",
-                                self.current_fps, self.max_fps),
-                            format!("Src rows:    {:.1}/s consumed from cache",
-                                self.pre_rows_per_sec),
-                            format!("Channels:    {} — {:.1} extra FFT/s",
-                                self.channel_view.label(), self.channel_ffts_per_sec),
-                            format!("REPAINT:     {:.1} fps (real)", self.real_repaint_fps),
-                            format!("DRAW cost:   {:.2} ms/frame", self.draw_ms),
-                            format!("LUFS:        {:.2}", self.momentary_lufs),
-                            format!("Correlation: {:.3}", self.correlation),
-                            format!("FFT norms:   {} bins", self.analyzer.last_fft_norms.len()),
-                        ];
-
-                        // Where the last pre-process actually spent itself.
-                        //
-                        // A GPU monitor reads the device at a fraction of its
-                        // capacity during an analysis, and the obvious reading
-                        // — "the shader is too small" — is wrong. The phases
-                        // inside a group run one after another, so the device
-                        // idles through everything that is not `device`. This
-                        // panel shows that directly, because four rewrites of
-                        // this path were aimed at the wrong phase for want of
-                        // exactly these six numbers.
-                        let st = aslt::stats();
-                        lines.push("── Pre-process cost ────────────────".into());
-                        if st.total_s <= 0.0 {
-                            lines.push("(no analysis has run this session)".into());
-                        } else {
-                            lines.push(format!("Wall clock:  {:.2} s", st.total_s));
-                            lines.push(format!(
-                                "Route:       {}",
-                                match aslt::gpu_device_name() {
-                                    Some(n) if st.used_gpu() => n,
-                                    Some(n) => format!("{n} (idle — no batch qualified)"),
-                                    None => "CPU only (no device)".into(),
-                                },
-                            ));
-                            if st.used_gpu() {
-                                lines.push(format!(
-                                    "Bars:        {} on device, {} on cores",
-                                    st.gpu_bars, st.cpu_bars,
-                                ));
-                                lines.push(format!(
-                                    "Batches:     {}  kernels: {}", st.chunks, st.kernels,
-                                ));
-                                // Thread-summed, so these exceed wall clock on a
-                                // parallel run; they are for weighing the phases
-                                // against each other, which is the whole point.
-                                lines.push(format!(
-                                    "  build      {:>7.2} s   (kernel taps)", st.build_s,
-                                ));
-                                lines.push(format!(
-                                    "  stage      {:>7.2} s   (signal upload)", st.stage_s,
-                                ));
-                                lines.push(format!(
-                                    "  device     {:>7.2} s   (GPU)", st.device_s,
-                                ));
-                                lines.push(format!(
-                                    "  fill       {:>7.2} s   (edges + CPU wavelets)", st.fill_s,
-                                ));
-                                lines.push(format!(
-                                    "Device duty: {:.0}% of the whole analysis",
-                                    st.device_duty() * 100.0,
-                                ));
-                            }
-                            // Which block sizes this machine has decided on.
-                            // "(probe)" means the synthetic bootstrap is still
-                            // in charge and real A/B samples are still coming.
-                            lines.push("── Calibration (this machine) ──────".into());
-                            lines.extend(gpu_calib::describe());
-                        }
-                        let x = rect.left() + 8.0;
-                        let mut y = rect.top() + 20.0;
-                        let line_h = 13.0;
-                        for line in &lines {
-                            painter.text(
-                                Pos2::new(x + 1.0, y + 1.0),
-                                egui::Align2::LEFT_TOP, line,
-                                egui::FontId::monospace(11.0),
-                                Color32::from_rgba_unmultiplied(0, 0, 0, 180),
-                            );
-                            painter.text(
-                                Pos2::new(x, y),
-                                egui::Align2::LEFT_TOP, line,
-                                egui::FontId::monospace(11.0),
-                                Color32::from_rgba_unmultiplied(255, 220, 80, 220),
-                            );
-                            y += line_h;
-                        }
-                    }
-
-                }
-            });
+            egui::CentralPanel::default().show(vp_ctx, |ui| self.panel_ui(ui));
             crate::frame_log::spectrum_pass(|| {
                 let (inner, ppp) = vp_ctx.input(|i| (i.viewport().inner_rect, i.pixels_per_point()));
                 let size = inner.map_or("null".to_string(), |r| format!("[{:.1},{:.1}]", r.width(), r.height()));
@@ -12843,6 +10632,2302 @@ The Mix is unaffected.                                  Analysing the track agai
         // Record the wall-clock cost of this full draw (EMA-smoothed).
         let ms = show_start.elapsed().as_secs_f32() * 1000.0;
         self.draw_ms = self.draw_ms * 0.9 + ms * 0.1;
+    }
+
+    /// The analyser drawn inside another window (the 1.6.0 shell's Analyze
+    /// mode) instead of its own viewport. Same body, same persistence.
+    pub fn embedded_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.open {
+            return;
+        }
+        let show_start = Instant::now();
+        self.panel_ui(ui);
+        self.persist_settings_if_changed();
+        let ms = show_start.elapsed().as_secs_f32() * 1000.0;
+        self.draw_ms = self.draw_ms * 0.9 + ms * 0.1;
+    }
+
+    /// The shell's Analyze mode with the controls in a drawer: the controls
+    /// on their own. Draw them before the plot, which persists the settings.
+    pub fn embedded_controls_ui(&mut self, ui: &mut egui::Ui) {
+        if self.open {
+            self.controls_ui(ui);
+        }
+    }
+
+    /// The plot on its own, beside the drawer.
+    pub fn embedded_plot_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.open {
+            return;
+        }
+        let show_start = Instant::now();
+        self.plot_ui(ui);
+        self.persist_settings_if_changed();
+        let ms = show_start.elapsed().as_secs_f32() * 1000.0;
+        self.draw_ms = self.draw_ms * 0.9 + ms * 0.1;
+    }
+
+    /// Everything inside the analyser window: controls, panels and the plot.
+    pub fn panel_ui(&mut self, ui: &mut egui::Ui) {
+        self.controls_ui(ui);
+        ui.separator();
+        self.plot_ui(ui);
+    }
+
+    /// The rows of controls and the open settings panels.
+    fn controls_ui(&mut self, ui: &mut egui::Ui) {
+        // ── Row 1: mode + view + channels + loudness ──────────────
+        //
+        // Wrapped, not clipped. This is one row of about a dozen
+        // controls and the window opens at 700 px with a 380 px
+        // minimum; a plain `horizontal` runs the tail of it off the
+        // right edge with nothing to say it is there. The Channels
+        // group was added to the end of it and was simply invisible at
+        // the default size — the feature shipped unreachable.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Mode:");
+            ui.add_enabled_ui(!matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)), |ui| {
+                ui.selectable_value(&mut self.mode, SpectrumMode::RealTime, "Real-time");
+            }).response.on_hover_text("True CQT uses centred full windows and is pre-process only. Select an FFT method for live analysis.");
+            ui.selectable_value(&mut self.mode, SpectrumMode::PreProcess, "Pre-process");
+            // Spectro and Octave rely on live FFT norms — unavailable in pre-process
+            // mode (which replays compressed bar data, not raw bins). Auto-fall-back
+            // to Waterfall so the display isn't blank.
+            if self.mode == SpectrumMode::PreProcess
+                && matches!(self.style, VizStyle::Spectrogram | VizStyle::OctaveBands)
+            {
+                self.style = VizStyle::Waterfall;
+            }
+            ui.separator();
+            ui.label("View:");
+            ui.selectable_value(&mut self.style, VizStyle::Bars, "Bars");
+            ui.selectable_value(&mut self.style, VizStyle::Line, "Line");
+            ui.selectable_value(&mut self.style, VizStyle::FilledArea, "Filled");
+            ui.selectable_value(&mut self.style, VizStyle::Waterfall, "Waterfall");
+            // Spectro and Octave are real-time only — hide buttons in pre-process mode.
+            if self.mode == SpectrumMode::RealTime {
+                ui.selectable_value(&mut self.style, VizStyle::Spectrogram, "Spectro");
+                ui.selectable_value(&mut self.style, VizStyle::OctaveBands, "Octave");
+            }
+            ui.selectable_value(&mut self.style, VizStyle::Phasescope, "Phase");
+            // The whole-track view replaces the plot while it is on and
+            // leaves the views above exactly as they were. It reads a
+            // finished analysis, so it exists only in Pre-process.
+            if self.mode == SpectrumMode::PreProcess {
+                let was = self.whole_track.open;
+                ui.toggle_value(&mut self.whole_track.open, "Whole track")
+                    .on_hover_text(
+                        "The whole analysed track as a time–frequency picture: \
+                         zoom with the wheel (Shift+wheel for frequency), drag to \
+                         pan, click to seek, middle-click to fit.\n\nIt shows the \
+                         stored analysis cells — no smoothing, no ISO 226 — and \
+                         never starts an analysis by being opened.",
+                    );
+                if was && !self.whole_track.open {
+                    self.whole_track.close();
+                }
+            } else {
+                // Another mode keeps the preference and releases the
+                // data; returning to Pre-process shows it again.
+                self.whole_track.retire();
+            }
+            ui.separator();
+            // ── Channel view ────────────────────────────────────────
+            // Mix is always offered. The rest are enabled only when a
+            // live two-channel PCM tap is feeding the analyser, and the
+            // reason they are not is on the disabled buttons rather
+            // than discovered by clicking one and seeing nothing change.
+            let ch_reason = self.channel_availability.reason();
+            ui.label("Channels:");
+            for view in channels::ChannelView::ALL {
+                if view == channels::ChannelView::Mix {
+                    ui.selectable_value(&mut self.channel_view, view, view.label())
+                        .on_hover_text(
+                            "Every channel averaged to one spectrum, \
+                             before the transform — which is not the \
+                             same as averaging the two finished spectra. \
+                             In a stereo analysis the mix is derived \
+                             from the two channels' complex responses, \
+                             at the point where that difference still \
+                             exists.",
+                        );
+                    continue;
+                }
+                let enabled = ch_reason.is_none();
+                let btn = ui.add_enabled(
+                    enabled,
+                    egui::SelectableLabel::new(self.channel_view == view, view.label()),
+                );
+                if enabled {
+                    if btn.clicked() {
+                        self.channel_view = view;
+                    }
+                    btn.on_hover_text(match view {
+                        channels::ChannelView::Left => "Left channel only.",
+                        channels::ChannelView::Right => "Right channel only.",
+                        channels::ChannelView::Split =>
+                            "Left above right, sharing one frequency \
+                             and dB scale.",
+                        channels::ChannelView::Diff =>
+                            "Per band, the right channel's level minus \
+                             the left channel's, in dB, about a centre \
+                             line at 0 and full-scale at \u{b1}20 dB. \
+                             Magenta means right is louder in that band, \
+                             cyan means left. It is a difference of two \
+                             measured levels, not a subtraction of the \
+                             waveforms and not the M/S Side signal — \
+                             two bands can cancel acoustically and still \
+                             read zero here. Arrangement is under \
+                             Settings.",
+                        _ => "Both channels in one plot: cyan is left, \
+                              magenta is right.",
+                    });
+                } else if let Some(ref why) = ch_reason {
+                    btn.on_hover_text(why.as_str());
+                }
+            }
+            // Shown whenever the group is disabled, not only once a
+            // channel view has been selected — which could not happen,
+            // because selecting one requires the buttons this explains
+            // the absence of. The reason was reachable only by hovering
+            // a greyed-out button, which is not a thing anyone does.
+            if let Some(ref why) = ch_reason {
+                let short = match self.channel_availability {
+                    channels::ChannelAvailability::PreProcessMono => "no channels cached",
+                    channels::ChannelAvailability::UnsupportedStyle => "Bars/Line/Filled only",
+                    channels::ChannelAvailability::Mono => "mono track",
+                    channels::ChannelAvailability::Multichannel(n) => {
+                        &*format!("{n}-channel track")
+                    }
+                    _ => "no live PCM",
+                };
+                ui.label(
+                    egui::RichText::new(format!("({short})"))
+                        .size(11.0)
+                        .color(txt_faint(ui.visuals().dark_mode)),
+                )
+                .on_hover_text(why.as_str());
+            }
+            // Obtainable is not resident. The buttons are live while a
+            // sidecar is being read, and the plot shows the Mix in the
+            // meantime — so say which of those is happening, or a
+            // second or two of apparently ignored clicks looks like a
+            // bug.
+            if self.mode == SpectrumMode::PreProcess
+                && let Some(note) = self.analyzer.pre_channels().note()
+            {
+                let label = ui.label(
+                    egui::RichText::new(format!("({note})"))
+                        .size(11.0)
+                        .color(txt_faint(ui.visuals().dark_mode)),
+                );
+                if let PreChannels::Refused(why) = self.analyzer.pre_channels() {
+                    label.on_hover_text(format!(
+                        "The channel file beside this track's cache could                                  not be read:
+{why}
+
+The Mix is unaffected.                                  Analysing the track again will rewrite it."
+                    ));
+                }
+            }
+            // Only in Pre-process, and next to the buttons it governs:
+            // this is where someone who wanted Left/Right and could not
+            // have it is already looking.
+            if self.mode == SpectrumMode::PreProcess {
+                self.stereo_intent_ui(ui);
+            }
+            ui.separator();
+            ui.label("Loudness:");
+            let prev_loudness = self.loudness_mode.clone();
+            ui.selectable_value(&mut self.loudness_mode, LoudnessMode::Flat, "Flat");
+            ui.selectable_value(&mut self.loudness_mode, LoudnessMode::EqualLoudness, "ISO 226");
+            if self.loudness_mode != prev_loudness {
+                self.sync_params();
+            }
+            ui.separator();
+            ui.label("Palette:");
+            egui::ComboBox::from_id_salt("spectrum_palette")
+                .selected_text(self.palette_kind.label())
+                .show_ui(ui, |ui| {
+                    for p in SpectrumPalette::ALL {
+                        let selected = self.palette_kind == p;
+                        let clicked = ui.horizontal(|ui| {
+                            paint_palette_swatch(
+                                ui, &Palette::new(p, self.palette_accent),
+                                egui::vec2(34.0, 13.0),
+                            );
+                            ui.selectable_label(selected, p.label()).clicked()
+                        }).inner;
+                        if clicked { self.palette_kind = p; }
+                    }
+                });
+            ui.separator();
+            let dark = ui.visuals().dark_mode;
+            let eq_label = egui::RichText::new("🎛 EQ")
+                .color(if self.show_eq { txt_accent(dark) } else { txt_faint(dark) });
+            if ui.selectable_label(self.show_eq, eq_label)
+                .on_hover_text("Toggle parametric EQ panel.\nClick on spectrum to add bands.\nDrag nodes to adjust.\nRight-click node to remove.")
+                .clicked()
+            {
+                self.show_eq = !self.show_eq;
+            }
+            ui.separator();
+            let dbg_label = egui::RichText::new("🐛 Debug")
+                .color(if self.show_debug { txt_warn(dark) } else { txt_faint(dark) });
+            if ui.selectable_label(self.show_debug, dbg_label)
+                .on_hover_text("Toggle debug overlay (F3)")
+                .clicked()
+            {
+                self.show_debug = !self.show_debug;
+            }
+        });
+
+        if let Some(note) = self.spectrum_source_note() {
+            ui.label(egui::RichText::new(note).color(txt_dim(ui.visuals().dark_mode)));
+        }
+
+        // ── Row 2: bar count (+ bar gap for Bars) ─────────────────
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Bars:");
+            let r = ui.add(egui::Slider::new(&mut self.bar_count,
+                    MIN_BAR_COUNT..=MAX_BAR_COUNT)
+                .logarithmic(true).integer().suffix(" bars"));
+            let commit = r.drag_stopped() || (r.changed() && !r.dragged());
+            if commit {
+                self.bar_count = snap_pow2(self.bar_count);
+                self.analyzer.set_bar_count(self.bar_count);
+                self.sync_params();
+                self.try_load_or_flag_reanalysis();
+            }
+            // FFT bin spacing, where an FFT is what is drawn. Under
+            // Superlet pre-process there are no bins in the analysis,
+            // and quoting the live preview's here read as if there were.
+            if self.fft_knobs_apply() || self.mode == SpectrumMode::RealTime {
+                // The live preview's FFT runs on the tap; an FFT
+                // pre-process on the analysis feed.
+                let (sr, size) = if self.mode == SpectrumMode::RealTime {
+                    (self.analyzer.live_rate, self.analyzer.fft_size)
+                } else {
+                    (self.analyzer.sample_rate, self.fft_size)
+                };
+                ui.label(format!(
+                    "  (FFT bins {:.1} Hz apart)",
+                    sr as f32 / size.max(1) as f32
+                ));
+            }
+            // Bar gap lives here (only meaningful for Bars), so it no
+            // longer needs a row of its own.
+            if self.style == VizStyle::Bars {
+                ui.separator();
+                ui.label("Gap:");
+                ui.add(egui::Slider::new(&mut self.bar_gap, 0.0..=12.0)
+                    .step_by(1.0).suffix(" px"))
+                    .on_hover_text(
+                        "Physical-pixel gap between bars.\n\
+                         0 = no gap (solid fill). Higher values give a more separated look."
+                    );
+            }
+        });
+
+        // ── Settings sections ─────────────────────────────────────
+        // One wrap-around row of toggles instead of three stacked
+        // collapsibles, so the plot keeps its height. Each section's
+        // body renders full-width below when its toggle is on; the row
+        // wraps to more lines only when the window is too narrow.
+        ui.horizontal_wrapped(|ui| {
+            let dark = ui.visuals().dark_mode;
+            let mut chip = |open: &mut bool, text: &str| {
+                let col = if *open { txt_accent(dark) } else { txt_dim(dark) };
+                if ui.selectable_label(*open, egui::RichText::new(text).color(col))
+                    .clicked()
+                {
+                    *open = !*open;
+                }
+            };
+            chip(&mut self.show_fft_settings, "⚙ Analysis");
+            if self.style == VizStyle::Bars {
+                chip(&mut self.show_peak_settings, "📌 Peak Hold");
+            }
+            chip(&mut self.show_art_settings, "🖼 Album Art");
+            if self.mode == SpectrumMode::PreProcess {
+                chip(&mut self.show_cache_settings, "🗄 Cache");
+            }
+        });
+
+        // ── FFT params ────────────────────────────────────────────
+        if self.show_fft_settings { ui.group(|ui| {
+                let mut rebuild = false;
+                // DSD decimation — only meaningful when a DSD track is
+                // loaded. Two settings: the preprocessing feed
+                // (analysis only) and the PCM fallback (audio).
+                if self.current_path.as_deref().is_some_and(crate::dsd::is_dsd_path) {
+                    let file_rate = self.current_path.as_deref()
+                        .and_then(|p| crate::dsd::parse_file(p).ok())
+                        .map(|i| i.sample_rate);
+                    let khz = khz_label;
+                    ui.horizontal(|ui| {
+                        ui.label("DSD preprocessing rate:").on_hover_text(
+                            "The rate DSD is decimated to for the pre-process analysis.                                      Analysis only: it does not change what you hear, the output                                      rate or the device. Superlet keeps its configured frame rate                                      at every rate. A lower rate analyses fewer samples with                                      shorter kernels — faster, smaller memory — and every rate                                      here covers the 24 kHz analysis band; a different rate gives                                      a close but not identical picture, so each rate keeps its                                      own cache.");
+                        let mut chosen = None;
+                        for &rate in &crate::dsd::decimate::PREPROCESS_RATES {
+                            let produced = file_rate
+                                .map(|f| crate::dsd::decimate::analysis_rate_for(f, rate));
+                            let name = dsd_rate_choice_label(rate, produced);
+                            let has = self.dsd_rate_cache_exists(rate);
+                            let label = if has {
+                                egui::RichText::new(&name).color(txt_ok(ui.visuals().dark_mode))
+                            } else {
+                                egui::RichText::new(&name)
+                            };
+                            let hover = match rate {
+                                r if r > 176_400 => "Most samples and the longest kernels: the slowest analysis and the largest memory.",
+                                r if r < 176_400 => "Fewest samples: the fastest analysis. Covers the 24 kHz band; the picture differs slightly from the higher rates.",
+                                _ => "The rate every version before 1.5.3 analysed at.",
+                            };
+                            if ui.selectable_label(self.analyzer.dsd_rate == rate, label)
+                                .on_hover_text(hover).clicked()
+                                && self.analyzer.dsd_rate != rate {
+                                chosen = Some(rate);
+                            }
+                        }
+                        if let Some(rate) = chosen {
+                            // Pre-process only: `sync_fft_sizes` leaves the
+                            // live transform alone, so nothing to rebuild.
+                            self.set_dsd_preprocess_rate(rate);
+                        }
+                    });
+                    if self.analyzer.sample_rate != self.analyzer.live_rate {
+                        ui.label(egui::RichText::new(format!(
+                            "Analysis feed {} · live view {} (the playback fallback's rate)",
+                            khz(self.analyzer.sample_rate), khz(self.analyzer.live_rate),
+                        )).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("DSD PCM fallback (playback):").on_hover_text(
+                            "Audio, not analysis: the rate DSD is decimated to for playback                                      when neither native DSD nor DoP can carry it. Takes effect                                      from the next track started.");
+                        for &rate in &crate::dsd::decimate::FALLBACK_RATES {
+                            if ui.selectable_label(self.dsd_fallback_rate == rate, khz(rate)).clicked() {
+                                self.dsd_fallback_rate = rate;
+                            }
+                        }
+                    });
+                }
+                {
+                    let bm_green = |bm: BarMappingMode| -> egui::RichText {
+                        let has = self.current_path.as_ref().map(|p| {
+                            self.cache_file_set.contains(&cache_path_for(
+                                &self.analyzer.cache_dir(),
+                                p, self.bar_count, self.fft_size, self.pad_factor,
+                                self.overlap, &self.window_fn, self.min_freq, self.max_freq,
+                                &bm, &self.interp_mode, self.analyzer.dsd_rate, &self.analyzer.aslt_cfg, self.analyzer.pre_fps,
+                            ))
+                        }).unwrap_or(false);
+                        let name = match bm {
+                            BarMappingMode::FlatOverlap => "FFT · flat",
+                            BarMappingMode::Gaussian    => "FFT · Gaussian",
+                            BarMappingMode::Cqt         => "FFT · constant-Q weighting",
+                            BarMappingMode::TrueCqt(_)  => "True CQT",
+                            BarMappingMode::Superlet    => "Superlet (wavelets)",
+                        };
+                        if has { egui::RichText::new(name).color(txt_ok(ui.visuals().dark_mode)) }
+                        else   { egui::RichText::new(name) }
+                    };
+                    let lbl_flat  = bm_green(BarMappingMode::FlatOverlap);
+                    let lbl_gauss = bm_green(BarMappingMode::Gaussian);
+                    let lbl_cqt   = bm_green(BarMappingMode::Cqt);
+                    let lbl_true_cqt = bm_green(BarMappingMode::TrueCqt(self.last_true_cqt));
+                    let lbl_slt   = bm_green(BarMappingMode::Superlet);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Analysis method:");
+                        let prev = self.bar_mapping.clone();
+                        ui.selectable_value(&mut self.bar_mapping, BarMappingMode::FlatOverlap, lbl_flat)
+                            .on_hover_text("An FFT, with each bar the equal-weight average of the FFT bins in its \
+                                                         frequency range.");
+                        ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Gaussian, lbl_gauss)
+                            .on_hover_text("An FFT, with each bar a Gaussian-weighted average of the FFT bins in \
+                                                         its range — bins near the bar's centre count most.");
+                        ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Cqt, lbl_cqt)
+                            .on_hover_text("FFT-based constant-Q weighting: each bar weights the FFT's bins \
+                                                         with a Hann kernel whose width grows with frequency, so every \
+                                                         bar spans the same fraction of an octave.\n\nNot a true \
+                                                         constant-Q transform: the FFT underneath has one fixed \
+                                                         window for every frequency, so time and frequency resolution \
+                                                         are still the FFT's.");
+                        ui.selectable_value(&mut self.bar_mapping, BarMappingMode::TrueCqt(self.last_true_cqt), lbl_true_cqt)
+                            .on_hover_text("A genuine constant-Q filterbank: each frequency has its own full centred window. Pre-process only. While it is not ready, live PCM can supply a clearly labelled FFT preview, never stored or described as CQT. Display bars and support Q are independent.");
+                        ui.selectable_value(&mut self.bar_mapping, BarMappingMode::Superlet, lbl_slt)
+                            .on_hover_text(format!(
+                                "Adaptive Superlet Transform — a direct wavelet analysis, not an FFT mapping.\n\
+                                 Pre-processing takes much longer than an FFT; how long depends on these\n\
+                                 settings and the track's length.\n\
+                                 Pre-process only; live view keeps using the FFT.\n\n\
+                                 Current: {} — bass window {:.2} s, grid Q {:.0} @ {:.0} fps",
+                                self.analyzer.aslt_preset.map(|p| p.label()).unwrap_or("Custom"),
+                                aslt::window_seconds_at(
+                                    self.min_freq,
+                                    aslt::grid_q(self.bar_count, self.min_freq, self.max_freq),
+                                    &self.analyzer.aslt_cfg,
+                                ),
+                                aslt::grid_q(self.bar_count, self.min_freq, self.max_freq),
+                                self.analyzer.pre_fps,
+                            ));
+                        if self.bar_mapping != prev {
+                            if let BarMappingMode::TrueCqt(cfg) = prev { self.last_true_cqt = cfg; }
+                            if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                                self.mode = SpectrumMode::PreProcess;
+                                if matches!(self.style, VizStyle::Spectrogram | VizStyle::OctaveBands) {
+                                    self.style = VizStyle::Waterfall;
+                                }
+                            }
+                            self.analyzer.bar_mapping = self.bar_mapping.clone();
+                            self.sync_params();
+                            self.try_load_or_flag_reanalysis();
+                        }
+                    });
+
+                    if self.true_cqt_settings_ui(ui) {
+                        self.analyzer.bar_mapping = self.bar_mapping.clone();
+                        self.sync_params();
+                        self.try_load_or_flag_reanalysis();
+                    }
+
+                    // Superlet quality ladder — only meaningful while
+                    // Superlet is the active mapping, so it stays hidden
+                    // otherwise rather than sitting there greyed out.
+                    if self.bar_mapping == BarMappingMode::Superlet {
+                        // The grid Q the readouts quote has to be the
+                        // one at the frequency being quoted: under ERB
+                        // it varies along the spectrum, and a single
+                        // number would describe a display that is not
+                        // on screen.
+                        let n_bars = self.bar_count;
+                        let (lo_hz, hi_hz) = (self.min_freq, self.max_freq);
+                        let grid_at_hz = |sc: freq_scale::FreqScale, f: f32| {
+                            // Straight inversion, not a search. Scanning
+                            // every bar for the nearest centre meant a
+                            // thousand `bar_center` calls per lookup, and
+                            // on a blended scale each of those is a
+                            // bisection — about a third of a million
+                            // evaluations per frame with this panel open,
+                            // which is what dropped the frame rate while
+                            // it was.
+                            let t = sc.position_of(f, lo_hz, hi_hz);
+                            let bar = (t * n_bars as f32 - 0.5)
+                                .round()
+                                .clamp(0.0, n_bars.saturating_sub(1) as f32)
+                                as usize;
+                            sc.grid_q_at(bar, n_bars, lo_hz, hi_hz)
+                        };
+                        // What the transform is competing against, so the
+                        // labels can say "better than the FFT" and mean it.
+                        let fft_sigma = aslt::fft_sigma_hz(
+                            self.analyzer.sample_rate, self.fft_size);
+                        let mut retune: Option<(Option<aslt::AsltPreset>, aslt::AsltConfig)> = None;
+                        ui.horizontal(|ui| {
+                            ui.label("Quality:");
+                            for p in [
+                                aslt::AsltPreset::Fast, aslt::AsltPreset::Standard,
+                                aslt::AsltPreset::High, aslt::AsltPreset::Ultra,
+                                aslt::AsltPreset::Extreme,
+                            ] {
+                                let cfg = p.config();
+                                let selected = self.analyzer.aslt_preset == Some(p);
+                                let beats_fft = 60.0 / aslt::effective_q_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg)
+                                    < fft_sigma;
+                                if ui.selectable_label(selected, p.label())
+                                    .on_hover_text(format!(
+                                        "Bass window {:.2} s, Q {:.0} at 60 Hz.\n{}",
+                                        aslt::window_seconds_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
+                                        aslt::effective_q_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
+                                        if beats_fft {
+                                            "Resolves bass detail the FFT cannot reach."
+                                        } else {
+                                            "Below FFT resolution in the bass; still much faster in the treble."
+                                        },
+                                    ))
+                                    .clicked() && !selected
+                                {
+                                    retune = Some((Some(p), cfg));
+                                }
+                            }
+                            let custom = self.analyzer.aslt_preset.is_none();
+                            if ui.selectable_label(custom, "Custom")
+                                .on_hover_text("Set the window budget and wavelet spread by hand.")
+                                .clicked() && !custom
+                            {
+                                retune = Some((None, self.analyzer.aslt_cfg.clone()));
+                            }
+                        });
+                        if self.analyzer.aslt_preset.is_none() {
+                            let mut cfg = self.analyzer.aslt_cfg.clone();
+                            let before = cfg.clone();
+                            ui.horizontal(|ui| {
+                                ui.label("Max window:");
+                                ui.add(egui::Slider::new(&mut cfg.max_window_s, aslt::MAX_WINDOW_RANGE)
+                                    .logarithmic(true).suffix(" s"))
+                                    .on_hover_text(
+                                        "Longest analysis window. This is the bass trade: \
+                                         constant-Q at 20 Hz needs ~10 s, so whatever you \
+                                         set here is where bass detail stops. Never binds \
+                                         above ~1 kHz.");
+                                // The same setting stated as what it
+                                // actually decides. Both are live and
+                                // either can be driven — the seconds are
+                                // the cost, the hertz are the result,
+                                // and which one someone thinks in is
+                                // their business.
+                                ui.label("= target sharpness above:");
+                                let mut hz = aslt::full_detail_above(grid_at_hz(cfg.scale, 1000.0), &cfg);
+                                if ui.add(egui::DragValue::new(&mut hz)
+                                    .range(30.0..=8000.0).speed(5.0).suffix(" Hz"))
+                                    .on_hover_text(
+                                        "The lowest frequency at which the window cap does \
+                                         not limit the transform, so it reaches the Sharpness \
+                                         target. That is not one bar of visible width: at \
+                                         Sharpness 1.0 a tone's peak is about 2.4 bars wide \
+                                         at half amplitude. Below this frequency the cap \
+                                         binds and the peak widens further — that is the \
+                                         uncertainty principle, not a defect, and no setting \
+                                         removes it. Driving this sets the window above.")
+                                    .changed()
+                                {
+                                    cfg.max_window_s = aslt::window_for_full_detail_above(
+                                        hz, grid_at_hz(cfg.scale, hz), &cfg,
+                                    ).clamp(0.1, 8.0);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Sharpness:");
+                                ui.add(egui::Slider::new(&mut cfg.q_ratio, aslt::Q_RATIO_RANGE)
+                                    .suffix("× grid"))
+                                    .on_hover_text(
+                                        "Target Q as a multiple of the bar grid. At 1.0 a \
+                                         tone's σ is one bar spacing and its peak is about \
+                                         2.4 bars wide at half amplitude; 2.0 brings that to \
+                                         about 1.2 bars. 1.0 is not the limit of what the \
+                                         display can show. Sharper costs time resolution \
+                                         (a longer window) and reads tones between bar \
+                                         centres lower.");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Wavelets:");
+                                ui.add(egui::Slider::new(&mut cfg.n_wavelets, aslt::N_WAVELETS_RANGE))
+                                    .on_hover_text(
+                                        "Members per superlet. 1 is a plain wavelet transform \
+                                         — sharpest peak, no cross-checking. More suppress \
+                                         energy the set disagrees about.");
+                                ui.label("Spread:");
+                                ui.add(egui::Slider::new(&mut cfg.spread, aslt::SPREAD_RANGE))
+                                    .on_hover_text(
+                                        "Shortest member as a fraction of the longest. 0 is \
+                                         the paper's layout and costs 1.73× resolution for \
+                                         the same time; ~0.5 keeps most of the cross-checking \
+                                         for 1.31×.");
+                            });
+                            let (lens_hz, lens_oct, lens_gain) =
+                                cfg.scale.lens().unwrap_or((1000.0, 2.0, 0.0));
+                            ui.horizontal(|ui| {
+                                ui.label("Bass width:");
+                                let mut tilt = cfg.scale.tilt();
+                                // Reversed range so dragging right
+                                // widens the bass, which is the
+                                // direction the label promises.
+                                let r = ui.add(
+                                    egui::Slider::new(&mut tilt, 1.0..=-1.0)
+                                        .step_by(0.05)
+                                        .custom_formatter(|v, _| match v {
+                                            v if v == 0.0 => "log".into(),
+                                            v if v == 1.0 => "ERB".into(),
+                                            v if v > 0.0 => format!("-{:.0}%", v * 100.0),
+                                            v => format!("+{:.0}%", -v * 100.0),
+                                        }))
+                                    .on_hover_text(
+                                        "How much of the display the bass gets. 'log' is \
+                                         constant bars per octave, the classic analyser \
+                                         axis. 'ERB' is constant bars per auditory filter \
+                                         (Glasberg & Moore 1990) — the bass narrows and \
+                                         the treble opens up. Past log, the bass keeps \
+                                         widening.\n\nThis is taste, not accuracy. A tone's \
+                                         blur and a bassline's travel both scale with bar \
+                                         density, so the ratio between them is the same \
+                                         everywhere on this slider — what changes is how \
+                                         much screen the bass gets to move across. And \
+                                         while the window cap is binding down there, \
+                                         which it is at any setting below about 1 s, \
+                                         widening the bass costs no extra compute at all.\
+                                         \n\nEach setting caches separately, so moving \
+                                         back and forth is free after the first analysis.");
+                                if r.changed() {
+                                    cfg.scale = freq_scale::FreqScale::from_parts(
+                                        tilt, lens_hz, lens_oct, lens_gain);
+                                }
+                                if ui.small_button("log").clicked() {
+                                    cfg.scale = freq_scale::FreqScale::from_parts(
+                                        0.0, lens_hz, lens_oct, lens_gain);
+                                }
+                                if ui.small_button("ERB").clicked() {
+                                    cfg.scale = freq_scale::FreqScale::from_parts(
+                                        1.0, lens_hz, lens_oct, lens_gain);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Zoom:");
+                                let mut on = lens_gain > 0.0;
+                                if ui.checkbox(&mut on, "").changed() {
+                                    cfg.scale = freq_scale::FreqScale::from_parts(
+                                        cfg.scale.tilt(), lens_hz, lens_oct,
+                                        if on { 2.0 } else { 0.0 },
+                                    );
+                                }
+                                let mut hz = lens_hz;
+                                let mut oct = lens_oct;
+                                let mut gain = lens_gain;
+                                let e = ui.add_enabled_ui(on, |ui| {
+                                    let a = ui.add(egui::DragValue::new(&mut hz)
+                                        .range(20.0..=20_000.0).speed(10.0).suffix(" Hz"))
+                                        .on_hover_text("Where the extra detail goes.");
+                                    let b = ui.add(egui::Slider::new(&mut oct, 0.25..=6.0)
+                                        .suffix(" oct").text(""))
+                                        .on_hover_text("How wide the magnified region is.");
+                                    let c = ui.add(egui::Slider::new(&mut gain, 0.5..=8.0)
+                                        .text("×"))
+                                        .on_hover_text(
+                                            "How much extra detail at the centre. Bars are \
+                                             taken from the rest of the spectrum to pay \
+                                             for it — the count never changes.");
+                                    a.changed() || b.changed() || c.changed()
+                                }).inner;
+                                if e {
+                                    cfg.scale = freq_scale::FreqScale::from_parts(
+                                        cfg.scale.tilt(), hz, oct, gain);
+                                }
+                            });
+                            // Zooming above the bass is not free: nothing
+                            // caps the window up there, so packing bars in
+                            // raises the resolution actually demanded.
+                            // Quoted as a ratio against the same settings
+                            // with the lens off, because a multiplier on a
+                            // twelve-minute analysis is the part that
+                            // matters.
+                            if cfg.scale.lens().is_some() {
+                                let mut flat = cfg.clone();
+                                flat.scale =
+                                    freq_scale::FreqScale::from_tilt(cfg.scale.tilt());
+                                let cost = |c: &aslt::AsltConfig| -> f64 {
+                                    aslt::bar_taps_per_frame(
+                                        self.analyzer.sample_rate, self.bar_count,
+                                        self.min_freq, self.max_freq, c,
+                                    ).iter().sum()
+                                };
+                                let (a, b) = (cost(&cfg), cost(&flat));
+                                let ratio = if b > 0.0 { a / b } else { 1.0 };
+                                let msg = format!("zoom costs {ratio:.2}x the analysis time");
+                                let col = if ratio > 1.5 {
+                                    txt_warn(ui.visuals().dark_mode)
+                                } else {
+                                    txt_dim(ui.visuals().dark_mode)
+                                };
+                                ui.label(egui::RichText::new(msg).size(10.0).color(col));
+                            }
+                            ui.label(egui::RichText::new(format!(
+                                "60 Hz: σ {:.2} Hz, window {:.2} s  ·  FFT: σ {fft_sigma:.2} Hz, window {:.0} ms  ·  10 kHz: window {:.0} ms (windows are full support, not a temporal width)",
+                                60.0 / aslt::effective_q_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
+                                aslt::window_seconds_at(60.0, grid_at_hz(cfg.scale, 60.0), &cfg),
+                                1000.0 * self.fft_size as f32 / self.analyzer.sample_rate as f32,
+                                1000.0 * aslt::window_seconds_at(10_000.0, grid_at_hz(cfg.scale, 10_000.0), &cfg),
+                            )).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
+                            // How wide a single bass tone will actually
+                            // draw, which is the thing people notice
+                            // first and the hardest to predict from a
+                            // window length in seconds.
+                            // σ in bar spacings, from the model, and
+                            // the amplitude FWHM that σ implies
+                            // (2√(2 ln 2) σ ≈ 2.355σ). The superlet's
+                            // measured peaks are a few per cent wider.
+                            let sigma_bars = |f: f32| {
+                                let g = grid_at_hz(cfg.scale, f);
+                                g / aslt::effective_q_at(f, g, &cfg)
+                            };
+                            const FWHM_PER_SIGMA: f32 = 2.354_82;
+                            ui.label(egui::RichText::new(format!(
+                                "a pure tone's peak, at half amplitude: ≈{:.1} bars wide at 60 Hz, \
+                                 ≈{:.1} at 200 Hz (σ {:.2} / {:.2} bars); the window cap stops \
+                                 limiting it above {:.0} Hz",
+                                FWHM_PER_SIGMA * sigma_bars(60.0), FWHM_PER_SIGMA * sigma_bars(200.0),
+                                sigma_bars(60.0), sigma_bars(200.0),
+                                aslt::full_detail_above(grid_at_hz(cfg.scale, 1000.0), &cfg),
+                            )).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
+                            if cfg != before { retune = Some((None, cfg)); }
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Frame rate:");
+                            let mut fps = self.analyzer.pre_fps;
+                            if ui.add(egui::Slider::new(&mut fps, 30.0..=240.0).step_by(30.0).suffix(" fps"))
+                                .on_hover_text("Pre-processed frames per second. Cost scales linearly, and so does cache size.")
+                                .changed()
+                            {
+                                self.analyzer.pre_fps = fps;
+                                self.try_load_or_flag_reanalysis();
+                            }
+                        });
+                        self.compute_budget_ui(ui);
+                        if let Some((preset, cfg)) = retune {
+                            self.analyzer.aslt_preset = preset;
+                            self.analyzer.aslt_cfg = cfg;
+                            self.try_load_or_flag_reanalysis();
+                        }
+                    }
+                }
+                // Under Superlet pre-process the FFT rows describe only the live
+                // preview, so they fold away rather than lead the panel. Values are
+                // kept either way; nothing here changes what is saved.
+                if self.mode == SpectrumMode::PreProcess
+                    && (self.bar_mapping == BarMappingMode::Superlet || self.true_cqt_preview_pending())
+                {
+                    egui::CollapsingHeader::new("Live FFT preview")
+                        .id_salt("live_fft_preview")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let note = if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                                "These settings affect only the LIVE FFT PREVIEW (FFT constant-Q weighting), not true CQT or its cache. The preview uses live PCM and stops when true CQT is ready. Live zero-padding controls its bin density; pre-process padding and overlap do not apply. Interpolation does not apply to this weighting."
+                            } else {
+                                "Superlet analyses the waveform directly, so these do not change \
+                                 the analysis. They shape only the live FFT drawn until the \
+                                 analysis is ready. Live zero-padding controls the preview's bin \
+                                 density; pre-process padding and overlap are hidden here and kept."
+                            };
+                            ui.label(egui::RichText::new(note)
+                                .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            self.fft_rows(ui, &mut rebuild, false);
+                        });
+                } else if self.fft_knobs_apply() {
+                    self.fft_rows(ui, &mut rebuild, true);
+                }
+                ui.horizontal(|ui| {
+                    // One control, whichever mode is showing — but two
+                    // values, persisted apart. They are not the same
+                    // quantity: Real-time is retention per accepted
+                    // tick, Pre-process is retention at a 60 Hz
+                    // reference converted for the source interval.
+                    // Sharing one number made a fast display change what
+                    // Real-time meant.
+                    let pre = self.mode == SpectrumMode::PreProcess;
+                    ui.label(if pre { "Smoothing (cached):" } else { "Smoothing (live):" });
+                    let value = if pre { &mut self.pre_smoothing } else { &mut self.smoothing };
+                    let r = ui.add(
+                        egui::Slider::new(value, 0.0..=0.97).step_by(0.01),
+                    );
+                    // Quoted in milliseconds, because that is the thing
+                    // being chosen and the retention figure hides it:
+                    // 0.75 is 174 ms, seven times what 0.125 gives, and
+                    // nothing on screen used to say so.
+                    let hint = if pre {
+                        let v = self.pre_smoothing;
+                        if v <= 0.0 {
+                            "Off — each cached row is shown exactly as analysed.".to_string()
+                        } else {
+                            format!(
+                                "Cached playback. A step reaches 95% in {:.0} ms, the same \
+                                 on every machine and at every analysis rate. Default {:.3} \
+                                 is {:.0} ms.",
+                                timing::step_response_95_secs(v) * 1000.0,
+                                timing::DEFAULT_PRE_SMOOTHING,
+                                timing::step_response_95_secs(timing::DEFAULT_PRE_SMOOTHING)
+                                    * 1000.0,
+                            )
+                        }
+                    } else {
+                        "Live analysis. Retention per analyser tick, so the response \
+                         follows Max FPS — the behaviour this control has always had."
+                            .to_string()
+                    };
+                    r.on_hover_text(hint);
+                    self.analyzer.smoothing = self.smoothing;
+                    self.analyzer.pre_smoothing = self.pre_smoothing;
+                });
+                if self.channel_view == channels::ChannelView::Diff {
+                    ui.horizontal(|ui| {
+                        ui.label("Diff layout:");
+                        for o in [
+                            channels::DiffOrientation::Horizontal,
+                            channels::DiffOrientation::Vertical,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.diff_layout.orientation,
+                                o,
+                                o.label(),
+                            );
+                        }
+                        ui.separator();
+                        let (pos, neg) = self.diff_layout.end_labels();
+                        let swap = if self.diff_layout.orientation
+                            == channels::DiffOrientation::Vertical
+                        {
+                            format!("{neg} ◀ ▶ {pos}")
+                        } else {
+                            format!("{pos} ▲ ▼ {neg}")
+                        };
+                        ui.checkbox(&mut self.diff_layout.flip_channels, "Swap L/R")
+                            .on_hover_text(format!(
+                                "Which channel sits on which side. Currently {swap}. \
+                                 Convention, not fact — the label moves with it, so the \
+                                 plot cannot end up saying the opposite of what it shows."
+                            ));
+                        ui.checkbox(&mut self.diff_layout.flip_frequency, "Flip freq")
+                            .on_hover_text(
+                                "Run the frequency axis the other way — high to low \
+                                 instead of low to high, or bottom to top instead of \
+                                 top to bottom.",
+                            );
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Waterfall history:");
+                    let r = ui.add(
+                        egui::Slider::new(
+                            &mut self.waterfall_secs,
+                            timing::WATERFALL_SECS_RANGE,
+                        )
+                        .step_by(0.01)
+                        .suffix(" s"),
+                    );
+                    // The row count is what it costs, and it follows
+                    // the row rate rather than the slider, so it is
+                    // worth showing rather than leaving to be guessed.
+                    // So is whether that rate is measured or requested,
+                    // and whether a bound moved the span off the slider.
+                    let (hz, nominal) = self.waterfall_row_rate();
+                    let rows = timing::waterfall_rows_for(self.waterfall_secs, hz);
+                    let span = timing::waterfall_span_secs(rows, hz);
+                    let bounded = (span - self.waterfall_secs as f64).abs() > 0.01;
+                    let mut shown = if nominal {
+                        format!("{rows} rows @ up to {hz:.0}/s (nominal)")
+                    } else {
+                        format!("{rows} rows @ {hz:.0}/s")
+                    };
+                    if bounded {
+                        let which = if rows <= timing::WATERFALL_MIN_ROWS {
+                            "min"
+                        } else {
+                            "max"
+                        };
+                        shown.push_str(&format!(
+                            " — {which} {rows} rows, so {span:.2} s"
+                        ));
+                    }
+                    ui.label(
+                        egui::RichText::new(shown)
+                            .size(10.0)
+                            .color(txt_faint(ui.visuals().dark_mode)),
+                    );
+                    r.on_hover_text(if nominal {
+                        "How much of the rolling waterfall's past to keep. \
+                         The waterfall advances once per analysis update and \
+                         the ring is a fixed number of rows, so the span is \
+                         rows divided by the rate they arrive at.\n\n\
+                         In Real-time that rate is taken from Max FPS, which \
+                         is a ceiling the analyser is asked to respect rather \
+                         than a rate anything has measured — so this duration \
+                         is nominal. If the machine delivers fewer updates a \
+                         second than Max FPS asks for, the same rows cover \
+                         more time and the history reaches further back than \
+                         the slider says.\n\n\
+                         The ring is held between 32 and 2048 rows. Where a \
+                         bound binds it, the span it actually covers is shown \
+                         beside the slider instead of the value requested."
+                    } else {
+                        "How much of the rolling waterfall's past to keep. \
+                         The waterfall advances once per cached row consumed \
+                         and the ring is a fixed number of rows, so the span \
+                         is rows divided by the cache's frame rate. Every \
+                         cached row is consumed, so this duration is measured \
+                         rather than nominal.\n\n\
+                         The ring is held between 32 and 2048 rows. Where a \
+                         bound binds it, the span it actually covers is shown \
+                         beside the slider instead of the value requested."
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Min Hz:");
+                    let r = ui.add(egui::DragValue::new(&mut self.min_freq)
+                        .range(10.0..=500.0).speed(1.0).suffix(" Hz"));
+                    ui.label("Max Hz:");
+                    let r2 = ui.add(egui::DragValue::new(&mut self.max_freq)
+                        .range(1000.0..=24000.0).speed(10.0).suffix(" Hz"));
+                    if r.changed() || r2.changed() {
+                        self.sync_params();
+                        self.try_load_or_flag_reanalysis();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Max FPS:");
+                    ui.add(egui::Slider::new(&mut self.max_fps, 1.0..=240.0)
+                        .step_by(1.0).suffix(" fps"));
+                });
+                if rebuild {
+                    self.analyzer.rebuild_fft();
+                }
+            }); }
+
+        // ── Pre-process cache ─────────────────────────────────────
+        // Warning banner and the stats refresh stay live; the actual
+        // management controls tuck into the 🗄 Cache chip so they don't
+        // eat plot height when unused.
+        if self.mode == SpectrumMode::PreProcess {
+            // Banner when settings changed and no matching cache exists
+            if self.needs_reanalysis && self.current_path.is_some() {
+                ui.horizontal(|ui| {
+                    let analyzing = self.analyzer.analysis_busy();
+                    let label = if analyzing {
+                        "⚠ No cache for current settings — waiting for analysis to finish…"
+                    } else {
+                        "⚠ No cache for current settings."
+                    };
+                    ui.label(egui::RichText::new(label)
+                        .size(11.0).color(txt_warn(ui.visuals().dark_mode)));
+                    let has_path = self.current_path.is_some();
+                    if ui.add_enabled(has_path && self.cache_controls_free(),
+                        egui::Button::new("🔄 Re-analyze now")).clicked() {
+                        self.reanalyze();
+                    }
+                });
+            }
+            self.alternates_ui(ui);
+
+            // Refresh cache stats + file set (no UI). Must run even when
+            // the Cache chip is closed — the FFT-size / window / padding
+            // buttons colour green from cache_file_set to show which
+            // combinations are already analysed.
+            let stale = self.cache_stats_at
+                .map(|t| t.elapsed().as_secs_f32() > 2.0)
+                .unwrap_or(true);
+            if stale {
+                let dir = self.analyzer.cache_dir();
+                self.cache_stats = cache_usage(&dir);
+                // Unit (head) paths: this set answers "is there an
+                // analysis of this track at those settings", a hint for
+                // the settings buttons. Whether it is an exact hit for
+                // the file as it is now is decided when it is used.
+                self.cache_file_set = cached_units(&dir);
+                self.cache_stats_at = Some(Instant::now());
+            }
+
+            if self.show_cache_settings { ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    let analyzing = self.analyzer.analysis_busy();
+                    let has_path  = self.current_path.is_some();
+                    let free = self.cache_controls_free();
+                    if ui.add_enabled(has_path && free,
+                        egui::Button::new("🗑 Clear Cache")).clicked() {
+                        self.clear_cache();
+                    }
+                    if ui.add_enabled(has_path && free,
+                        egui::Button::new("🔄 Re-analyze")).clicked() {
+                        self.reanalyze();
+                    }
+                    if analyzing {
+                        let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
+                        let eta = self.analyzer.eta_secs.load(Ordering::Relaxed);
+                        ui.spinner();
+                        // The ETA lives here rather than only on the plot
+                        // overlay: that overlay is gated on the plot being
+                        // silent, so during normal PCM playback — the live
+                        // FFT still drawing — it never appears at all.
+                        ui.label(egui::RichText::new(format!(
+                            "{} {}%{}",
+                            phase_label(pct), pct,
+                            if eta == usize::MAX {
+                                String::new()
+                            } else {
+                                format!(" — about {} left", fmt_eta(eta))
+                            },
+                        )).size(11.0).color(txt_dim(ui.visuals().dark_mode)));
+                        if ui.add(egui::Button::new("✖ Abort").small()).clicked() {
+                            self.analyzer.abort_preprocess();
+                            self.status_msg = "Analysis aborted.".into();
+                        }
+                    } else if !self.status_msg.is_empty() {
+                        ui.label(egui::RichText::new(&self.status_msg)
+                            .size(11.0).color(txt_dim(ui.visuals().dark_mode)));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Budget:");
+                    let mut unlimited = self.analyzer.cache_budget_gb <= 0.0;
+                    if ui.checkbox(&mut unlimited, "Unlimited")
+                        .on_hover_text("No eviction — the cache grows until you clear it.")
+                        .changed()
+                    {
+                        self.analyzer.cache_budget_gb =
+                            if unlimited { 0.0 } else { DEFAULT_CACHE_BUDGET_GB };
+                    }
+                    if !unlimited {
+                        let mut gb = self.analyzer.cache_budget_gb;
+                        // Logarithmic: the useful range runs from a
+                        // couple of superlet tracks to a whole library,
+                        // which linear steps cannot cover usefully.
+                        let changed = ui.add(egui::Slider::new(&mut gb, 0.1..=500.0)
+                            .logarithmic(true)
+                            .suffix(" GB")
+                            .custom_formatter(|v, _| if v < 1.0 {
+                                format!("{:.0} MB", v * 1000.0)
+                            } else {
+                                format!("{v:.1}")
+                            }))
+                            .on_hover_text(
+                                "Ceiling on the whole cache directory. Least-recently-used \
+                                 files are evicted after each analysis to stay under it. \
+                                 Type a number here to set it exactly.\n\nA superlet track \
+                                 at 180 fps costs 45–80 MB and cannot be packed much \
+                                 smaller — the low byte of every stored value is \
+                                 quantisation noise, so no lossless coder beats ~12 %. \
+                                 Bounding the total is the real control.")
+                            .changed();
+                        if changed { self.analyzer.cache_budget_gb = gb.max(0.05); }
+                        // What that budget actually holds, in the units
+                        // the user is spending it in.
+                        let per_track = 60.0; // MB, typical superlet track
+                        ui.label(egui::RichText::new(format!(
+                            "≈ {:.0} superlet tracks", gb * 1000.0 / per_track,
+                        )).size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                    }
+                    // Any worker still able to write, cancelled or not.
+                    let busy = self.analyzer.analysis_active();
+                    if ui.add_enabled(
+                        self.analyzer.cache_budget_gb > 0.0 && !busy,
+                        egui::Button::new("Trim now").small(),
+                    ).on_hover_text("Evict least-recently-used caches down to the budget.")
+                        .clicked()
+                    {
+                        self.status_msg = self.trim_now();
+                    }
+                });
+                let CacheUsage { analyses: count, bytes, legacy_files, legacy_bytes } = self.cache_stats;
+                let size_str = if bytes >= 1_000_000_000 {
+                    format!("{:.1} GB", bytes as f64 / 1e9)
+                } else if bytes >= 1_000_000 {
+                    format!("{:.1} MB", bytes as f64 / 1e6)
+                } else {
+                    format!("{:.0} KB", bytes as f64 / 1e3)
+                };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(
+                        format!("Cache: {} analys{} — {}", count, if count == 1 { "is" } else { "es" }, size_str))
+                        .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                    if legacy_files > 0 {
+                        ui.label(egui::RichText::new(format!(
+                            "· older versions: {} file{} — {} (kept)",
+                            legacy_files, if legacy_files == 1 { "" } else { "s" },
+                            alt_cache::fmt_bytes(legacy_bytes),
+                        )).size(10.0).color(txt_faint(ui.visuals().dark_mode)))
+                        .on_hover_text(LEGACY_KEPT);
+                    }
+                    let over = self.analyzer.cache_budget_gb > 0.0
+                        && bytes as f64 > self.analyzer.cache_budget_gb as f64 * 1e9;
+                    if over {
+                        ui.label(egui::RichText::new("over budget")
+                            .size(10.0).color(Color32::from_rgb(220, 160, 60)));
+                    }
+                    if ui.add_enabled(count > 0 && self.cache_controls_free(),
+                        egui::Button::new("🗑 Clear All").small()).clicked() {
+                        self.clear_all_caches();
+                    }
+                });
+            }); }
+        }
+
+        // ── Peak Hold settings (Bars only) ────────────────────────
+        if self.style == VizStyle::Bars && self.show_peak_settings {
+            ui.group(|ui| {
+                    ui.checkbox(&mut self.peak_config.enabled, "Enabled");
+                    ui.add_enabled_ui(self.peak_config.enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Hold time:");
+                            ui.add(egui::Slider::new(&mut self.peak_config.hold_ms, 10.0..=1000.0)
+                                .suffix(" ms"))
+                                .on_hover_text("How long the peak line freezes before it starts to decay.");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Decay mode:");
+                            ui.selectable_value(&mut self.peak_config.decay_mode, PeakDecayMode::Linear,  "Linear")
+                                .on_hover_text("Peak falls at a constant speed.");
+                            ui.selectable_value(&mut self.peak_config.decay_mode, PeakDecayMode::Gravity, "Gravity")
+                                .on_hover_text("Peak accelerates as it falls — feels physical.");
+                            ui.selectable_value(&mut self.peak_config.decay_mode, PeakDecayMode::FadeOut, "Fade Out")
+                                .on_hover_text("Peak stays in place but fades to transparent.");
+                        });
+                        let speed_label = match self.peak_config.decay_mode {
+                            PeakDecayMode::FadeOut => "Fade speed:",
+                            _                      => "Fall speed:",
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(speed_label);
+                            ui.add(egui::Slider::new(&mut self.peak_config.fall_speed, 0.05..=5.0)
+                                .logarithmic(true))
+                                .on_hover_text("Initial decay rate (normalized units/sec). For Fade Out this controls how fast the line disappears.");
+                        });
+                        if self.peak_config.decay_mode == PeakDecayMode::Gravity {
+                            ui.horizontal(|ui| {
+                                ui.label("Acceleration:");
+                                ui.add(egui::Slider::new(&mut self.peak_config.acceleration, 0.5..=20.0)
+                                    .logarithmic(true))
+                                    .on_hover_text("How quickly the fall accelerates. Higher values make it feel heavier.");
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Thickness:");
+                            let mut t = self.peak_config.peak_thickness as i32;
+                            if ui.add(egui::Slider::new(&mut t, 1..=6).suffix(" px"))
+                                .on_hover_text("Height of the peak marker in physical pixels.")
+                                .changed()
+                            {
+                                self.peak_config.peak_thickness = t as u8;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Color:");
+                            let mut rgb = [
+                                self.peak_config.color.r(),
+                                self.peak_config.color.g(),
+                                self.peak_config.color.b(),
+                            ];
+                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                self.peak_config.color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                            }
+                        });
+                    });
+                });
+        }
+
+        // ── Album Art settings ────────────────────────────────────
+        if self.show_art_settings { ui.group(|ui| {
+                let has_art   = self.current_art.is_some();
+                let has_track = self.current_path.is_some();
+                // Disable spectrum art controls when a track is loaded with no art
+                let art_enabled = has_art || !has_track;
+                let track_key = self.current_path.as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+
+                // ── Playlist thumbnails ──────────────────────────
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.art_settings.playlist_show, "Playlist thumbnails");
+                    ui.add_space(6.0);
+                    ui.add_enabled(
+                        self.art_settings.playlist_show,
+                        egui::Checkbox::new(
+                            &mut self.art_settings.playlist_placeholder,
+                            "Placeholder when no art",
+                        ),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.art_settings.spectrum_placeholder,
+                        "Spectrum placeholder (no art)",
+                    );
+                });
+
+                ui.separator();
+
+                // ── Spectrum scope: global vs per-track ──────────
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Spectrum:").size(11.0)
+                        .color(txt_dim(ui.visuals().dark_mode)));
+                    if !track_key.is_empty() {
+                        let has_override = self.art_settings.has_override(&track_key);
+                        let btn = if has_override { "This track ★" } else { "Global" };
+                        let tip = if has_override {
+                            "Per-track override active. Click to revert to global."
+                        } else {
+                            "Using global settings. Click to create a per-track override."
+                        };
+                        if ui.small_button(btn).on_hover_text(tip).clicked() {
+                            if has_override {
+                                self.art_settings.reset_to_global(&track_key);
+                            } else {
+                                self.art_settings.make_per_track(&track_key);
+                            }
+                        }
+                    }
+                });
+
+                // Resolve which config block to mutate
+                let use_per_track = !track_key.is_empty()
+                    && self.art_settings.has_override(&track_key);
+                let cfg: &mut ArtDisplaySettings = if use_per_track {
+                    self.art_settings.per_track.get_mut(&track_key).unwrap()
+                } else {
+                    &mut self.art_settings.global
+                };
+
+                ui.add_enabled_ui(art_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Mode:");
+                        ui.selectable_value(
+                            &mut cfg.spectrum_mode, ArtSpectrumMode::Hidden, "Hidden");
+                        ui.selectable_value(
+                            &mut cfg.spectrum_mode, ArtSpectrumMode::Transparent, "Transparent")
+                            .on_hover_text("Art behind bars at reduced opacity");
+                        ui.selectable_value(
+                            &mut cfg.spectrum_mode, ArtSpectrumMode::Mask, "Mask")
+                            .on_hover_text("Art visible only inside bar columns\n(Bars mode only)");
+                    });
+
+                    if cfg.spectrum_mode != ArtSpectrumMode::Hidden {
+                        ui.horizontal(|ui| {
+                            ui.label("Fit:");
+                            ui.selectable_value(&mut cfg.fit, ArtFit::Preserve, "Preserve ratio");
+                            ui.selectable_value(&mut cfg.fit, ArtFit::Stretch, "Stretch to fill");
+                        });
+                    }
+
+                    match cfg.spectrum_mode {
+                        ArtSpectrumMode::Transparent => {
+                            ui.horizontal(|ui| {
+                                ui.label("Opacity:");
+                                ui.add(egui::Slider::new(&mut cfg.transparency, 0.0..=1.0)
+                                    .step_by(0.01));
+                            });
+                        }
+                        ArtSpectrumMode::Mask => {
+                            ui.horizontal(|ui| {
+                                ui.label("Brightness:");
+                                ui.selectable_value(
+                                    &mut cfg.mask_mode, ArtMaskMode::Dynamic, "Dynamic")
+                                    .on_hover_text("Bar amplitude drives art brightness");
+                                ui.selectable_value(
+                                    &mut cfg.mask_mode, ArtMaskMode::Fixed, "Fixed")
+                                    .on_hover_text("Fixed brightness level, set by slider");
+                            });
+                            if cfg.mask_mode == ArtMaskMode::Fixed {
+                                ui.horizontal(|ui| {
+                                    ui.label("Level:");
+                                    ui.add(egui::Slider::new(&mut cfg.mask_brightness, 0.0..=1.0)
+                                        .step_by(0.01));
+                                });
+                            }
+                        }
+                        ArtSpectrumMode::Hidden => {}
+                    }
+                });
+
+                if has_track && !has_art {
+                    ui.label(egui::RichText::new("ℹ No embedded art in this track.")
+                        .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                }
+            }); }
+
+        // ── EQ panel ──────────────────────────────────────────────
+        if self.show_eq {
+            egui::CollapsingHeader::new("🎛 Parametric EQ")
+                .default_open(true)
+                .show(ui, |ui| {
+                    // EQ is bypassed whenever the session is on an
+                    // output device stream. That is a routing fact,
+                    // and it is what `bit_perfect` carries here — the
+                    // app sets it from `on_bp_stream()`, not from the
+                    // toggle.
+                    //
+                    // Whether the route is *exact* is a different
+                    // question with its own answer, and drawing a
+                    // green diamond for the first while claiming the
+                    // second is the defect. This says only what it
+                    // knows.
+                    if self.bit_perfect {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "\u{25C7} EQ is bypassed — this track plays on an \
+                                     output device stream with no processing in the path",
+                                )
+                                .size(12.0)
+                                .color(txt_faint(ui.visuals().dark_mode)),
+                            );
+                        });
+                        ui.separator();
+                    }
+
+                    // Global controls row
+                    ui.horizontal(|ui| {
+                        let eq_on = { self.eq_state.lock().unwrap().enabled };
+                        let on_label = egui::RichText::new(if eq_on { "ON" } else { "OFF" })
+                            .color(if eq_on { txt_ok(ui.visuals().dark_mode) } else { txt_faint(ui.visuals().dark_mode) });
+                        if ui.selectable_label(eq_on, on_label)
+                            .on_hover_text("Bypass all EQ bands").clicked()
+                        {
+                            let mut eq = self.eq_state.lock().unwrap();
+                            eq.enabled = !eq.enabled;
+                            eq.bump();
+                        }
+                        ui.separator();
+                        ui.label("Overlay:");
+                        ui.selectable_value(&mut self.eq_overlay, EqOverlayMode::Curve,       "Curve")
+                            .on_hover_text("Draw EQ response curve on top of spectrum bars");
+                        ui.selectable_value(&mut self.eq_overlay, EqOverlayMode::ApplyToBars, "Apply")
+                            .on_hover_text("Apply EQ gain to bar heights — bars show the EQ'd spectrum");
+                        ui.selectable_value(&mut self.eq_overlay, EqOverlayMode::Both,        "Both")
+                            .on_hover_text("Draw curve AND apply EQ gain to bars");
+                    });
+
+                    ui.separator();
+
+                    // ── Preset bar ──────────────────────────────────
+                    {
+                        // Collect lists first (avoid borrow conflicts)
+                        let global_presets: Vec<(u64, String, bool)> = self.preset_library.global
+                            .iter()
+                            .map(|p| (p.id, p.name.clone(), self.preset_library.default_id == Some(p.id)))
+                            .collect();
+                        let local_presets: Vec<(u64, String)> = self.track_key()
+                            .map(|key| self.preset_library.local_presets(&key)
+                                .iter().map(|p| (p.id, p.name.clone())).collect())
+                            .unwrap_or_default();
+
+                        // Refresh modified flag (happens every frame, cheap)
+                        self.refresh_preset_modified();
+
+                        // ── Pending-switch prompt (Save / Discard / Cancel) ──
+                        if let Some(pending) = self.pending_preset_switch.clone() {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("⚠ Unsaved changes — ").color(txt_warn(ui.visuals().dark_mode)));
+                                if ui.button("Save & switch").clicked() {
+                                    self.overwrite_active_preset();
+                                    let p = pending.clone();
+                                    self.apply_preset_ref(p);
+                                    self.pending_preset_switch = None;
+                                }
+                                if ui.button("Discard & switch").clicked() {
+                                    let p = pending.clone();
+                                    self.apply_preset_ref(p);
+                                    self.pending_preset_switch = None;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    self.pending_preset_switch = None;
+                                }
+                            });
+                            ui.separator();
+                        }
+
+                        // Helper: display name for active preset
+                        let active_label = |lib: &EqPresetLibrary, active: &Option<PresetRef>, modified: bool| -> String {
+                            match active {
+                                None => if modified { "(custom) *".into() } else { "(none)".into() },
+                                Some(r) => {
+                                    let key_str = lib.per_track.keys().next().map(|s| s.as_str()).unwrap_or("");
+                                    let name = lib.find(r, Some(key_str))
+                                        .map(|p| p.name.clone())
+                                        .unwrap_or_else(|| "?".into());
+                                    if modified { format!("{} *", name) } else { name }
+                                }
+                            }
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Preset:").size(11.0).color(txt_dim(ui.visuals().dark_mode)));
+
+                            // ── Global preset dropdown ──
+                            let global_label = {
+                                let is_global = self.active_preset.as_ref().map(|r| r.scope == PresetScope::Global).unwrap_or(false);
+                                if is_global {
+                                    active_label(&self.preset_library, &self.active_preset, self.preset_modified)
+                                } else {
+                                    "Global…".into()
+                                }
+                            };
+                            egui::ComboBox::from_id_salt("eq_preset_global")
+                                .selected_text(global_label)
+                                .width(130.0)
+                                .show_ui(ui, |ui| {
+                                    for (id, name, is_default) in &global_presets {
+                                        let display = if *is_default { format!("★ {}", name) } else { name.clone() };
+                                        let is_active = self.active_preset.as_ref()
+                                            .map(|r| r.scope == PresetScope::Global && r.id == *id)
+                                            .unwrap_or(false);
+                                        let r = PresetRef { scope: PresetScope::Global, id: *id };
+                                        if ui.selectable_label(is_active, display).clicked() {
+                                            if self.preset_modified {
+                                                self.pending_preset_switch = Some(r);
+                                            } else {
+                                                self.apply_preset_ref(r);
+                                            }
+                                        }
+                                    }
+                                });
+
+                            // ── Local (song) preset dropdown ──
+                            if !local_presets.is_empty() || self.current_path.is_some() {
+                                let local_label = {
+                                    let is_local = self.active_preset.as_ref().map(|r| r.scope == PresetScope::Local).unwrap_or(false);
+                                    if is_local {
+                                        active_label(&self.preset_library, &self.active_preset, self.preset_modified)
+                                    } else {
+                                        "Song…".into()
+                                    }
+                                };
+                                egui::ComboBox::from_id_salt("eq_preset_local")
+                                    .selected_text(local_label)
+                                    .width(120.0)
+                                    .show_ui(ui, |ui| {
+                                        for (id, name) in &local_presets {
+                                            let is_active = self.active_preset.as_ref()
+                                                .map(|r| r.scope == PresetScope::Local && r.id == *id)
+                                                .unwrap_or(false);
+                                            let r = PresetRef { scope: PresetScope::Local, id: *id };
+                                            if ui.selectable_label(is_active, name).clicked() {
+                                                if self.preset_modified {
+                                                    self.pending_preset_switch = Some(r);
+                                                } else {
+                                                    self.apply_preset_ref(r);
+                                                }
+                                            }
+                                        }
+                                    });
+                            }
+
+                            // ── Modified action buttons ──
+                            if self.preset_modified && self.pending_preset_switch.is_none() {
+                                if self.active_preset.is_some()
+                                    && ui.small_button("Update").on_hover_text("Overwrite active preset with current bands").clicked() {
+                                    self.overwrite_active_preset();
+                                }
+                                if ui.small_button("Discard").on_hover_text("Revert bands to saved preset").clicked() {
+                                    if let Some(r) = self.active_preset.clone() {
+                                        self.apply_preset_ref(r);
+                                    } else {
+                                        let mut eq = self.eq_state.lock().unwrap();
+                                        eq.bands.clear(); eq.bump();
+                                        self.preset_modified = false;
+                                    }
+                                }
+                            }
+
+                            // ── Save As New toggle ──
+                            let save_new_label = if self.eq_save_new_open { "▾ Save As New" } else { "▸ Save As New" };
+                            if ui.small_button(save_new_label).clicked() {
+                                if !self.eq_save_new_open {
+                                    // Pre-fill a sensible name
+                                    let track_key = self.track_key();
+                                    self.eq_save_name_buf = self.preset_library.auto_name(&self.eq_save_new_scope, track_key.as_deref());
+                                }
+                                self.eq_save_new_open = !self.eq_save_new_open;
+                            }
+                        });
+
+                        // ── Save As New expanded row ──
+                        if self.eq_save_new_open {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Name:").size(11.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.eq_save_name_buf).desired_width(140.0));
+                                ui.label(egui::RichText::new("Scope:").size(11.0));
+                                ui.selectable_value(&mut self.eq_save_new_scope, PresetScope::Global, "Global");
+                                if self.current_path.is_some() {
+                                    ui.selectable_value(&mut self.eq_save_new_scope, PresetScope::Local, "Song");
+                                }
+                                let name_ok = !self.eq_save_name_buf.trim().is_empty();
+                                if ui.add_enabled(name_ok, egui::Button::new("💾 Save")).clicked() {
+                                    let name = self.eq_save_name_buf.trim().to_string();
+                                    let scope = self.eq_save_new_scope.clone();
+                                    self.save_as_new_preset(name, scope);
+                                    self.eq_save_new_open = false;
+                                    self.eq_save_name_buf.clear();
+                                }
+                                if ui.small_button("✕").clicked() {
+                                    self.eq_save_new_open = false;
+                                }
+                            });
+                        }
+
+                        // ── Per-preset actions (Rename, Duplicate, Delete, Set Default) ──
+                        if let Some(active_ref) = self.active_preset.clone() {
+                            // Rename state
+                            if let Some((ref rename_ref, ref mut rename_buf)) = self.eq_rename_state.clone()
+                                && *rename_ref == active_ref {
+                                ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("Rename:").size(11.0));
+                                        // We need mutable access — pull from field
+                                        if let Some((_, ref mut buf)) = self.eq_rename_state {
+                                            ui.add(egui::TextEdit::singleline(buf).desired_width(140.0));
+                                        }
+                                        let new_name = rename_buf.trim().to_string();
+                                        let ok = !new_name.is_empty();
+                                        if ui.add_enabled(ok, egui::Button::new("✓")).clicked() {
+                                            let key = self.track_key();
+                                            if let Some(p) = self.preset_library.find_mut(&active_ref, key.as_deref()) { p.name = new_name; }
+                                            self.preset_library.save();
+                                            self.eq_rename_state = None;
+                                        }
+                                        if ui.small_button("✕").clicked() {
+                                            self.eq_rename_state = None;
+                                        }
+                                    });
+                            }
+
+                            ui.horizontal(|ui| {
+                                // Rename button
+                                if (self.eq_rename_state.is_none() || self.eq_rename_state.as_ref().map(|(r,_)| r) != Some(&active_ref))
+                                    && ui.small_button("✏ Rename").clicked() {
+                                    let key = self.track_key();
+                                    let cur_name = self.preset_library.find(&active_ref, key.as_deref())
+                                        .map(|p| p.name.clone()).unwrap_or_default();
+                                    self.eq_rename_state = Some((active_ref.clone(), cur_name));
+                                }
+
+                                // Duplicate
+                                if ui.small_button("⧉ Duplicate").on_hover_text("Save a copy as a new preset").clicked() {
+                                    let key = self.track_key();
+                                    let (cur_name, cur_bands) = self.preset_library.find(&active_ref, key.as_deref())
+                                        .map(|p| (format!("{} copy", p.name), p.bands.clone()))
+                                        .unwrap_or_else(|| (self.preset_library.auto_name(&active_ref.scope, key.as_deref()), self.eq_state.lock().unwrap().bands.clone()));
+                                    let id = self.preset_library.alloc_id();
+                                    let new_preset = EqPreset { id, name: cur_name, bands: cur_bands };
+                                    let scope = active_ref.scope.clone();
+                                    match &scope {
+                                        PresetScope::Global => self.preset_library.global.push(new_preset),
+                                        PresetScope::Local => {
+                                            let k = key.unwrap_or_default();
+                                            self.preset_library.per_track.entry(k).or_default().push(new_preset);
+                                        }
+                                    }
+                                    self.preset_library.save();
+                                    self.active_preset = Some(PresetRef { scope, id });
+                                    self.preset_modified = false;
+                                }
+
+                                // Set as Default (global only)
+                                if active_ref.scope == PresetScope::Global {
+                                    let is_default = self.preset_library.default_id == Some(active_ref.id);
+                                    let default_label = if is_default { "★ Default" } else { "☆ Set Default" };
+                                    if ui.small_button(default_label).on_hover_text("Use this preset for tracks that have no last-used preset").clicked() {
+                                        if is_default {
+                                            self.preset_library.default_id = None;
+                                        } else {
+                                            self.preset_library.default_id = Some(active_ref.id);
+                                        }
+                                        self.preset_library.save();
+                                    }
+                                }
+
+                                // Delete / confirm-delete
+                                if self.eq_confirm_delete.as_ref() == Some(&active_ref) {
+                                    ui.label(egui::RichText::new("Delete?").color(Color32::from_rgb(240, 80, 80)));
+                                    if ui.small_button("Yes").clicked() {
+                                        let key = self.track_key();
+                                        self.preset_library.delete(&active_ref, key.as_deref());
+                                        self.preset_library.save();
+                                        self.active_preset = None;
+                                        self.preset_modified = !self.eq_state.lock().unwrap().bands.is_empty();
+                                        self.eq_confirm_delete = None;
+                                    }
+                                    if ui.small_button("No").clicked() {
+                                        self.eq_confirm_delete = None;
+                                    }
+                                } else if ui.small_button("🗑 Delete").clicked() {
+                                    self.eq_confirm_delete = Some(active_ref.clone());
+                                }
+                            });
+                        }
+                    }
+
+                    ui.separator();
+
+                    // Band table
+                    let bands_snap: Vec<EqBand> = self.eq_state.lock().unwrap().bands.clone();
+                    let sr = self.eq_state.lock().unwrap().sample_rate;
+
+                    egui::Grid::new("eq_band_grid")
+                        .num_columns(8)
+                        .striped(true)
+                        .spacing([4.0, 2.0])
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("#").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            ui.label(egui::RichText::new("Type").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            ui.label(egui::RichText::new("Freq (Hz)").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            ui.label(egui::RichText::new("Gain (dB)").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            ui.label(egui::RichText::new("Q").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            ui.label(egui::RichText::new("On").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            ui.label(egui::RichText::new("Del").size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                            ui.end_row();
+
+                            let mut remove_idx: Option<usize> = None;
+                            for (i, _) in bands_snap.iter().enumerate() {
+                                let col = eq_band_color(i);
+                                ui.label(egui::RichText::new(format!("{}", i + 1)).color(col).size(11.0));
+
+                                // Band kind selector
+                                let mut eq = self.eq_state.lock().unwrap();
+                                let kind = eq.bands[i].kind.clone();
+                                egui::ComboBox::from_id_salt(format!("eq_kind_{}", i))
+                                    .selected_text(kind.label())
+                                    .width(58.0)
+                                    .show_ui(ui, |ui| {
+                                        let mut changed = false;
+                                        for k in [BandKind::Peaking, BandKind::LowShelf, BandKind::HighShelf, BandKind::HighPass, BandKind::LowPass, BandKind::Notch] {
+                                            let sel = ui.selectable_value(&mut eq.bands[i].kind, k.clone(), k.label()).changed();
+                                            if sel { changed = true; }
+                                        }
+                                        if changed { eq.bump(); }
+                                    });
+
+                                // Freq
+                                let freq_changed = ui.add(egui::DragValue::new(&mut eq.bands[i].freq)
+                                    .range(20.0..=20_000.0).speed(1.0).suffix(" Hz")).changed();
+                                if freq_changed { eq.bump(); }
+
+                                // Gain (only for band types that have gain)
+                                if eq.bands[i].kind.has_gain() {
+                                    let g_changed = ui.add(egui::DragValue::new(&mut eq.bands[i].gain_db)
+                                        .range(-EQ_DB_RANGE..=EQ_DB_RANGE).speed(0.1).suffix(" dB")).changed();
+                                    if g_changed { eq.bump(); }
+                                } else {
+                                    ui.label("—");
+                                }
+
+                                // Q
+                                let q_changed = ui.add(egui::DragValue::new(&mut eq.bands[i].q)
+                                    .range(0.1..=10.0).speed(0.01)).changed();
+                                if q_changed { eq.bump(); }
+
+                                // Enable toggle
+                                let en_changed = ui.checkbox(&mut eq.bands[i].enabled, "").changed();
+                                if en_changed { eq.bump(); }
+
+                                drop(eq);
+
+                                // Delete
+                                if ui.small_button("✕").clicked() {
+                                    remove_idx = Some(i);
+                                }
+
+                                ui.end_row();
+                            }
+
+                            if let Some(idx) = remove_idx {
+                                let mut eq = self.eq_state.lock().unwrap();
+                                if idx < eq.bands.len() { eq.bands.remove(idx); eq.bump(); }
+                            }
+                        });
+
+                    ui.horizontal(|ui| {
+                        if ui.button("➕ Add band").on_hover_text("Add a new peaking band at 1 kHz.\nYou can also click on the spectrum to add a band there.").clicked() {
+                            let mut eq = self.eq_state.lock().unwrap();
+                            if eq.bands.len() < 16 {
+                                eq.bands.push(EqBand::default_peak(1000.0));
+                                eq.bump();
+                            }
+                        }
+                        let band_count = self.eq_state.lock().unwrap().bands.len();
+                        if band_count > 0 && ui.button("🗑 Clear all").clicked() {
+                            let mut eq = self.eq_state.lock().unwrap();
+                            eq.bands.clear();
+                            eq.bump();
+                        }
+                        ui.label(egui::RichText::new(format!("{}/16 bands", band_count))
+                            .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
+                    });
+
+                    let _ = sr; // used in overlay, suppress warning
+                });
+        }
+
+    }
+
+    /// The plot, or the whole-track view, in the room that is left.
+    fn plot_ui(&mut self, ui: &mut egui::Ui) {
+        let vp_ctx = ui.ctx().clone();
+        let vp_ctx = &vp_ctx;
+        self.canvas = Some(ui.available_rect_before_wrap());
+        if self.whole_track.open && self.mode == SpectrumMode::PreProcess {
+            self.whole_track_ui(ui);
+            return;
+        }
+
+        let avail = ui.available_size();
+        let sense = if self.show_eq { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
+        let (rect, spec_response) = ui.allocate_exact_size(avail, sense);
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, Color32::from_rgb(8, 10, 16));
+            // Inset plot area to make room for axis labels
+            let plot_rect = Rect::from_min_max(
+                Pos2::new(rect.left() + DB_MARGIN, rect.top()),
+                Pos2::new(rect.right(), rect.bottom() - FREQ_MARGIN),
+            );
+
+            // ── EQ bar modification (apply EQ gain to displayed bars) ──
+            // Skipped in bit-perfect mode: EQ is not in the audio path, so
+            // the spectrum correctly shows what you hear without modification.
+            let eq_snap = if self.show_eq && !self.bit_perfect {
+                let eq = self.eq_state.lock().unwrap();
+                if eq.is_active() { Some((eq.bands.clone(), eq.sample_rate, eq.enabled)) } else { None }
+            } else { None };
+
+            let owned_mags: Vec<f32>;
+            let mags: &[f32] = if let Some((ref bands, sr, _)) = eq_snap {
+                if matches!(self.eq_overlay, EqOverlayMode::ApplyToBars | EqOverlayMode::Both) {
+                    owned_mags = self.analyzer.magnitudes.iter().enumerate().map(|(i, &m)| {
+                        let freq = bar_center_freq(i, self.analyzer.magnitudes.len(), self.min_freq, self.analysis_max_freq());
+                        let gain = 10f32.powf(total_eq_response_db(bands, sr, freq) / 20.0);
+                        (m * gain).clamp(0.0, 1.0)
+                    }).collect();
+                    &owned_mags
+                } else {
+                    &self.analyzer.magnitudes
+                }
+            } else {
+                &self.analyzer.magnitudes
+            };
+
+            // ── Album art background / placeholder ───────────────
+            let track_key = self.current_path.as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let art_cfg = self.art_settings.settings_for(&track_key).clone();
+            let has_art = self.current_art.is_some();
+
+            if has_art {
+                if let Some((tex_id, art_w, art_h)) = self.current_art {
+                    match &art_cfg.spectrum_mode {
+                        ArtSpectrumMode::Transparent => {
+                            let alpha = (art_cfg.transparency * 255.0) as u8;
+                            let art_rect = art_dest_rect(plot_rect, art_w, art_h, &art_cfg.fit);
+                            painter.image(
+                                tex_id, art_rect,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::from_white_alpha(alpha),
+                            );
+                        }
+                        ArtSpectrumMode::Hidden | ArtSpectrumMode::Mask => {}
+                    }
+                }
+            } else if self.art_settings.spectrum_placeholder {
+                painter.rect_filled(plot_rect, 4.0, Color32::from_gray(14));
+                painter.text(
+                    plot_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "♪",
+                    egui::FontId::proportional(56.0),
+                    Color32::from_gray(28),
+                );
+            }
+
+            let pal = Palette::new(self.palette_kind, self.palette_accent);
+
+            // Channel views take over the plot when they are both
+            // selected and possible. `effective_view` returns Mix
+            // whenever they are not, and `draw_channel_view` returns
+            // false if the frame it was handed lacks a channel it
+            // needs — so a missing channel falls back rather than
+            // drawing something that is not it.
+            // The corner readouts share one strip and have to be
+            // measured before any of them is drawn, because the legend
+            // sits between the other two and its start depends on how
+            // wide the LUFS number happens to be.
+            // Read before the row is planned: the badge is part of it,
+            // and it is only drawn when the plot is not already saying
+            // the same thing in the middle. A pure read of analyser
+            // state, so moving it earlier changes nothing else.
+            let plot_is_silent = self.analyzer.channel_frame().is_silent();
+            let analysis_text = (self.analyzer.analysis_busy() && !plot_is_silent)
+                .then(|| {
+                    let pct =
+                        self.analyzer.analysis_progress.load(Ordering::Relaxed);
+                    let eta = self.analyzer.eta_secs.load(Ordering::Relaxed);
+                    if eta == usize::MAX {
+                        format!("analysing {pct}%")
+                    } else {
+                        format!("analysing {pct}%  ~{}", fmt_eta(eta))
+                    }
+                });
+            let lufs_text = (self.style != VizStyle::Phasescope).then(|| {
+                if self.momentary_lufs.is_finite() {
+                    format!("{:.1} LUFS", self.momentary_lufs)
+                } else {
+                    "— LUFS".to_string()
+                }
+            });
+            let fps_text = format!("{:.0} fps", self.current_fps);
+            let top_row = TopRow::plan(
+                &painter,
+                plot_rect,
+                lufs_text.as_deref(),
+                &fps_text,
+                analysis_text.as_deref(),
+            );
+
+            let ch_view = channels::effective_view(
+                self.channel_view, &self.channel_availability,
+            );
+            let drew_channels = ch_view != channels::ChannelView::Mix && {
+                let frame = self.analyzer.channel_frame();
+                self.draw_channel_view(&painter, ch_view, &frame, plot_rect, &pal, top_row)
+            };
+            let drew_diff = uses_diff_axes(ch_view, drew_channels);
+
+            match self.style {
+                _ if drew_channels => {}
+                VizStyle::Bars => {
+                    if has_art && matches!(art_cfg.spectrum_mode, ArtSpectrumMode::Mask) {
+                        if let Some((tex_id, art_w, art_h)) = self.current_art {
+                            draw_bars_art_mask(
+                                &painter, mags, plot_rect, self.bar_gap,
+                                tex_id, art_w, art_h, &art_cfg.fit,
+                                &art_cfg.mask_mode, art_cfg.mask_brightness,
+                            );
+                        } else {
+                            draw_bars(&painter, mags, plot_rect, self.bar_gap, &pal);
+                        }
+                    } else {
+                        draw_bars(&painter, mags, plot_rect, self.bar_gap, &pal);
+                    }
+                    if self.peak_config.enabled && !self.peak_vals.is_empty() {
+                        draw_peak_hold(
+                            &painter, &self.peak_vals, &self.peak_alphas,
+                            plot_rect, self.bar_gap, &self.peak_config,
+                        );
+                    }
+                }
+                VizStyle::Line       => draw_line(&painter, mags, plot_rect, pal.line()),
+                VizStyle::FilledArea => draw_filled(&painter, mags, plot_rect, &pal),
+                VizStyle::Waterfall  => {
+                    self.update_waterfall_texture(vp_ctx, &pal);
+                    self.draw_waterfall(&painter, plot_rect);
+                },
+                VizStyle::Spectrogram => {
+                    if self.spectrogram.dirty {
+                        let img = self.spectrogram.to_color_image();
+                        if let Some(ref mut th) = self.spectrogram_texture {
+                            th.set(img, egui::TextureOptions::LINEAR);
+                        } else {
+                            let th = vp_ctx.load_texture(
+                                "moosik_spectrogram", img,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.spectrogram_texture = Some(th);
+                        }
+                        self.spectrogram.dirty = false;
+                    }
+                    if let Some(ref th) = self.spectrogram_texture {
+                        painter.image(
+                            th.id(), plot_rect,
+                            egui::Rect::from_min_max(
+                                egui::Pos2::ZERO,
+                                egui::Pos2::new(1.0, 1.0),
+                            ),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+                VizStyle::OctaveBands => {
+                    draw_octave_bands(
+                        &painter, &self.octave_bands, plot_rect,
+                        self.analyzer.live_rate, self.min_freq, self.max_freq, &pal,
+                    );
+                }
+                VizStyle::Phasescope => {
+                    // Use the snapshot captured in tick() — no lock or clone here
+                    draw_phasescope(&painter, &self.phasescope_frames, plot_rect, self.correlation);
+                }
+            }
+            // ── Analysis-status overlay ───────────────────────────
+            // Shown only when the plot is genuinely dead. DSD is the
+            // main case: playback is a DoP carrier or raw native DSD,
+            // not analysable PCM, so there
+            // is no live signal to fall back on and the first analysis
+            // of a track would otherwise be an unexplained blank panel.
+            if plot_is_silent && !matches!(self.style, VizStyle::Phasescope) {
+                let analyzing = self.analyzer.analysis_busy();
+                let is_dsd = self.current_path.as_deref().is_some_and(crate::dsd::is_dsd_path);
+                if self.mode == SpectrumMode::PreProcess
+                    && analyzing && self.analyzer.pre_frames.is_empty()
+                {
+                    let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
+                    let label = if is_dsd {
+                        format!("Analyzing DSD…  {pct}%")
+                    } else {
+                        format!("Analyzing…  {pct}%")
+                    };
+                    let center = plot_rect.center();
+                    painter.text(
+                        Pos2::new(center.x, center.y - 14.0),
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        egui::FontId::proportional(15.0),
+                        Color32::from_gray(200),
+                    );
+                    // Slim progress bar under the text.
+                    let bar_w = 220.0_f32.min(plot_rect.width() * 0.6);
+                    let bar = Rect::from_center_size(
+                        Pos2::new(center.x, center.y + 10.0),
+                        egui::Vec2::new(bar_w, 6.0),
+                    );
+                    painter.rect_filled(bar, 3.0, Color32::from_gray(30));
+                    let fill_w = bar_w * (pct.min(100) as f32 / 100.0);
+                    if fill_w > 1.0 {
+                        let fill = Rect::from_min_size(bar.min, egui::Vec2::new(fill_w, 6.0));
+                        painter.rect_filled(fill, 3.0, pal.line());
+                    }
+                    // Superlet analyses run for minutes, not seconds, so
+                    // the wait needs a number attached to it and a way
+                    // out. Both are shown for every mode — an ETA is
+                    // just as welcome on a fast one.
+                    let eta = self.analyzer.eta_secs.load(Ordering::Relaxed);
+                    painter.text(
+                        Pos2::new(center.x, center.y + 26.0),
+                        egui::Align2::CENTER_CENTER,
+                        if eta == usize::MAX {
+                            "estimating…".to_string()
+                        } else {
+                            format!("about {} remaining", fmt_eta(eta))
+                        },
+                        egui::FontId::proportional(11.0),
+                        Color32::from_gray(140),
+                    );
+                    let abort_rect = Rect::from_center_size(
+                        Pos2::new(center.x, center.y + 48.0),
+                        egui::Vec2::new(76.0, 22.0),
+                    );
+                    if ui.put(abort_rect, egui::Button::new(
+                        egui::RichText::new("Abort").size(11.0)
+                    )).clicked() {
+                        self.analyzer.abort_preprocess();
+                    }
+                } else if is_dsd && self.mode == SpectrumMode::RealTime {
+                    painter.text(
+                        plot_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Real-time FFT isn't available for DSD (playback is DoP, not PCM) — switch to Pre-Process mode",
+                        egui::FontId::proportional(13.0),
+                        Color32::from_gray(150),
+                    );
+                }
+            }
+
+            // Axis labels. The Diff view has its own pair, because
+            // neither of its axes is what the ordinary ones describe —
+            // see `draw_diff_axes`. This keys off `drew_diff`, not off
+            // the *requested* view, so a Diff selection that fell back
+            // to Mix gets the ordinary axes it is actually showing.
+            if drew_diff {
+                draw_diff_axes(
+                    &painter, plot_rect, self.diff_layout,
+                    self.display_sample_rate(), self.min_freq, self.analysis_max_freq(),
+                    self.analysis_scale(),
+                );
+            } else {
+                // Skip for spectrogram (its own freq axis is baked in),
+                // octave bands (draws its own labels below bars), and phasescope.
+                if !matches!(self.style, VizStyle::Spectrogram | VizStyle::OctaveBands | VizStyle::Phasescope) {
+                    draw_db_labels(&painter, plot_rect);
+                }
+                if !matches!(self.style, VizStyle::Spectrogram | VizStyle::Phasescope) {
+                    draw_freq_labels(
+                        &painter, plot_rect, self.display_sample_rate(),
+                        self.min_freq, self.analysis_max_freq(),
+                        self.analysis_scale(),
+                    );
+                }
+            }
+            // The EQ overlay is a curve in gain-against-frequency drawn
+            // on the plot's own coordinates, and its draggable nodes are
+            // hit-tested in them. Diff has neither of those axes, so the
+            // curve would be meaningless and every node would sit at the
+            // wrong frequency and gain. Rotating the interaction to suit
+            // is a larger piece of work than this change; until then the
+            // overlay stands down and says so. Nothing about the EQ
+            // itself changes — the bands, their gains and the EQ panel
+            // are all untouched.
+            if self.show_eq && drew_diff {
+                painter.text(
+                    Pos2::new(plot_rect.left() + 6.0, plot_rect.bottom() - 4.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    "EQ overlay off in Diff — this plot is not dB against frequency. \
+                     EQ settings are unchanged; edit them in the EQ panel.",
+                    egui::FontId::proportional(10.0),
+                    Color32::from_gray(105),
+                );
+            }
+            // ── EQ overlay and node interaction ──────────────────────
+            if self.show_eq && !drew_diff && !matches!(self.style, VizStyle::Phasescope | VizStyle::Waterfall | VizStyle::Spectrogram) {
+                let (bands, sr) = {
+                    let eq = self.eq_state.lock().unwrap();
+                    (eq.bands.clone(), eq.sample_rate)
+                };
+                let draw_curve = matches!(self.eq_overlay, EqOverlayMode::Curve | EqOverlayMode::Both);
+                draw_eq_overlay(&painter, &bands, sr, plot_rect,
+                    self.min_freq, self.analysis_max_freq(), draw_curve,
+                    self.eq_hovered_node, self.eq_dragging_node,
+                    self.analysis_scale());
+
+                // Mouse hit-test: find nearest node within 14px
+
+                if let Some(ptr) = spec_response.hover_pos() {
+                    self.eq_hovered_node = None;
+                    for (i, band) in bands.iter().enumerate() {
+                        if !band.enabled { continue; }
+                        let np = eq_node_pos(band, plot_rect, self.min_freq, self.analysis_max_freq(),
+                                             self.analysis_scale());
+                        if (np - ptr).length() < 14.0 {
+                            self.eq_hovered_node = Some(i);
+                            break;
+                        }
+                    }
+                }
+
+                if spec_response.drag_started() {
+                    self.eq_dragging_node = self.eq_hovered_node;
+                }
+                if spec_response.drag_stopped() {
+                    self.eq_dragging_node = None;
+                }
+
+                if let Some(drag_idx) = self.eq_dragging_node {
+                    let delta = spec_response.drag_delta();
+                    if delta != egui::Vec2::ZERO {
+                        let mut eq = self.eq_state.lock().unwrap();
+                        if let Some(band) = eq.bands.get_mut(drag_idx) {
+                            // Horizontal → frequency (log scale)
+                            // Along whichever axis is on screen, so the
+                            // node tracks the pointer instead of
+                            // sliding away from it.
+                            let fscale = self.analysis_scale();
+                            let t = fscale.position_of(
+                                band.freq, self.min_freq, self.analysis_max_freq(),
+                            ) + delta.x / plot_rect.width();
+                            band.freq = fscale
+                                .freq_at(t.clamp(0.0, 1.0), self.min_freq, self.analysis_max_freq())
+                                .clamp(20.0, 20_000.0);
+                            // Vertical → gain
+                            if band.kind.has_gain() {
+                                let db_per_px = EQ_DB_RANGE / (plot_rect.height() * 0.5);
+                                band.gain_db = (band.gain_db - delta.y * db_per_px).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
+                            }
+                            eq.bump();
+                        }
+                    }
+                }
+
+                // Right-click on node → remove
+                if spec_response.secondary_clicked()
+                    && let Some(idx) = self.eq_hovered_node {
+                    let mut eq = self.eq_state.lock().unwrap();
+                    if idx < eq.bands.len() { eq.bands.remove(idx); eq.bump(); }
+                    self.eq_hovered_node = None;
+                }
+
+                // Left-click on empty space → add band (up to 16)
+                if spec_response.clicked() && self.eq_hovered_node.is_none() && self.eq_dragging_node.is_none()
+                    && let Some(click) = spec_response.interact_pointer_pos()
+                    && plot_rect.contains(click) {
+                    let t = (click.x - plot_rect.left()) / plot_rect.width();
+                    let freq = self.analysis_scale()
+                        .freq_at(t, self.min_freq, self.analysis_max_freq())
+                        .clamp(20.0, 20_000.0);
+                    let db_per_px = EQ_DB_RANGE / (plot_rect.height() * 0.5);
+                    let gain = ((plot_rect.center().y - click.y) * db_per_px).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
+                    let mut eq = self.eq_state.lock().unwrap();
+                    if eq.bands.len() < 16 {
+                        let mut band = EqBand::default_peak(freq);
+                        band.gain_db = gain;
+                        eq.bands.push(band);
+                        eq.bump();
+                    }
+                }
+            }
+
+            // The two fixed readouts, in the strip planned above and
+            // drawn last so they sit over the bars. Both are inside the
+            // plot rather than in the dB margin, which a Diff plot uses
+            // for its own axis labels.
+            painter.text(
+                Pos2::new(top_row.fps_x, top_row.y),
+                egui::Align2::RIGHT_TOP,
+                &fps_text,
+                readout_font(),
+                Color32::from_rgba_unmultiplied(180, 180, 180, 120),
+            );
+            if let Some(lufs) = &lufs_text {
+                painter.text(
+                    Pos2::new(top_row.lufs_x, top_row.y),
+                    egui::Align2::LEFT_TOP,
+                    lufs,
+                    readout_font(),
+                    Color32::from_rgba_unmultiplied(180, 220, 180, 160),
+                );
+            }
+            // Analysis progress, wherever the plot happens to be.
+            //
+            // The centred "Analyzing..." text below only appears when
+            // there is nothing else to draw, so re-analysing a track
+            // that already has frames on screen used to show no
+            // progress at all unless the Cache panel was open — which
+            // is not somewhere anyone would think to look for it.
+            // Anywhere the centred notice is not already saying it.
+            //
+            // This used to require `!pre_frames.is_empty()`, to pair with
+            // the centred notice's `pre_frames.is_empty()`. That looked
+            // like a clean split and was not: a *first* analysis clears
+            // pre_frames, and the live-FFT fallback keeps drawing bars,
+            // so the plot is not silent either — the centred notice was
+            // ruled out by the plot and this one by the frames, and the
+            // most important case in the app showed no progress at all.
+            // The real condition is the plot, which is what the centred
+            // notice actually keys on.
+            if let Some(text) = &analysis_text {
+                let dark = ui.visuals().dark_mode;
+                let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
+                // The same string the row was planned around, so the
+                // space reserved is the space used. Re-reading the
+                // atomics here would let the text grow past its slot
+                // between the two reads and land on the frame rate
+                // again, which is the bug this is fixing.
+                let pos = Pos2::new(top_row.analysis_x, top_row.y + 2.0);
+                let gal = painter.layout_no_wrap(
+                    text.clone(), badge_font(), txt_accent(dark),
+                );
+                let bg = egui::Rect::from_min_size(
+                    Pos2::new(pos.x - gal.size().x - BADGE_PAD, pos.y - 3.0),
+                    gal.size() + egui::vec2(2.0 * BADGE_PAD, 6.0),
+                );
+                painter.rect_filled(
+                    bg, 3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 120));
+                // A bar under the text, so the rate is readable at a
+                // glance without reading the number.
+                let track = egui::Rect::from_min_size(
+                    Pos2::new(bg.left() + 4.0, bg.bottom() + 2.0),
+                    egui::vec2(bg.width() - 8.0, 2.0),
+                );
+                painter.rect_filled(
+                    track, 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40));
+                let done = egui::Rect::from_min_size(
+                    track.min,
+                    egui::vec2(track.width() * (pct as f32 / 100.0).clamp(0.0, 1.0), 2.0),
+                );
+                painter.rect_filled(done, 1.0, txt_accent(dark));
+                painter.galley(
+                    Pos2::new(bg.left() + BADGE_PAD, bg.top() + 3.0),
+                    gal,
+                    txt_accent(dark),
+                );
+            }
+
+            // Debug overlay (F3)
+            if self.show_debug {
+                let interp_name = format!("{:?}", self.interp_mode);
+                let mapping_name = format!("{:?}", self.bar_mapping);
+                let mode_name = format!("{:?}", self.mode);
+                let analyzing = self.analyzer.analysis_busy();
+                let pct = self.analyzer.analysis_progress.load(Ordering::Relaxed);
+                let mut lines = vec![
+                    format!("── Spectrum Debug ──────────────────"),
+                    format!("Mode:        {}", mode_name),
+                    format!("Live FFT:    {}  pad: {}×  padded: {}", self.analyzer.fft_size, self.analyzer.rt_pad_factor, self.analyzer.realtime_padded_size()),
+                    format!("Pre FFT:     {}  pad: {}×  padded: {}", self.analyzer.pre_fft_size, self.pad_factor, self.analyzer.pre_fft_size * self.pad_factor),
+                    if matches!(self.bar_mapping, BarMappingMode::TrueCqt(_)) {
+                        format!("CQT clock:   {:.2} fps, floor(k × sr / fps); FFT controls inactive", self.analyzer.analysis_frame_rate())
+                    } else {
+                        format!("Overlap:     {:.0}%  hop: {} smp ({:.1} fps)", self.overlap * 100.0,
+                            self.analyzer.pre_hop(), self.analyzer.analysis_frame_rate())
+                    },
+                    format!("Interp:      {}  mapping: {}", interp_name, mapping_name),
+                    format!("Bars:        {}  analysis sr: {} Hz  live sr: {} Hz", self.bar_count, self.analyzer.sample_rate, self.analyzer.live_rate),
+                    format!("freq range:  {:.0}–{:.0} Hz", self.min_freq, self.max_freq),
+                    format!("── Pre-process ─────────────────────"),
+                    format!("Analyzing:   {}  progress: {}%", analyzing, pct),
+                    format!("Frames:      {}  frame_rate: {:.2} fps", self.analyzer.pre_frames.len(), self.analyzer.pre_frame_rate),
+                    format!("── Runtime ─────────────────────────"),
+                    format!("Tick rate:   {:.1}/s (max {:.0}) — analyser, not frames",
+                        self.current_fps, self.max_fps),
+                    format!("Src rows:    {:.1}/s consumed from cache",
+                        self.pre_rows_per_sec),
+                    format!("Channels:    {} — {:.1} extra FFT/s",
+                        self.channel_view.label(), self.channel_ffts_per_sec),
+                    format!("REPAINT:     {:.1} fps (real)", self.real_repaint_fps),
+                    format!("DRAW cost:   {:.2} ms/frame", self.draw_ms),
+                    format!("LUFS:        {:.2}", self.momentary_lufs),
+                    format!("Correlation: {:.3}", self.correlation),
+                    format!("FFT norms:   {} bins", self.analyzer.last_fft_norms.len()),
+                ];
+
+                // Where the last pre-process actually spent itself.
+                //
+                // A GPU monitor reads the device at a fraction of its
+                // capacity during an analysis, and the obvious reading
+                // — "the shader is too small" — is wrong. The phases
+                // inside a group run one after another, so the device
+                // idles through everything that is not `device`. This
+                // panel shows that directly, because four rewrites of
+                // this path were aimed at the wrong phase for want of
+                // exactly these six numbers.
+                let st = aslt::stats();
+                lines.push("── Pre-process cost ────────────────".into());
+                if st.total_s <= 0.0 {
+                    lines.push("(no analysis has run this session)".into());
+                } else {
+                    lines.push(format!("Wall clock:  {:.2} s", st.total_s));
+                    lines.push(format!(
+                        "Route:       {}",
+                        match aslt::gpu_device_name() {
+                            Some(n) if st.used_gpu() => n,
+                            Some(n) => format!("{n} (idle — no batch qualified)"),
+                            None => "CPU only (no device)".into(),
+                        },
+                    ));
+                    if st.used_gpu() {
+                        lines.push(format!(
+                            "Bars:        {} on device, {} on cores",
+                            st.gpu_bars, st.cpu_bars,
+                        ));
+                        lines.push(format!(
+                            "Batches:     {}  kernels: {}", st.chunks, st.kernels,
+                        ));
+                        // Thread-summed, so these exceed wall clock on a
+                        // parallel run; they are for weighing the phases
+                        // against each other, which is the whole point.
+                        lines.push(format!(
+                            "  build      {:>7.2} s   (kernel taps)", st.build_s,
+                        ));
+                        lines.push(format!(
+                            "  stage      {:>7.2} s   (signal upload)", st.stage_s,
+                        ));
+                        lines.push(format!(
+                            "  device     {:>7.2} s   (GPU)", st.device_s,
+                        ));
+                        lines.push(format!(
+                            "  fill       {:>7.2} s   (edges + CPU wavelets)", st.fill_s,
+                        ));
+                        lines.push(format!(
+                            "Device duty: {:.0}% of the whole analysis",
+                            st.device_duty() * 100.0,
+                        ));
+                    }
+                    // Which block sizes this machine has decided on.
+                    // "(probe)" means the synthetic bootstrap is still
+                    // in charge and real A/B samples are still coming.
+                    lines.push("── Calibration (this machine) ──────".into());
+                    lines.extend(gpu_calib::describe());
+                }
+                let x = rect.left() + 8.0;
+                let mut y = rect.top() + 20.0;
+                let line_h = 13.0;
+                for line in &lines {
+                    painter.text(
+                        Pos2::new(x + 1.0, y + 1.0),
+                        egui::Align2::LEFT_TOP, line,
+                        egui::FontId::monospace(11.0),
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                    );
+                    painter.text(
+                        Pos2::new(x, y),
+                        egui::Align2::LEFT_TOP, line,
+                        egui::FontId::monospace(11.0),
+                        Color32::from_rgba_unmultiplied(255, 220, 80, 220),
+                    );
+                    y += line_h;
+                }
+            }
+
+        }
     }
 }
 
@@ -13553,6 +13638,27 @@ mod stereo_tap_tests {
             assert!(r < 0.0, "frame {i}: right {r} should be negative");
             assert!((l + r).abs() < 1e-6, "frame {i}: {l} and {r} are not a pair");
         }
+    }
+
+    /// The hand-off on the shared route is read off the tap: a claim, and the
+    /// frames pulled since it. A second source starts the count again.
+    #[test]
+    fn a_claim_counts_the_frames_pulled_since_it() {
+        let mono = new_sample_buf();
+        let stereo = new_stereo_buf();
+        let mut a = SpectrumSource::new(Pattern { data: interleaved(1000), at: 0, channels: 2 },
+            Arc::clone(&mono), Arc::clone(&stereo));
+        while a.next().is_some() {}
+        let played = |s: &StereoBuf| s.lock().unwrap().played.load(Ordering::Relaxed);
+        assert_eq!(played(&stereo), 1000);
+        assert_eq!(stereo.lock().unwrap().claims, 1);
+        let mut b = SpectrumSource::new(Pattern { data: interleaved(300), at: 0, channels: 2 },
+            Arc::clone(&mono), Arc::clone(&stereo));
+        for _ in 0..200 {
+            b.next();
+        }
+        assert_eq!(played(&stereo), 100, "a new claim restarts the count, in frames");
+        assert_eq!(stereo.lock().unwrap().claims, 2);
     }
 
     /// Mono material must publish one channel, and push no pairs at all.
@@ -21597,6 +21703,7 @@ mod preprocess_stereo_tests {
             deliver(&mut w, path);
             w.tick(0.0, false);
             assert!(w.analyzer.pre_frames.is_empty(), "{path}: a 20.1 Hz result was installed at 20.4 Hz");
+            assert!(!w.analyzer.celebrate, "{path}: a result nobody sees was celebrated");
             assert!(w.needs_reanalysis, "{path}: the 20.4 Hz prompt was cleared by a 20.1 Hz result");
             // On disk: 20.1's file, and nothing at 20.4's name or the legacy one.
             assert!(load_cache(&key, 32).is_some(), "{path}: 20.1's result was not kept");
@@ -21884,6 +21991,7 @@ mod preprocess_stereo_tests {
         finish_held(&mut w, &hold);
         deliver(&mut w, "paused");
         assert_eq!(w.analyzer.pre_cache_path(), Some(exact.as_path()), "the user's analysis was not shown");
+        assert!(w.analyzer.celebrate, "a finished analysis was not celebrated");
         assert!(!w.legacy_offered(), "legacy is still offered over the exact analysis");
         assert!(w.accept_alternate(&legacy).is_err(), "legacy accepted over the exact analysis");
         assert_eq!(std::fs::read(&legacy).unwrap(), legacy_bytes, "the legacy cache was touched");

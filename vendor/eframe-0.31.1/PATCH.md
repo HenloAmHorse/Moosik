@@ -110,16 +110,29 @@ no behaviour, are relaxed atomics, and exist only with the
 `moosik_windows_linked_viewport` feature. The wgpu backend is not counted
 (Moosik builds glow).
 
+## Accessibility for child windows (1.6.0)
+
+Upstream gives only the root window an AccessKit adapter, so screen readers
+and UI Automation see nothing inside immediate child viewports (Moosik's
+spectrum, lyrics, tags and info windows). With the
+`moosik_child_accesskit` feature the glow backend keeps the event-loop proxy
+it already uses for the root adapter and creates an adapter for each child
+viewport when that viewport's `egui_winit` state is first created. Events are
+already routed by window id. AccessKit recommends creating the adapter before
+the window is shown; a child window can already be visible by then, which on
+Windows worked in testing (each child window's tree is complete). The wgpu
+backend is unchanged (Moosik builds glow).
+
 ## Files changed relative to the official archive
 
 | file | change |
 |---|---|
-| `Cargo.toml` | adds the `moosik_windows_linked_viewport` feature |
+| `Cargo.toml` | adds the `moosik_windows_linked_viewport` and `moosik_child_accesskit` features |
 | `src/lib.rs` | re-exports `moosik_counters` |
 | `src/native/mod.rs` | declares `minimized_policy` and `moosik_counters` |
 | `src/native/moosik_counters.rs` | **new** — event, redraw and present counters |
 | `src/native/minimized_policy.rs` | **new** — the shared policy and its tests |
-| `src/native/glow_integration.rs` | adapter, one call at the sleep site, adapter tests; counter increments |
+| `src/native/glow_integration.rs` | adapter, one call at the sleep site, adapter tests; counter increments; child-window AccessKit adapters |
 | `src/native/wgpu_integration.rs` | the same, symmetrically |
 | `LICENSE-MIT`, `LICENSE-APACHE` | **added** from upstream at the pinned commit |
 

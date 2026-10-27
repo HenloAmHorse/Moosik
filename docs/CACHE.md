@@ -9,6 +9,11 @@ same store. It does not change the namespace or retire matching 1.5.3/1.5.4
 FFT/Superlet caches. The old `Cqt` setting remains FFT constant-Q weighting;
 its cached results are not offered as exact True CQT hits. See [CQT.md](CQT.md).
 
+1.6.0's chord files are not in this store. They live in `.moosik/cache/chords/`
+and identify a track the same way (D3) and are saved only if the file did not
+change while it was read (D2), but they are plain whole-file JSON with no
+locking, pinning or size limit. See [HARMONY.md](HARMONY.md).
+
 ## What changed, in one paragraph
 
 An earlier version knew a track only by its file path. If you replaced a file with different audio at the same path, it could show the old analysis for the new file. 1.5.3 also checks the file's size, its last-modified time and a sample of its contents. Each analysis is now published as a whole, in one step, so a crash cannot leave the spectrum and its Left/Right channels out of step. Something you are looking at, or that is still being read, is never deleted to make room.

@@ -1,6 +1,6 @@
 [package]
 name = "moosik"
-version = "1.5.5"
+version = "1.6.0"
 edition = "2024"
 
 [[bin]]
@@ -32,7 +32,7 @@ alsa-dsd = ["dep:alsa"]
 leaf-diagnostics = ["rustfft/moosik-diagnostics"]
 
 [dependencies]
-eframe = { version = "=0.31.1", features = ["default", "moosik_windows_linked_viewport"] }
+eframe = { version = "=0.31.1", features = ["default", "moosik_windows_linked_viewport", "moosik_child_accesskit"] }
 egui = "0.31"
 rodio = { version = "0.20", features = ["symphonia-all"] }
 lofty = "0.22"
@@ -53,6 +53,7 @@ cpal = "0.15"
 # OS media-key / now-playing integration (MPRIS, SMTC, macOS MediaPlayer).
 # use_zbus = pure-Rust D-Bus on Linux, so no system libdbus-1-dev needed.
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+miniz_oxide = "0.8"
 ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 # GPU compute for the superlet pre-process. wgpu is already in the tree via
 # eframe, so this only declares it directly; it runs on Vulkan and Metal, so
@@ -90,10 +91,16 @@ wasapi = "0.23.0"
 # deadline while the superlet pre-process has every other core busy.
 windows-sys = { version = "0.59", features = [
     "Win32_Media", "Win32_Graphics_Gdi", "Win32_System_Threading",
+    # Win32_Graphics_Dwm — DwmFlush, to line frames up with the display's refresh.
+    "Win32_Graphics_Dwm",
     # asio-dsd: driver discovery (registry) + COM instantiation + a desktop
     # HWND for drivers that refuse a null init handle.
     "Win32_System_Registry", "Win32_System_Com", "Win32_System_Ole", "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # GetLocalTime — the shell's logo knows when it is the middle of the night.
+    "Win32_System_SystemInformation",
+    # AllocConsole / AttachConsole — the "Debug console window" setting.
+    "Win32_System_Console",
 ] }
 # Extract the HWND from eframe for SMTC media controls (souvlaki needs it).
 raw-window-handle = "0.6"

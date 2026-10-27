@@ -451,6 +451,8 @@ enum Fetched {
 }
 
 pub struct LyricsWindow {
+    /// The 1.6.0 page colour (set by the app each frame); None is the classic look.
+    pub page_fill: Option<egui::Color32>,
     /// Private: every show/hide goes through [`LyricsWindow::set_open`], so
     /// the main toolbar cannot hide the window without its translation
     /// lifecycle.
@@ -623,6 +625,7 @@ pub fn sane_text_size(v: f32) -> f32 {
 impl Default for LyricsWindow {
     fn default() -> Self {
         Self {
+            page_fill: None,
             open: false,
             loaded_for: None,
             lyrics: None,
@@ -1065,12 +1068,12 @@ impl LyricsWindow {
             // A network call in flight has no other reason to redraw.
             if self.busy() { vctx.request_repaint_after(Duration::from_millis(100)); }
 
-            egui::TopBottomPanel::top("lyr_top").show(vctx, |ui| {
+            egui::TopBottomPanel::top("lyr_top").frame(crate::shell::bar_frame(self.page_fill, &vctx.style())).show_separator_line(self.page_fill.is_none()).show(vctx, |ui| {
                 ui.add_space(4.0);
                 action = self.toolbar(ui, &track).max_or(action);
                 ui.add_space(4.0);
             });
-            egui::TopBottomPanel::bottom("lyr_bot").show(vctx, |ui| {
+            egui::TopBottomPanel::bottom("lyr_bot").frame(crate::shell::bar_frame(self.page_fill, &vctx.style())).show_separator_line(self.page_fill.is_none()).show(vctx, |ui| {
                 ui.add_space(3.0);
                 ui.horizontal_wrapped(|ui| {
                     let dark = ui.visuals().dark_mode;
@@ -1084,7 +1087,7 @@ impl LyricsWindow {
                 });
                 ui.add_space(3.0);
             });
-            egui::CentralPanel::default().show(vctx, |ui| {
+            egui::CentralPanel::default().frame(crate::shell::page_frame(self.page_fill, &vctx.style())).show(vctx, |ui| {
                 if self.search_open { self.search_panel(ui); }
                 if !self.pending.is_empty() { self.pending_panel(ui); }
                 if self.paste_open { self.paste_panel(ui); }
@@ -1101,6 +1104,58 @@ impl LyricsWindow {
 
         if close { self.set_open(false); }
         action
+    }
+
+    /// The lyric lines alone, drawn inside another window (the 1.6.0 shell's
+    /// Listen mode). Loads and polls like `ui`; toolbar and editors stay in the
+    /// lyrics window.
+    /// Returns where the Follow box is on the pass it was switched off.
+    pub fn inline_viewer(&mut self, ui: &mut egui::Ui, track: TrackRef, pos: Duration) -> Option<egui::Rect> {
+        if self.loaded_for.as_deref() != Some(track.path) {
+            self.load_local(&track);
+        }
+        self.poll();
+        // Off lets the lyrics be scrolled freely.
+        let unfollowed = ui.horizontal(|ui| {
+            let r = ui.checkbox(&mut self.auto_scroll, "Follow")
+                .on_hover_text("Keep the current line centred");
+            (r.changed() && !self.auto_scroll).then_some(r.rect)
+        }).inner;
+        ui.add_space(4.0);
+        // Larger than in the lyrics window: here the lyrics are the page.
+        let saved = self.font_size;
+        self.font_size = (saved * 1.35).min(40.0);
+        self.viewer(ui, pos);
+        self.font_size = saved;
+        unfollowed
+    }
+
+    /// The lines around the current one, for drawing over another view (the
+    /// shell's lyrics over the spectrum): `(offset from the current line,
+    /// text, translation as displayed, how far the singing has got)`. Loads
+    /// and polls like `ui`. Empty without lyrics or before the first line.
+    pub fn nearby_lines(&mut self, track: TrackRef, pos: Duration, before: usize, after: usize)
+        -> Vec<(isize, String, Option<String>, Option<usize>)>
+    {
+        if self.loaded_for.as_deref() != Some(track.path) {
+            self.load_local(&track);
+        }
+        self.poll();
+        let Some(l) = &self.lyrics else { return Vec::new() };
+        let Some(active) = l.active_index(pos) else { return Vec::new() };
+        let lo = active.saturating_sub(before);
+        let hi = (active + after).min(l.lines.len().saturating_sub(1));
+        let mut out = Vec::new();
+        for i in lo..=hi {
+            let line = &l.lines[i];
+            if line.text.trim().is_empty() { continue; }
+            let translation = (self.show_translation).then(|| line.translation.as_ref()).flatten()
+                .map(|t| self.zh.get(i, t, self.translation_display).to_owned());
+            let upto = (i == active && self.karaoke).then(|| l.sung(i, pos)).flatten()
+                .filter(|&u| line.text.is_char_boundary(u));
+            out.push((i as isize - active as isize, line.text.clone(), translation, upto));
+        }
+        out
     }
 
     pub fn is_open(&self) -> bool { self.open }
@@ -1163,7 +1218,7 @@ impl LyricsWindow {
         ui.horizontal_wrapped(|ui| {
             let translation_editing = self.translation.is_editing();
             let idle = !self.busy() && !translation_editing;
-            if ui.add_enabled(idle && !self.editing && !self.romaji_editing, egui::Button::new("🔍 Find lyrics"))
+            if ui.add_enabled(idle && !self.editing && !self.romaji_editing, egui::Button::new(crate::shell::plain(self.page_fill, "🔍 Find lyrics")))
                 .on_hover_text(
                     "Look this track up on LRCLIB.\n\nTries the exact tags first, then \
                      progressively looser queries with the decoration stripped — brackets, \
@@ -1178,7 +1233,7 @@ impl LyricsWindow {
             {
                 self.search_open = !self.search_open;
             }
-            if ui.add_enabled(!self.editing && !self.romaji_editing && !translation_editing, egui::Button::new("📋 Paste…"))
+            if ui.add_enabled(!self.editing && !self.romaji_editing && !translation_editing, egui::Button::new(crate::shell::plain(self.page_fill, "📋 Paste…")))
                 .on_hover_text(
                     "Paste lyrics from anywhere.\n\nThe database does not have \
                      everything — a niche Vocaloid or UTAU library is mostly \
@@ -1193,24 +1248,24 @@ impl LyricsWindow {
             ui.separator();
 
             if self.editing || self.romaji_editing {
-                if ui.button("✔ Done").clicked() {
+                if ui.button(crate::shell::plain(self.page_fill, "✔ Done")).clicked() {
                     if self.editing { self.commit_edit(); } else { self.commit_romaji_edit(); }
                 }
-                if ui.button("✖ Cancel").clicked() {
+                if ui.button(crate::shell::plain(self.page_fill, "✖ Cancel")).clicked() {
                     self.editing = false;
                     self.romaji_editing = false;
                     self.status.clear();
                 }
             } else {
                 let has = self.lyrics.is_some();
-                if ui.add_enabled(has && !translation_editing, egui::Button::new("⏱ Sync…"))
+                if ui.add_enabled(has && !translation_editing, egui::Button::new(crate::shell::plain(self.page_fill, "⏱ Sync…")))
                     .on_hover_text("Time the lines by tapping along with the song.")
                     .clicked()
                 {
                     self.begin_edit();
                 }
                 if ui.add_enabled(has && !translation_editing && (self.dirty || self.romaji_dirty || self.translation_dirty),
-                                  egui::Button::new("💾 Save"))
+                                  egui::Button::new(crate::shell::plain(self.page_fill, "💾 Save")))
                     .on_hover_text(format!(
                         "Write {}\n\nA sidecar file — the audio file is never modified. \
                          Corrected romaji goes to {} beside it.",
@@ -1688,14 +1743,14 @@ impl LyricsWindow {
         let stamp = !typing && ui.input(|i| i.key_pressed(egui::Key::Space));
 
         ui.horizontal(|ui| {
-            let tapped = ui.add(egui::Button::new(RichText::new("⏱ Stamp").size(14.0)))
+            let tapped = ui.add(egui::Button::new(RichText::new(crate::shell::plain(self.page_fill, "⏱ Stamp")).size(14.0)))
                 .on_hover_text("Time the highlighted line at the current position (Space)")
                 .clicked() || stamp;
             if tapped && self.cursor < self.edit.len() {
                 self.edit[self.cursor].at = Some(pos);
                 self.cursor += 1;
             }
-            if ui.button("↩ Back").on_hover_text("Undo the last stamp").clicked()
+            if ui.button(crate::shell::plain(self.page_fill, "↩ Back")).on_hover_text("Undo the last stamp").clicked()
                 && self.cursor > 0
             {
                 self.cursor -= 1;

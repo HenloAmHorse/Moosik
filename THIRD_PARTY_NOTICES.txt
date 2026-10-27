@@ -1,8 +1,8 @@
-MOOSIK 1.5.5: THIRD-PARTY NOTICES
+MOOSIK 1.6.0: THIRD-PARTY NOTICES
 ==============================================================================
 
 Moosik is licensed under the GNU Affero General Public License v3.0 (see LICENSE).
-This file covers the third-party code and data in the Moosik 1.5.5 Windows x86_64
+This file covers the third-party code and data in the Moosik 1.6.0 Windows x86_64
 release executable
 (default features: asio-dsd, alsa-dsd), built with rustc 1.94.0 (4a4ef493e 2026-03-02).
 
@@ -26,6 +26,7 @@ Files distributed alongside this one:
   third_party/rust-std-COPYRIGHT-library.html       (Rust standard library notices)
   third_party/MPL-2.0.txt                        (MPL-2.0 license text)
   third_party/opusic-sys-0.7.5-LICENSE.txt          (libopus BSD notice)
+  third_party/lv-chordia-1.1.0-LICENSE              (lv-chordia MIT notice)
 
 This file records license information; it is not a legal opinion.
 Optional local translation packs are downloaded only by explicit user action.
@@ -153,6 +154,39 @@ The executable links the Rust standard library of rustc 1.94.0 (4a4ef493e 2026-0
 with notices for its own dependencies). Its notices are in
 third_party/rust-std-COPYRIGHT-library.html, copied unmodified from the toolchain's
 share/doc/rust/COPYRIGHT-library.html (SHA-256 af70aaabed1b73e872f14f9130db37e09f3f4d73a5f7c598b9173697a5d2729f).
+
+1.5 Code ported from lv-chordia 1.1.0 (chord recognition)
+
+Moosik's chord recognition (src/chords/) is a Rust port of the network, constant-Q
+front end and chord vocabulary of lv-chordia 1.1.0 by Junyan Jiang, Ke Chen, Wei Li and
+Gus Xia (ISMIR 2019), MIT License. It is not a Cargo package. The upstream LICENSE,
+taken from the lv_chordia-1.1.0 wheel (SHA-256 292241f03e1029e6739ee7a2a91fbe348c25c97b8b3641db76cbef9f9dee0cb0),
+is reproduced byte for byte in third_party/lv-chordia-1.1.0-LICENSE (SHA-256 24fe07e4202d179f...) and here:
+
+MIT License
+
+Copyright (c) 2023 Music X Lab
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The model weights are not in this executable. They are downloaded from that wheel only
+when the user asks, each file checked against a pinned SHA-256.
 
 ------------------------------------------------------------------------------
 PART 2. PACKAGES WITHOUT A COMPLETE LICENSE TEXT OF THEIR OWN

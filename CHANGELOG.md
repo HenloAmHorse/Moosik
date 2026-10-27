@@ -2,6 +2,57 @@
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-27
+
+A redesigned interface, live stereo and harmony panels, and chords from a
+trained model. No change to the bit-perfect playback
+contract or to how the spectrum is drawn.
+
+- **One player, three modes.** A header with **Listen** (cover, title and
+  lyrics), **Library** (playlists, the playlist and a Now playing / Queue
+  inspector) and **Analyze** (the analyser, drawn exactly as its own window
+  draws it), sharing one player bar. The cover glides between modes, a
+  blurred cover backdrop cross-fades on track change, and light and dark
+  switch together. Settings live in a drawer (⋯). Motion, backdrop, glow,
+  beat-following and the spectrum ribbon are settings; **1.6.0 layout (off =
+  classic)** in Appearance brings the old layout back.
+- **Info, Tags and Lyrics windows** take the new page look in the 1.6.0
+  layout. Tags puts each number beside its total (Track # 1 of 12).
+- **Stereo panel** (Analyze): a mid/side scope, width, balance, a
+  correlation bar, and ten octave bands placed where they sit between the
+  speakers. **Harmony panel**: the chord now and next, the key and a note
+  wheel. See [Harmony and Stereo](docs/HARMONY.md).
+- **Chords from a trained model,** downloaded only on request (27 MB, MIT):
+  a Rust port of lv-chordia 1.1.0 that works out the whole track once (about
+  4 s for three minutes on an 8-thread CPU), shows how sure it is, and lets
+  you correct a chord. Without it the panel guesses live, as labelled.
+- **Silly extras.** Small animations found by doing what their hints say,
+  each with its own switch once found, all behind one **Silly extras**
+  switch.
+- **Smoother frames:** the frame limiter now ends each frame on a refresh of
+  the screen the window is on, read once a second, so a frame lasts a whole
+  number of refreshes.
+- **Repeat One:** Next (button, media key, Ctrl+Right) moves on to the next
+  track; only a track that ends repeats.
+- **Processed playback hands off at the real track boundary.** A queued
+  track (every lap of Repeat One) took over when the clock passed the length
+  in its tags; wherever that disagreed with the decoded length, the
+  spectrum, seek bar and lyrics ran off the music from the first repeat on.
+  The hand-off now follows the mixer's own pull of the next track.
+- **Accessibility:** child windows (spectrum, lyrics, tags, info) now have
+  an accessibility tree for screen readers and UI Automation.
+- **Chinese text:** a Han-only title or name uses one Simplified or
+  Traditional family instead of mixing two.
+- **Windows:** release builds no longer open a console window. **Debug
+  console window** in Appearance opens one on demand (the terminal Moosik
+  was started from, if any); its close button is removed, since closing a
+  console would close Moosik.
+- **Notices:** no package was added; the 1.5.5 notices were carried forward
+  after a check that the locked graph is unchanged (302 packages), and gain
+  lv-chordia's MIT licence for the ported chord code (also in `third_party/`).
+- **Settings:** 1.6.0 writes new appearance settings. An older Moosik ignores
+  them, but back up `~/.moosik` before going back to one.
+
 ## [1.5.5] - 2026-10-22
 
 True CQT with a Responsive variable-Q bass option, common audio formats with

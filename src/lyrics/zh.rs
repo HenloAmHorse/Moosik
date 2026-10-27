@@ -79,6 +79,37 @@ pub(crate) fn is_han(c: char) -> bool {
         | '\u{3005}' | '\u{3007}' | '\u{3021}'..='\u{3029}' | '\u{3038}'..='\u{303B}')
 }
 
+/// Which Chinese family (`ZH_HANS` / `ZH_HANT` in `lyrics::ui`) a title or
+/// name is drawn in, so the whole string takes one face. In the general chain
+/// Japanese comes first: a Simplified title took what Meiryo has from Meiryo
+/// and the rest from JhengHei, two typefaces in one name. `None` for anything
+/// with kana or hangul, or no Han at all: the general chain is right for it.
+/// Han alone is not proof of Chinese, so a kanji-only Japanese name is drawn in
+/// the Traditional face; the forms differ little. Remembered per string.
+pub fn family_for(text: &str) -> Option<&'static str> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        // ponytail: never evicted; one entry per distinct title or name shown.
+        static SEEN: RefCell<HashMap<String, Option<&'static str>>> = RefCell::new(HashMap::new());
+    }
+    if !text.chars().any(is_han) || certainly_not_chinese(text) {
+        return None;
+    }
+    SEEN.with(|seen| {
+        if let Some(f) = seen.borrow().get(text) {
+            return *f;
+        }
+        // Unchanged by tw2s but changed by s2tw: Simplified characters, and no
+        // Traditional ones. Everything else, shared characters included, reads
+        // as Traditional.
+        let simplified = tw2s().convert(text) == text && s2tw().convert(text) != text;
+        let f = Some(if simplified { super::ui::ZH_HANS } else { super::ui::ZH_HANT });
+        seen.borrow_mut().insert(text.to_owned(), f);
+        f
+    })
+}
+
 /// `text` as `mode` shows it. `None` when it is shown as it is.
 pub fn display(text: &str, mode: ChineseDisplay) -> Option<String> {
     if mode == ChineseDisplay::Original || certainly_not_chinese(text) {
@@ -141,6 +172,17 @@ mod tests {
     use ChineseDisplay::*;
 
     fn show(s: &str, m: ChineseDisplay) -> String { display(s, m).unwrap_or_else(|| s.to_string()) }
+
+    #[test]
+    fn titles_take_one_chinese_face() {
+        use super::super::ui::{ZH_HANS, ZH_HANT};
+        assert_eq!(family_for("风吹过的旧站台"), Some(ZH_HANS));
+        assert_eq!(family_for("雨停之後的街角"), Some(ZH_HANT));
+        assert_eq!(family_for("林 若晴"), Some(ZH_HANT));
+        assert_eq!(family_for("夜明けのプリズム"), None);
+        assert_eq!(family_for("너의 계절이 오면"), None);
+        assert_eq!(family_for("Morning Static"), None);
+    }
 
     #[test]
     fn original_is_never_converted() {

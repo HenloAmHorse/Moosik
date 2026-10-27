@@ -71,6 +71,16 @@ See also [BIT_PERFECT.md](BIT_PERFECT.md) and [SPECTRUM.md](SPECTRUM.md).
 - **Safe writes** — the change goes to a copy which then replaces the original by rename, so an interrupted write can't damage the file; the result is read back and verified before it's accepted
 - **DSD is read-only** — DSF keeps its ID3 blob behind a header pointer, and a bad write there costs the audio, not the metadata
 
+## Interface (1.6.0)
+
+- **Three modes in one window** — **Listen** (cover, title, a spectrum ribbon and the lyrics card), **Library** (playlists, the playlist, and a Now playing / Queue inspector) and **Analyze** (the analyser with its controls in a drawer, plus the Stereo and Harmony panels). One player bar serves all three
+- **Settings drawer (⋯)** — output, loudness, visuals and motion, silly extras, appearance, track windows and files in one panel; below 1000 px wide the player bar's extra controls move into it
+- **Motion** — the cover glides between modes, a blurred cover backdrop cross-fades on track change, buttons spring; animation duration and intensity are sliders, and each effect has its own switch. An idle window does not redraw
+- **Info, Tags and Lyrics windows** take the same page colour and margins; their buttons drop the emoji
+- **Classic layout** — **1.6.0 layout (off = classic)** in Appearance
+- **Silly extras** — small animations hidden around the player, each found by doing what its hint says and then switchable on its own; one switch turns them all off
+- **Debug console window** (Windows) — release builds open no console; this setting opens one showing what Moosik prints, attached to the terminal it was started from if any. The window's close button is removed because closing a console closes Moosik
+
 ## Theme & Appearance
 
 - **Cohesive theme, light or dark** — built from the app's own identity colors (the **Eigengrau** #16161d base and **Kugelblitz** #94b1ff accent): a tinted surface ramp, rounded corners, and accent-coloured selection and hover, applied across both the egui widgets and the custom-painted surfaces (seek bar, playlist rows, status text). A light variant is a click away

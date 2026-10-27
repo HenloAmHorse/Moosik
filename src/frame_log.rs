@@ -20,6 +20,9 @@ struct State {
     spectrum_passes: u64,
     last: [[u64; 2]; eframe::moosik_counters::COUNTERS],
     spectrum: String,
+    /// When the last root pass began, and the gaps between them this second.
+    prev: Option<Instant>,
+    gaps: Vec<f64>,
 }
 
 fn state() -> Option<&'static Mutex<State>> {
@@ -33,6 +36,8 @@ fn state() -> Option<&'static Mutex<State>> {
             spectrum_passes: 0,
             last: eframe::moosik_counters::snapshot(),
             spectrum: "null".into(),
+            prev: None,
+            gaps: Vec::new(),
         }))
     })
     .as_ref()
@@ -43,16 +48,25 @@ pub fn root_pass() {
     let Some(m) = state() else { return };
     let Ok(mut s) = m.lock() else { return };
     s.root_passes += 1;
+    let now_i = Instant::now();
+    if let Some(p) = s.prev.replace(now_i) {
+        s.gaps.push(now_i.duration_since(p).as_secs_f64() * 1000.0);
+    }
     let dt = s.since.elapsed().as_secs_f64();
     if dt < 1.0 {
         return;
     }
     let now = eframe::moosik_counters::snapshot();
     let d = |c: usize| [now[c][0] - s.last[c][0], now[c][1] - s.last[c][1]];
+    // Gap between root passes, ms: mean, standard deviation, longest.
+    let n = s.gaps.len().max(1) as f64;
+    let mean = s.gaps.iter().sum::<f64>() / n;
+    let sd = (s.gaps.iter().map(|g| (g - mean).powi(2)).sum::<f64>() / n).sqrt();
+    let max = s.gaps.iter().copied().fold(0.0, f64::max);
     let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
     let line = format!(
         "{{\"t\":{t},\"dt\":{dt:.3},\"root_passes\":{},\"spectrum_passes\":{},\"moved\":{:?},\"resized\":{:?},\
-         \"scale\":{:?},\"redraw\":{:?},\"redirected\":{:?},\"present\":{:?},\"spectrum\":{}}}\n",
+         \"scale\":{:?},\"redraw\":{:?},\"redirected\":{:?},\"present\":{:?},\"gap_ms\":[{mean:.2},{sd:.2},{max:.1}],\"spectrum\":{}}}\n",
         s.root_passes, s.spectrum_passes, d(0), d(1), d(2), d(3), d(4), d(5), s.spectrum
     );
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&s.path) {
@@ -61,6 +75,7 @@ pub fn root_pass() {
     s.last = now;
     s.since = Instant::now();
     s.root_passes = 0;
+    s.gaps.clear();
     s.spectrum_passes = 0;
 }
 
