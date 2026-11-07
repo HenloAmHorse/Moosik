@@ -51,7 +51,7 @@ pub fn install(dir: &Path, cancel: &AtomicBool, mut progress: impl FnMut(u64, u6
         return Err("The download is not the pinned lv-chordia 1.1.0 file; it was deleted and nothing was installed.".into());
     }
     for (name, want) in super::WEIGHT_FILES.iter().zip(MEMBER_SHA256) {
-        let bytes = member(&wheel, &format!("{MEMBER_DIR}{name}"))?;
+        let bytes = crate::unzip::member(&wheel, &format!("{MEMBER_DIR}{name}"))?;
         if sha256(&bytes) != want {
             return Err(format!("{name} in the download is not the pinned file; nothing was installed."));
         }
@@ -67,10 +67,11 @@ pub fn install(dir: &Path, cancel: &AtomicBool, mut progress: impl FnMut(u64, u6
 
 /// Download the wheel into `part`, resuming after `have` bytes when the server allows.
 fn fetch(part: &Path, have: u64, cancel: &AtomicBool, progress: &mut impl FnMut(u64, u64)) -> Result<(), String> {
-    // No overall limit: a slow line may need minutes for 27 MB.
+    // A slow line may need minutes for 27 MB: ureq's response limit would
+    // run on through the body, so only half an hour bounds it all.
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(30)))
-        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+        .timeout_global(Some(std::time::Duration::from_secs(30 * 60)))
         .build()
         .into();
     let mut req = agent.get(WHEEL_URL);
@@ -113,42 +114,4 @@ fn fetch(part: &Path, have: u64, cancel: &AtomicBool, progress: &mut impl FnMut(
         return Err(format!("The download stopped at {done} of {WHEEL_BYTES} bytes; it will resume from there next time."));
     }
     Ok(())
-}
-
-fn u16_at(b: &[u8], at: usize) -> Result<usize, String> {
-    b.get(at..at + 2).map(|s| u16::from_le_bytes([s[0], s[1]]) as usize).ok_or_else(|| "damaged archive".to_string())
-}
-fn u32_at(b: &[u8], at: usize) -> Result<usize, String> {
-    b.get(at..at + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize).ok_or_else(|| "damaged archive".to_string())
-}
-
-/// One member of a zip archive held in memory, inflated.
-fn member(zip: &[u8], name: &str) -> Result<Vec<u8>, String> {
-    // End of central directory: the last 22+ bytes, signature PK\x05\x06.
-    let tail = zip.len().saturating_sub(22 + 65_535);
-    let eocd = (tail..zip.len().saturating_sub(21)).rev().find(|&i| zip[i..i + 4] == [0x50, 0x4b, 0x05, 0x06]).ok_or("not a zip archive")?;
-    let (entries, mut at) = (u16_at(zip, eocd + 10)?, u32_at(zip, eocd + 16)?);
-    for _ in 0..entries {
-        if u32_at(zip, at)? != 0x0201_4b50 {
-            return Err("damaged archive".into());
-        }
-        let (method, csize, usize_) = (u16_at(zip, at + 10)?, u32_at(zip, at + 20)?, u32_at(zip, at + 24)?);
-        let (nlen, xlen, clen, local) = (u16_at(zip, at + 28)?, u16_at(zip, at + 30)?, u16_at(zip, at + 32)?, u32_at(zip, at + 42)?);
-        let this = zip.get(at + 46..at + 46 + nlen).ok_or("damaged archive")?;
-        at += 46 + nlen + xlen + clen;
-        if this != name.as_bytes() {
-            continue;
-        }
-        if u32_at(zip, local)? != 0x0403_4b50 {
-            return Err("damaged archive".into());
-        }
-        let start = local + 30 + u16_at(zip, local + 26)? + u16_at(zip, local + 28)?;
-        let data = zip.get(start..start + csize).ok_or("damaged archive")?;
-        return match method {
-            0 => Ok(data.to_vec()),
-            8 => miniz_oxide::inflate::decompress_to_vec_with_limit(data, usize_).map_err(|_| "damaged archive".to_string()),
-            _ => Err("unsupported compression".into()),
-        };
-    }
-    Err(format!("{name} is not in the download"))
 }

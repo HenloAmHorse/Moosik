@@ -39,6 +39,8 @@ mod realtime_route_tests;
 mod live_workspace_tests;
 #[cfg(test)]
 mod bar_capacity_tests;
+#[cfg(test)]
+mod level_tests;
 mod live_mapping;
 #[cfg(test)]
 mod realtime_padding_tests;
@@ -1641,6 +1643,9 @@ pub struct SpectrumAnalyzer {
     pub max_freq: f32,
     /// Optional per-bar dB correction (ISO 226).  Empty = disabled.
     pub eq_weights: Vec<f32>,
+    /// dB added to every bar on its way to the screen: "Normalized level",
+    /// less the room left for the EQ's largest boost. Display only.
+    pub level_offset_db: f32,
     /// Sub-bin interpolation strategy.
     pub interp_mode: InterpolationMode,
     /// Zero-padding multiplier applied before the FFT (1 = off, 2/4/… = denser bins).
@@ -1814,6 +1819,7 @@ impl SpectrumAnalyzer {
             min_freq: DEFAULT_MIN_FREQ,
             max_freq: DEFAULT_MAX_FREQ,
             eq_weights: Vec::new(),
+            level_offset_db: 0.0,
             interp_mode: InterpolationMode::None,
             pad_factor: DEFAULT_PAD,
             rt_pad_factor: DEFAULT_REALTIME_PAD,
@@ -2038,7 +2044,9 @@ impl SpectrumAnalyzer {
     /// by every route that produces bars, so they cannot drift apart.
     fn bar_db(&self, mag: f32, bar: usize, scale: f32) -> f32 {
         let raw_db = 20.0 * (mag / scale).log10().max(-80.0);
-        let corrected_db = if let Some(&w) = self.eq_weights.get(bar) { raw_db + w } else { raw_db };
+        // The level offset moves what was heard; the floor stays silent.
+        let level = if raw_db > -80.0 { self.level_offset_db } else { 0.0 };
+        let corrected_db = raw_db + self.eq_weights.get(bar).copied().unwrap_or(0.0) + level;
         ((corrected_db + 80.0) / 80.0).clamp(0.0, 1.0)
     }
 
@@ -2484,11 +2492,13 @@ impl SpectrumAnalyzer {
         // the display needs `bars` values per frame and this is where they are
         // needed.
         let inv = self.pre_frames.inv_max();
+        let off = self.level_offset_db / 80.0;
         for (bar, (sm, &code)) in self.smoothed.iter_mut().zip(mags.iter()).enumerate() {
-            let m = code as f32 * inv;
+            // The floor (and above the file's Nyquist) stays silent.
+            let m = if code == 0 { 0.0 } else { code as f32 * inv + off };
             let v = match w.get(bar) {
                 Some(&db) => (m + db / 80.0).clamp(0.0, 1.0),
-                None => m,
+                None => m.clamp(0.0, 1.0),
             };
             *sm = *sm * alpha + v * (1.0 - alpha);
             // Max across the interval, so a transient living in a row the UI
@@ -2534,19 +2544,20 @@ impl SpectrumAnalyzer {
         if self.smoothed_right.len() != n {
             self.smoothed_right = vec![0.0; n];
         }
+        let off = self.level_offset_db / 80.0;
         for (bar, (sm, &code)) in self.smoothed_left.iter_mut().zip(left.iter()).enumerate() {
-            let m = code as f32 * inv_l;
+            let m = if code == 0 { 0.0 } else { code as f32 * inv_l + off };
             let v = match w.get(bar) {
                 Some(&db) => (m + db / 80.0).clamp(0.0, 1.0),
-                None => m,
+                None => m.clamp(0.0, 1.0),
             };
             *sm = *sm * alpha + v * (1.0 - alpha);
         }
         for (bar, (sm, &code)) in self.smoothed_right.iter_mut().zip(right.iter()).enumerate() {
-            let m = code as f32 * inv_r;
+            let m = if code == 0 { 0.0 } else { code as f32 * inv_r + off };
             let v = match w.get(bar) {
                 Some(&db) => (m + db / 80.0).clamp(0.0, 1.0),
-                None => m,
+                None => m.clamp(0.0, 1.0),
             };
             *sm = *sm * alpha + v * (1.0 - alpha);
         }
@@ -5914,6 +5925,64 @@ fn compute_spectral_ceiling(
     Some(SpectralCeiling { hz, rolloff_octaves, matched_standard_sr })
 }
 
+/// "Normalized level" draws a song as tall as one this loud: about where loud
+/// modern masters measure (K-weighted mono, as below), so they barely move and
+/// a quiet song or an off-vocal mix comes up to meet them.
+const LEVEL_TARGET_LUFS: f32 = -10.0;
+
+/// dB a song at `lufs` is raised by to look `LEVEL_TARGET_LUFS` loud. Capped:
+/// a near-silent track is not blown up into its noise, and a very loud one
+/// is lowered only a little.
+fn level_gain_db(lufs: f32) -> f32 {
+    (LEVEL_TARGET_LUFS - lufs).clamp(-6.0, 20.0)
+}
+
+/// A whole song's integrated loudness for "Normalized level": the measure the
+/// analysis reports (K-weighted mono, 400 ms blocks, gated at −70 LUFS), read
+/// in its own pass because a song whose analysis is cached never runs that
+/// one. A song still downloading is read as it arrives. `None` if it cannot
+/// be read, is silent, or `stop` is set.
+fn measure_lufs(path: &Path, dsd_rate: u32, stop: &AtomicBool) -> Option<f32> {
+    let (sr, ch, mut samples): (u32, usize, Box<dyn Iterator<Item = f32>>) = if crate::dsd::is_dsd_path(path) {
+        let src = crate::dsd::decimate::open_pcm_source_file(std::fs::File::open(path).ok()?, dsd_rate).ok()?;
+        (src.out_rate(), src.channels().max(1), Box::new(src))
+    } else {
+        let dec = rodio::Decoder::new(std::io::BufReader::new(crate::youtube::stream::open(path).ok()?)).ok()?;
+        (dec.sample_rate(), (dec.channels() as usize).max(1), Box::new(dec.map(|s| s as f32 / 32_768.0)))
+    };
+    let mut kw = KWeightFilter::new(sr);
+    let block = ((sr as f64 * 0.4) as usize).max(1);
+    let (mut sq, mut n, mut frames) = (0.0f64, 0usize, 0usize);
+    let mut blocks = Vec::new();
+    loop {
+        let (mut sum, mut got) = (0.0f32, 0usize);
+        for s in samples.by_ref().take(ch) { sum += s; got += 1; }
+        if got == 0 { break; }
+        let k = kw.process(sum / got as f32);
+        sq += (k * k) as f64;
+        n += 1;
+        if n == block { blocks.push(sq / n as f64); sq = 0.0; n = 0; }
+        frames += 1;
+        if frames % 65_536 == 0 && stop.load(Ordering::Relaxed) { return None; }
+    }
+    if n > 0 { blocks.push(sq / n as f64); }
+    let gate = 10f64.powf((-70.0 + 0.691) / 10.0);
+    let gated: Vec<f64> = blocks.into_iter().filter(|&b| b > gate).collect();
+    if gated.is_empty() { return None; }
+    Some((-0.691 + 10.0 * (gated.iter().sum::<f64>() / gated.len() as f64).log10()) as f32)
+}
+
+/// The EQ drawn onto the bars: each bar moves by the EQ's gain at its
+/// centre, in dB like the bars themselves (a linear factor on a dB-scaled
+/// height turned +6 dB into some +40). Also returns the largest boost, the
+/// room "Normalized level" leaves at the top so a boosted band reaches it
+/// rather than running off it.
+fn eq_on_bars(mags: &[f32], eq_db: impl Fn(usize) -> f32) -> (Vec<f32>, f32) {
+    let db: Vec<f32> = (0..mags.len()).map(eq_db).collect();
+    let boost = db.iter().copied().fold(0.0, f32::max);
+    (mags.iter().zip(&db).map(|(&m, &d)| if m > 0.0 { (m + d / 80.0).clamp(0.0, 1.0) } else { 0.0 }).collect(), boost)
+}
+
 // ---------------------------------------------------------------------------
 // Spectrogram (pixel-accurate rolling time-frequency display)
 //
@@ -7158,6 +7227,7 @@ struct SpectrumSettings {
     #[serde(default)] style:         VizStyle,
     #[serde(default)] channel_view:  channels::ChannelView,
     #[serde(default)] loudness_mode: LoudnessMode,
+    #[serde(default = "def_true")] normalize_level: bool,
     #[serde(default)] bar_count:     usize,
     #[serde(default)] bar_gap:       f32,
     #[serde(default)] window_fn:     WindowFn,
@@ -7219,6 +7289,8 @@ struct SpectrumSettings {
     /// Whether the pre-process may use the GPU. `Auto` follows the per-machine
     /// calibration, which is the measured answer; the other two override it.
     #[serde(default)] gpu_mode: gpu_calib::GpuMode,
+    /// The exact NVIDIA lane for the 2^15 shared blocks (1.6.1, experimental).
+    #[serde(default)] exact_gpu: bool,
     /// Cores the pre-process may use. 0 = the default (`cores - 2`).
     #[serde(default)] worker_threads: usize,
     #[serde(default = "def_peak_accel")] peak_acceleration: f32,
@@ -7455,6 +7527,17 @@ pub struct SpectrumWindow {
     /// the old one may survive into the new.
     last_mode: SpectrumMode,
     pub loudness_mode: LoudnessMode,
+    /// "Normalized level": every song drawn as tall as a loud master.
+    pub normalize_level: bool,
+    /// The song `level` was measured on, its loudness (LUFS; `None` while
+    /// measuring or unreadable), and the measurement under way.
+    level_for: Option<PathBuf>,
+    level: Option<f32>,
+    level_rx: Option<std::sync::mpsc::Receiver<Option<f32>>>,
+    level_stop: Arc<AtomicBool>,
+    /// The EQ's largest boost where it is drawn on the bars: the top leaves
+    /// that much room. 0 in bit-perfect, where the EQ is not in the sound.
+    eq_headroom_db: f32,
     pub analyzer: SpectrumAnalyzer,
     pub sample_buf: SampleBuf,
     pub bar_count: usize,
@@ -7549,6 +7632,8 @@ pub struct SpectrumWindow {
     last_true_cqt: cqt::Config,
     /// GPU policy for the pre-process, mirrored into `gpu_calib`'s global.
     pub gpu_mode: gpu_calib::GpuMode,
+    /// The exact NVIDIA lane, mirrored into `aslt`'s switch.
+    pub exact_gpu: bool,
     /// Cores the pre-process may use; 0 = default. Mirrored the same way.
     pub worker_threads: usize,
     /// Set while a re-calibration runs on a worker thread, so the button can
@@ -7651,6 +7736,11 @@ pub struct SpectrumWindow {
     /// Texture of the currently-playing track's album art, if any.
     /// Set by MoosikApp before each call to show().
     pub current_art: Option<(egui::TextureId, u32, u32)>,
+    /// The song's music video, its latest picture and size: shown behind
+    /// the plot in place of the cover.
+    pub video: Option<crate::video::Shown>,
+    /// How bright the video shows, 0–1.
+    pub video_brightness: f32,
 
     // ── Peak hold ──────────────────────────────────────────────────────────
     pub peak_config:     PeakHoldConfig,
@@ -7777,6 +7867,15 @@ impl SpectrumWindow {
             seen_pre_revision: 0,
             last_mode: SpectrumMode::PreProcess,
             loudness_mode: LoudnessMode::Flat,
+            // Off under test: the lifecycle tests compare drawn bars with
+            // cached rows bit for bit, and a song measured in the background
+            // would move them mid-test. `level_tests` turns it on.
+            normalize_level: !cfg!(test),
+            level_for: None,
+            level: None,
+            level_rx: None,
+            level_stop: Arc::new(AtomicBool::new(false)),
+            eq_headroom_db: 0.0,
             analyzer,
             sample_buf: buf,
             bar_count: DEFAULT_BAR_COUNT,
@@ -7830,6 +7929,7 @@ impl SpectrumWindow {
             show_debug: false,
             last_true_cqt: cqt::Config::default(),
             gpu_mode: gpu_calib::GpuMode::default(),
+            exact_gpu: false,
             worker_threads: 0,
             recalibrating: None,
             needs_reanalysis: false,
@@ -7872,6 +7972,8 @@ impl SpectrumWindow {
             settings_save_at: None,
             art_settings: ArtSettingsStore::load(),
             current_art: None,
+            video: None,
+            video_brightness: 0.6,
             peak_config: PeakHoldConfig::default(),
             peak_vals: Vec::new(),
             peak_hold_timers: Vec::new(),
@@ -7999,6 +8101,19 @@ impl SpectrumWindow {
             }
         });
 
+        let mut exact = self.exact_gpu;
+        ui.checkbox(&mut exact, "Exact NVIDIA assist (experimental)").on_hover_text(
+            "Computes part of the Pre-process (the 32768-point blocks of a stereo \
+             analysis) on an NVIDIA graphics card while the cores do the rest. \
+             The result is the same to the last bit; anything the card cannot do \
+             stays on the CPU. Used only on cards of compute capability 7.5 \
+             (Turing: the GeForce RTX 20 and GTX 16 series, among others); \
+             tested on an RTX 2060 SUPER.");
+        if exact != self.exact_gpu {
+            self.exact_gpu = exact;
+            aslt::set_exact_gpu(exact);
+        }
+
         // What the machine has actually decided, per block size. "(probe)" means
         // the synthetic bootstrap is still in charge and real A/B samples are
         // still being collected.
@@ -8021,6 +8136,7 @@ impl SpectrumWindow {
             style:         self.style.clone(),
             channel_view:  self.channel_view,
             loudness_mode: self.loudness_mode.clone(),
+            normalize_level: self.normalize_level,
             bar_count:     self.bar_count,
             bar_gap:       self.bar_gap,
             window_fn:     self.window_fn.clone(),
@@ -8048,6 +8164,7 @@ impl SpectrumWindow {
             pre_stereo:    self.analyzer.pre_stereo_enabled,
             cache_budget_gb: self.analyzer.cache_budget_gb,
             gpu_mode:       self.gpu_mode,
+            exact_gpu:      self.exact_gpu,
             worker_threads: self.worker_threads,
             show_fft:      self.show_fft_settings,
             show_peak:     self.show_peak_settings,
@@ -8074,6 +8191,7 @@ impl SpectrumWindow {
         self.style         = s.style.clone();
         self.channel_view  = s.channel_view;
         self.loudness_mode = s.loudness_mode.clone();
+        self.normalize_level = s.normalize_level;
         self.bar_gap       = s.bar_gap.clamp(0.0, 12.0);
         self.window_fn     = s.window_fn.clone();
         self.smoothing     = s.smoothing.clamp(0.0, 0.99);
@@ -8115,6 +8233,8 @@ impl SpectrumWindow {
         // to be pushed there as well as mirrored on the window.
         self.gpu_mode = s.gpu_mode;
         gpu_calib::set_mode(s.gpu_mode);
+        self.exact_gpu = s.exact_gpu;
+        aslt::set_exact_gpu(s.exact_gpu);
         self.worker_threads = s.worker_threads.min(gpu_calib::core_count());
         gpu_calib::set_workers(self.worker_threads);
         let (fallback, preprocess) = dsd_rates_from(s.dsd_rate, s.dsd_preprocess_rate);
@@ -9669,7 +9789,9 @@ impl SpectrumWindow {
         // Skipped while resuming: the job in flight is already doing exactly
         // this work. Otherwise the request never waits here: if a cancelled
         // job is still finishing, this one is queued and starts after it.
-        if !resuming && !retained {
+        // A YouTube song played while it downloads is analysed once it is all
+        // in (`track_ready`).
+        if !resuming && !retained && !crate::youtube::stream::downloading(path) {
             let track = path.to_path_buf();
             let kept = chosen.is_some_and(|c| self.adopt(&track, c).is_ok());
             if !kept {
@@ -9678,6 +9800,42 @@ impl SpectrumWindow {
         }
         self.refresh_alternates();
         self.waveform_rx = None;
+    }
+
+    /// `path` is all in (a YouTube song played while it downloaded): if it
+    /// is the track on and has no analysis, it gets one now.
+    pub fn track_ready(&mut self, path: &Path) {
+        if self.current_path.as_deref() == Some(path) && !self.analyzer.analysis_busy() && self.analyzer.pre_frames.is_empty() {
+            self.analyzer.start_preprocess(path.to_path_buf());
+        }
+    }
+
+    /// "Normalized level": measure each song's loudness once, in the
+    /// background (a fraction of a second of one core), and raise or lower
+    /// its bars by what it lacks; the top leaves room for the EQ's boost.
+    fn tick_level(&mut self) {
+        if let Some(rx) = &self.level_rx
+            && let Ok(l) = rx.try_recv()
+        {
+            self.level = l;
+            self.level_rx = None;
+        }
+        if self.normalize_level && self.level_for != self.current_path {
+            self.level_for = self.current_path.clone();
+            self.level = None;
+            self.level_stop.store(true, Ordering::Relaxed);
+            self.level_stop = Arc::new(AtomicBool::new(false));
+            self.level_rx = self.current_path.clone().map(|p| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (dsd_rate, stop) = (self.analyzer.dsd_rate, Arc::clone(&self.level_stop));
+                std::thread::spawn(move || { let _ = tx.send(measure_lufs(&p, dsd_rate, &stop)); });
+                rx
+            });
+        }
+        self.analyzer.level_offset_db = match (self.normalize_level, self.level) {
+            (true, Some(l)) => level_gain_db(l) - self.eq_headroom_db,
+            _ => 0.0,
+        };
     }
 
     /// Call when playback stops or the player is stopped.
@@ -9713,6 +9871,7 @@ impl SpectrumWindow {
             self.track_analysis = Some(analysis);
             self.waveform_rx = None;
         }
+        self.tick_level();
         self.analyzer.try_receive_frames();
         // An analysis that finishes for the settings now selected answers the
         // "no cache for current settings" banner; nothing else does.
@@ -9803,8 +9962,12 @@ impl SpectrumWindow {
         }
         if !is_playing { return; }
 
-        // Throttle FFT runs to max_fps
-        let min_dt = 1.0 / self.max_fps.max(1.0) as f64;
+        // Throttle FFT runs to max_fps. With Max FPS at the screen's rate,
+        // frames come one refresh apart, give or take; one a little early was
+        // skipped outright, and a 180 Hz screen showed 120-odd fps. A quarter
+        // of a frame's grace takes those and still turns away a second frame
+        // in the same refresh.
+        let min_dt = 0.75 / self.max_fps.max(1.0) as f64;
         let now = Instant::now();
         let elapsed_since_last = self.last_fft_time
             .map(|t| t.elapsed().as_secs_f64())
@@ -10844,6 +11007,12 @@ The Mix is unaffected.                                  Analysing the track agai
             if self.loudness_mode != prev_loudness {
                 self.sync_params();
             }
+            ui.checkbox(&mut self.normalize_level, "Normalized level").on_hover_text(format!(
+                "Draw every song as tall as one mastered at {LEVEL_TARGET_LUFS:.0} LUFS, from the \
+                 song's loudness measured as it starts: a quiet song or an off-vocal mix no longer \
+                 draws short bars. Display only; the sound is not changed.\n\nWhere the EQ is drawn \
+                 on the bars, the top also leaves room for its largest boost (not in bit-perfect, \
+                 where the EQ is not in the sound)."));
             ui.separator();
             ui.label("Palette:");
             egui::ComboBox::from_id_salt("spectrum_palette")
@@ -12363,13 +12532,14 @@ The Mix is unaffected.                                  Analysing the track agai
             } else { None };
 
             let owned_mags: Vec<f32>;
+            let mut eq_boost = 0.0;
             let mags: &[f32] = if let Some((ref bands, sr, _)) = eq_snap {
                 if matches!(self.eq_overlay, EqOverlayMode::ApplyToBars | EqOverlayMode::Both) {
-                    owned_mags = self.analyzer.magnitudes.iter().enumerate().map(|(i, &m)| {
-                        let freq = bar_center_freq(i, self.analyzer.magnitudes.len(), self.min_freq, self.analysis_max_freq());
-                        let gain = 10f32.powf(total_eq_response_db(bands, sr, freq) / 20.0);
-                        (m * gain).clamp(0.0, 1.0)
-                    }).collect();
+                    let (n, lo, hi) = (self.analyzer.magnitudes.len(), self.min_freq, self.analysis_max_freq());
+                    let (bars, boost) = eq_on_bars(&self.analyzer.magnitudes,
+                        |i| total_eq_response_db(bands, sr, bar_center_freq(i, n, lo, hi)));
+                    owned_mags = bars;
+                    eq_boost = boost;
                     &owned_mags
                 } else {
                     &self.analyzer.magnitudes
@@ -12385,7 +12555,12 @@ The Mix is unaffected.                                  Analysing the track agai
             let art_cfg = self.art_settings.settings_for(&track_key).clone();
             let has_art = self.current_art.is_some();
 
-            if has_art {
+            if let Some(v) = self.video {
+                // Fill the plot, cropping what overflows, dim enough that
+                // the bars stay the brightest thing.
+                let a = (self.video_brightness.clamp(0.0, 1.0) * 0.92 * 255.0) as u8;
+                painter.image(v.tex, plot_rect, v.fill_uv(plot_rect.size()), Color32::from_white_alpha(a));
+            } else if has_art {
                 if let Some((tex_id, art_w, art_h)) = self.current_art {
                     match &art_cfg.spectrum_mode {
                         ArtSpectrumMode::Transparent => {
@@ -12458,6 +12633,8 @@ The Mix is unaffected.                                  Analysing the track agai
             let ch_view = channels::effective_view(
                 self.channel_view, &self.channel_availability,
             );
+            // Room at the top only where the EQ is drawn: the Mix's bars.
+            self.eq_headroom_db = if ch_view == channels::ChannelView::Mix { eq_boost } else { 0.0 };
             let drew_channels = ch_view != channels::ChannelView::Mix && {
                 let frame = self.analyzer.channel_frame();
                 self.draw_channel_view(&painter, ch_view, &frame, plot_rect, &pal, top_row)
@@ -14643,6 +14820,23 @@ mod mode_and_availability_tests {
         assert!(empty.analyzer.pre_frames.is_empty(), "setup: no cache");
         let (_, nominal) = empty.waterfall_row_rate();
         assert!(nominal, "with no cache there is no measured rate to report");
+    }
+
+    /// A frame a little early (a screen's refresh, give or take) still
+    /// ticks; one far too soon does not.
+    #[test]
+    fn a_frame_a_hair_early_still_ticks() {
+        let mut w = window();
+        w.mode = SpectrumMode::RealTime;
+        w.max_fps = 180.0;
+        let early = Instant::now() - Duration::from_secs_f64(0.97 / 180.0);
+        w.last_fft_time = Some(early);
+        w.tick(1.0, true);
+        assert_ne!(w.last_fft_time, Some(early), "ticked");
+        let soon = Instant::now() - Duration::from_secs_f64(0.3 / 180.0);
+        w.last_fft_time = Some(soon);
+        w.tick(1.0, true);
+        assert_eq!(w.last_fft_time, Some(soon), "too soon: skipped");
     }
 
     /// The window keeps the ring in step with whatever is feeding it.

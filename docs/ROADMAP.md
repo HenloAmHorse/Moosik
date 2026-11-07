@@ -67,7 +67,16 @@ window does not redraw.
 - The owner accepted the chord model's accuracy for this release and is not
   pursuing more of it for now.
 
-## 1.6.1 — YouTube source (planned, timing open)
+## 1.6.1 — YouTube source (released 2026-11-08)
+
+Shipped: search (YouTube and YouTube Music songs), play, queue and download
+through yt-dlp with Deno, both optional components fetched on request; songs
+play while they download; music videos behind Listen and the spectrum, 480p
+to 2160p (see [YOUTUBE.md](YOUTUBE.md)). Also: QQ Music as a third lyrics
+source and lyrics looked up as a song starts, spectrum bars drawn to each
+song's loudness, and the experimental
+[exact NVIDIA assist](ASLT_EXACT_GPU.md) for the superlet pre-process (off
+by default). The scope as planned:
 
 - Search, stream and download from YouTube and YouTube Music through yt-dlp,
   installed as an optional component the user downloads, with one-click
@@ -79,6 +88,8 @@ window does not redraw.
 
 ## 1.6.2 — Pro audio tools (planned)
 
+- **Less disk:** what the analysis cache, YouTube's cache and videos,
+  downloads and models take, and trimming it.
 - **What a file really is:** lossy-transcode ("fake lossless") detection from
   the spectrum's cut-off, upsampled ("fake hi-res") and padded ("fake 24-bit")
   detection, and FLAC MD5 verification of the decoded audio.

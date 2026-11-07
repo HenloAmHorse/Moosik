@@ -642,3 +642,24 @@ fn a_new_face_measures_every_row_again() {
         assert!((got - fresh.offset()).abs() <= 0.5, "phase {k}: Follow at {got}, a fresh viewer at {}", fresh.offset());
     }
 }
+
+/// Listen with lyrics still offers the lyrics window: to fix the words or
+/// their timing, or to translate them.
+#[test]
+fn listen_with_lyrics_opens_the_window_to_fix_or_translate() {
+    use egui_kittest::kittest::Queryable;
+    let w =LyricsWindow { lyrics: Some(sheet(8)), loaded_for: Some(PathBuf::from("song.flac")), ..Default::default() };
+    let mut h = egui_kittest::Harness::new_ui_state(|ui, w: &mut LyricsWindow| {
+        let path = PathBuf::from("song.flac");
+        let t = TrackRef { path: &path, title: "Song", artist: "Singer", album: "", duration: None };
+        w.inline_viewer(ui, t, at_line(2));
+    }, w);
+    h.run();
+    h.get_by_label("🎤 Lyrics…").click();
+    h.run();
+    assert!(h.state().is_open(), "Lyrics… opens the window");
+    assert!(!h.state().translation.is_open());
+    h.get_by_label("Translate…").click();
+    h.run();
+    assert!(h.state().is_open() && h.state().translation.is_open(), "Translate… opens it at translation");
+}

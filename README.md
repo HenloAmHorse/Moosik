@@ -17,17 +17,18 @@ professional-grade spectrum analyzer, and a parametric EQ, built in Rust.
 
 ## Build
 
-**Current release: [1.6.0](https://github.com/HenloAmHorse/Moosik-Player/releases/tag/v1.6.0).**
+**Current release: [1.6.1](https://github.com/HenloAmHorse/Moosik-Player/releases/tag/v1.6.1).**
 Download the Windows x86_64 `.exe` and the accompanying notices. There is no
 installer; local translation models are optional, separate downloads.
 
-1.6.0 redesigns the interface as one window with three modes (Listen,
-Library, Analyze) and adds live [Stereo and Harmony](docs/HARMONY.md) panels,
-with chords from an optional downloaded model that shows how sure it is and
-takes your corrections. The analyser itself is drawn exactly as before, and
-the classic layout is one switch away. 1.5.5 added a genuine pre-processed
-[CQT](docs/CQT.md), 2048-bar spectra and more
-[audio formats](docs/AUDIO_FORMATS.md), including native Opus.
+1.6.1 adds [YouTube and YouTube Music](docs/YOUTUBE.md) as a source: songs
+play while they download, and music videos (up to 2160p) play behind Listen
+and the spectrum. Lyrics gain a third source and are looked up as a song
+starts; the spectrum draws every song to its loudness; and an experimental
+[exact NVIDIA assist](docs/ASLT_EXACT_GPU.md) shortens the superlet
+pre-process with the same result to the last bit. 1.6.0 redesigned the
+interface as one window with three modes (Listen, Library, Analyze) with
+live [Stereo and Harmony](docs/HARMONY.md) panels.
 
 Requires Rust (stable, edition 2024). Tagged releases attach a prebuilt Windows
 x86_64 executable (it needs the Microsoft Visual C++ 2015-2022 Redistributable,
@@ -101,6 +102,11 @@ first build so the compiled dictionary is kept there, and later build with
   wheel. Chords come from an optional downloaded model (lv-chordia, MIT) that
   shows how sure it is and takes your corrections, or from a live guess
   ([docs/HARMONY.md](docs/HARMONY.md))
+- **YouTube and YouTube Music** (1.6.1) — search, play, queue and download
+  through yt-dlp, an optional component downloaded on request; a song plays
+  while it downloads, its music video behind Listen and the spectrum (480p
+  to 2160p); audio stays as delivered and is marked lossy
+  ([docs/YOUTUBE.md](docs/YOUTUBE.md))
 - **Parametric EQ** — up to 16 bands, dragged directly on the spectrum, with
   global and per-song presets
 - **Lyrics** — synced `.lrc`, read from the file or looked up online, with a
@@ -147,8 +153,7 @@ describes what the current release does.
 
 | | |
 |---|---|
-| **1.6.1** | A YouTube / YouTube Music source through an optional yt-dlp component. |
-| **1.6.2** | Pro audio tools: fake-lossless and fake-hi-res detection, true peak, loudness range, DR, clipping, headphone EQ and crossfeed, room correction, A/B and ABX, tempo and sections. See [docs/ROADMAP.md](docs/ROADMAP.md). |
+| **1.6.2** | Less disk: what caches, downloads and models take, and trimming it. Pro audio tools: fake-lossless and fake-hi-res detection, true peak, loudness range, DR, clipping, headphone EQ and crossfeed, room correction, A/B and ABX, tempo and sections. See [docs/ROADMAP.md](docs/ROADMAP.md). |
 
 Principles that work is meant to hold to:
 
@@ -173,6 +178,8 @@ Principles that work is meant to hold to:
 | [docs/CQT.md](docs/CQT.md) | true CQT and the Responsive variable-Q option: definition and limits |
 | [docs/REALTIME_FFT.md](docs/REALTIME_FFT.md) | live FFT bars, padding and exact reuse |
 | [docs/AUDIO_FORMATS.md](docs/AUDIO_FORMATS.md) | which containers and codecs are read, and their limits |
+| [docs/YOUTUBE.md](docs/YOUTUBE.md) | YouTube and YouTube Music: the optional components, videos, sizes and limits |
+| [docs/ASLT_EXACT_GPU.md](docs/ASLT_EXACT_GPU.md) | the experimental exact NVIDIA assist: what runs on the card, measurements, limits |
 | [docs/CACHE.md](docs/CACHE.md) | the analysis cache: what it guarantees, what it does not, and older versions' files |
 | [docs/RELEASE_COMPARISON_153.md](docs/RELEASE_COMPARISON_153.md) | 1.5.3 measured against 1.5.2.1: pre-processing time, CPU, memory, and loading a saved analysis |
 | [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) | third-party licenses and notices for the Windows executable ([how they were assembled](docs/THIRD_PARTY_NOTICES.md)) |

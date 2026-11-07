@@ -201,6 +201,13 @@ pub fn score(h: &Hit, norm_artist: &str, norm_title: &str, duration: Option<Dura
 /// Bigrams work on both scripts without a word segmenter: they measure how much
 /// of one string's character sequence appears in the other's.
 pub fn similarity(a: &str, b: &str) -> f64 {
+    // One Chinese script: a Taiwanese tag's 大風吹 is QQ Music's 大风吹.
+    let one_script = |s: &str| if s.chars().any(super::zh::is_han) {
+        super::zh::display(s, super::zh::ChineseDisplay::Simplified).unwrap_or_else(|| s.to_string())
+    } else {
+        s.to_string()
+    };
+    let (a, b) = (one_script(a), one_script(b));
     let bigrams = |s: &str| -> Vec<(char, char)> {
         let cs: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
         if cs.len() < 2 {
@@ -210,7 +217,7 @@ pub fn similarity(a: &str, b: &str) -> f64 {
         }
         cs.windows(2).map(|w| (w[0], w[1])).collect()
     };
-    let (mut x, mut y) = (bigrams(a), bigrams(b));
+    let (mut x, mut y) = (bigrams(&a), bigrams(&b));
     if x.is_empty() || y.is_empty() { return 0.0; }
     x.sort_unstable(); y.sort_unstable();
     // Multiset intersection, so a repeated bigram only counts as often as both
@@ -224,6 +231,17 @@ pub fn similarity(a: &str, b: &str) -> f64 {
         }
     }
     2.0 * shared as f64 / (x.len() + y.len()) as f64
+}
+
+/// NetEase's and QQ Music's way of saying a track is instrumental: a sheet of
+/// a line or two such as "纯音乐，请欣赏" or "此歌曲为没有填词的纯音乐，请您欣赏"
+/// ("pure music, enjoy"). That is not lyrics.
+pub fn instrumental_note(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines()
+        .map(|l| l.rsplit(']').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.len() <= 3 && lines.iter().any(|l| l.contains("纯音乐") || l.contains("純音樂"))
 }
 
 /// Fold full-width Latin and the ideographic space to ASCII.
@@ -476,6 +494,29 @@ mod tests {
         // Genuinely unrelated.
         assert!(similarity("カンケーガール", "senbonzakura") < 0.2);
         assert_eq!(similarity("", "abc"), 0.0);
+    }
+
+    /// A Taiwanese library is tagged in Traditional Chinese and the Chinese
+    /// services list the same song in Simplified; to the gate they are one.
+    #[test]
+    fn traditional_and_simplified_are_the_same_name() {
+        assert!(similarity("大風吹", "大风吹") > 0.99);
+        assert!(similarity(&normalise_artist("草東沒有派對"), &normalise_artist("草东没有派对")) > 0.99);
+        let qq = Hit { title: "大风吹".into(), artist: "草东没有派对".into(), duration: 236.0,
+                       synced: Some("x".into()), ..Default::default() };
+        assert!(acceptable(&qq, &normalise_artist("草東沒有派對"), &normalise_title("大風吹"),
+                           Some(Duration::from_secs(238))), "same song, a rip two seconds longer");
+        // Kana is left as it is.
+        assert!(similarity("夜に駆ける", "夜に駆ける") > 0.99);
+    }
+
+    #[test]
+    fn a_pure_music_note_is_not_lyrics() {
+        assert!(instrumental_note("[00:00:00]此歌曲为没有填词的纯音乐，请您欣赏"));
+        assert!(instrumental_note("[ti:Summer]\n[ar:久石让]\n[00:00.00] 作曲 : 久石譲\n[00:01.00]纯音乐，请欣赏\n"));
+        let song = (0..20).map(|i| format!("[00:{i:02}.00]line {i}\n")).collect::<String>() + "[01:00.00]纯音乐\n";
+        assert!(!instrumental_note(&song), "a real sheet that happens to say it");
+        assert!(!instrumental_note("[00:01.00]Never gonna give you up"));
     }
 
     #[test]

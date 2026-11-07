@@ -2080,3 +2080,63 @@ impl<T> Butterfly512Avx<T> {
         }
     }
 }
+
+/// Moosik 1.6.1: the stored coefficients of an original `Butterfly512Avx<f32>`,
+/// read back as f32 bits for the exact GPU lane, which evaluates the same
+/// graph with the same constants. Read-only; no FFT body changes.
+pub struct ExactGpuLeafWords {
+    /// `twiddles_butterfly32` (one lane each), the rotation mask, half_root2.
+    pub phase2: [u32; 16],
+    /// `twiddles_butterfly16`, one lane each.
+    pub tw16: [u32; 4],
+    /// The separated-column twiddles laid out per element (1 + 0i where none).
+    pub outer: Vec<[u32; 2]>,
+}
+
+impl ExactGpuLeafWords {
+    pub(crate) fn new(direction: FftDirection) -> Option<Self> {
+        let p = Butterfly512Avx::<f32>::new(direction).ok()?;
+        Some(unsafe { Self::with_avx(&p) })
+    }
+
+    #[target_feature(enable = "avx", enable = "fma")]
+    unsafe fn with_avx(p: &Butterfly512Avx<f32>) -> Self {
+        let lane0 = |v: __m256| {
+            let mut bits = [0u32; 8];
+            _mm256_storeu_ps(bits.as_mut_ptr().cast(), v);
+            for lane in 1..4 {
+                assert_eq!(&bits[0..2], &bits[lane * 2..lane * 2 + 2], "broadcast twiddle lanes differ");
+            }
+            [bits[0], bits[1]]
+        };
+        let mut phase2 = [0u32; 16];
+        for (k, &v) in p.twiddles_butterfly32.iter().enumerate() {
+            phase2[k * 2..k * 2 + 2].copy_from_slice(&lane0(v));
+        }
+        let masks = p.twiddles_butterfly4.moosik_mask_bits();
+        for lane in 1..4 {
+            assert_eq!(&masks[0..2], &masks[lane * 2..lane * 2 + 2], "rotation mask lanes differ");
+        }
+        phase2[12..14].copy_from_slice(&masks[0..2]);
+        let h: __m256 = AvxVector::half_root2();
+        let mut hwords = [0u32; 8];
+        _mm256_storeu_ps(hwords.as_mut_ptr().cast(), h);
+        assert!(hwords.iter().all(|&v| v == hwords[0]));
+        phase2[14] = hwords[0];
+        let mut tw16 = [0u32; 4];
+        for (i, &v) in p.twiddles_butterfly16.iter().enumerate() {
+            tw16[i * 2..i * 2 + 2].copy_from_slice(&lane0(v));
+        }
+        let stride = 512 / 32;
+        let mut outer = vec![[1.0f32.to_bits(), 0]; 512];
+        for c in 0..32 {
+            for k in 1..stride {
+                let v = p.twiddles[(stride - 1) * (c / 4) + k - 1];
+                let mut bits = [0u32; 8];
+                _mm256_storeu_ps(bits.as_mut_ptr().cast(), v);
+                outer[c * stride + k].copy_from_slice(&bits[(c % 4) * 2..(c % 4) * 2 + 2]);
+            }
+        }
+        Self { phase2, tw16, outer }
+    }
+}

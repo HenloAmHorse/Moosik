@@ -4,7 +4,7 @@ The notices themselves are in [`THIRD_PARTY_NOTICES.txt`](../THIRD_PARTY_NOTICES
 with four companion files in [`third_party/`](../third_party). This page says what
 they cover and how the original open items were settled for 1.5.3, with
 the scope rechecked for 1.5.4, regenerated for 1.5.5 and carried forward,
-checked, for 1.6.0. It records license
+checked, for 1.6.0 and 1.6.1. It records license
 information; it is not a legal opinion.
 
 **1.5.5:** the current locked Windows normal/build graph was enumerated
@@ -92,6 +92,22 @@ adds the one new item, as section 1.5 of the notices:
 | Item | Disposition |
 |---|---|
 | lv-chordia 1.1.0 (MIT, Copyright (c) 2023 Music X Lab) | **Ported code in the executable; weights not distributed.** `src/chords/` is a Rust port of its network, CQT front end and chord vocabulary. The upstream `LICENSE` from the pinned wheel (SHA-256 `292241f0…ee0cb0`) is reproduced byte for byte in `third_party/lv-chordia-1.1.0-LICENSE` (SHA-256 `24fe07e4…8e0512`). The five weight files are downloaded from that wheel only when the user asks, each checked against a pinned SHA-256; they are not in the release assets. |
+
+## Items for 1.6.1
+
+No package is added to the executable, so the 1.6.0 notices were carried
+forward: `research/v161/notices161.py` refuses to run unless the locked
+default Windows x86_64 normal/build graph is exactly the 302 packages the
+notices list, every package `Cargo.lock` gained since v1.6.0 lies outside it
+(the ten are `egui_kittest` 0.31.1 and what it brings, dev-dependencies of the
+offscreen interface tests), none was removed and the toolchain is the same
+rustc 1.94.0. It changes only the version lines.
+
+| Item | Disposition |
+|---|---|
+| yt-dlp (The Unlicense, with its bundled Python and other components), Deno (MIT) | **Not distributed.** Separate programs the user downloads on request from their own GitHub releases, checked against the checksums those releases publish; not in the release assets, not linked into Moosik and not covered by these notices. The setup card names both and their licenses before anything is fetched, and a short notice is written beside them when installed. |
+| `rustfft` 6.4.1 (vendored, modified) | Gains read-only accessors for the coefficients of its f32 32768-point AVX plan, used by the exact GPU assist; listed in `vendor/rustfft-6.4.1/PATCH.md`. Still distributed under its MIT option. |
+| `src/spectrum/aslt_exact_gpu.ptx` | Moosik's own shader, derived by `tools/aslt_exact_gpu/derive_ptx.py` from Moosik's own exact-ASLT research (see [ASLT_EXACT_GPU.md](ASLT_EXACT_GPU.md)); no third-party code. It runs through the NVIDIA driver already on the machine; no NVIDIA library is bundled. |
 
 ## Regenerating
 

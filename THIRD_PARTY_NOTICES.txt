@@ -1,8 +1,8 @@
-MOOSIK 1.6.0: THIRD-PARTY NOTICES
+MOOSIK 1.6.1: THIRD-PARTY NOTICES
 ==============================================================================
 
 Moosik is licensed under the GNU Affero General Public License v3.0 (see LICENSE).
-This file covers the third-party code and data in the Moosik 1.6.0 Windows x86_64
+This file covers the third-party code and data in the Moosik 1.6.1 Windows x86_64
 release executable
 (default features: asio-dsd, alsa-dsd), built with rustc 1.94.0 (4a4ef493e 2026-03-02).
 

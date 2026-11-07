@@ -5,6 +5,11 @@
 #![cfg_attr(all(windows, not(debug_assertions), not(test)), windows_subsystem = "windows")]
 
 mod analysis;
+mod unzip;
+mod youtube;
+mod video;
+#[cfg(test)]
+mod screens161_tests;
 mod chords;
 mod audio_formats;
 mod audio_probe;
@@ -171,7 +176,6 @@ use spectrum::{SampleBuf, SpectralCeiling, StereoBuf, TrackAnalysis, SpectrumSou
 use spectrum::eq::{EqSource, EqStateHandle};
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -768,6 +772,12 @@ fn read_metadata(path: &PathBuf) -> TrackMeta {
          probed.as_ref().and_then(|p| p.artist.clone()).unwrap_or_else(|| "Unknown Artist".into()),
          probed.as_ref().and_then(|p| p.album.clone()).unwrap_or_else(|| "Unknown Album".into()), None, None, None)
     };
+    // Audio from YouTube carries no tags of its own; Moosik's record of it
+    // stands in, for a file whose tags gave nothing.
+    let (title, artist, album) = match youtube::store::lookup(&youtube::store::file(&moosik_dir()), path) {
+        Some(i) if artist == "Unknown Artist" => (i.title, i.artist, i.album),
+        _ => (title, artist, album),
+    };
 
     let (duration, sample_rate, channels, bit_depth, bitrate) = if let Some(ref i) = dsd_info {
         // Stream properties come from the DSD header, not lofty.
@@ -946,7 +956,7 @@ fn frame_time(frames: u64, rate: u32) -> Duration {
 /// the file does not contain and the track ended immediately, which read as a
 /// track that had failed.
 struct SeekLanding {
-    decoder: Decoder<BufReader<File>>,
+    decoder: Decoder<BufReader<youtube::stream::Source>>,
     /// Where the decoder is, which is not always where it was asked to go.
     landed: Duration,
     /// What the file actually is — carried from the thread that opened it, so
@@ -1753,7 +1763,7 @@ impl Engine {
     ) -> Result<Duration, String> {
         let start = opening.at;
         let handle = self.rodio_handle()?;
-        let file = File::open(path).map_err(|e| format!("Open failed: {e}"))?;
+        let file = crate::youtube::stream::open(path).map_err(|e| format!("Open failed: {e}"))?;
         let decoder = Decoder::new(BufReader::new(file))
             .map_err(|e| format!("Decode failed: {e}"))?;
         let sink = Sink::try_new(&handle)
@@ -3923,7 +3933,7 @@ fn completion(&self) -> bitperfect::Completion {
             });
             return Ok(());
         }
-        let file = File::open(path).map_err(|e| format!("Open failed: {e}"))?;
+        let file = crate::youtube::stream::open(path).map_err(|e| format!("Open failed: {e}"))?;
         let decoder = Decoder::new(BufReader::new(file))
             .map_err(|e| format!("Decode failed: {e}"))?;
         let tapped = SpectrumSource::new(decoder, self.sample_buf.clone(), self.stereo_buf.clone());
@@ -4339,7 +4349,7 @@ fn completion(&self) -> bitperfect::Completion {
             .name("rodio-seek".into())
             .spawn(move || {
                 let seeked = (|| -> Result<SeekLanding, SeekError> {
-                    let file = File::open(&path_c)
+                    let file = crate::youtube::stream::open(&path_c)
                         .map_err(|e| SeekError::Open(e.to_string()))?;
                     let mut decoder = Decoder::new(BufReader::new(file))
                         .map_err(|e| SeekError::Decode(e.to_string()))?;
@@ -5945,7 +5955,28 @@ struct Appearance {
     #[serde(default)] visual: shell::VisualSettings,
     /// Open a console window showing Moosik's output, for debugging.
     #[serde(default)] console: bool,
+    /// Where YouTube downloads go; None is Music\Moosik.
+    #[serde(default)] youtube_dir: Option<PathBuf>,
+    /// YouTube Play, Queue and Download bring the music video too.
+    #[serde(default)] youtube_video: bool,
+    /// Music videos: the tallest picture fetched, how bright they show
+    /// behind Listen and the spectrum (0–1), and where.
+    #[serde(default = "default_video_height")] video_height: u32,
+    #[serde(default = "default_video_brightness")] video_brightness: f32,
+    #[serde(default = "default_true")] video_listen: bool,
+    #[serde(default = "default_true")] video_spectrum: bool,
+    /// Decode videos on the processor, not the graphics card.
+    #[serde(default)] video_software: bool,
+    /// Recent YouTube searches, newest first.
+    #[serde(default)] youtube_recent: Vec<String>,
+    /// The YouTube sign-in yt-dlp uses: a browser's name or a cookies.txt.
+    #[serde(default)] youtube_sign_in: Option<String>,
+    /// A song without lyrics is looked up online as it starts.
+    #[serde(default = "default_true")] lyrics_auto: bool,
 }
+
+fn default_video_height() -> u32 { 720 }
+fn default_video_brightness() -> f32 { 0.6 }
 
 impl Default for Appearance {
     fn default() -> Self {
@@ -5960,6 +5991,16 @@ impl Default for Appearance {
             lyrics_text_size: lyrics::ui::TEXT_SIZE_DEFAULT,
             visual: shell::VisualSettings::default(),
             console: false,
+            youtube_dir: None,
+            youtube_video: false,
+            video_height: default_video_height(),
+            video_brightness: default_video_brightness(),
+            video_listen: true,
+            video_spectrum: true,
+            video_software: false,
+            youtube_recent: Vec::new(),
+            youtube_sign_in: None,
+            lyrics_auto: true,
         }
     }
 }
@@ -6245,12 +6286,21 @@ impl ArtCache {
     }
 
     fn extract_bytes(path: &Path) -> Option<Vec<u8>> {
-        let tagged = probe_tagged(path)?;
-        let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
-        let pic = tag.pictures().iter()
-            .find(|p| p.pic_type() == lofty::picture::PictureType::CoverFront)
-            .or_else(|| tag.pictures().first())?;
-        Some(pic.data().to_vec())
+        let embedded = probe_tagged(path).and_then(|tagged| {
+            let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+            let pic = tag.pictures().iter()
+                .find(|p| p.pic_type() == lofty::picture::PictureType::CoverFront)
+                .or_else(|| tag.pictures().first())?;
+            Some(pic.data().to_vec())
+        });
+        // A file without a picture of its own: the cover kept beside it
+        // (a YouTube song's thumbnail; see youtube::cover).
+        embedded.or_else(|| std::fs::read(youtube::cover_path(path)).ok())
+    }
+
+    /// Load `path`'s art again (its cover has just arrived).
+    fn forget(&mut self, path: &Path) {
+        self.entries.remove(path);
     }
 }
 
@@ -6372,6 +6422,7 @@ impl MoosikApp {
             }
         }
         let appearance = load_appearance(&moosik_dir());
+        youtube::set_sign_in(appearance.youtube_sign_in.clone());
         if appearance.console {
             set_console(true);
         }
@@ -8042,7 +8093,7 @@ impl MoosikApp {
         if ui.add_enabled(info_enabled, egui::Button::new(lyr_label))
             .on_hover_text(
                 "Lyrics for the playing track.\n\nReads a .lrc beside the file \
-                 or the file's own tags, and can look the track up on LRCLIB. \
+                 or the file's own tags, and can look the track up on LRCLIB, NetEase and QQ Music. \
                  Saved lyrics go to a .lrc — the audio file is never modified.")
             .clicked()
         {
@@ -9329,6 +9380,9 @@ fn show_track_info(ui: &mut egui::Ui, modern: bool, t: &Track, stat: Option<Play
         row(ui, modern, "Size",     &fmt_size(t.file_size));
         row(ui, modern, "Format",   codec);
         row(ui, modern, "Lossless", match t.lossless { Some(true) => "Yes", Some(false) => "No (lossy)", None => "Unknown" });
+        if let Some(i) = youtube::store::lookup(&youtube::store::file(&moosik_dir()), &t.path) {
+            row(ui, modern, "Source", &i.url);
+        }
 
         // ── History ─────────────────────────────────────────────────────
         section(ui, modern, "History");
@@ -9967,6 +10021,9 @@ impl eframe::App for MoosikApp {
         self.spectrum_window.tick(elapsed_secs, is_playing);
         // Update current art for the spectrum window (loads it if needed), then
         // refresh the per-track accent now that the art is available.
+        let video = self.video_frame(ctx);
+        self.spectrum_window.video = video.filter(|_| self.appearance.video_spectrum);
+        self.spectrum_window.video_brightness = self.appearance.video_brightness;
         self.spectrum_window.current_art = self.current_index
             .and_then(|i| self.playlist.get(i))
             .and_then(|t| self.art_cache.get_or_load(&t.path, ctx));

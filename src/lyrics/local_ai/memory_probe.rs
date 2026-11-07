@@ -40,7 +40,7 @@ fn local_memory_route_probe() {
         // Research only: experimental placements have no admitted product
         // requirement yet. Supervision still enforces the system memory floor.
         need: if tag == "production-lowram" { HY30_LOW_RAM_NEED } else { memory::Need { phys: 0, commit: 0 } },
-        adapter: HYMT2_30B.adapter, gpu_args: args };
+        adapter: HYMT2_30B.adapter, gpu_args: args, paged: std::env::var_os("MOOSIK_MEMORY_PROBE_PAGED").is_some() };
     let fixture = ["駅のホームで君を待っていた", "帰らないと知っていても", "雨に消えた約束を", "今も胸に抱いている",
         "遠い灯りが揺れるたび", "言えなかった言葉がある", "昨日の風は戻らない", "それでも朝はやって来る",
         "君の名前を呼ばずに", "空いた椅子を見つめていた", "さよならだけが残っても", "この歌を忘れないで"];

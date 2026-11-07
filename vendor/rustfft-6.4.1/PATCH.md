@@ -85,3 +85,17 @@ the vendor's original dev-dependency wasm-bindgen-test is absent offline.
 It includes singleton, mixed-row, product, contract and exhaustive-pair checks
 against the unchanged full functions, both directions. This is local modified
 source under the upstream MIT/Apache-2.0 terms, not an upstream release.
+
+## 1.6.1: read-only coefficients of the f32 32768-point AVX plan
+
+`ExactGpuWords32768::new(direction)` (x86_64, `avx` feature) builds
+`MixedRadix8xnAvx(MixedRadix8xnAvx(Butterfly512Avx))` with the planner's own
+constructors and returns every stored coefficient as f32 bits: the root and
+inner radix-8 twiddles, the 90-degree rotation mask, and the 512-point leaf's
+broadcast and separated-column twiddles (`ExactGpuLeafWords`). Moosik's exact
+GPU lane evaluates the same operation graph with these constants, so its
+outputs can be held bit for bit to this plan's. Nothing else reads them; no FFT
+body, planner choice or numerical path changes. `None` without AVX and FMA.
+The accessors are adapted from the research coefficient accessor of the
+2026-11-03 exact-ASLT investigation (words only; its debug stages are not
+included).

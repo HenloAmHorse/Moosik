@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{apply_theme, lyrics, moosik_dir, save_appearance, save_playlist_store, LoopMode, MoosikApp, PlayState, ThemeMode};
 
+#[path = "shell_youtube.rs"]
+pub(crate) mod youtube_ui;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub(crate) enum UiMode {
     #[default]
@@ -187,6 +190,10 @@ const TOYS: &[Toy] = &[
     toy("apple", "Teacher's apple", "Correct five chords.", true),
     toy("on_repeat", "On repeat", "Play one song ten times in a row.", true),
     toy("centurion", "Centurion", "Grow the playlist past a hundred tracks.", true),
+    toy("lofi_rain", "Lo-fi rain", "Look for something lo-fi on YouTube.", true),
+    toy("rickroll", "Rickroll", "You know the rules.", true),
+    toy("popcorn", "Popcorn", "Watch a music video in Listen.", true),
+    toy("ticket", "Admit one", "Go to the theater.", true),
     toy("eyes", "Watching eyes", "Eyes on the analyser's controls that follow the pointer.", false),
     toy("six_seven", "6 7", "Palms up, see-sawing, at 67% volume or 6:07 into a track.", false),
 ];
@@ -577,6 +584,22 @@ pub(crate) struct ShellState {
     playlist_seen: Option<usize>,
     /// The chord model: its weights, an install, the track being worked out.
     chord_ai: ChordAi,
+    /// Library → Sources → YouTube.
+    yt: youtube_ui::Yt,
+    /// A music video's first picture in Listen: popcorn, from when.
+    popcorn: Option<Instant>,
+    /// Listen shows the music video whole, lyrics as subtitles.
+    pub(crate) theater: bool,
+    /// Theater with the bars and pointer stepped aside; the last time the
+    /// mouse or keyboard did anything.
+    pub(crate) cinema: bool,
+    stirred: Option<Instant>,
+    /// Theater put the window in full screen (and takes it out again).
+    pub(crate) full_screen: bool,
+    /// The ticket torn on the first visit to the theater: since when.
+    ticket: Option<Instant>,
+    /// Theater's title card: for which song, since when.
+    title_card: Option<(Option<usize>, Instant)>,
     mono_since: Option<Instant>,
     four_at: Option<(usize, Instant)>,
     /// The key now, and since when; the last key that held; the last change of key, from what.
@@ -779,6 +802,7 @@ impl MoosikApp {
         let dark = self.appearance.theme.is_dark();
         let tok = Tokens::new(dark);
         self.party_keys(ctx);
+        self.tick_youtube(ctx);
         if let Some(until) = self.shell.party_until {
             if Instant::now() < until {
                 // The accent runs round the colour wheel.
@@ -804,8 +828,23 @@ impl MoosikApp {
         self.shell_toys_tick(ctx, dt);
 
         self.paint_backdrop(ctx, &tok, mode);
-        self.shell_header(ctx, &tok, accent);
-        self.shell_player_bar(ctx, &tok, accent, mode);
+        // Watching a video, the bars and the pointer step aside after three
+        // still seconds; a move brings them back.
+        let stir = ctx.input(|i| i.events.iter().any(|e| matches!(e,
+            egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::Key { .. } | egui::Event::MouseWheel { .. })));
+        if stir || self.shell.stirred.is_none() {
+            self.shell.stirred = Some(now);
+        }
+        let idle = self.shell.stirred.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
+        let cinema = mode == UiMode::Listen && self.shell.theater && self.shell.yt.shown.is_some()
+            && self.play_state == PlayState::Playing && !self.shell.more_open && idle > 3.0;
+        self.shell.cinema = cinema;
+        if cinema {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        } else {
+            self.shell_header(ctx, &tok, accent);
+            self.shell_player_bar(ctx, &tok, accent, mode);
+        }
         self.settings_drawer(ctx, &tok);
 
         let content = {
@@ -1208,6 +1247,14 @@ impl MoosikApp {
         let idx = match mode { UiMode::Listen => 0, UiMode::Library => 1, UiMode::Analyze => 2 };
         let mode_secs = self.shell_secs(360.0);
         let veil = self.shell.tween("veil", tok.veil[idx], mode_secs, ease_out_quart);
+        // A music video, when the song has one, is Listen's backdrop.
+        let video = self.shell.yt.shown.filter(|_| mode == UiMode::Listen && (self.shell.theater || self.appearance.video_listen));
+        if let Some(v) = video && self.shell.theater {
+            // The whole picture, as large as fits, on black.
+            painter.rect_filled(screen, 0.0, Color32::BLACK);
+            painter.image(v.tex, v.fit(screen), v.uv, Color32::WHITE);
+            return;
+        }
         if v.ambient {
             // The current track's backdrop; a change of track cross-fades.
             let path = self.current_index.and_then(|i| self.playlist.get(i)).map(|t| t.path.clone());
@@ -1246,7 +1293,63 @@ impl MoosikApp {
                 painter.image(cur, rect, uv, Color32::from_white_alpha((t * strength * 255.0) as u8));
             }
         }
+        // The video over it, fading in from its first picture, under a
+        // lighter veil (Settings → YouTube → Brightness).
+        let mut veil = veil;
+        if let Some(v) = video {
+            let since = self.shell.yt.video_since.map_or(1.0, |at| at.elapsed().as_secs_f32());
+            let secs = self.shell_secs(700.0);
+            let fade = if secs > 0.0 { ease_out_quart((since / secs).min(1.0)) } else { 1.0 };
+            if fade < 1.0 {
+                self.shell.animating = true;
+            }
+            painter.image(v.tex, screen, v.fill_uv(screen.size()), Color32::from_white_alpha((fade * 255.0) as u8));
+            let dim = 1.0 - self.appearance.video_brightness.clamp(0.0, 1.0);
+            veil = lerp(veil, dim.min(veil), fade);
+            if self.shell.popcorn.is_none() && self.toy("popcorn") {
+                self.found("popcorn");
+                self.shell.popcorn = Some(Instant::now());
+            }
+        }
         painter.rect_filled(screen, 0.0, with_alpha(tok.bg, veil));
+        if video.is_some() {
+            self.paint_popcorn(ctx, screen);
+        }
+    }
+
+    /// A handful of popcorn hopping up from the bottom, once a session, the
+    /// first time a music video plays behind Listen.
+    fn paint_popcorn(&mut self, ctx: &egui::Context, screen: Rect) {
+        let Some(at) = self.shell.popcorn else { return };
+        let t = at.elapsed().as_secs_f32();
+        if t > 3.0 {
+            return;
+        }
+        self.shell.animating = true;
+        let p = ctx.layer_painter(LayerId::new(egui::Order::Foreground, Id::new("popcorn")));
+        let fade = ((3.0 - t) * 2.0).clamp(0.0, 1.0);
+        for k in 0..14 {
+            let seed = (k as f32 * 0.618_034).fract();
+            let start = seed * 0.6;
+            let s = t - start;
+            if s <= 0.0 {
+                continue;
+            }
+            // Each kernel pops up and falls back, a little sideways.
+            let (vy, vx) = (520.0 + 260.0 * seed, (seed - 0.5) * 160.0);
+            let x = screen.left() + screen.width() * (0.2 + 0.6 * ((k as f32 * 0.37).fract()));
+            let y = screen.bottom() - 90.0 - (vy * s - 600.0 * s * s).max(-80.0);
+            let c = Pos2::new(x + vx * s, y);
+            let a = fade;
+            let white = Color32::from_rgba_unmultiplied(255, 248, 230, (a * 255.0) as u8);
+            let butter = Color32::from_rgba_unmultiplied(255, 214, 120, (a * 255.0) as u8);
+            // A puff of three bumps with a buttery heart.
+            let r = 6.0 + 3.0 * seed;
+            for (dx, dy) in [(-0.6, 0.1), (0.6, 0.1), (0.0, -0.55)] {
+                p.circle_filled(c + Vec2::new(dx * r, dy * r), r * 0.75, white);
+            }
+            p.circle_filled(c + Vec2::new(0.0, 0.25 * r), r * 0.35, butter);
+        }
     }
 
     fn shell_header(&mut self, ctx: &egui::Context, tok: &Tokens, accent: Color32) {
@@ -1461,7 +1564,16 @@ impl MoosikApp {
                             ui.add_space(8.0);
                             self.tb_log(ui);
                         });
+                        if ui.checkbox(&mut self.appearance.lyrics_auto, "Find lyrics automatically")
+                            .on_hover_text("A song without lyrics of its own is looked up online as it starts \
+                                            (its title, artist and length go to LRCLIB, NetEase, then QQ Music). \
+                                            Found lyrics show; they are saved only if you save them.")
+                            .changed()
+                        {
+                            save_appearance(&moosik_dir(), &self.appearance);
+                        }
                     });
+                    settings_section(ui, tok, "YouTube", |ui| self.youtube_settings_ui(ui, tok));
                     settings_section(ui, tok, "Files", |ui| {
                         ui.horizontal_wrapped(|ui| self.tb_files(ui));
                     });
@@ -1875,6 +1987,9 @@ impl MoosikApp {
         let area = ui.max_rect().shrink2(Vec2::new(56.0, 28.0)).translate(self.shell.sway);
         let side = (area.height() - 150.0).min(area.width() * 0.40).min(480.0).max(96.0);
         let cover = Rect::from_min_size(area.min, Vec2::splat(side));
+        if self.listen_video_ui(ui, accent, cover) {
+            return;
+        }
         self.shell.cover_target = Some((cover, 18.0));
         // Title, artist and the ribbon under the cover.
         let text = Rect::from_min_max(Pos2::new(cover.left(), cover.bottom() + 20.0), Pos2::new(cover.right(), area.bottom()));
@@ -1908,6 +2023,209 @@ impl MoosikApp {
                 self.found("balloon");
                 self.shell.balloon = Some((r, Instant::now()));
             }
+        }
+    }
+
+    /// With a music video: the Watch / Back switch (also V and Esc), and in
+    /// theater the lyrics as subtitles. True when theater took the view.
+    fn listen_video_ui(&mut self, ui: &mut egui::Ui, accent: Color32, cover: Rect) -> bool {
+        // A song played from YouTube's cache can be kept, video and all.
+        if !self.shell.theater && self.can_save_current() {
+            let r = Rect::from_min_size(cover.right_bottom() + Vec2::new(-12.0 - 72.0, -12.0 - 30.0), Vec2::new(72.0, 30.0));
+            if pill_button(ui.ctx(), "shell_save_song", r, "Save", accent, None, true)
+                .on_hover_text("Keep this song (and its video and cover) in your downloads folder")
+                .clicked()
+            {
+                self.save_current();
+            }
+        }
+        let has_video = self.shell.yt.shown.is_some();
+        if !has_video {
+            self.shell.theater = false;
+            // The next song has no video: no reason to stay full screen.
+            if self.shell.full_screen {
+                self.set_full_screen(ui.ctx(), false);
+            }
+            // A YouTube song without its video can still get it.
+            if self.shell.yt.current.is_some() && self.shell.yt.video.is_none() {
+                let r = Rect::from_min_size(cover.right_top() + Vec2::new(-12.0 - 104.0, 12.0), Vec2::new(104.0, 30.0));
+                let busy = self.current_video_fetch();
+                let label = busy.map_or("Get video".to_string(), |q| format!("Video {:.0}%", q * 100.0));
+                let resp = pill_button(ui.ctx(), "shell_get_video", r, &label, accent, busy, busy.is_none())
+                    .on_hover_text("Fetch this song's music video from YouTube, to play behind it");
+                if resp.clicked() && busy.is_none() {
+                    self.get_current_video();
+                }
+            }
+            return false;
+        }
+        let typing = ui.ctx().wants_keyboard_input();
+        let (v, esc) = ui.input(|i| (i.key_pressed(egui::Key::V) && i.modifiers.is_none(), i.key_pressed(egui::Key::Escape)));
+        let area = ui.max_rect();
+        let label = if self.shell.theater { "Back" } else { "Watch" };
+        // On the cover's corner; in theater, the view's.
+        let corner = if self.shell.theater { area.right_top() + Vec2::new(-20.0, 14.0) } else { cover.right_top() + Vec2::new(-12.0, 12.0) };
+        let r = Rect::from_min_size(corner - Vec2::new(88.0, 0.0), Vec2::new(88.0, 30.0));
+        let clicked = !self.shell.cinema && pill_button(ui.ctx(), "shell_watch", r, label, accent, None, true)
+            .on_hover_text(if self.shell.theater {
+                "Back to the cover and lyrics (V or Esc); double-click the picture for full screen".to_string()
+            } else {
+                // Its size says which was fetched.
+                let size = self.shell.yt.video.as_ref().and_then(|(v, _)| v.native_size());
+                size.map_or("Watch the music video (V)".to_string(), |[w, h]| format!("Watch the music video (V) · {w}×{h}"))
+            })
+            .clicked();
+        if clicked || (v && !typing) {
+            self.shell.theater = !self.shell.theater;
+            // Three still seconds from now, not from the last move.
+            self.shell.stirred = Some(Instant::now());
+        } else if esc && self.shell.theater && !typing {
+            // Out of full screen first, then out of theater.
+            if self.shell.full_screen {
+                self.set_full_screen(ui.ctx(), false);
+            } else {
+                self.shell.theater = false;
+            }
+        }
+        if !self.shell.theater {
+            if self.shell.full_screen {
+                self.set_full_screen(ui.ctx(), false);
+            }
+            // The card again next time theater opens.
+            self.shell.title_card = None;
+            return false;
+        }
+        // A double click on the picture: full screen, and back.
+        let screen = ui.interact(area, Id::new("shell_theater_screen"), Sense::click());
+        if screen.double_clicked() {
+            let full = !self.shell.full_screen;
+            self.set_full_screen(ui.ctx(), full);
+        }
+        if self.shell.ticket.is_none() && self.toy("ticket") {
+            self.found("ticket");
+            self.shell.ticket = Some(Instant::now());
+        }
+        self.paint_ticket(ui.ctx(), area);
+        self.paint_title_card(ui.ctx(), area);
+        self.paint_subtitles(ui.ctx(), area);
+        true
+    }
+
+    /// A cinema ticket drops in, is torn in two, and the halves fall away.
+    fn paint_ticket(&mut self, ctx: &egui::Context, area: Rect) {
+        let Some(at) = self.shell.ticket else { return };
+        let t = at.elapsed().as_secs_f32();
+        if t > 3.2 {
+            return;
+        }
+        self.shell.animating = true;
+        let p = ctx.layer_painter(LayerId::new(egui::Order::Foreground, Id::new("shell_ticket")));
+        let size = Vec2::new(220.0, 84.0);
+        // Down in 0.5 s, held, torn at 1.4 s, the halves drifting apart.
+        let drop = ease_out_quart((t / 0.5).min(1.0));
+        let tear = ((t - 1.4) / 1.8).clamp(0.0, 1.0);
+        let fade = 1.0 - tear;
+        let center = Pos2::new(area.center().x, area.top() - size.y + drop * (size.y + 70.0));
+        let paper = Color32::from_rgba_unmultiplied(250, 214, 120, (255.0 * fade) as u8);
+        let ink = Color32::from_rgba_unmultiplied(120, 40, 30, (255.0 * fade) as u8);
+        let stub = 62.0;
+        for (half, sign) in [(0, -1.0f32), (1, 1.0)] {
+            let r = Rect::from_center_size(center, size);
+            let (r, txt, font) = if half == 0 {
+                (Rect::from_min_max(r.min, Pos2::new(r.max.x - stub, r.max.y)), "ADMIT ONE", 20.0)
+            } else {
+                (Rect::from_min_max(Pos2::new(r.max.x - stub, r.min.y), r.max), "No. 1", 12.0)
+            };
+            // Apart, down and a little turned, once torn.
+            let off = Vec2::new(sign * 60.0 * tear, 140.0 * tear * tear);
+            let r = r.translate(off);
+            p.rect_filled(r, 6, paper);
+            p.text(r.center(), egui::Align2::CENTER_CENTER, txt, egui::FontId::proportional(font), ink);
+        }
+        // The perforation, until it gives.
+        if tear == 0.0 {
+            let x = center.x + size.x / 2.0 - stub;
+            let mut y = center.y - size.y / 2.0 + 4.0;
+            while y < center.y + size.y / 2.0 - 4.0 {
+                p.line_segment([Pos2::new(x, y), Pos2::new(x, y + 4.0)], Stroke::new(1.5, ink));
+                y += 8.0;
+            }
+        }
+    }
+
+    /// Title and artist at the top left for a few seconds, the way a film
+    /// names its song: on entering theater, and at each new song in it.
+    fn paint_title_card(&mut self, ctx: &egui::Context, area: Rect) {
+        let now = Instant::now();
+        if self.shell.title_card.is_none_or(|(i, _)| i != self.current_index) {
+            self.shell.title_card = Some((self.current_index, now));
+        }
+        let Some(i) = self.current_index else { return };
+        let t = self.shell.title_card.map_or(9.0, |(_, at)| now.duration_since(at).as_secs_f32());
+        // In over half a second, held, out over a second.
+        let a = (t / 0.5).min(1.0) * ((5.0 - t) / 1.0).clamp(0.0, 1.0);
+        if a <= 0.0 {
+            return;
+        }
+        self.shell.animating = true;
+        let track = &self.playlist[i];
+        let painter = ctx.layer_painter(LayerId::new(egui::Order::Foreground, Id::new("shell_title_card"))).with_clip_rect(area);
+        let at = Pos2::new(area.left() + 40.0, area.top() + 40.0 + (1.0 - a) * 6.0);
+        let ink = Color32::from_white_alpha((235.0 * a) as u8);
+        let dim = Color32::from_white_alpha((170.0 * a) as u8);
+        let shadow = Color32::from_black_alpha((200.0 * a) as u8);
+        let line = |text: &str, size: f32, color: Color32, y: f32| {
+            let g = ctx.fonts(|f| f.layout_no_wrap(text.to_string(), crate::name_font(text, size), color));
+            for d in [Vec2::new(1.5, 1.5), Vec2::new(0.0, 2.0)] {
+                painter.galley_with_override_text_color(Pos2::new(at.x, y) + d, g.clone(), shadow);
+            }
+            painter.galley(Pos2::new(at.x, y), g.clone(), color);
+            g.size().y
+        };
+        let h = line(&track.title, 30.0, ink, at.y);
+        line(&track.artist, 16.0, dim, at.y + h + 4.0);
+    }
+
+    fn set_full_screen(&mut self, ctx: &egui::Context, full: bool) {
+        self.shell.full_screen = full;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(full));
+    }
+
+    /// Theater's subtitles: the current lyric line (and its translation)
+    /// low in the picture, light on a dark outline.
+    fn paint_subtitles(&mut self, ctx: &egui::Context, area: Rect) {
+        let Some(i) = self.current_index else { return };
+        let t = &self.playlist[i];
+        let tref = lyrics::ui::TrackRef { path: &t.path, title: &t.title, artist: &t.artist, album: &t.album, duration: t.duration };
+        let pos = self.elapsed();
+        let lines = self.lyrics_window.nearby_lines(tref, pos, 0, 0);
+        let Some((_, text, translation, _)) = lines.into_iter().find(|l| l.0 == 0) else { return };
+        let now = Instant::now();
+        if self.shell.overlay_line.as_ref().map(|(s, _)| s) != Some(&text) {
+            self.shell.overlay_line = Some((text.clone(), now));
+        }
+        let since = self.shell.overlay_line.as_ref().map_or(1.0, |(_, at)| now.duration_since(*at).as_secs_f32());
+        let secs = self.shell_secs(300.0);
+        let k = if secs > 0.0 { ease_out_quart((since / secs).min(1.0)) } else { 1.0 };
+        if k < 1.0 {
+            self.shell.animating = true;
+        }
+        let painter = ctx.layer_painter(LayerId::new(egui::Order::Foreground, Id::new("shell_subtitles"))).with_clip_rect(area);
+        let ink = with_alpha(Color32::from_rgb(0xf6, 0xf6, 0xf8), k);
+        let dark = Color32::from_black_alpha((230.0 * k) as u8);
+        let mut y = area.bottom() - 34.0 + (1.0 - k) * 8.0;
+        for (s, size) in [(translation, 18.0), (Some(text), 28.0)] {
+            let Some(s) = s else { continue };
+            let font = crate::name_font(&s, size);
+            let mut job = egui::text::LayoutJob::simple(s, font, ink, area.width() - 120.0);
+            job.halign = egui::Align::Center;
+            let g = ctx.fonts(|f| f.layout_job(job));
+            let at = Pos2::new(area.center().x, y - g.size().y);
+            for d in [Vec2::new(-1.5, 0.0), Vec2::new(1.5, 0.0), Vec2::new(0.0, -1.5), Vec2::new(0.0, 1.5), Vec2::new(0.0, 2.5)] {
+                painter.galley_with_override_text_color(at + d, g.clone(), dark);
+            }
+            painter.galley(at, g.clone(), ink);
+            y -= g.size().y + 6.0;
         }
     }
 
@@ -1948,16 +2266,31 @@ impl MoosikApp {
             ui.painter().rect(side, 18, tok.scrim, Stroke::new(1.0, tok.line), egui::StrokeKind::Inside);
             let mut sui = ui.new_child(egui::UiBuilder::new().max_rect(side.shrink(12.0)));
             self.playlist_sidebar(&mut sui, tok, accent);
+            self.sources_sidebar(&mut sui, tok, accent);
         }
         ui.painter().rect(list, 18, tok.scrim, Stroke::new(1.0, tok.line), egui::StrokeKind::Inside);
         let mut pui = ui.new_child(egui::UiBuilder::new().max_rect(list.shrink(14.0)));
+        // Without the sidebar, its Sources move into a switch above the list.
+        if side_w == 0.0 {
+            pui.horizontal(|ui| {
+                if ui.selectable_label(!self.shell.yt.open, "Queue").clicked() {
+                    self.shell.yt.open = false;
+                }
+                if ui.selectable_label(self.shell.yt.open, "YouTube").clicked() {
+                    self.shell.yt.open = true;
+                }
+            });
+            pui.add_space(4.0);
+        }
         // With the sidebar, the saved playlists live there, not above the list.
-        if side_w > 0.0 {
+        if self.shell.yt.open {
+            self.youtube_ui(&mut pui, tok, accent);
+        } else if side_w > 0.0 {
             self.playlist_list_ui(&mut pui);
         } else {
             self.playlist_ui(&mut pui);
         }
-        if self.playlist.is_empty() {
+        if self.playlist.is_empty() && !self.shell.yt.open {
             self.empty_box(ui, list, tok, accent);
         }
         if self.play_state == PlayState::Playing && self.toy("row_eq") {
@@ -1976,7 +2309,8 @@ impl MoosikApp {
         let spin = (self.play_state == PlayState::Playing).then(|| ui.input(|i| i.time) as f32 * 3.0);
         let mut pick: Option<Option<usize>> = None;
         let mut active_row = None;
-        let below = if self.show_save_playlist_input { 120.0 } else { 50.0 };
+        // Room under the list for its buttons and the Sources section.
+        let below = if self.show_save_playlist_input { 120.0 } else { 50.0 } + 76.0;
         egui::ScrollArea::vertical().id_salt("shell_playlists").auto_shrink([false, true])
             .max_height((ui.available_height() - below).max(60.0)).show(ui, |ui| {
                 for row in 0..=self.playlist_store.len() {
@@ -2010,8 +2344,11 @@ impl MoosikApp {
                     if count == 42 && idx.is_some() && self.toy("answer") {
                         self.found("answer");
                     }
-                    if resp.clicked() && !active {
-                        pick = Some(idx);
+                    if resp.clicked() {
+                        self.shell.yt.open = false;
+                        if !active {
+                            pick = Some(idx);
+                        }
                     }
                     if active {
                         active_row = Some((r, name));
@@ -4647,4 +4984,21 @@ mod tests {
             }
         }
     }
+}
+
+/// A dark pill over the cover, in an area of its own above it (the cover
+/// takes clicks and drags itself); `progress` fills it with the accent.
+fn pill_button(ctx: &egui::Context, id: &str, r: Rect, label: &str, accent: Color32, progress: Option<f32>, enabled: bool) -> egui::Response {
+    egui::Area::new(Id::new(id)).order(egui::Order::Foreground).fixed_pos(r.min).show(ctx, |ui| {
+        let (r, resp) = ui.allocate_exact_size(r.size(), if enabled { Sense::click() } else { Sense::hover() });
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+        let fill = if resp.hovered() && enabled { with_alpha(accent, 0.55) } else { Color32::from_black_alpha(140) };
+        ui.painter().rect_filled(r, 15, fill);
+        if let Some(q) = progress {
+            let bar = Rect::from_min_size(r.min, Vec2::new(r.width() * q.clamp(0.0, 1.0), r.height()));
+            ui.painter().rect_filled(bar, 15, with_alpha(accent, 0.45));
+        }
+        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(13.0), Color32::WHITE);
+        resp
+    }).inner
 }

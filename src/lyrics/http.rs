@@ -4,19 +4,23 @@ use std::time::Duration;
 
 /// A lyric lookup is a nicety, not a feature worth hanging a thread on
 /// indefinitely — and it runs on a worker, so a stuck socket would leak one.
-const TIMEOUT: Duration = Duration::from_secs(12);
+/// Room enough for a line where connecting alone takes ten seconds.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 const UA: &str = concat!(
     "moosik/", env!("MOOSIK_VERSION"),
     " (https://github.com/HenloAmHorse/Moosik-Player)"
 );
 
+/// One agent for every lookup: the steps of a lookup reuse its connections
+/// rather than connecting again each time.
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
         .user_agent(UA)
         .build()
-        .into()
+        .into()).clone()
 }
 
 /// GET a URL and parse JSON. `Ok(None)` for a 404, which several of these APIs

@@ -1,0 +1,14 @@
+[package]
+name = "moosik-format-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rodio = { path = "../../../vendor/rodio-0.20.1", default-features = false, features = ["symphonia-all"] }
+symphonia = { path = "../../../vendor/symphonia-0.5.5", features = ["aac", "isomp4", "alac", "aiff", "caf", "mp3", "moosik-opus"] }
+
+[patch.crates-io]
+symphonia = { path = "../../../vendor/symphonia-0.5.5" }
+symphonia-format-mkv = { path = "../../../vendor/symphonia-format-mkv-0.5.5" }
+symphonia-format-ogg = { path = "../../../vendor/symphonia-format-ogg-0.5.5" }

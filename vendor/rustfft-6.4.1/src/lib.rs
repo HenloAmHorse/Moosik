@@ -569,6 +569,8 @@ mod avx {
 }
 
 pub use self::avx::avx_planner::FftPlannerAvx;
+#[cfg(all(target_arch = "x86_64", feature = "avx"))]
+pub use self::avx::ExactGpuWords32768;
 
 // Algorithms implemented to use SSE4.1 instructions. Only compiled on x86_64, and only compiled if the "sse" feature flag is set.
 #[cfg(all(target_arch = "x86_64", feature = "sse"))]

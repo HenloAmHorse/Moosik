@@ -32,6 +32,7 @@ See also [BIT_PERFECT.md](BIT_PERFECT.md) and [FEATURES.md](FEATURES.md).
   - *Legacy analyses.* Caches written before exact identity name their settings only rounded (hundredths, tenths, whole hertz), and nothing records what they were really analysed at. They are never loaded automatically, not even one whose rounded name is today's settings: the track is analysed at your settings straight away, and the notice under the controls offers the legacy analysis, labelled **"Legacy analysis — original settings not verified."**, with the settings from its file name described as nominal. "Use this legacy analysis" stops the running analysis and shows it for this track only; repeating the track keeps it, changing a setting or the track ends it, and "Return to my settings" goes back. Your saved settings never change. Legacy analyses are offered only in Superlet mode and only while your own analysis of the track is not on screen. They are not deleted on purpose, but the cache size limit can remove them like any other cache; the one on screen is not removed while shown
   - *A sidecar is two more planes.* A track analysed in stereo has three planes on disk rather than one. Adding channels to a track that already has a valid mix cache keeps that cache rather than rewriting it — a rewrite would coarsen a 16-bit cache to 12 for no reason the user asked for
 - **GPU acceleration** — the superlet pre-process offloads its large convolutions to the GPU through wgpu (Vulkan or Metal, so AMD, Intel, NVIDIA and Apple are all covered). Measured against the same build with the device off: High 1.23×, Ultra 1.71×, Extreme 1.32×. Fast and Standard are unchanged by design — their kernels never reach a size where a device beats the cores
+- **Exact NVIDIA assist** (1.6.1, experimental, off; Pre-process settings → GPU) — on a compute-capability 7.5 NVIDIA card, the stereo superlet's 32768-point blocks run on the card with the same result to the last bit; about 15–18 % less time in the whole-track examples measured. See [ASLT_EXACT_GPU.md](ASLT_EXACT_GPU.md)
   - *Calibrated per machine, above a fixed floor.* Blocks below 2^17 samples never reach the device at all — that eligibility floor is a conservative constant compiled in, not a measurement. Above it the crossover is a property of one device against one core count, so it is settled per machine rather than assumed: a probe on first run picks a starting point, then real analyses A/B the two routes on the eligible sizes and adapt on evidence. A device that turns out slower gets switched off by itself. Settings expose Auto / Always / Off, a Re-measure button, and the per-size table
   - *Analysis core budget* — a slider, defaulting to two fewer threads than the machine has, so the output thread keeps its deadline while a track is being analysed
 - **Bar spacing** — where the bars land, independent of how many there are
@@ -39,6 +40,7 @@ See also [BIT_PERFECT.md](BIT_PERFECT.md) and [FEATURES.md](FEATURES.md).
   - *Zoom*, a lens anywhere on the axis with adjustable centre, width and strength. Bars are taken from the rest of the spectrum, never invented. Unlike bass width this is not free above ~1 kHz, so the panel quotes the cost multiplier
   - Every setting is the normalised integral of a strictly positive density, so the axis cannot fold back on itself or push a bar off the display at any setting
 - **Loudness** — flat or ISO 226:2003 equal-loudness weighting, applied at display time so toggling it is instant
+- **Normalized level** (on by default) — each song's bars are raised or lowered as if it were mastered at −10 LUFS (at most +20 dB, −6 dB), from its integrated loudness (K-weighted mono, 400 ms blocks, gated at −70 LUFS — the figure the Info window shows), measured in the background as the song starts: 0.2–0.5 s of one core for a CD-length FLAC. Loud masters move a dB or two; a quiet song or an off-vocal mix no longer draws short bars. Silence, and everything above a file's Nyquist, stays at the floor. Display only: nothing reaches the sound or the cache
 
 ### Channels in Pre-process
 
@@ -116,7 +118,7 @@ gestures.
 - **Up to 16 bands** — Peaking, Low Shelf, High Shelf, High Pass, Low Pass, Notch
 - **Biquad IIR filters** (Audio EQ Cookbook) — applied in real time via a `rodio` Source wrapper
 - **Draggable nodes on the spectrum** — click to add a band, drag horizontally for frequency, drag vertically for gain, right-click to remove
-- **EQ overlay modes** — Curve (response curve drawn over spectrum), Apply (bar heights reflect EQ gain), Both
+- **EQ overlay modes** — Curve (response curve drawn over spectrum), Apply (bar heights reflect EQ gain, in dB like the bars), Both. With Normalized level on, the top leaves room for the EQ's largest boost so a boosted band reaches it rather than running off it. Not in bit-perfect, where the EQ is not in the sound
 
 ## EQ Presets
 

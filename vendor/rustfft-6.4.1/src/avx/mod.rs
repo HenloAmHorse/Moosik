@@ -320,4 +320,5 @@ pub use self::avx_mixed_radix::{
     MixedRadix9xnAvx,
 };
 pub use self::avx_raders::RadersAvx2;
+pub use self::avx_mixed_radix::ExactGpuWords32768;
 use self::avx_vector::AvxVector256;

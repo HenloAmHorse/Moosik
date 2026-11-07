@@ -1582,3 +1582,67 @@ mod unit_tests {
         16
     );
 }
+
+/// Moosik 1.6.1: every stored coefficient of the f32 inverse (or forward)
+/// 32768-point AVX plan, `MixedRadix8xn(MixedRadix8xn(Butterfly512))`, as
+/// f32 bits, for the exact GPU lane: the root and inner radix-8 twiddles
+/// (`m · 7` each, element `c · 7 + r − 1`), the rotation mask and the leaf's.
+/// Built with the planner's own constructors; read-only, no FFT body
+/// changes. `None` without AVX and FMA.
+pub struct ExactGpuWords32768 {
+    pub root: Vec<[u32; 2]>,
+    pub inner: Vec<[u32; 2]>,
+    pub rotation: [u32; 2],
+    pub leaf: super::avx32_butterflies::ExactGpuLeafWords,
+}
+
+impl ExactGpuWords32768 {
+    pub fn new(direction: FftDirection) -> Option<Self> {
+        if !(is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma")) {
+            return None;
+        }
+        let leaf = super::avx32_butterflies::ExactGpuLeafWords::new(direction)?;
+        let original_leaf: Arc<dyn Fft<f32>> =
+            Arc::new(super::avx32_butterflies::Butterfly512Avx::<f32>::new(direction).ok()?);
+        let child = MixedRadix8xnAvx::<f32, f32>::new(Arc::clone(&original_leaf)).ok()?;
+        let top_child: Arc<dyn Fft<f32>> = Arc::new(MixedRadix8xnAvx::<f32, f32>::new(original_leaf).ok()?);
+        let root = MixedRadix8xnAvx::<f32, f32>::new(top_child).ok()?;
+        if root.len() != 32768 || child.len() != 4096 {
+            return None;
+        }
+        Some(unsafe { Self::with_avx(&root, &child, leaf) })
+    }
+
+    #[target_feature(enable = "avx", enable = "fma")]
+    unsafe fn with_avx(
+        root: &MixedRadix8xnAvx<f32, f32>,
+        child: &MixedRadix8xnAvx<f32, f32>,
+        leaf: super::avx32_butterflies::ExactGpuLeafWords,
+    ) -> Self {
+        let flatten = |tw: &[<f32 as AvxNum>::VectorType], m: usize| {
+            assert_eq!(tw.len(), (m / 4) * 7);
+            let mut out = vec![[0u32; 2]; m * 7];
+            for c in 0..m {
+                for r in 1..8 {
+                    let v = tw[(c / 4) * 7 + r - 1];
+                    let mut bits = [0u32; 8];
+                    std::arch::x86_64::_mm256_storeu_ps(bits.as_mut_ptr().cast(), v);
+                    out[c * 7 + r - 1].copy_from_slice(&bits[(c % 4) * 2..(c % 4) * 2 + 2]);
+                }
+            }
+            out
+        };
+        let masks = root.twiddles_butterfly4.moosik_mask_bits();
+        assert_eq!(masks, child.twiddles_butterfly4.moosik_mask_bits());
+        for lane in 1..4 {
+            assert_eq!(&masks[..2], &masks[lane * 2..lane * 2 + 2]);
+        }
+        assert_eq!(&masks[..2], &leaf.phase2[12..14]);
+        Self {
+            root: flatten(&root.common_data.twiddles, 4096),
+            inner: flatten(&child.common_data.twiddles, 512),
+            rotation: [masks[0], masks[1]],
+            leaf,
+        }
+    }
+}

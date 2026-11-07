@@ -453,10 +453,14 @@ enum Fetched {
 pub struct LyricsWindow {
     /// The 1.6.0 page colour (set by the app each frame); None is the classic look.
     pub page_fill: Option<egui::Color32>,
+    /// The track last looked up unasked, so it is looked up once.
+    auto_tried: Option<PathBuf>,
     /// Private: every show/hide goes through [`LyricsWindow::set_open`], so
     /// the main toolbar cannot hide the window without its translation
     /// lifecycle.
     open: bool,
+    /// Bring the open window forward on its next frame.
+    raise: bool,
     /// Track the loaded sheet belongs to, so a track change reloads.
     loaded_for: Option<PathBuf>,
     lyrics: Option<Lyrics>,
@@ -627,7 +631,9 @@ impl Default for LyricsWindow {
         Self {
             page_fill: None,
             open: false,
+            raise: false,
             loaded_for: None,
+            auto_tried: None,
             lyrics: None,
             status: String::new(),
             fetch_rx: None,
@@ -685,12 +691,25 @@ impl LyricsWindow {
         !self.font_dragging
     }
 
+    /// Look `track` up online, once, if it has no lyrics of its own and no
+    /// lookup is under way ("Find lyrics automatically"). Found lyrics show
+    /// at once and are saved only if the user saves them.
+    pub fn find_if_missing(&mut self, track: TrackRef) {
+        if self.loaded_for.as_deref() != Some(track.path) {
+            self.load_local(&track);
+        }
+        if self.lyrics.is_none() && !self.busy() && self.auto_tried.as_deref() != Some(track.path) {
+            self.auto_tried = Some(track.path.to_path_buf());
+            self.start_fetch(&track);
+        }
+    }
+
     fn busy(&self) -> bool { self.fetch_rx.is_some() || self.search_rx.is_some() || self.translation.is_busy() }
 
     /// Load whatever is already on disk or in the tags for this track.
     ///
-    /// Never fetches. An automatic network call on every track change is a
-    /// surprise the user did not ask for, so lookup is always a button.
+    /// Never fetches: a lookup is the button's, or `find_if_missing`'s when
+    /// the user has left "Find lyrics automatically" on.
     fn load_local(&mut self, track: &TrackRef) {
         self.cancel_translation();
         self.translation.clear_sheet();
@@ -790,7 +809,7 @@ impl LyricsWindow {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut h = hit;
-            let msg = match super::netease::fill_lyrics(&mut h) {
+            let msg = match super::fill(&mut h) {
                 Ok(()) if h.best_text().is_some() => Fetched::Hit(Box::new(h)),
                 Ok(()) => Fetched::Nothing,
                 Err(e) => Fetched::Failed(e),
@@ -1065,6 +1084,7 @@ impl LyricsWindow {
 
         ctx.show_viewport_immediate(vp_id, vp, |vctx, _class| {
             if vctx.input(|i| i.viewport().close_requested()) { close = true; return; }
+            if std::mem::take(&mut self.raise) { vctx.send_viewport_cmd(egui::ViewportCommand::Focus); }
             // A network call in flight has no other reason to redraw.
             if self.busy() { vctx.request_repaint_after(Duration::from_millis(100)); }
 
@@ -1115,11 +1135,36 @@ impl LyricsWindow {
             self.load_local(&track);
         }
         self.poll();
+        if self.lyrics.is_none() {
+            self.inline_find(ui, &track);
+            return None;
+        }
         // Off lets the lyrics be scrolled freely.
         let unfollowed = ui.horizontal(|ui| {
             let r = ui.checkbox(&mut self.auto_scroll, "Follow")
                 .on_hover_text("Keep the current line centred");
-            (r.changed() && !self.auto_scroll).then_some(r.rect)
+            let unfollowed = (r.changed() && !self.auto_scroll).then_some(r.rect);
+            if self.has_readings() && !self.editing && !self.romaji_editing {
+                ui.separator();
+                self.script_picker(ui);
+            }
+            // Wrong words or timing, another take, a translation: the lyrics window.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(crate::shell::plain(self.page_fill, "🎤 Lyrics…"))
+                    .on_hover_text("Fix, time, replace or save these lyrics in the lyrics window")
+                    .clicked()
+                {
+                    self.bring_up();
+                }
+                if ui.add_enabled(!self.translation.is_editing(), egui::Button::new("Translate…"))
+                    .on_hover_text("Find a translation or translate these lyrics, in the lyrics window")
+                    .clicked()
+                {
+                    self.bring_up();
+                    if !self.translation.is_open() { self.open_translation(); }
+                }
+            });
+            unfollowed
         }).inner;
         ui.add_space(4.0);
         // Larger than in the lyrics window: here the lyrics are the page.
@@ -1128,6 +1173,59 @@ impl LyricsWindow {
         self.viewer(ui, pos);
         self.font_size = saved;
         unfollowed
+    }
+
+    /// Listen without lyrics: looking for them, or Find lyrics and what the
+    /// last look said; the lyrics window has Search, Paste and the rest.
+    fn inline_find(&mut self, ui: &mut egui::Ui, track: &TrackRef) {
+        let faint = pal::text_faint(ui.visuals().dark_mode);
+        let looking = self.fetch_rx.is_some();
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.3).max(0.0));
+            if looking {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+                ui.add(egui::Spinner::new().size(22.0));
+                ui.add_space(6.0);
+                ui.label(RichText::new("Looking for lyrics…").size(15.0).color(faint));
+                return;
+            }
+            ui.label(RichText::new("No lyrics").size(20.0).color(faint));
+            ui.add_space(10.0);
+            let idle = !self.busy() && !self.translation.is_editing();
+            if ui.add_enabled(idle, egui::Button::new(RichText::new(crate::shell::plain(self.page_fill, "🔍 Find lyrics")).size(16.0)))
+                .on_hover_text("Look this song up online: LRCLIB, NetEase, then QQ Music")
+                .clicked()
+            {
+                self.start_fetch(track);
+            }
+            ui.add_space(6.0);
+            if ui.small_button("Search, paste or write them…").on_hover_text("The lyrics window").clicked() {
+                self.bring_up();
+            }
+            // What the last look found, if it found nothing.
+            if self.status != "No lyrics found for this track." && !self.status.is_empty() {
+                ui.add_space(10.0);
+                ui.label(RichText::new(&self.status).size(12.0).color(faint));
+            }
+        });
+    }
+
+    /// Original, furigana, romanization or both; for Both in Japanese,
+    /// romaji under lines or words. In the window's toolbar and on Listen.
+    fn script_picker(&mut self, ui: &mut egui::Ui) {
+        for (s, label) in [(Script::Original, "Original"), (Script::Furigana, "Furigana"),
+                           (Script::Romaji, "Romanization"), (Script::Both, "Both")] {
+            if s == Script::Furigana && !self.is_japanese() { continue; }
+            ui.selectable_value(&mut self.script, s, label);
+        }
+        if self.script == Script::Both && self.is_japanese() {
+            ui.label(RichText::new("·").color(pal::text_faint(ui.visuals().dark_mode)));
+            ui.selectable_value(&mut self.per_word, false, "Lines")
+                .on_hover_text("Romaji under each line");
+            ui.selectable_value(&mut self.per_word, true, "Words")
+                .on_hover_text("Romaji under each word, so you can see which \
+                                sound belongs to which word");
+        }
     }
 
     /// The lines around the current one, for drawing over another view (the
@@ -1171,6 +1269,12 @@ impl LyricsWindow {
     pub fn set_open(&mut self, open: bool) {
         if self.open && !open { self.abandon_translation(); }
         self.open = open;
+    }
+
+    /// Open the window, or bring it forward if it is open behind Moosik.
+    fn bring_up(&mut self) {
+        self.raise = self.open;
+        self.set_open(true);
     }
 
     fn poll(&mut self) {
@@ -1220,7 +1324,8 @@ impl LyricsWindow {
             let idle = !self.busy() && !translation_editing;
             if ui.add_enabled(idle && !self.editing && !self.romaji_editing, egui::Button::new(crate::shell::plain(self.page_fill, "🔍 Find lyrics")))
                 .on_hover_text(
-                    "Look this track up on LRCLIB.\n\nTries the exact tags first, then \
+                    "Look this track up on LRCLIB, NetEase, then QQ Music, taking timed \
+                     lyrics over untimed ones.\n\nTries the exact tags first, then \
                      progressively looser queries with the decoration stripped — brackets, \
                      feat. credits, full-width text — matching on duration throughout.")
                 .clicked()
@@ -1228,7 +1333,7 @@ impl LyricsWindow {
                 self.start_fetch(track);
             }
             if ui.add_enabled(idle, egui::Button::new("Search…"))
-                .on_hover_text("Search LRCLIB by hand and pick the take you want.")
+                .on_hover_text("Search LRCLIB, NetEase and QQ Music by hand and pick the take you want.")
                 .clicked()
             {
                 self.search_open = !self.search_open;
@@ -1281,19 +1386,7 @@ impl LyricsWindow {
 
             if self.has_readings() && !self.editing && !self.romaji_editing {
                 ui.separator();
-                for (s, label) in [(Script::Original, "Original"), (Script::Furigana, "Furigana"),
-                                   (Script::Romaji, "Romanization"), (Script::Both, "Both")] {
-                    if s == Script::Furigana && !self.is_japanese() { continue; }
-                    ui.selectable_value(&mut self.script, s, label);
-                }
-                if self.script == Script::Both && self.is_japanese() {
-                    ui.label(RichText::new("·").color(pal::text_faint(ui.visuals().dark_mode)));
-                    ui.selectable_value(&mut self.per_word, false, "Lines")
-                        .on_hover_text("Romaji under each line");
-                    ui.selectable_value(&mut self.per_word, true, "Words")
-                        .on_hover_text("Romaji under each word, so you can see which \
-                                        sound belongs to which word");
-                }
+                self.script_picker(ui);
                 if ui.add_enabled(!translation_editing, egui::Button::new("✎")).on_hover_text(
                     "Correct the romanization.\n\nSupplied or corrected readings take priority. \
                      Japanese dictionary and Korean standard-pronunciation guesses are italic. \
@@ -1467,7 +1560,7 @@ impl LyricsWindow {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new(
                     "No lyrics.\n\n\
-                     “Find lyrics” looks this track up on LRCLIB.\n\
+                     “Find lyrics” looks this track up on LRCLIB, NetEase and QQ Music.\n\
                      “Paste…” takes them from anywhere else and can time them here.")
                     .size(13.0).color(pal::text_faint(dark)));
             });

@@ -88,6 +88,10 @@ pub fn fill_lyrics(h: &mut Hit) -> Result<(), String> {
     check_code(&v)?;
     let text = v.pointer("/lrc/lyric").and_then(|x| x.as_str()).unwrap_or("");
     if text.trim().is_empty() { return Ok(()); }
+    if super::matching::instrumental_note(text) {
+        h.instrumental = true;
+        return Ok(());
+    }
     let sheet = |key: &str| v.pointer(key).and_then(|x| x.as_str())
         .filter(|r| !r.trim().is_empty()).map(str::to_string);
     h.romaji = sheet("/romalrc/lyric");
@@ -125,7 +129,8 @@ pub fn find_translation(
         || cancel.load(std::sync::atomic::Ordering::Acquire), search, fill_lyrics)
 }
 
-fn find_with(
+/// Also QQ Music's ladder: same shape of service, same request budget.
+pub(super) fn find_with(
     artist: &str, title: &str, duration: Option<Duration>, translation_only: bool,
     cancelled: impl Fn() -> bool,
     mut search: impl FnMut(&str) -> Result<Vec<Hit>, String>,

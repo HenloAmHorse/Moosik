@@ -121,7 +121,10 @@ pub fn import_extensions() -> Vec<&'static str> {
 /// Whether the local-audio importer should offer to probe this path.
 /// Case-insensitive and allocation-free; no file or directory is opened.
 pub fn is_importable(path: &Path) -> bool {
-    format_for(path).is_some_and(|format| format.importable)
+    // "<song>.video.webm" (or .mp4, .mkv) is a music video kept beside its
+    // song (video.rs), not a song.
+    let video = path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.to_ascii_lowercase().ends_with(".video"));
+    !video && format_for(path).is_some_and(|format| format.importable)
 }
 
 /// Extension-based file/container label, never a measured codec verdict.
@@ -188,5 +191,14 @@ mod tests {
         }
         assert_eq!(container_label(Path::new("song.alac")), "Unknown");
         assert_eq!(container_label(Path::new("song.OPUS")), "Ogg / Opus");
+    }
+
+    #[test]
+    fn a_music_video_kept_beside_its_song_is_not_a_song() {
+        for path in ["Artist - Song [id].video.webm", "song.VIDEO.mp4", "song.video.mkv"] {
+            assert!(!is_importable(Path::new(path)), "{path}");
+        }
+        assert!(is_importable(Path::new("Artist - Song [id].webm")));
+        assert!(is_importable(Path::new("my video.mp4")), "only the kept-beside name");
     }
 }

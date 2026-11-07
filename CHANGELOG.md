@@ -2,6 +2,119 @@
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-11-08
+
+YouTube and YouTube Music as a source, with music videos and playback while
+the song downloads; a third lyrics source; spectrum bars drawn to each song's
+loudness; and an experimental exact NVIDIA assist for the superlet
+pre-process. No change to the bit-perfect playback contract.
+
+- **Experimental: exact NVIDIA assist for the Pre-process** (off; Pre-process
+  settings → GPU). On an NVIDIA card of compute capability 7.5 (Turing: the
+  GeForce RTX 20 and GTX 16 series, among others; tested on an RTX 2060
+  SUPER), the 32768-point blocks of a stereo superlet analysis are computed
+  on the card while the cores do the rest, with the same result to the last
+  bit; about 15–18 % less time in the whole-track examples measured on the
+  owner's machine. Tracks longer than about six minutes, and anything else
+  the card cannot do, stay on the CPU. See
+  [Exact GPU assist](docs/ASLT_EXACT_GPU.md).
+
+- **Library → Sources → YouTube.** Search YouTube or YouTube Music's songs
+  and Play, Queue or Download a result, with thumbnails, progress and
+  Cancel. In a narrow window a Queue / YouTube switch replaces the sidebar
+  entry. A pasted video link goes straight to that video; a pasted playlist
+  or YouTube Music album link lists its songs, and Queue all adds them in
+  order. See
+  [YouTube](docs/YOUTUBE.md).
+- **Sign in**, one button at the top of the YouTube view: Google's sign-in
+  in a window of Chrome, Brave, Edge, Vivaldi or Chromium with Moosik's own
+  profile, which closes once you are in (or a cookies.txt, or a browser
+  picked in Settings), for
+  age-restricted, members-only and private videos and your own playlists;
+  Liked videos, Liked music and Watch later are a click away.
+- **Optional components:** yt-dlp and Deno (the JavaScript runtime yt-dlp
+  needs for YouTube), downloaded only on request from their latest GitHub
+  releases and checked against the checksums those releases publish; one
+  button updates them. They run hidden, with no console window.
+- **Audio as delivered** (Opus or AAC, lossy), played from a 1 GB cache that
+  never drops what is on the playlist; downloads go to `Music\Moosik` or a
+  folder you choose. Moosik's own record supplies title and artist for these
+  untagged files, and the Info window shows the source link.
+- **Music videos.** Audio / Audio + video chooses what Play, Queue and
+  Download bring. The video (VP9, up to 720p by default, decoded by
+  Windows) plays silently behind Listen and the spectrum, following the
+  song; the audio plays first and the video follows, fading in, without
+  black bars. **Watch** shows it whole with the lyrics as subtitles; the
+  bars step aside while you watch, and a double click goes full screen.
+  **Get video** fetches it for a YouTube song that has none. Settings
+  choose the size (480p to 2160p), brightness, and behind Listen and/or the
+  spectrum. Decoded only while it shows.
+- **Covers** from the video's thumbnail; **titles** like "Artist - Song
+  (Official Video)" become song and artist.
+- **Played before, plays at once:** a cached result skips yt-dlp, and the
+  results say *ready*. Recent searches sit under an empty search box.
+- Videos decode on the graphics card where it can (Moosik in Listen with
+  a 720p video: 6.3% of one core), on the processor otherwise.
+- **Faster starts:** yt-dlp is installed as its one-folder build, about half
+  a second quicker per search and per fetch.
+- **Settings → YouTube:** downloads folder, cache size and Clear, Remove the
+  components.
+- **Readings on Listen:** Japanese and Korean lyrics on Listen offer
+  Original, Furigana, Romanization and Both beside Follow, as the lyrics
+  window does.
+- **The 30B local translation model starts with 4 GiB of free RAM** (was
+  19 GiB, or 16 GiB on the lower-RAM route). Its weights stay in their file
+  and are read as needed, and Moosik holds it to half of the RAM free when it
+  starts (2 GiB at least): slower with less, but it runs, on the graphics
+  card or the CPU alone. A 16-row sheet held to 4 GiB took about 60 s on
+  the graphics card and 88 s on the CPU only; see
+  [Features](docs/FEATURES.md).
+- **Plays while it downloads:** a song starts once enough of it is in
+  and the rest arrives while it plays; its music video comes in the same
+  run of yt-dlp (one look at YouTube instead of two) and shows while it
+  arrives. The spectrum analyses the song once its audio is all in.
+- **The video's size beside Audio + video:** 480p, 720p, 1080p, 1440p (2K)
+  or 2160p (4K). A video larger than the screen is scaled to it on the
+  graphics card; a kept video smaller than the size now chosen is fetched
+  again.
+- **Lyrics found as the song starts,** for every song without its own
+  (Settings → Track → Find lyrics automatically, on by default), and
+  **Find lyrics** on Listen itself.
+- **Updating yt-dlp and Deno on a slow line** no longer stops with
+  "timeout: receive response" (the limit meant for waiting on an answer
+  bounded the whole download); YouTube's pictures and the lyric lookups
+  reuse their connections.
+- **A third lyrics source, QQ Music,** after LRCLIB and NetEase: on twenty
+  Taiwanese indie and Vocaloid songs it had timed lyrics for four that
+  neither had (草東沒有派對, 告五人, 落日飛車, 康士坦的變化球). The lookup now
+  takes timed lyrics wherever they are and keeps untimed words only when no
+  source has the song timed; Traditional and Simplified Chinese names match
+  each other; NetEase's and QQ Music's "pure music" note for an instrumental
+  is no longer shown as its lyrics.
+- **Lyrics… and Translate… on Listen** beside Follow, with lyrics showing:
+  fix, time or replace them, or translate them, in the lyrics window (which
+  comes forward if it is behind Moosik).
+- **Normalized level** (Analyze, beside Loudness; on): every song's bars are
+  drawn as tall as a song mastered at −10 LUFS, from its loudness measured as
+  it starts (0.2–0.5 s of one core), so a quiet song or an off-vocal mix no
+  longer draws short bars; loud masters move a dB or two. The floor, and
+  everything above a file's Nyquist, stays dark. Display only.
+- **The EQ drawn on the bars** moves them by its gain in dB: a +6 dB band
+  used to show some +40 dB higher and pin to the top. With Normalized level
+  the top leaves room for the EQ's largest boost. Not in bit-perfect, where
+  the EQ is not in the sound.
+- **Silly extras:** lo-fi rain, and you know the rules.
+- **Windows N:** Media Foundation, which decodes the videos, is loaded only
+  when a video is shown, so an edition without the Media Feature Pack still
+  starts and plays; its videos say the pack is missing.
+- **Notices:** no package was added to the Windows build; the 1.6.0 notices
+  were carried forward after a check that the locked graph is unchanged (302
+  packages). yt-dlp and Deno are separate programs downloaded on request, not
+  bundled.
+- **Settings:** 1.6.1 writes new settings (YouTube, video, lyrics, spectrum).
+  An older Moosik ignores them, but back up `~/.moosik` before going back to
+  one.
+
 ## [1.6.0] - 2026-10-27
 
 A redesigned interface, live stereo and harmony panels, and chords from a

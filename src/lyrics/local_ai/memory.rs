@@ -139,6 +139,16 @@ pub fn startup_text(need: Need, h: Headroom) -> String {
     }
 }
 
+/// The working-set ceiling for a run whose weights are mapped from the file
+/// (1.6.1): half of what is available now, so the rest of the computer keeps
+/// the other half, and never more than leaves the reserve; `floor` at least.
+/// Held to it, the runtime reads the weights back as they are needed instead
+/// of needing them all in RAM. (Everything above the reserve took a 32 GB
+/// computer to the edge with a build running beside it.)
+pub fn paged_cap(floor: u64) -> u64 {
+    read().phys.map_or(floor, |p| (p / 2).min(p.saturating_sub(RESERVE)).max(floor))
+}
+
 /// Whether a run needing `need` may start now. The error is the sentence for
 /// the panel.
 pub fn admit(need: Need) -> Result<(), String> {

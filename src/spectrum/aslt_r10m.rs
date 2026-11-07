@@ -102,7 +102,12 @@ fn r10_bench() {
     let part = |_: usize, _: f32| part_stamps.lock().unwrap().push(t0.elapsed().as_secs_f64());
     seams.bar_progress = Some(&part);
     r10t::reset();
-    r10t::CENSUS.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Census timers off when timing the exact GPU lane, so the two arms pay
+    // the same (none): `MOOSIK_R10_CENSUS=0`.
+    r10t::CENSUS.store(std::env::var("MOOSIK_R10_CENSUS").ok().as_deref() != Some("0"), std::sync::atomic::Ordering::SeqCst);
+    // The exact GPU lane (1.6.1): `MOOSIK_R10_EXACT=1`.
+    let exact = std::env::var("MOOSIK_R10_EXACT").ok().as_deref() == Some("1");
+    set_exact_gpu(exact);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(workers).build().unwrap();
     let mem0 = probe::mem();
     let (cpu0, t1) = (probe::cpu_s(), std::time::Instant::now());
@@ -113,6 +118,7 @@ fn r10_bench() {
     let wall = t1.elapsed().as_secs_f64();
     let cpu = probe::cpu_s() - cpu0;
     let mem1 = probe::mem();
+    set_exact_gpu(false);
     let done_count = stamps.lock().unwrap().len();
     let mut st = stamps.into_inner().unwrap();
     st.extend(part_stamps.into_inner().unwrap());
@@ -167,9 +173,10 @@ fn r10_bench() {
          \"wall_s\":{wall},\"cpu_s\":{cpu},\"rtf\":{},\"commit_before\":{},\"peak_commit\":{},\"peak_ws\":{},\
          \"share_peak_bytes\":{},\"shared_members\":{},\"share_refused\":{},\"share_subbatches\":{},\"share_batches\":{},\
          \"callbacks\":{},\"progress_events\":{},\"max_progress_gap_s\":{max_gap},\
-         \"hash_mix\":\"{}\",\"hash_l\":\"{}\",\"hash_r\":\"{}\"}}",
+         \"hash_mix\":\"{}\",\"hash_l\":\"{}\",\"hash_r\":\"{}\",\"exact\":{exact},\"exact_members\":{},\"exact_banks\":{},\"exact_blocks\":{},\"exact_failures\":{}}}",
         wall / secs, mem0.0, mem1.1, mem1.3, w.share_peak_bytes, w.shared_members, w.share_refused_members,
         w.share_subbatches, w.share_batches, done_count, st.len(), hashes[0], hashes[1], hashes[2],
+        w.exact_gpu_members, w.exact_gpu_banks, w.exact_gpu_blocks, w.exact_gpu_failures,
     );
     // Stage census.
     let mut census = format!(",\"hop\":{hop},\"f_lo\":20,\"f_hi\":{a_max},\"process_cpu_s\":{cpu}");
@@ -182,6 +189,14 @@ fn r10_bench() {
         let c = a.load(std::sync::atomic::Ordering::Relaxed);
         if c > 0 { census.push_str(&format!(",\"inv_2^{lg}\":{c}")); }
     }
+    // The shared-block route by size, and at 2^15 by taps (1.6.1 ceiling).
+    for (lg, r) in r10t::BLK.lock().unwrap().iter().enumerate().filter(|(_, r)| r[0] > 0) {
+        census.push_str(&format!(",\"blk_2^{lg}\":[{},{:.4},{},{:.4}]", r[0], r[1] as f64 * 1e-9, r[2], r[3] as f64 * 1e-9));
+    }
+    let by_k: Vec<String> = r10t::BY_K.lock().unwrap().iter()
+        .map(|(k, r)| format!("\"{k}\":[{},{:.4},{},{:.4}]", r[0], r[1] as f64 * 1e-9, r[2], r[3] as f64 * 1e-9))
+        .collect();
+    census.push_str(&format!(",\"blk_by_k_2^15\":{{{}}}", by_k.join(",")));
     let line = format!("{}{census}{}}}", &line[..line.len() - 1], compare);
     println!("R10RUN {line}");
     let mut j = std::fs::OpenOptions::new().create(true).append(true).open(out.join("runs.jsonl")).unwrap();
@@ -229,6 +244,11 @@ fn r10_e2e() {
     let cfg = AsltConfig { q_ratio: 2.0, max_window_s: 0.25, n_wavelets: 9, spread: 0.5,
                            scale: super::super::freq_scale::FreqScale::Blend(0.5) };
     r10t::reset();
+    // The exact GPU lane (1.6.1): `MOOSIK_R10_EXACT=1`; the cache this run
+    // publishes is named on stderr, to compare its bytes across arms.
+    let exact = std::env::var("MOOSIK_R10_EXACT").ok().as_deref() == Some("1");
+    set_exact_gpu(exact);
+    eprintln!("R10CACHE exact={exact} {}", cache.display());
     let progress = Arc::new(AtomicUsize::new(0));
     let abort = Arc::new(AtomicBool::new(false));
     let eta = Arc::new(AtomicUsize::new(usize::MAX));
@@ -243,6 +263,7 @@ fn r10_e2e() {
     let wall = t0.elapsed().as_secs_f64();
     let cpu = probe::cpu_s() - cpu0;
     let mem1 = probe::mem();
+    set_exact_gpu(false);
     let super::super::PreMessage::Done { frames, stereo, frame_rate, .. } = msg else { panic!("pre-process did not finish") };
     let stereo = stereo.expect("joint run returned no channels");
     let n = frames.len();
@@ -290,4 +311,81 @@ fn r10_e2e() {
     let _ = std::fs::remove_file(&cache);
     let _ = std::fs::remove_file(&sidecar);
     let _ = std::fs::remove_dir(&dir);
+}
+
+/// 1.6.1 exact-GPU planning census (no transforms): per group, the bars whose
+/// members in the 2^15 pass all take the shared-block route, grouped by their
+/// kernel-length sequence there; how many fall in full 32-bar chunks of one
+/// sequence, and those members' share of that pass's members. `MOOSIK_R11_SR`
+/// (48000), `MOOSIK_R11_BARS` (1024), `MOOSIK_R11_SECS` (190).
+#[test]
+#[ignore]
+fn r11_chunk_census() {
+    let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    let sr = env("MOOSIK_R11_SR", 48_000.0) as u32;
+    let n_bars = env("MOOSIK_R11_BARS", 1024.0) as usize;
+    let secs = env("MOOSIK_R11_SECS", 190.0);
+    let cfg = AsltConfig { q_ratio: 2.0, max_window_s: 0.25, n_wavelets: 9, spread: 0.5,
+                           scale: super::super::freq_scale::FreqScale::Blend(0.5) };
+    let hop = hop_for_fps(sr, 180.0);
+    let srf = sr as f32;
+    let (min_freq, max_freq) = (20.0f32, (srf / 2.0).min(24_000.0));
+    let frames = frame_count((secs * sr as f64) as usize, hop);
+    let n_sig = (secs * sr as f64) as usize;
+    let mut groups: std::collections::BTreeMap<usize, Vec<(usize, f32, f32)>> = Default::default();
+    for bar in 0..n_bars {
+        let f = cfg.scale.bar_center(bar, n_bars, min_freq, max_freq);
+        if f >= srf * 0.5 { continue; }
+        let q = effective_q_at(f, cfg.scale.grid_q_at(bar, n_bars, min_freq, max_freq), &cfg);
+        let max_n = superlet_cycles(q, &cfg).into_iter().map(|c| morlet_taps(f, c, srf))
+            .filter(|&k| fft_is_cheaper(k, hop)).map(fft_block_len).filter(|&n| n > 0).max();
+        if let Some(n) = max_n { groups.entry(n).or_default().push((bar, f, q)); }
+    }
+    let n = 32_768usize;
+    for (gn, bars) in groups.iter().rev() {
+        // As `analyze_routed` admits them: largest first while the joint
+        // block sets fit the shared budget.
+        let chosen: Vec<usize> = {
+            let mut w: Vec<usize> = bars.iter().flat_map(|&(_, f, q)| superlet_cycles(q, &cfg).into_iter()
+                .map(move |c| morlet_taps(f, c, srf)).filter(|&k| fft_is_cheaper(k, hop)).map(fft_block_len)).collect();
+            w.sort_unstable_by(|a, b| b.cmp(a));
+            w.dedup();
+            let cost = 2 * 2 * n_sig * std::mem::size_of::<C32>();
+            let budget = Seams::production().shared_budget;
+            let mut spent = 0usize;
+            w.into_iter().take_while(|_| { let ok = spent + cost <= budget; if ok { spent += cost; } ok }).collect()
+        };
+        let Some(plan) = plan_size_sequential(bars, &chosen, hop, &cfg, srf) else {
+            println!("R11 group {gn}: shared route (no size-sequential plan)");
+            continue;
+        };
+        let mut seqs: std::collections::BTreeMap<Vec<usize>, usize> = Default::default();
+        let (mut members, mut shared_members, mut excluded_bars) = (0usize, 0usize, 0usize);
+        for p in &plan {
+            let ks: Vec<(usize, bool)> = p.cycles.iter().zip(&p.passes).filter(|&(_, &k)| k == n).map(|(&c, _)| {
+                let k = morlet_taps(p.freq, c, srf);
+                let ok = fft_block_len(k) == n && fft_is_cheaper(k, hop) && own_route_applies(k, n_sig, hop, frames);
+                (k, ok)
+            }).collect();
+            if ks.is_empty() { continue; }
+            members += ks.len();
+            shared_members += ks.iter().filter(|x| x.1).count();
+            if ks.iter().all(|x| x.1) {
+                *seqs.entry(ks.iter().map(|x| x.0).collect()).or_default() += 1;
+            } else {
+                excluded_bars += 1;
+            }
+        }
+        if members == 0 { continue; }
+        let chunked: usize = seqs.iter().map(|(s, &c)| (c / 32) * 32 * s.len()).sum();
+        let full_m = |k: usize| (n - k + 1) / hop;
+        let mut top: Vec<(&Vec<usize>, &usize)> = seqs.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        println!("R11 sr {sr} bars {n_bars} hop {hop} group {gn}: pass 2^15 members {members}, shared-block {shared_members}, \
+                  bars with a non-shared member {excluded_bars}, sequences {}, members in full 32-bar chunks {chunked} ({:.1}%)",
+                 seqs.len(), 100.0 * chunked as f64 / members as f64);
+        for (s, c) in top.iter().take(8) {
+            println!("R11    {c:4} bars  K {s:?}  M~{:?}", s.iter().map(|&k| full_m(k)).collect::<Vec<_>>());
+        }
+    }
 }

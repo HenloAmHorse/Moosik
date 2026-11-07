@@ -1,6 +1,7 @@
 //! Real encoded containers, no device, subprocess, owner cache or network.
 use super::*;
 use rodio::Source;
+use std::fs::File;
 use symphonia::core::io::Monitor;
 
 fn fixture(name: &str) -> PathBuf {

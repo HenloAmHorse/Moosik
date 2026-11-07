@@ -16,6 +16,7 @@ pub mod local_ai;
 pub mod lrclib;
 pub mod matching;
 pub mod netease;
+pub mod qq;
 pub mod korean;
 pub mod romaji;
 pub mod translation;
@@ -31,12 +32,14 @@ type SourceFind =
     fn(&str, &str, &str, Option<std::time::Duration>) -> Result<Option<Hit>, String>;
 
 /// Look a track up across every source, in order, stopping at the first
-/// confident match.
+/// confident match with timestamps. Words without them are kept only in case
+/// no source has the song timed.
 ///
 /// LRCLIB first: it is purpose-built for this, needs no key, and its records
 /// are contributed by people syncing lyrics deliberately. NetEase second, where
 /// it earns its place — for a Japanese or Vocaloid library LRCLIB is mostly
-/// empty and NetEase mostly is not.
+/// empty and NetEase mostly is not. QQ Music third, for Taiwanese and Chinese
+/// releases neither has.
 ///
 /// A source that errors does not stop the ladder. One service being down or
 /// unreachable is not a reason to report "no lyrics" when another might have
@@ -44,23 +47,37 @@ type SourceFind =
 pub fn find_anywhere(
     artist: &str, title: &str, album: &str, duration: Option<std::time::Duration>,
 ) -> Result<Option<Hit>, String> {
-    let sources: [(&str, SourceFind); 2] =
-        [(lrclib::NAME, lrclib::find), (netease::NAME, netease::find)];
+    find_in(&[(lrclib::NAME, lrclib::find), (netease::NAME, netease::find), (qq::NAME, qq::find)],
+            artist, title, album, duration)
+}
 
+fn find_in(
+    sources: &[(&str, SourceFind)],
+    artist: &str, title: &str, album: &str, duration: Option<std::time::Duration>,
+) -> Result<Option<Hit>, String> {
+    let timed = |h: &Hit| h.synced.as_deref().is_some_and(|t| parse(t, LyricSource::Online).is_synced());
+    let mut untimed = None;
     let mut errors: Vec<String> = Vec::new();
     for (name, f) in sources {
         match f(artist, title, album, duration) {
-            Ok(Some(h)) => return Ok(Some(h)),
+            Ok(Some(h)) if timed(&h) => return Ok(Some(h)),
+            Ok(Some(h)) => { untimed.get_or_insert(h); }
             Ok(None) => {}
             Err(e) => errors.push(format!("{name}: {e}")),
         }
     }
+    if untimed.is_some() { return Ok(untimed); }
     // "Not found" is only honest when every source actually answered. If one
     // was rate-limited or unreachable, saying the track has no lyrics sends the
     // user off to transcribe something a service would have handed over a
     // minute later — so report what went wrong instead.
     if !errors.is_empty() { return Err(errors.join("; ")); }
     Ok(None)
+}
+
+/// Fetch the words of a row a source listed without them.
+pub fn fill(h: &mut Hit) -> Result<(), String> {
+    if h.source == qq::NAME { qq::fill_lyrics(h) } else { netease::fill_lyrics(h) }
 }
 
 /// Every source's free-text search, pooled, for the manual picker.
@@ -76,13 +93,13 @@ pub fn find_anywhere(
 pub fn search_anywhere(query: &str) -> Result<(Vec<Hit>, Option<String>), String> {
     let mut out = Vec::new();
     let mut errors = Vec::new();
-    match lrclib::search(query) {
-        Ok(h) => out.extend(h),
-        Err(e) => errors.push(format!("{}: {e}", lrclib::NAME)),
-    }
-    match netease::search(query) {
-        Ok(h) => out.extend(h),
-        Err(e) => errors.push(format!("{}: {e}", netease::NAME)),
+    let sources: [(&str, fn(&str) -> Result<Vec<Hit>, String>); 3] =
+        [(lrclib::NAME, lrclib::search), (netease::NAME, netease::search), (qq::NAME, qq::search)];
+    for (name, search) in sources {
+        match search(query) {
+            Ok(h) => out.extend(h),
+            Err(e) => errors.push(format!("{name}: {e}")),
+        }
     }
     if out.is_empty() && !errors.is_empty() { return Err(errors.join("; ")); }
     let note = (!errors.is_empty()).then(|| errors.join("; "));
@@ -844,6 +861,31 @@ mod tests {
     use super::*;
 
     fn ms(m: u64) -> Option<Duration> { Some(Duration::from_millis(m)) }
+
+    /// Timed words win wherever they are on the ladder; untimed words are the
+    /// fallback, and a failing source only matters when nothing was found.
+    #[test]
+    fn the_ladder_takes_timed_lyrics_over_an_earlier_untimed_sheet() {
+        type R = Result<Option<Hit>, String>;
+        fn untimed(_: &str, _: &str, _: &str, _: Option<Duration>) -> R {
+            Ok(Some(Hit { source: "A", plain: Some("words".into()), ..Default::default() }))
+        }
+        // Brackets but no times: still untimed.
+        fn tags_only(_: &str, _: &str, _: &str, _: Option<Duration>) -> R {
+            Ok(Some(Hit { source: "B", synced: Some("[ar:x]\nwords".into()), ..Default::default() }))
+        }
+        fn timed(_: &str, _: &str, _: &str, _: Option<Duration>) -> R {
+            Ok(Some(Hit { source: "C", synced: Some("[00:01.00]words".into()), ..Default::default() }))
+        }
+        fn none(_: &str, _: &str, _: &str, _: Option<Duration>) -> R { Ok(None) }
+        fn down(_: &str, _: &str, _: &str, _: Option<Duration>) -> R { Err("down".into()) }
+        let run = |s: &[(&str, SourceFind)]| find_in(s, "a", "t", "", None).map(|h| h.map(|h| h.source));
+        assert_eq!(run(&[("A", untimed), ("B", tags_only), ("C", timed)]), Ok(Some("C")));
+        assert_eq!(run(&[("A", untimed), ("B", tags_only), ("D", none)]), Ok(Some("A")));
+        assert_eq!(run(&[("E", down), ("A", untimed)]), Ok(Some("A")));
+        assert_eq!(run(&[("D", none), ("E", down)]), Err("E: down".into()));
+        assert_eq!(run(&[("D", none)]), Ok(None));
+    }
 
     #[test]
     fn parses_a_plain_synced_sheet() {

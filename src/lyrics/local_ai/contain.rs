@@ -28,6 +28,10 @@ pub struct Spec {
     pub args: Vec<OsString>,
     pub env: Option<Vec<(OsString, OsString)>>,
     pub cwd: Option<PathBuf>,
+    /// A hard working-set ceiling, bytes, set before the child runs a single
+    /// instruction (1.6.1). Windows then trims the child rather than let it
+    /// grow past it.
+    pub ws_cap: Option<u64>,
 }
 
 impl Spec {
@@ -56,6 +60,7 @@ impl Spec {
             args: c.get_args().map(|a| a.to_os_string()).collect(),
             env,
             cwd: c.get_current_dir().map(PathBuf::from),
+            ws_cap: None,
         }
     }
 }
@@ -65,6 +70,9 @@ mod sys {
     #![allow(non_snake_case)]
     pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     pub const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    pub const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    pub const QUOTA_LIMITS_HARDWS_MIN_DISABLE: u32 = 0x2;
+    pub const QUOTA_LIMITS_HARDWS_MAX_ENABLE: u32 = 0x4;
     pub const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
     pub const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
     pub const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
@@ -167,6 +175,10 @@ mod sys {
         pub fn CreateFileW(name: *const u16, access: u32, share: u32, attrs: *const SecurityAttributes,
                            disposition: u32, flags: u32, template: isize) -> isize;
         pub fn TerminateProcess(h: isize, code: u32) -> i32;
+        pub fn SetProcessWorkingSetSizeEx(h: isize, min: usize, max: usize, flags: u32) -> i32;
+        pub fn ResumeThread(h: isize) -> u32;
+        #[cfg(test)]
+        pub fn GetProcessWorkingSetSizeEx(h: isize, min: *mut usize, max: *mut usize, flags: *mut u32) -> i32;
         pub fn WaitForSingleObject(h: isize, ms: u32) -> u32;
         pub fn GetExitCodeProcess(h: isize, code: *mut u32) -> i32;
         pub fn CloseHandle(h: isize) -> i32;
@@ -206,6 +218,14 @@ impl Job {
     #[cfg(not(windows))]
     pub fn new() -> Result<Job, String> {
         Err("process containment is only implemented on Windows".into())
+    }
+
+    /// The hard working-set ceiling `p` runs under, if any.
+    #[cfg(all(test, windows))]
+    pub fn ceiling(p: &Proc) -> Option<usize> {
+        let (mut min, mut max, mut flags) = (0usize, 0usize, 0u32);
+        let ok = unsafe { sys::GetProcessWorkingSetSizeEx(p.raw(), &mut min, &mut max, &mut flags) } != 0;
+        (ok && flags & sys::QUOTA_LIMITS_HARDWS_MAX_ENABLE != 0).then_some(max)
     }
 
     /// Whether `p` is in this job.
@@ -501,7 +521,8 @@ pub fn spawn_in(spec: &Spec, job: &Job) -> Result<Proc, String> {
     let ok = unsafe {
         CreateProcessW(
             app.as_ptr(), cmdline.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1,
-            CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
+                | if spec.ws_cap.is_some() { CREATE_SUSPENDED } else { 0 },
             env.as_ref().map_or(std::ptr::null(), |e| e.as_ptr() as *const _),
             cwd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             &si, &mut pi,
@@ -509,6 +530,22 @@ pub fn spawn_in(spec: &Spec, job: &Job) -> Result<Proc, String> {
     };
     if ok == 0 {
         return refuse("Windows refused to create it inside Moosik's job object", unsafe { GetLastError() });
+    }
+    // A ceiling is in place before the child runs, or the child does not run.
+    if let Some(cap) = spec.ws_cap {
+        let capped = unsafe {
+            SetProcessWorkingSetSizeEx(pi.process, 16 << 20, cap as usize, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE)
+        } != 0;
+        if !capped || unsafe { ResumeThread(pi.thread) } == u32::MAX {
+            let e = unsafe { GetLastError() };
+            unsafe {
+                TerminateProcess(pi.process, 1);
+                WaitForSingleObject(pi.process, 10_000);
+                CloseHandle(pi.thread);
+                CloseHandle(pi.process);
+            }
+            return refuse("its memory ceiling could not be set, so it was ended before it ran", e);
+        }
     }
     unsafe { CloseHandle(pi.thread) };
     // The child has its copies; Moosik closes its own of the child's ends so

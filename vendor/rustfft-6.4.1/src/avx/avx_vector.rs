@@ -2516,3 +2516,13 @@ impl<'a, T: AvxNum> AvxArrayMut<T> for InplaceProductBuf<'a, T> {
         T::VectorType::store_partial3_complex(self.out.as_mut_ptr().add(index), data);
     }
 }
+
+// Moosik 1.6.1: read-only, for `exact_gpu_words_32768` (the mask is private here).
+impl Rotation90<__m256> {
+    #[target_feature(enable = "avx")]
+    pub(crate) unsafe fn moosik_mask_bits(self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        _mm256_storeu_ps(out.as_mut_ptr().cast(), self.0);
+        out
+    }
+}

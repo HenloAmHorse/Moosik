@@ -1,6 +1,6 @@
 [package]
 name = "moosik"
-version = "1.6.0"
+version = "1.6.1"
 edition = "2024"
 
 [[bin]]
@@ -101,7 +101,16 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     # AllocConsole / AttachConsole — the "Debug console window" setting.
     "Win32_System_Console",
+    # Job objects — yt-dlp runs (and what they start) end when Moosik does.
+    "Win32_System_JobObjects", "Win32_Security",
 ] }
+# Media Foundation decodes the music videos YouTube delivers (video.rs), on
+# the graphics card through Direct3D 11 where it can. 0.58 is already in
+# the tree (through cpal/wasapi); this adds only API declarations.
+windows = { version = "0.58", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Foundation", "implement"] }
+# A video still downloading is read through a COM stream of our own (video.rs);
+# `implement` writes its glue against windows-core, already in the tree.
+windows-core = "0.58"
 # Extract the HWND from eframe for SMTC media controls (souvlaki needs it).
 raw-window-handle = "0.6"
 # asio-dsd: registry driver discovery + COM instantiation for ASIO.
@@ -113,6 +122,11 @@ raw-window-handle = "0.6"
 # viewport whose pass belongs to the minimized parent — the spectrum window.
 # The vendored copy is the exact published archive plus one Windows-only,
 # opt-in policy; see vendor/eframe-0.31.1/PATCH.md.
+[dev-dependencies]
+# Renders the real app offscreen in tests, so screens can be checked without
+# opening a window. Test-only: not in the executable.
+egui_kittest = { version = "=0.31.1", features = ["eframe", "wgpu", "snapshot"] }
+
 [patch.crates-io]
 rodio = { path = "vendor/rodio-0.20.1" }
 symphonia = { path = "vendor/symphonia-0.5.5" }

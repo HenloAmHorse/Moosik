@@ -359,7 +359,6 @@ pub mod native_dsd {
         Ok(())
     }
 }
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -880,7 +879,7 @@ fn canonicalize_packet(
 pub fn prepare(path: &Path, start: Duration) -> Result<Prepared, state::FailureReason> {
     use state::FailureReason as FR;
 
-    let file = File::open(path).map_err(|e| FR::SourceOpen(format!("open failed: {e}")))?;
+    let file = crate::youtube::stream::open(path).map_err(|e| FR::SourceOpen(format!("open failed: {e}")))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();

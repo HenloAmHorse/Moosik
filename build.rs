@@ -46,6 +46,16 @@ fn main() {
     println!("cargo:rustc-env=MOOSIK_BUILD_LABEL={label}");
     let _ = numeric;
 
+    // Media Foundation (music videos) is delay-loaded: Windows N without the
+    // Media Feature Pack has no mfplat.dll, and a load-time import would stop
+    // Moosik from starting at all. `video::decode` checks before calling it.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        for dll in ["mfplat.dll", "mfreadwrite.dll"] {
+            println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
+        }
+        println!("cargo:rustc-link-arg=delayimp.lib");
+    }
+
     #[cfg(target_os = "windows")]
     {
         let packed = numeric.iter().fold(0u64, |acc, &p| (acc << 16) | p as u64);

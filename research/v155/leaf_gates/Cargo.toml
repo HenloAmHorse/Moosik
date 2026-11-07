@@ -1,0 +1,15 @@
+[package]
+name = "moosik-cqt-f64-leaf-gates"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rustfft = { path = "../../../vendor/rustfft-6.4.1" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Cargo test ignores panic=abort, as it does for application tests.
+

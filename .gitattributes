@@ -5,3 +5,5 @@ THIRD_PARTY_NOTICES.txt -text -whitespace
 vendor/rodio-0.20.1/outreach/v0.20_announcement_and_call_for_userstories.md -whitespace
 vendor/rodio-0.20.1/src/decoder/mp3.rs -whitespace
 vendor/rodio-0.20.1/src/spatial_sink.rs -whitespace
+# Derived shader, recorded by SHA-256 in docs/ASLT_EXACT_GPU.md: no line-ending conversion.
+src/spectrum/aslt_exact_gpu.ptx -text

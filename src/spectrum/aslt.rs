@@ -105,8 +105,29 @@ pub(crate) mod r10t {
     impl Drop for Scope {
         fn drop(&mut self) { FULL.with(|c| c.set(self.0)); }
     }
+    /// The shared-block route by transform size (log2 n): `[members, member
+    /// ns, inverse calls, inverse ns]`, and at one size (`BY_K_N`) the same by
+    /// kernel taps. What a block-inverse offload could ever reach (1.6.1).
+    pub static BLK: std::sync::Mutex<[[u64; 4]; 24]> = std::sync::Mutex::new([[0; 4]; 24]);
+    pub static BY_K: std::sync::Mutex<std::collections::BTreeMap<usize, [u64; 4]>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    pub const BY_K_N: usize = 32_768;
+    pub fn blk(n: usize, k: usize, member_ns: u64, inv_calls: u64, inv_ns: u64) {
+        let add = |r: &mut [u64; 4]| {
+            r[0] += 1;
+            r[1] += member_ns;
+            r[2] += inv_calls;
+            r[3] += inv_ns;
+        };
+        add(&mut BLK.lock().unwrap()[n.trailing_zeros() as usize]);
+        if n == BY_K_N {
+            add(BY_K.lock().unwrap().entry(k).or_default());
+        }
+    }
     pub fn reset() {
         for a in NS.iter().chain(CNT.iter()).chain(INV.iter()) { a.store(0, O::Relaxed); }
+        *BLK.lock().unwrap() = [[0; 4]; 24];
+        BY_K.lock().unwrap().clear();
     }
 }
 /// How an inverse transform's input is formed in `buf`.
@@ -918,6 +939,8 @@ impl Morlet {
         use rustfft::num_complex::Complex;
 
         let k = self.re.len();
+        #[cfg(test)]
+        let census = r10t::on().then(|| (std::time::Instant::now(), std::cell::Cell::new([0u64; 2])));
         let n_sig = signals[0].len();
         if signals.iter().any(|s| s.len() != n_sig) || blocks.len() != signals.len() { return None; }
         let half = self.half as isize;
@@ -974,9 +997,21 @@ impl Morlet {
                 // see.
                 #[cfg(test)]
                 r10t::inv(n);
+                #[cfg(test)]
+                let ti = census.as_ref().map(|_| std::time::Instant::now());
                 r10t!(7, iw.outputs(&*inv, Operand::Product(set.block(b), &kernel), &mut buf, &mut scratch,
                                     fi_lo, hop, half as usize, base, scale, &mut out[fi_lo..=fi_hi]));
+                #[cfg(test)]
+                if let (Some((_, acc)), Some(ti)) = (&census, ti) {
+                    let [c, ns] = acc.get();
+                    acc.set([c + 1, ns + ti.elapsed().as_nanos() as u64]);
+                }
             }
+        }
+        #[cfg(test)]
+        if let Some((t0, acc)) = census {
+            let [c, ns] = acc.get();
+            r10t::blk(n, k, t0.elapsed().as_nanos() as u64, c, ns);
         }
         Some(outs)
     }
@@ -1918,6 +1953,16 @@ pub struct WorkCount {
     /// that does not prune.
     pub inverses_pruned: u64,
     pub inverses_full: u64,
+    /// The exact GPU lane (1.6.1): passes that asked it to start (whether it
+    /// came up or not), members whose 2^15 shared blocks it computed, the
+    /// banks of 32 and device blocks that took, banks that failed or
+    /// disagreed with the CPU, and members recomputed on the CPU for them.
+    pub exact_gpu_attempts: u64,
+    pub exact_gpu_members: u64,
+    pub exact_gpu_banks: u64,
+    pub exact_gpu_blocks: u64,
+    pub exact_gpu_failures: u64,
+    pub exact_gpu_replayed: u64,
 }
 
 impl WorkCount {
@@ -1944,6 +1989,12 @@ impl WorkCount {
             share_peak_bytes: c.share_peak_bytes.load(O::Relaxed),
             inverses_pruned: c.inverses_pruned.load(O::Relaxed),
             inverses_full: c.inverses_full.load(O::Relaxed),
+            exact_gpu_attempts: c.exact_gpu_attempts.load(O::Relaxed),
+            exact_gpu_members: c.exact_gpu_members.load(O::Relaxed),
+            exact_gpu_banks: c.exact_gpu_banks.load(O::Relaxed),
+            exact_gpu_blocks: c.exact_gpu_blocks.load(O::Relaxed),
+            exact_gpu_failures: c.exact_gpu_failures.load(O::Relaxed),
+            exact_gpu_replayed: c.exact_gpu_replayed.load(O::Relaxed),
         }
     }
 }
@@ -1974,6 +2025,12 @@ struct WorkCells {
     share_peak_bytes: std::sync::atomic::AtomicU64,
     inverses_pruned: std::sync::atomic::AtomicU64,
     inverses_full: std::sync::atomic::AtomicU64,
+    exact_gpu_attempts: std::sync::atomic::AtomicU64,
+    exact_gpu_members: std::sync::atomic::AtomicU64,
+    exact_gpu_banks: std::sync::atomic::AtomicU64,
+    exact_gpu_blocks: std::sync::atomic::AtomicU64,
+    exact_gpu_failures: std::sync::atomic::AtomicU64,
+    exact_gpu_replayed: std::sync::atomic::AtomicU64,
     /// Worst deviation between the redundantly computed mean-signal response
     /// and the mix derived from the two channels, as `f32` bits.
     ///
@@ -2482,6 +2539,9 @@ enum PassEvent {
     /// The subbatch of member index `member` is over (finished or cancelled):
     /// `released` worker slots dropped, of `created`.
     SlotsReleased { member: usize, created: usize, released: usize },
+    /// The cores' side of an exact-GPU pass has no work left: only the lane's
+    /// thread still runs the pass.
+    CoresDrained,
 }
 
 /// Runs a planned group. Returns its finished bars — none if the run was
@@ -2549,39 +2609,443 @@ fn run_size_sequential(
         building += t.elapsed();
         #[cfg(test)]
         if let Some(f) = seams.pass_event { f(PassEvent::Built(pass)); }
-        accs.par_iter_mut().zip(plans.par_iter()).with_max_len(1).for_each(|(acc, p)| {
-            if !p.passes.contains(&pass) || stop() { return; }
-            #[cfg(test)]
-            if let Some(f) = seams.pass_event { f(PassEvent::Bar(pass, p.bar)); }
-            for (&c, &k) in p.cycles.iter().zip(&p.passes) {
-                if k != pass { continue; }
-                let w = Morlet::new(p.freq, c, sr);
-                let col = w.member_cols(chans, hop, frames, &set, work, seams);
-                fold_logs(&mut acc.mix, &col.mix, 1.0);
-                if joint {
-                    fold_logs(&mut acc.left, &col.left, 1.0);
-                    fold_logs(&mut acc.right, &col.right, 1.0);
-                }
-            }
-            if p.passes.last() == Some(&pass) {
-                // `Superlet::new`'s weights are all 1.0, summed as f32.
-                let total_weight = p.cycles.iter().map(|_| 1.0f32).sum::<f32>().max(f32::EPSILON);
-                let inv = 1.0 / total_weight;
-                let finish = |v: &mut Vec<f32>| v.iter_mut().for_each(|a| *a = (*a * inv).exp());
-                finish(&mut acc.mix);
-                if joint {
-                    finish(&mut acc.left);
-                    finish(&mut acc.right);
-                }
-                on_bar_done(p.bar);
-            }
-        });
+        let gpu = exact_gpu_on() && pass == exact_gpu::N
+            && run_pass_exact_gpu(plans, &mut accs, pass, chans, hop, frames, sr, &set, work, seams, &stop, on_bar_done);
+        if !gpu {
+            accs.par_iter_mut().zip(plans.par_iter()).with_max_len(1).for_each(|(acc, p)| {
+                if !p.passes.contains(&pass) || stop() { return; }
+                #[cfg(test)]
+                if let Some(f) = seams.pass_event { f(PassEvent::Bar(pass, p.bar)); }
+                run_bar_pass(acc, p, pass, 0, chans, hop, frames, sr, &set, work, seams, on_bar_done);
+            });
+        }
         drop(set);
     }
     if cancelled.load(Ordering::Relaxed) { return (Vec::new(), building); }
     (plans.iter().map(|p| p.bar).zip(accs).collect(), building)
 }
 
+
+/// A bar's members in `pass`, in member order.
+fn pass_cycles(p: &SizeSeqBar, pass: usize) -> impl Iterator<Item = f32> + '_ {
+    p.cycles.iter().zip(&p.passes).filter(move |&(_, &k)| k == pass).map(|(&c, _)| c)
+}
+
+/// One bar's members of one pass from its `from`-th member in the pass,
+/// each folded as it is computed, and the bar finished when this is its last
+/// pass: what [`run_size_sequential`] runs for every bar.
+#[allow(clippy::too_many_arguments)]
+fn run_bar_pass(
+    acc: &mut Cols, p: &SizeSeqBar, pass: usize, from: usize, chans: &Chans, hop: usize, frames: usize, sr: f32,
+    set: &SharedSet, work: &WorkCells, seams: &Seams, on_bar_done: &(dyn Fn(usize) + Sync),
+) {
+    let joint = chans.joint();
+    for c in pass_cycles(p, pass).skip(from) {
+        let w = Morlet::new(p.freq, c, sr);
+        let col = w.member_cols(chans, hop, frames, set, work, seams);
+        fold_cols(acc, &col, joint);
+    }
+    finish_bar_pass(acc, p, pass, joint, on_bar_done);
+}
+
+/// A bar whose last pass this is: `exp(Σ ln / n)`, and reported done.
+fn finish_bar_pass(acc: &mut Cols, p: &SizeSeqBar, pass: usize, joint: bool, on_bar_done: &(dyn Fn(usize) + Sync)) {
+    if p.passes.last() == Some(&pass) {
+        // `Superlet::new`'s weights are all 1.0, summed as f32.
+        let total_weight = p.cycles.iter().map(|_| 1.0f32).sum::<f32>().max(f32::EPSILON);
+        let inv = 1.0 / total_weight;
+        let finish = |v: &mut Vec<f32>| v.iter_mut().for_each(|a| *a = (*a * inv).exp());
+        finish(&mut acc.mix);
+        if joint {
+            finish(&mut acc.left);
+            finish(&mut acc.right);
+        }
+        on_bar_done(p.bar);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The exact GPU lane's share of the 2^15 pass (1.6.1, experimental)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[path = "aslt_exact_gpu.rs"]
+mod exact_gpu;
+
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+#[path = "aslt_exact_gpu_tests.rs"]
+mod exact_gpu_tests;
+
+/// Elsewhere there is no lane: these keep the callers' shape and admit nothing.
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+mod exact_gpu {
+    pub(super) const N: usize = 32_768;
+    pub(super) fn set_enabled(_: bool) {}
+    pub(super) fn enabled() -> bool { false }
+}
+
+/// Turns the exact GPU lane on or off for analyses that start from now on
+/// (the analysis settings). Off by default; a no-op where there is none.
+pub fn set_exact_gpu(on: bool) { exact_gpu::set_enabled(on) }
+
+fn exact_gpu_on() -> bool { exact_gpu::enabled() }
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+#[allow(clippy::too_many_arguments)]
+fn run_pass_exact_gpu(
+    _: &[SizeSeqBar], _: &mut [Cols], _: usize, _: &Chans, _: usize, _: usize, _: f32, _: &SharedSet, _: &WorkCells,
+    _: &Seams, _: &(dyn Fn() -> bool + Sync), _: &(dyn Fn(usize) + Sync),
+) -> bool {
+    false
+}
+
+/// Host memory one bank may hold, checked before any of it is allocated (see
+/// [`exact_gpu_bank_bytes`]). Only one bank is in flight; a track long enough
+/// that a bank would not fit leaves the pass to the cores.
+#[cfg(all(windows, target_arch = "x86_64"))]
+const EXACT_GPU_HOST_BUDGET: usize = 256 << 20;
+
+/// What one bank allocates at most on the host, for `frames` frames: per
+/// kernel its wavelet's three tables (`re`, `im`, `env`), its spectrum, its
+/// two complex columns and the three magnitude planes made from them; and
+/// one inverse transform's buffer, scratch and pruned workspace. Bounds, not
+/// the admitted values: a 2^15 block is only chosen for kernels of at most
+/// N/2 taps (`fft_block_len`), and an admitted kernel's workspace is sized
+/// for `MIN_M..=MAX_M` outputs. `None` when it does not fit a `usize`.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn exact_gpu_bank_bytes(frames: usize) -> Option<usize> {
+    use exact_gpu::{BANK, MAX_M, MIN_M, N};
+    let (c, f) = (std::mem::size_of::<C32>(), std::mem::size_of::<f32>());
+    let inv = ASLT_PLANNER.with(|p| p.borrow_mut().plan_fft_inverse(N));
+    let pruned = (MIN_M..=MAX_M).map(|m| InvWork::bytes(&*inv, m)).max()?;
+    let workspace = (N + inv.get_inplace_scratch_len()) * c + pruned;
+    let per_kernel = frames.checked_mul(2 * c + 3 * f)?.checked_add(3 * (N / 2) * f + N * c)?;
+    BANK.checked_mul(per_kernel)?.checked_add(workspace)
+}
+
+/// What the 2^15 pass hands the lane: chunks of 32 bars whose members in the
+/// pass all take the shared-block route with one sequence of tap counts, so a
+/// chunk is one bank per member position and every bar's members still fold
+/// in their order. The rest are the cores'. Bars with nothing in the pass are
+/// in neither.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn exact_gpu_chunks(
+    plans: &[SizeSeqBar], pass: usize, n_sig: usize, hop: usize, frames: usize, sr: f32,
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    use exact_gpu::{BANK, MAX_M, MIN_M, N};
+    let mut by_seq: std::collections::BTreeMap<Vec<usize>, Vec<usize>> = Default::default();
+    let mut rest = Vec::new();
+    for (i, p) in plans.iter().enumerate() {
+        if !p.passes.contains(&pass) { continue; }
+        let ks: Option<Vec<usize>> = pass_cycles(p, pass).map(|c| {
+            let k = morlet_taps(p.freq, c, sr);
+            // An interior block owns ⌊(n − k + 1)/hop⌋ or one more frames.
+            let valid = (N + 1).saturating_sub(k);
+            let fits = valid / hop >= MIN_M && valid.div_ceil(hop) <= MAX_M;
+            (fft_block_len(k) == N && fft_is_cheaper(k, hop) && own_route_applies(k, n_sig, hop, frames) && fits)
+                .then_some(k)
+        }).collect();
+        match ks {
+            Some(ks) => by_seq.entry(ks).or_default().push(i),
+            None => rest.push(i),
+        }
+    }
+    let mut chunks = Vec::new();
+    for idx in by_seq.into_values() {
+        let mut it = idx.chunks_exact(BANK);
+        chunks.extend(it.by_ref().map(<[usize]>::to_vec));
+        rest.extend_from_slice(it.remainder());
+    }
+    (chunks, rest)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+enum BankFault {
+    Cancelled,
+    Failed(String),
+}
+
+/// One bank: member position `q` of 32 bars with the same taps there. As
+/// [`Morlet::complex_via_shared_multi`] for each member, with its device
+/// blocks computed by the lane: the kernel spectra and edge frames first,
+/// then every block in increasing order — those before the device's on the
+/// cores, the device's, then those after it on the cores — so each frame
+/// holds the value of the last block that owns it, as on the CPU route. Then
+/// `member_cols`' norms. The columns are the CPU route's bits; `check` holds
+/// the device's first block to the CPU's before anything is used. `stop` is
+/// polled while the device works (see [`exact_gpu::Lane::run`]).
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn exact_gpu_bank(
+    lane: &exact_gpu::Lane, cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>, stop: &dyn Fn() -> bool,
+    check: bool, bars: &[&SizeSeqBar], q: usize, pass: usize, chans: &Chans, hop: usize, frames: usize, sr: f32,
+    set: &SharedSet, work: &WorkCells, seams: &Seams,
+) -> Result<Vec<Cols>, BankFault> {
+    use exact_gpu::{BANK, MAX_M, MIN_M, N};
+    use rustfft::num_complex::Complex;
+    use std::sync::atomic::Ordering;
+    #[cfg(test)]
+    let _full = r10t::scope(seams.full_inverse);
+    #[cfg(not(test))]
+    let _ = seams;
+    let failed = |e: &str| BankFault::Failed(e.to_string());
+    let (Some(a), Some(b), Some(right)) = (set.a.get(&pass), set.b.get(&pass), chans.b) else {
+        return Err(failed("no block sets for the pass"));
+    };
+    let ws: Vec<Morlet> = bars.iter()
+        .map(|p| pass_cycles(p, pass).nth(q).map(|c| Morlet::new(p.freq, c, sr)))
+        .collect::<Option<_>>()
+        .ok_or_else(|| failed("a bar without that member"))?;
+    let k = ws[0].re.len();
+    let half = ws[0].half;
+    if ws.len() != BANK || ws.iter().any(|w| w.re.len() != k || w.half != half) {
+        return Err(failed("a bank of mixed lengths"));
+    }
+    // The geometry `complex_via_shared_multi` derives, and which blocks the
+    // device takes: those owning MIN_M..=MAX_M frames, one run of them.
+    let n_sig = chans.a.len();
+    let stride = a.stride;
+    let first = half.div_ceil(hop);
+    let last = ((n_sig - 1 - half) / hop).min(frames - 1);
+    let (mut before, mut device, mut after) = (Vec::new(), Vec::new(), Vec::new());
+    for blk in 0..a.blocks() {
+        let base = blk * stride;
+        if base >= n_sig { break; }
+        let m_lo = base + k - 1;
+        let m_hi = (base + N).min(n_sig);
+        let fi_lo = ((m_lo as isize - half as isize).max(0) as usize).div_ceil(hop).max(first);
+        let fi_hi = if (m_hi as isize) - 1 - (half as isize) < 0 { 0 } else { ((m_hi - 1 - half) / hop).min(last) };
+        if fi_lo > fi_hi { continue; }
+        let m = fi_hi - fi_lo + 1;
+        if (MIN_M..=MAX_M).contains(&m) && after.is_empty() {
+            device.push(exact_gpu::Block { index: blk, lo: fi_lo, first: fi_lo * hop + half - base, m });
+        } else if device.is_empty() {
+            before.push((blk, fi_lo, fi_hi));
+        } else {
+            after.push((blk, fi_lo, fi_hi));
+        }
+    }
+    if device.is_empty() {
+        return Err(failed("no block the device takes"));
+    }
+    let fwd = ASLT_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(N));
+    let h: Vec<Vec<C32>> = ws.iter().map(|w| {
+        let mut kernel = vec![Complex { re: 0.0f32, im: 0.0f32 }; N];
+        for (slot, i) in kernel.iter_mut().zip((0..k).rev()) {
+            *slot = Complex { re: w.re[i], im: w.im[i] };
+        }
+        fwd.process(&mut kernel);
+        kernel
+    }).collect();
+    let mut cols: Vec<[Vec<C32>; 2]> = ws.iter().map(|w| {
+        let mut e = w.edge_frames(&[chans.a, right], hop, frames, first, last);
+        let r = e.pop().expect("two columns");
+        [e.pop().expect("two columns"), r]
+    }).collect();
+    let inv = ASLT_PLANNER.with(|p| p.borrow_mut().plan_fft_inverse(N));
+    let scale = 1.0 / N as f32;
+    let mut buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; N];
+    let mut scratch = vec![Complex { re: 0.0f32, im: 0.0f32 }; inv.get_inplace_scratch_len()];
+    let mut iw = InvWork::new(&*inv, InvWork::cap(N, k, hop));
+    let sets = [a, b];
+    let mut cores = |blocks: &[(usize, usize, usize)], h: &[Vec<C32>], cols: &mut [[Vec<C32>; 2]],
+                     check: Option<(exact_gpu::Block, &[C32])>| -> Result<(), BankFault> {
+        for &(blk, lo, hi) in blocks {
+            for (kernel, col) in h.iter().zip(cols.iter_mut()) {
+                for (set, out) in sets.iter().zip(col.iter_mut()) {
+                    iw.outputs(&*inv, Operand::Product(set.block(blk), kernel), &mut buf, &mut scratch,
+                               lo, hop, half, blk * stride, scale, &mut out[lo..=hi]);
+                }
+            }
+        }
+        // The device's first block against the cores', every pair, bit for bit.
+        if let Some((blk, got)) = check {
+            let mut want = vec![C32 { re: 0.0, im: 0.0 }; blk.m];
+            for pair in 0..2 * BANK {
+                let (ch, kernel) = (pair / BANK, pair % BANK);
+                iw.outputs(&*inv, Operand::Product(sets[ch].block(blk.index), &h[kernel]), &mut buf, &mut scratch,
+                           blk.lo, hop, half, blk.index * stride, scale, &mut want);
+                let seen = &got[pair * blk.m..(pair + 1) * blk.m];
+                let differs = |j: usize| seen[j].re.to_bits() != want[j].re.to_bits() || seen[j].im.to_bits() != want[j].im.to_bits();
+                if let Some(j) = (0..blk.m).find(|&j| differs(j)) {
+                    return Err(BankFault::Failed(format!(
+                        "the device disagrees with the CPU (taps {k}, block {}, pair {pair}, output {j}: {:?} vs {:?})",
+                        blk.index, seen[j], want[j])));
+                }
+            }
+        }
+        Ok(())
+    };
+    cores(&before, &h, &mut cols, None)?;
+    let bank = exact_gpu::Bank {
+        h, sets: [std::sync::Arc::clone(a), std::sync::Arc::clone(b)], hop, blocks: device.clone(), cols,
+    };
+    let (h, mut cols, stats) = match lane.run(bank, cancel, check, stop) {
+        exact_gpu::Reply::Done(bank, stats) => (bank.h, bank.cols, stats),
+        exact_gpu::Reply::Cancelled => return Err(BankFault::Cancelled),
+        exact_gpu::Reply::Failed(e) => return Err(BankFault::Failed(e)),
+    };
+    let got = if check {
+        Some((device[0], stats.check.as_deref().ok_or_else(|| failed("no check block returned"))?))
+    } else {
+        None
+    };
+    cores(&after, &h, &mut cols, got)?;
+    work.exact_gpu_blocks.fetch_add(stats.blocks as u64, Ordering::Relaxed);
+    work.exact_gpu_banks.fetch_add(1, Ordering::Relaxed);
+    work.exact_gpu_members.fetch_add(BANK as u64, Ordering::Relaxed);
+    work.column(2 * BANK as u64);
+    Ok(cols.into_iter().map(|[l, r]| {
+        let mix = mix_norms(&l, &r);
+        Cols { mix, left: norms(l), right: norms(r) }
+    }).collect())
+}
+
+/// The 2^15 pass with the lane: it takes chunks (see [`exact_gpu_chunks`])
+/// from the front, the cores take every other bar and then chunks from the
+/// back, so neither waits while there is work. Each bar's members fold in
+/// order, and a bar is finished once, when its last member is in. `false`,
+/// with nothing done, when the lane does not apply or cannot start: the
+/// caller runs the pass as before.
+///
+/// Cancelled, the lane stops between blocks — its wait for the device polls
+/// the analysis, so it does even once the cores have run out of work — a
+/// bank that came back is neither folded nor finished, and the pass's
+/// results are discarded by the caller as ever. A bank that fails, or
+/// disagrees with the CPU on its check, is recomputed on the cores from its
+/// members — it was never folded — and the lane is not used again; the
+/// chunks it had not started go to the cores. The lane is retired before
+/// this returns, and what its retirement reports is logged.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn run_pass_exact_gpu(
+    plans: &[SizeSeqBar], accs: &mut [Cols], pass: usize, chans: &Chans, hop: usize, frames: usize, sr: f32,
+    set: &SharedSet, work: &WorkCells, seams: &Seams, stop: &(dyn Fn() -> bool + Sync),
+    on_bar_done: &(dyn Fn(usize) + Sync),
+) -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    if chans.b.is_none() || set.a.get(&pass).is_none() || set.b.get(&pass).is_none() {
+        return false;
+    }
+    let threads = rayon::current_num_threads();
+    if threads < 2 {
+        crate::mlog!("aslt    exact GPU lane: not with one analysis worker");
+        return false;
+    }
+    let (chunks, rest) = exact_gpu_chunks(plans, pass, chans.a.len(), hop, frames, sr);
+    if chunks.is_empty() {
+        return false;
+    }
+    match exact_gpu_bank_bytes(frames) {
+        Some(b) if b <= EXACT_GPU_HOST_BUDGET => {}
+        b => {
+            crate::mlog!("aslt    exact GPU lane: a bank of this track would hold {} MiB, over its {} MiB",
+                         b.map_or(usize::MAX, |b| b >> 20), EXACT_GPU_HOST_BUDGET >> 20);
+            return false;
+        }
+    }
+    work.exact_gpu_attempts.fetch_add(1, Ordering::Relaxed);
+    let lane = match exact_gpu::Lane::start() {
+        Ok(l) => l,
+        Err(e) => {
+            crate::mlog!("aslt    exact GPU lane unavailable: {e}");
+            return false;
+        }
+    };
+    let t0 = std::time::Instant::now();
+    let chunk_members: usize = chunks.iter().map(|c| c.len() * pass_cycles(&plans[c[0]], pass).count()).sum();
+    crate::mlog!(
+        "aslt    exact GPU lane on {}: setup {:.0} ms; {} chunks of 32 bars ({chunk_members} members), {} bars on the cores, {threads} workers",
+        lane.device, lane.setup.as_secs_f64() * 1e3, chunks.len(), rest.len(),
+    );
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stop_all = || {
+        let s = stop();
+        if s { cancel.store(true, Ordering::Relaxed); }
+        s
+    };
+    let cells: Vec<Mutex<&mut Cols>> = accs.iter_mut().map(Mutex::new).collect();
+    let queue = Mutex::new(std::collections::VecDeque::from(chunks));
+    let usable = AtomicBool::new(true);
+    let checked = AtomicBool::new(false);
+    let (gpu_chunks, cpu_chunks) = (AtomicU64::new(0), AtomicU64::new(0));
+    let cpu_bar = |i: usize, from: usize| {
+        let mut acc = cells[i].lock().unwrap_or_else(|p| p.into_inner());
+        run_bar_pass(&mut acc, &plans[i], pass, from, chans, hop, frames, sr, set, work, seams, on_bar_done);
+    };
+    rayon::scope(|s| {
+        s.spawn(|_| {
+            use rayon::prelude::*;
+            rest.par_iter().with_max_len(1).for_each(|&i| {
+                if !stop_all() { cpu_bar(i, 0); }
+            });
+            loop {
+                let next = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_back();
+                let Some(chunk) = next else { break };
+                cpu_chunks.fetch_add(1, Ordering::Relaxed);
+                chunk.par_iter().with_max_len(1).for_each(|&i| {
+                    if !stop_all() { cpu_bar(i, 0); }
+                });
+            }
+            #[cfg(test)]
+            if let Some(f) = seams.pass_event { f(PassEvent::CoresDrained); }
+        });
+        // The lane, on this thread.
+        while usable.load(Ordering::Relaxed) && !stop_all() {
+            let next = queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
+            let Some(chunk) = next else { break };
+            gpu_chunks.fetch_add(1, Ordering::Relaxed);
+            let bars: Vec<&SizeSeqBar> = chunk.iter().map(|&i| &plans[i]).collect();
+            let positions = pass_cycles(bars[0], pass).count();
+            let mut done = true;
+            for q in 0..positions {
+                if stop_all() { done = false; break; }
+                let bank = exact_gpu_bank(&lane, &cancel, &stop_all, !checked.load(Ordering::Relaxed), &bars, q, pass,
+                                          chans, hop, frames, sr, set, work, seams);
+                match bank {
+                    // Cancelled while it ran: not folded, so never progress.
+                    Ok(_) if stop_all() => { done = false; break; }
+                    Ok(cols) => {
+                        checked.store(true, Ordering::Relaxed);
+                        for (&i, col) in chunk.iter().zip(&cols) {
+                            fold_cols(&mut cells[i].lock().unwrap_or_else(|p| p.into_inner()), col, true);
+                        }
+                    }
+                    Err(BankFault::Cancelled) => { done = false; break; }
+                    Err(BankFault::Failed(e)) => {
+                        crate::mlog!("aslt    exact GPU lane stopped, the cores take over: {e}");
+                        usable.store(false, Ordering::Relaxed);
+                        work.exact_gpu_failures.fetch_add(1, Ordering::Relaxed);
+                        work.exact_gpu_replayed.fetch_add(((positions - q) * chunk.len()) as u64, Ordering::Relaxed);
+                        // From this member on, on the cores; `run_bar_pass` finishes each bar.
+                        use rayon::prelude::*;
+                        chunk.par_iter().with_max_len(1).for_each(|&i| {
+                            if !stop_all() { cpu_bar(i, q); }
+                        });
+                        done = false;
+                        break;
+                    }
+                }
+            }
+            if done && !stop_all() {
+                for &i in &chunk {
+                    finish_bar_pass(&mut cells[i].lock().unwrap_or_else(|p| p.into_inner()), &plans[i], pass, true, on_bar_done);
+                }
+            }
+        }
+    });
+    if let Err(e) = lane.retire() {
+        crate::mlog!("aslt    exact GPU lane retired with an error: {e}");
+    }
+    crate::mlog!(
+        "aslt    exact GPU lane done in {:.2} s: {} chunks on the device, {} on the cores; {} banks, {} device blocks, {} failed",
+        t0.elapsed().as_secs_f64(), gpu_chunks.load(Ordering::Relaxed), cpu_chunks.load(Ordering::Relaxed),
+        work.exact_gpu_banks.load(Ordering::Relaxed), work.exact_gpu_blocks.load(Ordering::Relaxed),
+        work.exact_gpu_failures.load(Ordering::Relaxed),
+    );
+    true
+}
 
 // ---------------------------------------------------------------------------
 // Forward-transform sharing in the size-sequential no-blocks pass
@@ -3547,14 +4011,20 @@ fn analyze_routed(
                 STATS.cpu_bars.fetch_add(plan.len() as u64, Ordering::Relaxed);
             };
             let t_group = std::time::Instant::now();
+            let lane_before = work.exact_gpu_attempts.load(Ordering::Relaxed);
             let (done, building) = run_size_sequential(
                 &plan, &chans, hop, frames, sr, &work, &seams, &cancelled, should_continue, on_bar_done,
                 &start,
             );
             columns.install(done);
             // As the shared route's cores time: the group after its blocks are
-            // built, and nothing for a cancelled group.
-            if !cancelled.load(Ordering::Relaxed) {
+            // built, and nothing for a cancelled group — nor for one the exact
+            // GPU lane (1.6.1) was asked to start in, whatever became of it:
+            // that time holds the lane's setup and its banks, or a failed bank
+            // and its replay, which no cores group pays. The decision is
+            // retired with the scope, its attempt charged.
+            let lane_tried = work.exact_gpu_attempts.load(Ordering::Relaxed) != lane_before;
+            if !cancelled.load(Ordering::Relaxed) && !lane_tried {
                 super::gpu_calib::record(
                     (plan.len() * frames) as f64,
                     t_group.elapsed().saturating_sub(building).as_secs_f64(),
@@ -7848,7 +8318,7 @@ mod size_sequential_tests {
             PassEvent::BeforeBuild(n) | PassEvent::Built(n) | PassEvent::Bar(n, _) => n < GPU_MIN_BLOCK,
             PassEvent::WorkStarted | PassEvent::SharedPrepared { .. } | PassEvent::SharedWindow { .. }
                 | PassEvent::SharedIndexDone { .. } | PassEvent::SlotCharge { .. } | PassEvent::SlotRun { .. }
-                | PassEvent::SlotsReleased { .. } => true,
+                | PassEvent::SlotsReleased { .. } | PassEvent::CoresDrained => true,
         }), "a device-routed group ran size-sequential");
     }
 

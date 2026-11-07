@@ -36,7 +36,7 @@ impl Path {
         match self {
             Path::Gpu => "graphics card",
             Path::Cpu => "CPU only",
-            Path::GpuLowRam => "graphics card, lower RAM (more graphics memory and commit)",
+            Path::GpuLowRam => "graphics card, more on the card (faster; more graphics memory and commit)",
         }
     }
 }
@@ -335,11 +335,11 @@ mod tests {
         use super::super::{memory, HYMT2_30B};
         let p = Pick { pack: &HYMT2_30B, path: Path::Gpu, cost: HYMT2_30B.costs[0].1 };
         let mut m = machine(32, Some(8));
-        m.ram_free = 18 * GIB;
+        m.ram_free = 3 * GIB;
         assert_eq!(memory::room(p.need(), m.headroom()), memory::Room::Short { phys: GIB, commit: 0 });
-        m.ram_free = 19 * GIB;
+        m.ram_free = 4 * GIB;
         assert_eq!(memory::room(p.need(), m.headroom()), memory::Room::Fits);
-        m.commit_free = 5 * GIB;
+        m.commit_free = 4 * GIB;
         assert_eq!(memory::room(p.need(), m.headroom()), memory::Room::Short { phys: 0, commit: GIB });
         assert_eq!(Machine::default().headroom(), memory::Headroom::default());
         m.ram_free = 0;
@@ -347,18 +347,17 @@ mod tests {
     }
 
     #[test]
-    fn largest_selects_a_lower_ram_placement_only_when_it_can_start() {
+    fn largest_selects_more_on_the_card_only_when_it_can_start() {
         let mut m = machine(32, Some(8));
-        m.ram_free = 16 * GIB;
-        m.commit_free = 24 * GIB;
+        m.ram_free = 4 * GIB;
+        m.commit_free = 8 * GIB;
         let p = advise(PACKS, &m).largest.unwrap();
         assert_eq!(p.path, Path::GpuLowRam);
         assert_eq!(super::super::memory::room(p.need(), m.headroom()), super::super::memory::Room::Fits);
-        m.ram_free = 19 * GIB;
-        assert_eq!(advise(PACKS, &m).largest.unwrap().path, Path::Gpu);
-        m.ram_free = 16 * GIB;
         m.commit_free = 6 * GIB;
-        assert_ne!(advise(PACKS, &m).largest.unwrap().path, Path::GpuLowRam);
+        let p = advise(PACKS, &m).largest.unwrap();
+        assert_eq!(p.path, Path::Gpu, "its commit does not fit; the standard route's does");
+        assert_eq!(super::super::memory::room(p.need(), m.headroom()), super::super::memory::Room::Fits);
     }
 
     /// The ranking basis: Hy-MT2 7B above Qwen2.5 7B above Hy-MT2 1.8B

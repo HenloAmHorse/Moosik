@@ -510,43 +510,39 @@ pub const HYMT2_1_8B: Pack = Pack {
     ..HYMT2_7B
 };
 
-// The 30B's figures, measured 2026-10-18 on the reference computer
-// (i7-9700F, RTX 2060 SUPER 8 GB, 32 GB). Keeping every layer's experts in
-// RAM and the rest on the card (`--cpu-moe`) was fastest there: experts of
-// 12 layers on the card took +6.2 GB of its memory and ran at about half
-// the speed (`raw/tr154/hy30_probe.jsonl`).
-// A long sheet touches nearly every expert: 15.5-16.7 GiB working set
-// measured on the graphics-card route; the CPU-only route adds ~0.6 GiB.
-const HY30_NEED_GPU_PHYS: u64 = 17 << 30;
-// Separate measured placement: CPU experts in the first 40 of 48 layers,
-// buffered model loading to avoid touching the whole mapped file at once.
-// 10/16/80/150-row probes and JA/KO/EN product-path sheets: <=13.40 GiB
-// peak RAM, <=18.30 GiB commit on the reference PC (2026-10-19 matrix).
-// The admission includes additional headroom via memory::RESERVE.
-const HY30_LOW_RAM_NEED: memory::Need = memory::Need { phys: 14 << 30, commit: 19 << 30 };
+// The 30B's figures. Its weights are mapped from the file, never copied
+// (`--no-repack` keeps the CPU's share mapped too), and the runtime runs
+// under a hard working-set ceiling: half of what is available, never less
+// than `HY30_FLOOR` (see `memory::paged_cap`). With less RAM the
+// experts are read back from the file as each token needs them: slower, but
+// the run no longer needs the model's 17 GiB free to start (1.6.1).
+// Measured 2026-11-02 on the reference computer (i7-9700F, RTX 2060 SUPER
+// 8 GB, 32 GB), one 16-row product prompt, every answer valid:
+//   all experts on the CPU, ~2 GB on the card: 2.5 GiB commit; 60 s capped
+//     at 4 GiB, 83 s at 2 GiB;
+//   CPU only: 1.7 GiB commit; 88 s at 4 GiB, 205 s at 2 GiB;
+//   experts of 40 of 48 layers on the CPU (7 GiB card): 5.4 GiB commit;
+//     50 s at 4 GiB, 63 s at 2 GiB, 24 s uncapped (16.3 GiB working set).
+// The file stayed in Windows' standby cache there; a computer that cannot
+// cache it reads the experts from disk, which is slower again.
+const HY30_FLOOR: u64 = 2 << 30;
+const HY30_LOW_RAM_NEED: memory::Need = memory::Need { phys: HY30_FLOOR, commit: 6 << 30 };
 const HY30_LOW_RAM_VRAM: u64 = (7 << 30) - advice::VRAM_RESERVE;
-const HY30_LOW_RAM_ARGS: &[&str] = &["-ngl", "99", "--n-cpu-moe", "40", "--load-mode", "none"];
-// Graphics-card route measured on 7 product-path sheets (14-16 rows: 25-27 s
-// each, most of it loading the model; 15.5-16.7 GiB working set; +1.9 GB on
-// the card). The CPU-only route was refused by the memory check there with
-// the owner's usual programs open, so its figures are estimates (a short
-// probe generated at 10.4 tokens/s against 15.4 on the card route).
+const HY30_LOW_RAM_ARGS: &[&str] = &["-ngl", "99", "--n-cpu-moe", "40"];
 const HY30_COSTS: &[(advice::Path, advice::Cost)] = &[
-    (advice::Path::Gpu, advice::Cost { vram: 1950 * MIB, ram: 16_700 * MIB, secs_per_sheet: 22.0, measured: true }),
-    (advice::Path::Cpu, advice::Cost { vram: 0, ram: 17_300 * MIB, secs_per_sheet: 30.0, measured: false }),
-    (advice::Path::GpuLowRam, advice::Cost { vram: HY30_LOW_RAM_VRAM, ram: 14 << 30, secs_per_sheet: 27.3, measured: true }),
+    (advice::Path::GpuLowRam, advice::Cost { vram: HY30_LOW_RAM_VRAM, ram: 4 << 30, secs_per_sheet: 50.0, measured: true }),
+    (advice::Path::Gpu, advice::Cost { vram: 1950 * MIB, ram: 4 << 30, secs_per_sheet: 60.0, measured: true }),
+    (advice::Path::Cpu, advice::Cost { vram: 0, ram: 4 << 30, secs_per_sheet: 88.0, measured: true }),
 ];
 const HYMT2_30B_RESOURCES: &str = concat!(
-    "Measured on one computer (i7-9700F, RTX 2060 SUPER 8 GB, 32 GB), graphics-card route (attention on the card, ",
-    "every expert in RAM): about 16.7 GiB of working set (RAM) and 2.7 GiB of commit, and the graphics card's own ",
-    "memory use rises by about 1.9 GB; a 14-16 row sheet took about 25 to 27 s, most of it loading the model. It needs ",
-    "about 17 GiB of RAM free while it runs; with less, Moosik refuses to start it, and one 150-row sheet was stopped ",
-    "part-way when free memory ran out. CPU-only route: not measured on a sheet (refused there for lack of free ",
-    "memory); estimated slower and about 0.6 GiB larger. Experimental lower-RAM graphics-card route: the same ",
-    "weights and 8192-token context, with more experts on the card and buffered loading. Sheets of 10 to 150 rows ",
-    "peaked at 13.4 GiB RAM and 18.3 GiB commit on this computer. Startup requires 16 GiB available RAM and 21 GiB commit ",
-    "headroom including the reserve, and at least 7 GiB dedicated graphics memory. It can be slower; a smaller ",
-    "model remains the choice for computers without that room.");
+    "Measured on one computer (i7-9700F, RTX 2060 SUPER 8 GB, 32 GB). The model's 18 GB stay in its file and are read ",
+    "as they are needed, and Moosik caps how much RAM the model may hold: half of what is free when it starts, so the ",
+    "rest of the computer keeps the other half, and at least 2 GiB. The less it is given, the slower it runs. A 16-row sheet held to 4 GiB ",
+    "took about 60 s on the graphics-card route (about 2 GB of graphics memory, 2.5 GiB of commit), 88 s on the CPU only ",
+    "(1.7 GiB of commit), and 50 s on the route that keeps more on the card (at least 7 GiB of graphics memory, 5.4 GiB ",
+    "of commit). Held to 2 GiB: 83 s, 205 s and 63 s. Startup requires 4 GiB of available RAM, and 5 GiB of commit ",
+    "headroom (8 GiB on the route with more on the card). On that computer the model file stayed in Windows' cache; a ",
+    "computer short of RAM reads it from disk instead, which is slower again, most of all from a hard disk.");
 
 /// Hy-MT2 30B-A3B (Tencent, Apache-2.0, the official GGUF at a pinned
 /// revision): a mixture-of-experts translation model, 30B parameters of which
@@ -570,17 +566,19 @@ pub const HYMT2_30B: Pack = Pack {
               Runtime: llama.cpp b11429 (the build of release v0.6.0), MIT License (https://github.com/ggml-org/llama.cpp).",
     licenses: &[("LICENSE-Hy-MT2-30B-A3B-GGUF.txt", include_str!("local_ai/licenses/Hy-MT2-30B-A3B-GGUF-LICENSE.txt")), LLAMA_LICENSE],
     resources: HYMT2_30B_RESOURCES,
-    // Attention and shared weights on the card, every expert in RAM.
+    // Attention and shared weights on the card, every expert mapped from
+    // the file.
     gpu_args: &["-ngl", "99", "--cpu-moe"],
-    need_gpu: memory::Need { phys: HY30_NEED_GPU_PHYS, commit: 4 << 30 },
-    need_cpu: memory::Need { phys: 18 << 30, commit: 4 << 30 },
+    need_gpu: memory::Need { phys: HY30_FLOOR, commit: 3 << 30 },
+    need_cpu: memory::Need { phys: HY30_FLOOR, commit: 3 << 30 },
     costs: HY30_COSTS,
     quality: 0,
     adapter: Adapter::Hy30,
     summary: "Hy-MT2 30B-A3B by Tencent: the largest of the Hy-MT2 translation models (mixture of experts, about 3B active \
               per word), 18 GB of weights.",
-    limitations: "Large: it needs most of this computer's free memory while it runs, and on a card with less than 18 GB \
-                  most of it runs on the CPU. A translation model, not a lyric model. Not yet judged on real songs.",
+    limitations: "Large: on a card with less than 18 GB most of it runs on the CPU, and with little free RAM it reads \
+                  itself from disk as it goes, which can make a sheet take minutes. A translation model, not a lyric \
+                  model. Not yet judged on real songs.",
     ..HYMT2_7B
 };
 
@@ -1736,7 +1734,7 @@ pub fn memory_need(pack: &Pack, device: Device) -> Result<memory::Need, String> 
         Device::Gpu => Ok(pack.need_gpu),
         Device::Cpu => Ok(pack.need_cpu),
         Device::GpuLowRam if pack.id == HYMT2_30B.id => Ok(HY30_LOW_RAM_NEED),
-        Device::GpuLowRam => Err("The lower-RAM route is available for Hy-MT2 30B only.".into()),
+        Device::GpuLowRam => Err("The route with more on the graphics card is available for Hy-MT2 30B only.".into()),
     }
 }
 
@@ -2439,6 +2437,8 @@ pub struct Llama {
     adapter: Adapter,
     variation: Variation,
     gpu_args: &'static [&'static str],
+    /// Weights mapped and held under a working-set ceiling (the 30B).
+    paged: bool,
 }
 
 impl Llama {
@@ -2447,7 +2447,7 @@ impl Llama {
         if device == Device::GpuLowRam {
             let gpu = advice::inventory().gpu;
             if gpu.is_none_or(|g| g.dedicated < HY30_LOW_RAM_VRAM + advice::VRAM_RESERVE) {
-                return Err("The 30B lower-RAM route needs a graphics card with at least 7 GiB of dedicated memory. Use the standard route or a smaller model.".into());
+                return Err("The 30B route with more on the graphics card needs a graphics card with at least 7 GiB of dedicated memory. Use the standard route or a smaller model.".into());
             }
         }
         if !installed(root, pack) {
@@ -2463,7 +2463,8 @@ impl Llama {
             handed_over: Default::default(),
         };
         Ok(Self { runtime: dir.join("runtime"), model: dir.join(model.name), scratch, device, n_ctx: pack.n_ctx, keep, need, adapter: pack.adapter, variation: Variation::default(),
-                  gpu_args: if device == Device::GpuLowRam { HY30_LOW_RAM_ARGS } else { pack.gpu_args } })
+                  gpu_args: if device == Device::GpuLowRam { HY30_LOW_RAM_ARGS } else { pack.gpu_args },
+                  paged: pack.id == HYMT2_30B.id })
     }
 
     /// A child with a cleared environment: only what Windows itself needs and
@@ -2579,9 +2580,11 @@ fn supervise(cmd: Command, stop: &Stop, limit: Duration) -> Result<String, Strin
 /// loaded (every time, a corrective retry included), then supervision that
 /// also watches the computer's headroom and stops the run if it falls below
 /// the floor. A refusal starts nothing; nothing is queued or retried.
-fn run_model(spec: contain::Spec, need: memory::Need, stop: &Stop, keep: &Keep) -> Result<String, String> {
+fn run_model(mut spec: contain::Spec, need: memory::Need, stop: &Stop, keep: &Keep) -> Result<String, String> {
     stop.check()?;
     memory::admit(need)?;
+    // A paged run gets what is free now, its floor at least.
+    spec.ws_cap = spec.ws_cap.map(memory::paged_cap);
     supervise_kept(spec, stop, REQUEST_TIMEOUT, keep, true)
 }
 
@@ -2718,7 +2721,12 @@ impl Backend for Llama {
                    "-no-cnv", "--no-display-prompt", "--no-warmup"])
             .args(if self.device == Device::Cpu { &["-ngl", "0"] } else { self.gpu_args })
             .args(workbench::sampling_args(self.adapter, self.variation));
-        let out = run_model(contain::Spec::from_command(&cmd, true), self.need, stop, &self.keep)?;
+        if self.paged {
+            cmd.arg("--no-repack");
+        }
+        let mut spec = contain::Spec::from_command(&cmd, true);
+        spec.ws_cap = self.paged.then_some(self.need.phys);
+        let out = run_model(spec, self.need, stop, &self.keep)?;
         Ok(out.trim().trim_end_matches("[end of text]").trim().to_string())
     }
 }

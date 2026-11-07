@@ -1249,6 +1249,26 @@ fn supervised_children_join_the_process_job() {
     assert!(wait_exit(&mut child, Duration::from_secs(10)));
 }
 
+/// A paged run's child starts under its working-set ceiling, and runs once
+/// it is set (1.6.1); an ordinary child has none.
+#[test]
+fn a_paged_child_runs_under_its_ceiling() {
+    let mut s = spec(ps("Start-Sleep 30"));
+    s.ws_cap = Some(256 << 20);
+    let mut child = contain::spawn(&s).unwrap();
+    assert_eq!(contain::Job::ceiling(&child), Some(256 << 20));
+    child.kill().unwrap();
+    assert!(wait_exit(&mut child, Duration::from_secs(10)));
+    let mut quick = spec(ps("exit 0"));
+    quick.ws_cap = Some(256 << 20);
+    let mut quick = contain::spawn(&quick).unwrap();
+    assert!(wait_exit(&mut quick, Duration::from_secs(30)), "it was resumed and ran to its end");
+    let mut plain = contain::spawn(&spec(ps("Start-Sleep 30"))).unwrap();
+    assert_eq!(contain::Job::ceiling(&plain), None);
+    plain.kill().unwrap();
+    assert!(wait_exit(&mut plain, Duration::from_secs(10)));
+}
+
 /// When the job cannot be named at creation, Windows creates nothing: no
 /// process, nothing ran, and the request fails with that reason.
 #[test]
@@ -1759,6 +1779,21 @@ fn the_stated_admission_thresholds_are_the_enforced_ones() {
     memory::seam::clear();
 }
 
+/// A paged run takes half of what is free, leaves the reserve, and never
+/// less than its floor (1.6.1).
+#[test]
+fn a_paged_run_takes_half_of_what_is_free() {
+    const G: u64 = 1 << 30;
+    let at = |phys| memory::Headroom { phys: Some(phys), commit: Some(32 * G) };
+    for (free, cap) in [(16 * G, 8 * G), (5 * G, 5 * G / 2), (3 * G, 2 * G), (0, 2 * G)] {
+        memory::seam::set(vec![at(free)]);
+        assert_eq!(memory::paged_cap(2 * G), cap, "{free} free");
+    }
+    memory::seam::set(vec![memory::Headroom::default()]);
+    assert_eq!(memory::paged_cap(2 * G), 2 * G, "no reading: the floor");
+    memory::seam::clear();
+}
+
 #[test]
 fn reduced_ram_is_an_explicit_30b_route_with_its_own_admission_and_identity() {
     let make = |device| Identity::new(&HYMT2_30B, Source::Japanese, Target::TraditionalChinese, Style::Faithful, device);
@@ -1769,13 +1804,14 @@ fn reduced_ram_is_an_explicit_30b_route_with_its_own_admission_and_identity() {
     assert_eq!(standard.chunk_policy, reduced.chunk_policy);
     assert_eq!(standard.sampling, reduced.sampling);
     let need = memory_need(&HYMT2_30B, Device::GpuLowRam).unwrap();
-    assert!(need.phys < HYMT2_30B.need_gpu.phys);
+    assert_eq!(need.phys, HYMT2_30B.need_gpu.phys, "both are paged to the same floor");
     assert!(need.commit > HYMT2_30B.need_gpu.commit);
     assert!(memory_need(&HYMT2_7B, Device::GpuLowRam).is_err());
-    let h = memory::Headroom { phys: Some(16 << 30), commit: Some(21 << 30) };
+    let h = memory::Headroom { phys: Some(4 << 30), commit: Some(8 << 30) };
     assert_eq!(memory::room(need, h), memory::Room::Fits);
-    assert!(matches!(memory::room(HYMT2_30B.need_gpu, h), memory::Room::Short { .. }));
-    assert!(matches!(memory::room(need, memory::Headroom { commit: Some(20 << 30), ..h }), memory::Room::Short { .. }));
+    let short = memory::Headroom { commit: Some(7 << 30), ..h };
+    assert!(matches!(memory::room(need, short), memory::Room::Short { .. }));
+    assert_eq!(memory::room(HYMT2_30B.need_gpu, short), memory::Room::Fits);
 }
 
 // ---------------------------------------------------------------- batch 155: import, reuse, progress, Hy-MT2
