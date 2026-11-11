@@ -8,11 +8,15 @@ A desktop music player with bit-perfect output (PCM and DSD), a
 professional-grade spectrum analyzer, and a parametric EQ, built in Rust.
 
 <p align="center">
-  <img src="screenshots/player.png" alt="UI" width="700"/>
+  <img src="screenshots/Listen.jpg" alt="UI" width="700"/>
 </p>
 
 <p align="center">
-  <img src="screenshots/spectrum.png" alt="Spectrum analyzer with parametric EQ overlay" width="700"/>
+  <img src="screenshots/Library.jpg" alt="UI" width="700"/>
+</p>
+
+<p align="center">
+  <img src="screenshots/Analyze.png" alt="UI" width="700"/>
 </p>
 
 ## Build
