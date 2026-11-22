@@ -39,13 +39,17 @@
 //! the transform's code — must change its identity. The true CQT has its own
 //! `cqt-rev` field; bumping it does not retire unrelated FFT or Superlet
 //! records. [`SCHEMA`] remains the version of the common record format. The
-//! compute route (CPU or GPU) is not part of the
-//! identity: it is an implementation of the same transform, not a setting.
+//! compute route (CPU, the GPU assist, the exact NVIDIA assist) is not part of
+//! the identity: it is an implementation of the same transform, not a setting.
+//! High-accuracy GPU is not such a route — it is a different numerical method
+//! — so it is identity: `num=gpu-hp1` after the Superlet fields, with its own
+//! revision. Standard appends nothing, and `num` is outside the transform
+//! fields, so alternate discovery never crosses between the two.
 use std::path::{Path, PathBuf};
 
 use super::aslt::AsltConfig;
 use super::freq_scale::FreqScale;
-use super::{AnalysisSettings, BarMappingMode, InterpolationMode, WindowFn};
+use super::{AnalysisSettings, BarMappingMode, InterpolationMode, Numerics, WindowFn};
 
 /// The record's first field. Bump it to retire every record written before.
 pub const SCHEMA: &str = "moosik-analysis/1";
@@ -160,6 +164,11 @@ impl AnalysisSettings {
                 scale(c.scale),
                 bits(*fps),
             );
+            // A different numerical method, with its own revision; appended
+            // only for it, so every Standard record stays byte-identical.
+            if self.numerics == Numerics::HighAccuracyGpu {
+                out += &format!(";num={}", super::aslt::hp::REVISION);
+            }
         }
         out
     }
@@ -307,6 +316,160 @@ mod tests {
             dsd_rate: None,
             fft,
             aslt,
+            numerics: Numerics::Standard,
+        }
+    }
+
+    /// High-accuracy GPU is its own identity: `num=gpu-hp1` after the
+    /// Superlet fields, so its canonical record, stem, stereo identity, unit
+    /// and legacy key all differ from Standard's — whose bytes are the pinned
+    /// ones above, unchanged. Other methods cannot carry it.
+    #[test]
+    fn high_accuracy_gpu_is_its_own_identity_and_standard_is_unchanged() {
+        let std = settings(BarMappingMode::Superlet);
+        let hp = std.clone().with_numerics(Numerics::HighAccuracyGpu);
+        // Frozen Standard bytes from before HP existed. These literals pin
+        // every downstream identity, rather than comparing two calls to the
+        // same new implementation and allowing both to drift together.
+        let standard = "moosik-analysis/1;src=18d70cab9692be0d;bars=1024;lo=41a00000;hi=46bb8000;map=superlet;dsd=-;q=40000000;win=3e800000;n=9;spread=3f000000;scale=blend:3f000000;fps=43340000";
+        assert_eq!(std.canonical(), standard);
+        assert_eq!(std.record(44_100), format!("{standard};sr=44100;hop=245"));
+        assert_eq!(std.record(48_000), format!("{standard};sr=48000;hop=267"));
+        assert_eq!(std.stem(), "d8bd162d2b0a6d04_dafa55f94fc295f4");
+        assert_eq!(std.identity(), super::super::stereo::Identity {
+            source: 0x18d7_0cab_9692_be0d,
+            params: 0xf9f5_98ee_6041_633b,
+        });
+        assert_eq!(std.key(Path::new("D")).1,
+            Path::new("D").join("v2").join("d8bd162d2b0a6d04_dafa55f94fc295f4.head"));
+        assert_eq!(std.legacy_record_key(Path::new("D")),
+            Path::new("D").join("18d70cab9692be0d_ef9f598ee6041633b.spectrumcache"));
+        assert_eq!(std.clone().with_numerics(Numerics::Standard), std);
+        assert_eq!(hp.record(44_100), format!(
+            "moosik-analysis/1;src={:016x};bars=1024;lo=41a00000;hi=46bb8000;map=superlet;dsd=-;q=40000000;win=3e800000;n=9;spread=3f000000;scale=blend:3f000000;fps=43340000;num=gpu-hp1;sr=44100;hop=245",
+            source_of(&hp.track),
+        ));
+        assert!(!std.canonical().contains("num="), "Standard gained a field");
+        assert_ne!(hp, std, "completion matching must tell the modes apart");
+        assert_ne!(hp.canonical(), std.canonical());
+        assert_ne!(hp.stem(), std.stem());
+        assert_ne!(hp.identity(), std.identity());
+        assert_ne!(hp.key(Path::new("D")).1, std.key(Path::new("D")).1);
+        assert_ne!(hp.legacy_record_key(Path::new("D")), std.legacy_record_key(Path::new("D")));
+        // Outside the transform fields: an HP record and a Standard one never
+        // share a remainder, so neither is ever the other's alternate.
+        let (rec_hp, rec_std) = (hp.record(48_000), std.record(48_000));
+        let (rest_hp, t_hp) = split_transform(&rec_hp);
+        let (rest_std, t_std) = split_transform(&rec_std);
+        assert_eq!(t_hp, t_std);
+        assert_ne!(rest_hp, rest_std);
+        assert!(rest_hp.contains(";num=gpu-hp1"));
+        // FFT and CQT methods have no such choice.
+        for m in [BarMappingMode::FlatOverlap, BarMappingMode::Cqt, BarMappingMode::TrueCqt(super::super::cqt::Config::default())] {
+            let s = settings(m);
+            assert_eq!(s.clone().with_numerics(Numerics::HighAccuracyGpu), s);
+        }
+    }
+
+    /// A private on-disk cache fixture: no analysis, device, home profile or
+    /// owner cache is opened. Store publication only needs a source snapshot.
+    struct CacheFixture(PathBuf);
+
+    impl CacheFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "moosik_hp_identity_{}_{stamp}_{serial}", std::process::id(),
+            ));
+            // Fail on a pre-existing path rather than cleaning or overwriting
+            // anything the test did not create.
+            std::fs::create_dir(&dir).expect("private identity fixture directory");
+            Self(dir)
+        }
+
+        fn settings(&self) -> AnalysisSettings {
+            let mut s = settings(BarMappingMode::Superlet);
+            s.track = self.0.join("source.flac");
+            std::fs::write(&s.track, b"identity fixture: not decoded").unwrap();
+            s
+        }
+    }
+
+    impl Drop for CacheFixture {
+        fn drop(&mut self) {
+            let temp = std::env::temp_dir();
+            if self.0.parent() == Some(temp.as_path()) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    fn alternate_settings(current: &AnalysisSettings, cfg: &AsltConfig) -> AnalysisSettings {
+        let mut other = current.clone();
+        other.aslt.as_mut().unwrap().0 = cfg.clone();
+        other
+    }
+
+    /// Exercise actual store discovery, including its record and re-key
+    /// checks, with same-mode positive controls in both directions.
+    #[test]
+    fn store_alternates_do_not_cross_standard_and_high_accuracy_modes() {
+        use super::super::{alt_cache, cache, seed_generation, store};
+        let fixture = CacheFixture::new();
+        let standard = fixture.settings();
+        let hp = standard.clone().with_numerics(Numerics::HighAccuracyGpu);
+        let mut alternate_cfg = standard.aslt.as_ref().unwrap().0.clone();
+        alternate_cfg.n_wavelets = 7;
+        let rows = cache::PreFrames::from_analysis(&[vec![0.5; standard.bars], vec![0.5; standard.bars]]);
+        let cache_dir = fixture.0.join("cache");
+        let alt_std = alternate_settings(&standard, &alternate_cfg);
+        let alt_hp = alternate_settings(&hp, &alternate_cfg);
+        let std_path = seed_generation(&cache_dir, &alt_std, 48_000, &rows, None);
+        let hp_path = seed_generation(&cache_dir, &alt_hp, 48_000, &rows, None);
+        let st = store::Store::open(&store_dir(&cache_dir)).unwrap();
+        let source = store::SourceSnapshot::of_path(&standard.track).unwrap();
+        for (current, expected) in [(&standard, &std_path), (&hp, &hp_path)] {
+            let found = alt_cache::discover_store(
+                &st, &cache_dir, &current.track, &source, &current.record(48_000),
+                Some(&current.stem()), alternate_cfg.scale,
+                &|cfg| alternate_settings(current, cfg).key(&cache_dir).1,
+            );
+            assert_eq!(found.len(), 1, "cross-mode store alternate or missing positive control");
+            assert_eq!(found[0].path, *expected);
+            assert!(!found[0].legacy && !found[0].nominal);
+            assert_eq!(found[0].cfg, alternate_cfg);
+        }
+    }
+
+    /// Record-bearing legacy discovery uses the same numerical-method barrier.
+    /// These files remain labelled legacy; finding one never installs it.
+    #[test]
+    fn record_alternates_do_not_cross_standard_and_high_accuracy_modes() {
+        use super::super::{alt_cache, cache};
+        let fixture = CacheFixture::new();
+        let standard = fixture.settings();
+        let hp = standard.clone().with_numerics(Numerics::HighAccuracyGpu);
+        let mut alternate_cfg = standard.aslt.as_ref().unwrap().0.clone();
+        alternate_cfg.n_wavelets = 7;
+        let rows = cache::PreFrames::from_analysis(&[vec![0.5; standard.bars], vec![0.5; standard.bars]]);
+        let alt_std = alternate_settings(&standard, &alternate_cfg);
+        let alt_hp = alternate_settings(&hp, &alternate_cfg);
+        let paths = [&alt_std, &alt_hp].map(|s| {
+            let path = s.legacy_record_key(&fixture.0);
+            std::fs::write(&path, rows.to_v4_with(s.record(48_000).as_bytes())).unwrap();
+            path
+        });
+        for (current, expected) in [(&standard, &paths[0]), (&hp, &paths[1])] {
+            let found = alt_cache::discover_verified(
+                &fixture.0, &current.track, &current.record(48_000), alternate_cfg.scale,
+                &|cfg| alternate_settings(current, cfg).legacy_record_key(&fixture.0),
+            );
+            assert_eq!(found.len(), 1, "cross-mode record alternate or missing positive control");
+            assert_eq!(found[0].path, *expected);
+            assert!(found[0].legacy && !found[0].nominal);
+            assert_eq!(found[0].cfg, alternate_cfg);
         }
     }
 

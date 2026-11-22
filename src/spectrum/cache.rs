@@ -112,6 +112,8 @@ impl Default for Limits {
     }
 }
 
+mod v5;
+
 // ---------------------------------------------------------------------------
 // The v4 container
 // ---------------------------------------------------------------------------
@@ -176,6 +178,32 @@ const MAGIC_V3: u32 = 0x4D53_5033; // "MSP3"
 /// when the cell count is odd; it is written as zero and ignored on read.
 const MAGIC_V4: u32 = 0x4D53_5034;
 
+/// v5 magic, "MSP5": the same 12-bit codes as v4, coded by [`v5`] (lossless,
+/// about a third smaller).
+///
+/// The header is v4's, field for field, with two differences: bytes 16–19 are
+/// the body's length, and byte 20 is 1 when the plane was coded against a
+/// reference plane (bytes 21–23 zero). The record follows as in v4, then the
+/// body. A build that does not know v5 refuses the magic and recomputes.
+const MAGIC_V5: u32 = 0x4D53_5035;
+
+/// Whether analyses published from now on are written as v5 (the cache
+/// settings). Off by default; reading v5 never depends on it.
+static COMPACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_compact(on: bool) {
+    COMPACT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn compact() -> bool {
+    COMPACT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether these bytes begin a v5 plane.
+pub fn is_compact(raw: &[u8]) -> bool {
+    raw.len() >= 4 && le_u32(raw, 0) == MAGIC_V5
+}
+
 const V4_HEADER: usize = 24;
 
 /// Header flag: a settings record follows the header.
@@ -205,6 +233,13 @@ pub enum CacheError {
     TooLarge { what: &'static str, got: usize, limit: usize },
     /// An allocation this size could not be reserved.
     OutOfMemory { bytes: usize },
+    /// A v5 body this build cannot take apart.
+    Malformed(&'static str),
+    /// A v5 plane decoded to something other than what was encoded.
+    Checksum,
+    /// A v5 plane coded against a reference, read without (or with another
+    /// shape of) one.
+    NeedsReference,
 }
 
 impl std::fmt::Display for CacheError {
@@ -233,6 +268,9 @@ impl std::fmt::Display for CacheError {
             CacheError::OutOfMemory { bytes } => {
                 write!(f, "could not reserve {bytes} bytes")
             }
+            CacheError::Malformed(why) => write!(f, "compact plane: {why}"),
+            CacheError::Checksum => write!(f, "compact plane does not decode to what was stored"),
+            CacheError::NeedsReference => write!(f, "compact plane needs the plane it was coded against"),
         }
     }
 }
@@ -451,6 +489,56 @@ impl PreFrames {
         self.to_v4_with(&[])
     }
 
+    /// v5 with a settings record (empty for none), coded against `reference`
+    /// if given: the same rows, in about two thirds of v4's bytes.
+    ///
+    /// `None` when these rows cannot be written as v5 (not 12-bit codes, no
+    /// rows, a reference of another shape) or when the bytes just written do
+    /// not decode back to these rows. The caller then writes v4: a compact
+    /// file is only ever published after it has been read back whole.
+    pub fn to_v5_with(&self, record: &[u8], reference: Option<&PreFrames>) -> Option<Vec<u8>> {
+        assert!(record.len() <= u16::MAX as usize, "a settings record is at most 64 KiB");
+        let same_shape = |r: &PreFrames| r.frames == self.frames && r.bars == self.bars && r.max_code == V4_MAX_CODE;
+        if self.max_code != V4_MAX_CODE || self.frames == 0 || self.bars == 0 || !reference.is_none_or(same_shape) {
+            return None;
+        }
+        let refc = reference.map(|r| &r.codes[..]);
+        let body = v5::encode(&self.codes, self.frames, self.bars, refc);
+        if body.len() > u32::MAX as usize || v5::decode(&body, self.frames, self.bars, refc).ok().as_deref() != Some(&self.codes[..]) {
+            crate::mlog!("[cache] a compact plane did not read back; writing the plain form instead");
+            return None;
+        }
+        let mut out = Vec::with_capacity(V4_HEADER + record.len() + body.len());
+        out.extend_from_slice(&MAGIC_V5.to_le_bytes());
+        out.extend_from_slice(&(self.frames as u32).to_le_bytes());
+        out.extend_from_slice(&(self.bars as u32).to_le_bytes());
+        out.push(V4_BITS as u8);
+        out.push(if record.is_empty() { 0 } else { FLAG_RECORD });
+        out.extend_from_slice(&(record.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[reference.is_some() as u8, 0, 0, 0]);
+        out.extend_from_slice(record);
+        out.extend_from_slice(&body);
+        Some(out)
+    }
+
+    /// The bytes to publish for these rows: v4, or with the compact setting
+    /// on, v5 where the rows take it and it is the smaller of the two.
+    pub fn to_bytes_with(&self, record: &[u8], reference: Option<&PreFrames>) -> Vec<u8> {
+        self.to_bytes_as(record, reference, compact())
+    }
+
+    /// [`PreFrames::to_bytes_with`] with the setting stated. A small plane can
+    /// be larger compact than plain (the compact form carries its tables), so
+    /// the smaller is kept.
+    pub fn to_bytes_as(&self, record: &[u8], reference: Option<&PreFrames>, compact: bool) -> Vec<u8> {
+        let plain = self.to_v4_with(record);
+        match compact.then(|| self.to_v5_with(record, reference)).flatten() {
+            Some(small) if small.len() < plain.len() => small,
+            _ => plain,
+        }
+    }
+
     /// v4 with a settings record in the header; an empty record writes the
     /// plain v4 `to_v4` does, byte for byte.
     pub fn to_v4_with(&self, record: &[u8]) -> Vec<u8> {
@@ -585,6 +673,18 @@ pub fn decode_with(
     max_bars: usize,
     limits: Limits,
 ) -> Result<PreFrames, CacheError> {
+    decode_with_reference(raw, want_bars, max_bars, limits, None)
+}
+
+/// [`decode_with`], for a plane that may have been coded against `reference`
+/// (Left and Right against Mix). A plane coded without one ignores it.
+pub fn decode_with_reference(
+    raw: &[u8],
+    want_bars: usize,
+    max_bars: usize,
+    limits: Limits,
+    reference: Option<&PreFrames>,
+) -> Result<PreFrames, CacheError> {
     if raw.len() > limits.max_file_bytes {
         return Err(CacheError::TooLarge {
             what: "file",
@@ -621,6 +721,7 @@ pub fn decode_with(
 
     match magic {
         MAGIC_V4 => decode_v4(raw, frames, bars, cells, limits),
+        MAGIC_V5 => decode_v5(raw, frames, bars, cells, limits, reference),
         MAGIC_V2 | MAGIC_V3 => {
             decode_legacy(raw, frames, bars, cells, magic == MAGIC_V3, limits)
         }
@@ -718,6 +819,48 @@ fn decode_v4(
     Ok(PreFrames::from_codes(codes, frames, bars, V4_MAX_CODE))
 }
 
+fn decode_v5(
+    raw: &[u8],
+    frames: usize,
+    bars: usize,
+    cells: usize,
+    limits: Limits,
+    reference: Option<&PreFrames>,
+) -> Result<PreFrames, CacheError> {
+    if raw.len() < V4_HEADER {
+        return Err(CacheError::TooShort);
+    }
+    let bits = raw[12];
+    if bits as u32 != V4_BITS {
+        return Err(CacheError::UnsupportedBits(bits));
+    }
+    let rec = record_len(raw)?;
+    let start = V4_HEADER + rec;
+    let body_len = le_u32(raw, 16) as usize;
+    let declared = start.checked_add(body_len).ok_or(CacheError::LengthMismatch { declared: usize::MAX, actual: raw.len() })?;
+    if declared != raw.len() {
+        return Err(CacheError::LengthMismatch { declared, actual: raw.len() });
+    }
+    let needs_reference = match raw[20..24] {
+        [0, 0, 0, 0] => false,
+        [1, 0, 0, 0] => true,
+        _ => return Err(CacheError::Reserved),
+    };
+    // The plane's size comes from the dimensions, and is weighed against the
+    // bytes present before anything is allocated for it.
+    check_expansion("compact plane", body_len, cells, limits)?;
+    let reference = match (needs_reference, reference) {
+        (false, _) => None,
+        (true, Some(r)) if r.frames == frames && r.bars == bars && r.max_code == V4_MAX_CODE => Some(&r.codes[..]),
+        (true, _) => return Err(CacheError::NeedsReference),
+    };
+    let codes = v5::decode(&raw[start..], frames, bars, reference).map_err(|e| match e {
+        v5::Refused::Malformed(why) => CacheError::Malformed(why),
+        v5::Refused::Checksum => CacheError::Checksum,
+    })?;
+    Ok(PreFrames::from_codes(codes, frames, bars, V4_MAX_CODE))
+}
+
 /// The length of the settings record a v4 header declares; 0 for none.
 ///
 /// Bytes 13–15 were reserved. Anything but "no flag, no length" or "the record
@@ -737,7 +880,7 @@ fn record_len(raw: &[u8]) -> Result<usize, CacheError> {
 /// not ASCII, or a file too short to hold what it declares. None of those is an
 /// error to the caller: each means "states no exact settings".
 pub fn record_of(raw: &[u8]) -> Option<&str> {
-    if raw.len() < V4_HEADER || le_u32(raw, 0) != MAGIC_V4 {
+    if raw.len() < V4_HEADER || !matches!(le_u32(raw, 0), MAGIC_V4 | MAGIC_V5) {
         return None;
     }
     let len = record_len(raw).ok().filter(|&n| n > 0)?;
@@ -751,7 +894,7 @@ pub fn read_record(path: &Path) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
     let mut head = [0u8; V4_HEADER];
     f.read_exact(&mut head).ok()?;
-    if le_u32(&head, 0) != MAGIC_V4 {
+    if !matches!(le_u32(&head, 0), MAGIC_V4 | MAGIC_V5) {
         return None;
     }
     let len = record_len(&head).ok().filter(|&n| n > 0)?;
@@ -978,6 +1121,8 @@ pub(crate) fn read_bounded(path: &Path, limits: Limits) -> Result<Vec<u8>, Cache
 
 #[cfg(test)]
 mod codec_screen;
+#[cfg(test)]
+mod v5_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

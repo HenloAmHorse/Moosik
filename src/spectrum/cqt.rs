@@ -449,57 +449,174 @@ fn kernel(
 ) -> Result<Vec<Complex<f64>>, Error> {
     let mut spectrum = zeroed::<Complex<f64>>(n)?;
     let mut sum = 0.0;
-    for i in 0..=2 * bin.half {
-        if i % 4096 == 0 {
-            poll(should_continue)?;
+    if 2 * bin.half < n {
+        for i in 0..=bin.half {
+            if i % 4096 == 0 {
+                poll(should_continue)?;
+            }
+            let j = i as f64 - bin.half as f64;
+            let w = window.at(PI * j / bin.half as f64);
+            sum += w;
+            // Reuse the already charged spectrum storage; the second pass uses
+            // the very same f64 window value, not another transcendental call.
+            spectrum[bin.half - i].re = w;
         }
-        let j = i as f64 - bin.half as f64;
-        let w = window.at(PI * j / bin.half as f64);
-        sum += w;
-        // Reuse the already charged spectrum storage; the second pass uses
-        // the very same f64 window value, not another transcendental call.
-        let at = (n + bin.half - i) % n;
-        spectrum[at].re = w;
-    }
-    let gain = 2.0 / sum;
-    for i in 0..=2 * bin.half {
-        if i % 4096 == 0 {
-            poll(should_continue)?;
+        for i in (bin.half + 1)..=2 * bin.half {
+            if i % 4096 == 0 {
+                poll(should_continue)?;
+            }
+            let j = i as f64 - bin.half as f64;
+            let w = window.at(PI * j / bin.half as f64);
+            sum += w;
+            spectrum[n + bin.half - i].re = w;
         }
-        let j = i as f64 - bin.half as f64;
-        let at = (n + bin.half - i) % n;
-        let amplitude = gain * spectrum[at].re;
-        let angle = -TAU * bin.frequency * j / f64::from(sr);
-        // Reverse centred correlation kernel for circular convolution.
-        spectrum[at] = Complex::new(amplitude * angle.cos(), amplitude * angle.sin());
+        let gain = 2.0 / sum;
+        for i in 0..=bin.half {
+            if i % 4096 == 0 {
+                poll(should_continue)?;
+            }
+            let j = i as f64 - bin.half as f64;
+            let at = bin.half - i;
+            let amplitude = gain * spectrum[at].re;
+            let angle = -TAU * bin.frequency * j / f64::from(sr);
+            // Reverse centred correlation kernel for circular convolution.
+            spectrum[at] = Complex::new(amplitude * angle.cos(), amplitude * angle.sin());
+        }
+        for i in (bin.half + 1)..=2 * bin.half {
+            if i % 4096 == 0 {
+                poll(should_continue)?;
+            }
+            let j = i as f64 - bin.half as f64;
+            let at = n + bin.half - i;
+            let amplitude = gain * spectrum[at].re;
+            let angle = -TAU * bin.frequency * j / f64::from(sr);
+            // Reverse centred correlation kernel for circular convolution.
+            spectrum[at] = Complex::new(amplitude * angle.cos(), amplitude * angle.sin());
+        }
+    } else {
+        for i in 0..=2 * bin.half {
+            if i % 4096 == 0 {
+                poll(should_continue)?;
+            }
+            let j = i as f64 - bin.half as f64;
+            let w = window.at(PI * j / bin.half as f64);
+            sum += w;
+            let at = (n + bin.half - i) % n;
+            spectrum[at].re = w;
+        }
+        let gain = 2.0 / sum;
+        for i in 0..=2 * bin.half {
+            if i % 4096 == 0 {
+                poll(should_continue)?;
+            }
+            let j = i as f64 - bin.half as f64;
+            let at = (n + bin.half - i) % n;
+            let amplitude = gain * spectrum[at].re;
+            let angle = -TAU * bin.frequency * j / f64::from(sr);
+            spectrum[at] = Complex::new(amplitude * angle.cos(), amplitude * angle.sin());
+        }
     }
     Ok(spectrum)
 }
 
-fn fill_input(
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn fill_input_f32_to_c64_avx2(src: &[f32], dst: &mut [Complex<f64>]) -> bool {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let len = src.len();
+        debug_assert_eq!(len, dst.len());
+        let src_ptr = src.as_ptr();
+        let dst_ptr = dst.as_mut_ptr() as *mut f64;
+        let exp_mask = _mm256_set1_epi32(0x7F80_0000u32 as i32);
+        let zero = _mm256_setzero_pd();
+        let mut i = 0usize;
+        while i + 8 <= len {
+            let v = _mm256_loadu_ps(src_ptr.add(i));
+            let bits = _mm256_castps_si256(v);
+            let nonfinite = _mm256_cmpeq_epi32(_mm256_and_si256(bits, exp_mask), exp_mask);
+            if _mm256_movemask_epi8(nonfinite) != 0 {
+                return false;
+            }
+            let d0 = _mm256_cvtps_pd(_mm256_castps256_ps128(v));
+            let d1 = _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(v));
+            let lo0 = _mm256_unpacklo_pd(d0, zero);
+            let hi0 = _mm256_unpackhi_pd(d0, zero);
+            let lo1 = _mm256_unpacklo_pd(d1, zero);
+            let hi1 = _mm256_unpackhi_pd(d1, zero);
+            let out_ptr = dst_ptr.add(i * 2);
+            _mm256_storeu_pd(out_ptr, _mm256_permute2f128_pd::<0x20>(lo0, hi0));
+            _mm256_storeu_pd(out_ptr.add(4), _mm256_permute2f128_pd::<0x31>(lo0, hi0));
+            _mm256_storeu_pd(out_ptr.add(8), _mm256_permute2f128_pd::<0x20>(lo1, hi1));
+            _mm256_storeu_pd(out_ptr.add(12), _mm256_permute2f128_pd::<0x31>(lo1, hi1));
+            i += 8;
+        }
+        for j in i..len {
+            let sample = *src_ptr.add(j);
+            if !sample.is_finite() {
+                return false;
+            }
+            *dst.get_unchecked_mut(j) = Complex::new(f64::from(sample), 0.0);
+        }
+        true
+    }
+}
+
+pub(crate) fn fill_input(
     target: &mut [Complex<f64>],
     source: &[f32],
     start: usize,
     half: usize,
     should_continue: &dyn Fn() -> bool,
 ) -> Result<(), Error> {
-    for (i, value) in target.iter_mut().enumerate() {
-        if i % 4096 == 0 {
-            poll(should_continue)?;
+    let n = target.len();
+    let lo = start as i128 - half as i128;
+    let t_start = (-lo).clamp(0, n as i128) as usize;
+    let t_end = (source.len() as i128 - lo).clamp(0, n as i128) as usize;
+    let zero = Complex::new(0.0, 0.0);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let use_avx2 = is_x86_feature_detected!("avx2");
+    let mut chunk_start = 0;
+    while chunk_start < n {
+        poll(should_continue)?;
+        let chunk_end = (chunk_start + 4096).min(n);
+        let fill_start = t_start.clamp(chunk_start, chunk_end);
+        let fill_end = t_end.clamp(chunk_start, chunk_end);
+        if fill_start > chunk_start {
+            target[chunk_start..fill_start].fill(zero);
         }
-        let source_at = if i >= half {
-            start.checked_add(i - half)
-        } else {
-            start.checked_sub(half - i)
-        };
-        let sample = source_at
-            .and_then(|at| source.get(at))
-            .copied()
-            .unwrap_or(0.0);
-        if !sample.is_finite() {
-            return Err(Error::Invalid("CQT input contains a non-finite sample"));
+        if fill_end > fill_start {
+            let s_start = (lo + fill_start as i128) as usize;
+            let s_len = fill_end - fill_start;
+            let src = &source[s_start..s_start + s_len];
+            let dst = &mut target[fill_start..fill_end];
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if use_avx2 {
+                // SAFETY: AVX2 availability verified above; slices have matching length `s_len`.
+                if unsafe { !fill_input_f32_to_c64_avx2(src, dst) } {
+                    return Err(Error::Invalid("CQT input contains a non-finite sample"));
+                }
+                if chunk_end > fill_end {
+                    target[fill_end..chunk_end].fill(zero);
+                }
+                chunk_start = chunk_end;
+                continue;
+            }
+            for (&sample, value) in src.iter().zip(dst.iter_mut()) {
+                if !sample.is_finite() {
+                    return Err(Error::Invalid("CQT input contains a non-finite sample"));
+                }
+                *value = Complex::new(f64::from(sample), 0.0);
+            }
         }
-        *value = Complex::new(f64::from(sample), 0.0);
+        if chunk_end > fill_end {
+            target[fill_end..chunk_end].fill(zero);
+        }
+        chunk_start = chunk_end;
     }
     Ok(())
 }
@@ -509,6 +626,53 @@ fn fill_input(
 /// existing level converter. It must be a pure mapping for budget-independent
 /// outputs. `on_progress` is a monotonically increasing cell-count fraction,
 /// not an elapsed-time/ETA prediction. Cancellation drops partial output.
+trait CodeMap {
+    fn map_one(&self, mag: f32) -> u16;
+    fn write_wave_parallel(
+        &self,
+        _workspace: &mut parallel::Workspace,
+        _codes: &mut [Vec<u16>; 3],
+        _bins: &[Bin],
+        _bars: usize,
+        _norm: f64,
+    ) -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+struct DynCodeMap<'a>(&'a dyn Fn(f32) -> u16);
+
+#[cfg(test)]
+impl CodeMap for DynCodeMap<'_> {
+    #[inline(always)]
+    fn map_one(&self, mag: f32) -> u16 {
+        (self.0)(mag)
+    }
+}
+
+struct SyncCodeMap<'a, M>(&'a M);
+
+impl<M: Fn(f32) -> u16 + Sync> CodeMap for SyncCodeMap<'_, M> {
+    #[inline(always)]
+    fn map_one(&self, mag: f32) -> u16 {
+        (self.0)(mag)
+    }
+
+    fn write_wave_parallel(
+        &self,
+        workspace: &mut parallel::Workspace,
+        codes: &mut [Vec<u16>; 3],
+        bins: &[Bin],
+        bars: usize,
+        norm: f64,
+    ) -> bool {
+        workspace.write_wave_codes(codes, bins, bars, norm, self.0);
+        true
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn analyze_input_codes(
     input: Input<'_>,
@@ -536,12 +700,43 @@ pub fn analyze_input_codes(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analyze_input_codes_sync<M: Fn(f32) -> u16 + Sync>(
+    input: Input<'_>,
+    sample_rate: u32,
+    frequencies: &[f64],
+    config: &Config,
+    limits: Limits,
+    should_continue: &(dyn Fn() -> bool + Sync),
+    on_progress: &dyn Fn(f32),
+    map: &M,
+) -> Result<Output, Error> {
+    let phase_timing = std::env::var_os("MOOSIK_CQT_PHASES").is_some_and(|v| v == "1");
+    let mapper = SyncCodeMap(map);
+    analyze_inner_profiled_with(
+        input,
+        sample_rate,
+        frequencies,
+        config,
+        limits,
+        should_continue,
+        on_progress,
+        &mapper,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        false,
+        phase_timing,
+    )
+}
+
 // The test-only observer sees the actual production FFT values before their
 // magnitudes are taken. A conjugated/wrong-sign coefficient can pass every
 // real-signal magnitude check; it must not pass the complex-reference gate.
 #[cfg(test)]
 type CoefficientObserver<'a> = &'a dyn Fn(usize, usize, Complex<f64>, Option<Complex<f64>>);
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn analyze_inner(
     input: Input<'_>,
@@ -559,13 +754,23 @@ fn analyze_inner(
     // an explicit diagnostic run can be enabled without changing the analysis.
     let phase_timing = std::env::var_os("MOOSIK_CQT_PHASES").is_some_and(|v| v == "1");
     analyze_inner_profiled(
-        input, sample_rate, frequencies, config, limits, should_continue, on_progress, map,
-        #[cfg(test)] observer,
-        #[cfg(test)] force_full_inverse,
+        input,
+        sample_rate,
+        frequencies,
+        config,
+        limits,
+        should_continue,
+        on_progress,
+        map,
+        #[cfg(test)]
+        observer,
+        #[cfg(test)]
+        force_full_inverse,
         phase_timing,
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn analyze_inner_profiled(
     input: Input<'_>,
@@ -576,6 +781,38 @@ fn analyze_inner_profiled(
     should_continue: &(dyn Fn() -> bool + Sync),
     on_progress: &dyn Fn(f32),
     map: &dyn Fn(f32) -> u16,
+    #[cfg(test)] observer: Option<CoefficientObserver<'_>>,
+    #[cfg(test)] force_full_inverse: bool,
+    phase_timing: bool,
+) -> Result<Output, Error> {
+    let mapper = DynCodeMap(map);
+    analyze_inner_profiled_with(
+        input,
+        sample_rate,
+        frequencies,
+        config,
+        limits,
+        should_continue,
+        on_progress,
+        &mapper,
+        #[cfg(test)]
+        observer,
+        #[cfg(test)]
+        force_full_inverse,
+        phase_timing,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_inner_profiled_with<M: CodeMap + ?Sized>(
+    input: Input<'_>,
+    sample_rate: u32,
+    frequencies: &[f64],
+    config: &Config,
+    limits: Limits,
+    should_continue: &(dyn Fn() -> bool + Sync),
+    on_progress: &dyn Fn(f32),
+    map: &M,
     #[cfg(test)] observer: Option<CoefficientObserver<'_>>,
     #[cfg(test)] force_full_inverse: bool,
     phase_timing: bool,
@@ -669,7 +906,7 @@ fn analyze_inner_profiled(
         // Allocate this *instead of* serial buffers, never beside them.
         let phase = profile.clock();
         let parallel_plan = if allow_pruning {
-            parallel::Plan::for_group(
+            parallel::Plan::for_group_batched(
                 n,
                 channels,
                 bins.len(),
@@ -682,7 +919,9 @@ fn analyze_inner_profiled(
                 limits,
                 true,
             )
-        } else { None };
+        } else {
+            None
+        };
         profile.record(phases::Region::Planning, phase);
         if let Some(plan) = parallel_plan {
             let phase = profile.clock();
@@ -690,11 +929,15 @@ fn analyze_inner_profiled(
             profile.record(phases::Region::Allocation, phase);
             match workspace {
                 Ok(mut workspace) => {
+                    let actual_workspace_bytes = workspace.workspace_bytes();
                     workspace.set_phase_timing(phase_timing);
                     work.parallel_groups += 1;
                     work.max_inverse_workers = work.max_inverse_workers.max(plan.slots);
-                    work.peak_workspace_bytes = work.peak_workspace_bytes.max(plan.workspace_bytes);
-                    for batch in bins.chunks(plan.batch_size) {
+                    work.peak_workspace_bytes =
+                        work.peak_workspace_bytes.max(actual_workspace_bytes);
+                    let mut wave_blocks = Vec::with_capacity(plan.source_blocks);
+                    let mut sources_cached = false;
+                    for (batch_idx, batch) in bins.chunks(plan.batch_size).enumerate() {
                         poll(should_continue)?;
                         work.batches += 1;
                         let phase = profile.clock();
@@ -704,84 +947,220 @@ fn analyze_inner_profiled(
                         work.kernel_ffts += entered;
                         profile.record(phases::Region::Kernel, phase);
                         let mut first = 0;
-                        while first < frames {
-                            poll(should_continue)?;
-                            let start = frame_center(first, sample_rate, config.frame_rate);
-                            let mut end = first + 1;
-                            while end < frames
-                                && frame_center(end, sample_rate, config.frame_rate) - start
-                                    < payload
-                            {
-                                end += 1;
-                            }
-                            let phase = profile.clock();
-                            {
-                                let (source_left, source_right, scratch) =
-                                    workspace.source_buffers();
-                                fill_input(source_left, left, start, half, should_continue)?;
-                                work.input_ffts += 1;
-                                forward.process_with_scratch(source_left, scratch);
-                                if let Some(right) = right {
-                                    fill_input(source_right, right, start, half, should_continue)?;
-                                    work.input_ffts += 1;
-                                    forward.process_with_scratch(source_right, scratch);
+                        let mut cached_pass = sources_cached;
+                        while cached_pass || (!sources_cached && first < frames) {
+                            if !cached_pass {
+                                wave_blocks.clear();
+                                while first < frames && wave_blocks.len() < plan.source_blocks {
+                                    poll(should_continue)?;
+                                    let start = frame_center(first, sample_rate, config.frame_rate);
+                                    let mut end = first + 1;
+                                    while end < frames
+                                        && frame_center(end, sample_rate, config.frame_rate) - start
+                                            < payload
+                                    {
+                                        end += 1;
+                                    }
+                                    wave_blocks.push(parallel::Block {
+                                        first,
+                                        end,
+                                        sample_rate,
+                                        frame_rate: config.frame_rate,
+                                        half,
+                                        start,
+                                    });
+                                    first = end;
+                                }
+                                if batch_idx == 0
+                                    && wave_blocks.first().is_some_and(|b| b.first == 0)
+                                    && first == frames
+                                    && bins.len() > plan.batch_size
+                                {
+                                    sources_cached = true;
+                                }
+                                let phase = profile.clock();
+                                workspace.prepare_sources_wave(
+                                    &wave_blocks,
+                                    left,
+                                    right,
+                                    &*forward,
+                                    should_continue,
+                                )?;
+                                work.input_ffts += (wave_blocks.len() * channels) as u64;
+                                profile.record(phases::Region::Source, phase);
+                                if phase.is_some() {
+                                    for _ in 1..wave_blocks.len() {
+                                        profile.record(phases::Region::Source, profile.clock());
+                                    }
                                 }
                             }
-                            profile.record(phases::Region::Source, phase);
                             let phase = profile.clock();
-                            let stats = workspace.process_block(
+                            let stats = workspace.process_wave(
                                 &kernels,
                                 &*inverse,
-                                parallel::Block {
-                                    first,
-                                    end,
-                                    sample_rate,
-                                    frame_rate: config.frame_rate,
-                                    half,
-                                    start,
-                                },
+                                &wave_blocks,
                                 should_continue,
                             )?;
-                            profile.record(phases::Region::ParallelInverse, phase);
-                            profile.workers(stats.worker_wall_ns, stats.worker_tasks);
+                            if cached_pass {
+                                profile.record_elapsed(phases::Region::ParallelInverse, phase);
+                            } else {
+                                profile.record(phases::Region::ParallelInverse, phase);
+                                if phase.is_some() {
+                                    for _ in 1..wave_blocks.len() {
+                                        profile.record(
+                                            phases::Region::ParallelInverse,
+                                            profile.clock(),
+                                        );
+                                    }
+                                }
+                            }
+                            let b_u64 = wave_blocks.len() as u64;
+                            let b_u128 = wave_blocks.len() as u128;
+                            let per_blk_ns = stats.worker_wall_ns / b_u128;
+                            let rem_ns = stats.worker_wall_ns % b_u128;
+                            if stats.worker_tasks >= b_u64 {
+                                let base_tasks = stats.worker_tasks / b_u64;
+                                let rem_tasks = stats.worker_tasks % b_u64;
+                                for blk in 0..wave_blocks.len() {
+                                    let ns = per_blk_ns + if blk == 0 { rem_ns } else { 0 };
+                                    let t = base_tasks + u64::from((blk as u64) < rem_tasks);
+                                    profile.workers(ns, t);
+                                }
+                            } else {
+                                for blk in 0..wave_blocks.len() {
+                                    let ns = per_blk_ns + if blk == 0 { rem_ns } else { 0 };
+                                    profile.workers(ns, stats.worker_tasks.max(1));
+                                }
+                            }
                             work.inverse_ffts += stats.inverse_ffts;
                             work.inverses_pruned += stats.inverses_pruned;
                             work.inverses_full += stats.inverses_full;
                             work.pruned_output_values += stats.pruned_output_values;
                             let phase = profile.clock();
                             let norm = 1.0 / n as f64;
-                            for (local, bin) in batch.iter().enumerate() {
-                                poll(should_continue)?;
-                                if first == 0 {
-                                    work.column_convolutions += channels as u64;
-                                }
-                                let ls = workspace.coefficients(local, 0, end - first);
-                                let rs =
-                                    right.map(|_| workspace.coefficients(local, 1, end - first));
-                                for frame in first..end {
-                                    let l = ls[frame - first] * norm;
-                                    let r = rs.map(|values| values[frame - first] * norm);
-                                    let cell = frame * bars + bin.index;
-                                    #[cfg(test)]
-                                    if let Some(observer) = observer {
-                                        observer(frame, bin.index, l, r);
+                            #[cfg(test)]
+                            let allow_fast_write = observer.is_none();
+                            #[cfg(not(test))]
+                            let allow_fast_write = true;
+                            if allow_fast_write
+                                && map.write_wave_parallel(&mut workspace, &mut codes, batch, bars, norm)
+                            {
+                                for blk in &wave_blocks {
+                                    let block_frames = blk.end - blk.first;
+                                    if blk.first == 0 {
+                                        work.column_convolutions += (batch.len() * channels) as u64;
                                     }
-                                    if let Some(r) = r {
-                                        codes[0][cell] = map(((l + r) * 0.5).norm() as f32);
-                                        codes[1][cell] = map(l.norm() as f32);
-                                        codes[2][cell] = map(r.norm() as f32);
-                                    } else {
-                                        codes[0][cell] = map(l.norm() as f32);
-                                    }
+                                    completed += batch.len() * block_frames;
                                 }
-                                completed += end - first;
                                 on_progress(completed as f32 / cells as f32);
+                                poll(should_continue)?;
+                            } else {
+                                if allow_fast_write {
+                                    workspace.fold_wave_magnitudes(norm);
+                                }
+                                for (blk_idx, blk) in wave_blocks.iter().enumerate() {
+                                    let block_frames = blk.end - blk.first;
+                                    if blk.first == 0 {
+                                        work.column_convolutions += (batch.len() * channels) as u64;
+                                    }
+                                    for (chunk_idx, bin_chunk) in batch.chunks(32).enumerate() {
+                                        let mut ls_arr: [&[Complex<f64>]; 32] = [&[]; 32];
+                                        let mut rs_arr: [&[Complex<f64>]; 32] = [&[]; 32];
+                                        let mut idx_arr: [usize; 32] = [0; 32];
+                                        let base_local = chunk_idx * 32;
+                                        let m = bin_chunk.len();
+                                        for (k, bin) in bin_chunk.iter().enumerate() {
+                                            idx_arr[k] = bin.index;
+                                            ls_arr[k] = workspace.wave_coefficients(
+                                                blk_idx,
+                                                base_local + k,
+                                                0,
+                                                block_frames,
+                                            );
+                                            if right.is_some() {
+                                                rs_arr[k] = workspace.wave_coefficients(
+                                                    blk_idx,
+                                                    base_local + k,
+                                                    1,
+                                                    block_frames,
+                                                );
+                                            }
+                                        }
+                                        if allow_fast_write {
+                                            let stereo = right.is_some();
+                                            for rel in 0..block_frames {
+                                                if rel % 64 == 0 {
+                                                    poll(should_continue)?;
+                                                }
+                                                let row_base = (blk.first + rel) * bars;
+                                                if stereo {
+                                                    for k in 0..m {
+                                                        let pair = ls_arr[k][rel];
+                                                        let cell = row_base + idx_arr[k];
+                                                        codes[0][cell] =
+                                                            map.map_one(pair.re as f32);
+                                                        codes[1][cell] =
+                                                            map.map_one(pair.im as f32);
+                                                        codes[2][cell] = map.map_one(
+                                                            rs_arr[k][rel].re as f32,
+                                                        );
+                                                    }
+                                                } else {
+                                                    for k in 0..m {
+                                                        let cell = row_base + idx_arr[k];
+                                                        codes[0][cell] = map.map_one(
+                                                            ls_arr[k][rel].re as f32,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            for rel in 0..block_frames {
+                                                if rel % 64 == 0 {
+                                                    poll(should_continue)?;
+                                                }
+                                                let frame = blk.first + rel;
+                                                let row_base = frame * bars;
+                                                for k in 0..m {
+                                                    let l = ls_arr[k][rel] * norm;
+                                                    let r = right.map(|_| rs_arr[k][rel] * norm);
+                                                    let cell = row_base + idx_arr[k];
+                                                    #[cfg(test)]
+                                                    if let Some(observer) = observer {
+                                                        observer(frame, idx_arr[k], l, r);
+                                                    }
+                                                    if let Some(r) = r {
+                                                        codes[0][cell] = map.map_one(
+                                                            ((l + r) * 0.5).norm() as f32,
+                                                        );
+                                                        codes[1][cell] =
+                                                            map.map_one(l.norm() as f32);
+                                                        codes[2][cell] =
+                                                            map.map_one(r.norm() as f32);
+                                                    } else {
+                                                        codes[0][cell] =
+                                                            map.map_one(l.norm() as f32);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        completed += m * block_frames;
+                                        on_progress(completed as f32 / cells as f32);
+                                        poll(should_continue)?;
+                                    }
+                                }
                             }
                             profile.record(phases::Region::ParallelFold, phase);
-                            first = end;
+                            cached_pass = false;
                         }
                     }
-                    profile.finish_group(group_phase, plan.slots, plan.batch_size, plan.workspace_bytes, work);
+                    profile.finish_group(
+                        group_phase,
+                        plan.slots,
+                        plan.batch_size,
+                        actual_workspace_bytes,
+                        work,
+                    );
                     continue;
                 }
                 Err(Error::Allocation) => {
@@ -950,11 +1329,11 @@ fn analyze_inner_profiled(
                             observer(frame, bin.index, l, r);
                         }
                         if let Some(r) = r {
-                            codes[0][cell] = map(((l + r) * 0.5).norm() as f32);
-                            codes[1][cell] = map(l.norm() as f32);
-                            codes[2][cell] = map(r.norm() as f32);
+                            codes[0][cell] = map.map_one(((l + r) * 0.5).norm() as f32);
+                            codes[1][cell] = map.map_one(l.norm() as f32);
+                            codes[2][cell] = map.map_one(r.norm() as f32);
                         } else {
-                            codes[0][cell] = map(l.norm() as f32);
+                            codes[0][cell] = map.map_one(l.norm() as f32);
                         }
                     }
                     completed += end - first;

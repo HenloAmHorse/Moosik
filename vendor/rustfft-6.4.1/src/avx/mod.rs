@@ -321,4 +321,5 @@ pub use self::avx_mixed_radix::{
 };
 pub use self::avx_raders::RadersAvx2;
 pub use self::avx_mixed_radix::ExactGpuWords32768;
+pub(crate) use self::avx_vector::{product_in_place_avx, product_into_avx};
 use self::avx_vector::AvxVector256;

@@ -99,3 +99,24 @@ body, planner choice or numerical path changes. `None` without AVX and FMA.
 The accessors are adapted from the research coefficient accessor of the
 2026-11-03 exact-ASLT investigation (words only; its debug stages are not
 included).
+
+## 1.6.2: faster AVX passes, the same outputs
+
+From `gemini/v162-rustfft` (`02016b1`, merged as `b3429d1`): AVX point
+multiplies for the pruned product forms (`product_into_avx`,
+`product_in_place_avx`, taken by `product_into` and `product_in_place` when
+AVX is present, to the bits `mul_assign_ops` gives); live-row
+column passes with a compile-time row count and L1 tiling, and 16x16 tiled
+transposes, in the AVX mixed-radix family; and reworked f32 and f64 butterfly
+leaves (`avx32_butterflies.rs`, `avx64_butterflies.rs`, `avx64_pruned.rs`).
+The immutable mixed-radix strip reads `input`, never `buffer`
+(`immut_mixed_radix_strip_reads_input_not_buffer`). No planner or FFT-size
+selection changes, and no public API change.
+
+Checked against the 1.6.1 copy in one binary: 2,147 sizes (1 to 2048, and
+mixed radices up to 2^22), f32 and f64, both directions, in-place,
+out-of-place and immutable, batch 1 and 2, and the pruned, product and
+in-place product forms on 27 sizes and 9 index sets, with scratch and outputs
+starting as NaN: 278,296 comparisons, none differ (the review that took
+Gemini's round 2 into 1.6.2). Local modified source under the upstream
+MIT/Apache-2.0 terms, not an upstream release.

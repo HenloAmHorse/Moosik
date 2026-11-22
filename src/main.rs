@@ -4,15 +4,23 @@
 // and each would get a console window of its own.
 #![cfg_attr(all(windows, not(debug_assertions), not(test)), windows_subsystem = "windows")]
 
+mod abx;
+mod beats;
+mod sections;
 mod analysis;
+mod measure;
+mod practice;
 mod unzip;
 mod youtube;
+mod autoeq;
 mod video;
 #[cfg(test)]
 mod screens161_tests;
 mod chords;
 mod audio_formats;
 mod audio_probe;
+#[cfg(test)]
+mod screens_tests;
 #[cfg(test)]
 mod audio_format_tests;
 mod bitperfect;
@@ -1215,6 +1223,8 @@ struct Engine {
     stereo_buf: StereoBuf,
     pub last_sample_rate: u32,
     eq: Option<EqStateHandle>,
+    /// Practice tempo and key (1.6.2): the last stage of the shared route.
+    practice: crate::practice::Handle,
     /// ReplayGain factor (linear) applied on the rodio path only; 1.0 = off.
     /// Never applied on the bit-perfect path (a gain multiply breaks bit-perfect).
     replay_gain: f32,
@@ -1317,6 +1327,7 @@ impl Engine {
             bp_base: Duration::ZERO,
             bp_played_at_track_start: Duration::ZERO,
             started_at: None,
+            practice: Default::default(),
             paused_elapsed: Duration::ZERO,
             current_duration: None,
             volume: 1.0,
@@ -1780,7 +1791,7 @@ impl Engine {
         let sink_channels = decoder.channels();
         let tapped = SpectrumSource::new(decoder, self.sample_buf.clone(), self.stereo_buf.clone());
         if let Some(ref eq) = self.eq {
-            sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+            sink.append(crate::practice::Practice::new(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()), self.practice.clone()));
         } else {
             sink.append(tapped);
         }
@@ -2659,7 +2670,7 @@ fn open_pcm_route(
         let tapped = SpectrumSource::new(
             DsdRodioSource(src), self.sample_buf.clone(), self.stereo_buf.clone());
         if let Some(ref eq) = self.eq {
-            sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+            sink.append(crate::practice::Practice::new(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()), self.practice.clone()));
         } else {
             sink.append(tapped);
         }
@@ -3421,7 +3432,9 @@ fn eq_is_active(&self) -> bool {
     match self.eq.as_ref() {
         None => false,
         Some(h) => match h.try_lock() {
-            Ok(eq) => eq.enabled && eq.bands.iter().any(|b| b.enabled),
+            // Bands, preamp, crossfeed, room correction or practice tempo
+            // and key: anything that changes samples.
+            Ok(eq) => eq.is_active() || !self.practice.lock().map(|p| p.is_normal()).unwrap_or(true),
             Err(_) => true,
         },
     }
@@ -3586,8 +3599,27 @@ fn bp_refresh_processing(&mut self) {
             && !sink.is_paused() {
             sink.pause();
             if let Some(started) = self.started_at.take() {
-                self.paused_elapsed += started.elapsed();
+                self.paused_elapsed += started.elapsed().mul_f32(self.shared_tempo());
             }
+        }
+    }
+
+    /// How fast the shared route moves through the music (practice tempo).
+    fn shared_tempo(&self) -> f32 {
+        self.practice.lock().map(|s| s.tempo).unwrap_or(1.0)
+    }
+
+    /// A new practice tempo or key. The clock is re-based first so the
+    /// position stays where it was.
+    fn set_practice(&mut self, setting: crate::practice::Setting) {
+        if !self.on_native_stream() && !self.on_bp_stream()
+            && let Some(started) = self.started_at
+        {
+            self.paused_elapsed += started.elapsed().mul_f32(self.shared_tempo());
+            self.started_at = Some(Instant::now());
+        }
+        if let Ok(mut s) = self.practice.lock() {
+            *s = setting;
         }
     }
 
@@ -3749,7 +3781,7 @@ fn completion(&self) -> bitperfect::Completion {
             return self.bp_base + bp.played().saturating_sub(self.bp_played_at_track_start);
         }
         let running = self.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
-        self.paused_elapsed + running
+        self.paused_elapsed + running.mul_f32(self.shared_tempo())
     }
 
     /// End playback because the session failed.
@@ -3921,7 +3953,7 @@ fn completion(&self) -> bitperfect::Completion {
             let tapped = SpectrumSource::new(
                 DsdRodioSource(src), self.sample_buf.clone(), self.stereo_buf.clone());
             if let Some(ref eq) = self.eq {
-                sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+                sink.append(crate::practice::Practice::new(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()), self.practice.clone()));
             } else {
                 sink.append(tapped);
             }
@@ -3938,7 +3970,7 @@ fn completion(&self) -> bitperfect::Completion {
             .map_err(|e| format!("Decode failed: {e}"))?;
         let tapped = SpectrumSource::new(decoder, self.sample_buf.clone(), self.stereo_buf.clone());
         if let Some(ref eq) = self.eq {
-            sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+            sink.append(crate::practice::Practice::new(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()), self.practice.clone()));
         } else {
             sink.append(tapped);
         }
@@ -4652,7 +4684,7 @@ fn completion(&self) -> bitperfect::Completion {
             self.stereo_buf.clone(),
         );
         if let Some(ref eq) = self.eq {
-            sink.append(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()));
+            sink.append(crate::practice::Practice::new(EqSource::new(tapped.convert_samples::<f32>(), eq.clone()), self.practice.clone()));
         } else {
             sink.append(tapped);
         }
@@ -5957,6 +5989,10 @@ struct Appearance {
     #[serde(default)] console: bool,
     /// Where YouTube downloads go; None is Music\Moosik.
     #[serde(default)] youtube_dir: Option<PathBuf>,
+    /// Headphone crossfeed: an index into `eq::CROSSFEED`, or off.
+    #[serde(default)] crossfeed: Option<usize>,
+    /// Room correction: the impulse response file, or none.
+    #[serde(default)] room_fir: Option<PathBuf>,
     /// YouTube Play, Queue and Download bring the music video too.
     #[serde(default)] youtube_video: bool,
     /// Music videos: the tallest picture fetched, how bright they show
@@ -5973,6 +6009,8 @@ struct Appearance {
     #[serde(default)] youtube_sign_in: Option<String>,
     /// A song without lyrics is looked up online as it starts.
     #[serde(default = "default_true")] lyrics_auto: bool,
+    /// AutoEq's headphone list is checked for changes when Moosik starts.
+    #[serde(default = "default_true")] autoeq_check: bool,
 }
 
 fn default_video_height() -> u32 { 720 }
@@ -5992,6 +6030,8 @@ impl Default for Appearance {
             visual: shell::VisualSettings::default(),
             console: false,
             youtube_dir: None,
+            crossfeed: None,
+            room_fir: None,
             youtube_video: false,
             video_height: default_video_height(),
             video_brightness: default_video_brightness(),
@@ -6001,6 +6041,7 @@ impl Default for Appearance {
             youtube_recent: Vec::new(),
             youtube_sign_in: None,
             lyrics_auto: true,
+            autoeq_check: true,
         }
     }
 }
@@ -6033,6 +6074,11 @@ fn set_console(on: bool) {
 
 #[cfg(not(windows))]
 fn set_console(_on: bool) {}
+
+/// A saved crossfeed choice as (cut-off, feed).
+fn crossfeed_of(i: Option<usize>) -> Option<(f32, f32)> {
+    i.and_then(|i| spectrum::eq::CROSSFEED.get(i)).map(|&(_, f, d)| (f, d))
+}
 
 fn default_lyrics_text_size() -> f32 { lyrics::ui::TEXT_SIZE_DEFAULT }
 
@@ -6325,6 +6371,8 @@ struct MoosikApp {
     lyrics_window: lyrics::ui::LyricsWindow,
     tag_window: tags::ui::TagWindow,
     info_open: bool,
+    /// The Info window's whole-file measurement (1.6.2).
+    measure: measure::State,
     loop_mode: LoopMode,
     /// Last (volume, loop_mode) written to player.json, for change detection.
     saved_player: PlayerPrefs,
@@ -6422,12 +6470,25 @@ impl MoosikApp {
             }
         }
         let appearance = load_appearance(&moosik_dir());
+        // AutoEq's headphone list, in the background (Settings can turn it off).
+        if appearance.autoeq_check && !cfg!(test) {
+            autoeq::refresh_in_background();
+        }
         youtube::set_sign_in(appearance.youtube_sign_in.clone());
         if appearance.console {
             set_console(true);
         }
         apply_theme(&cc.egui_ctx, appearance.theme.is_dark());
         let mut spectrum_window = SpectrumWindow::new();
+        if let Some(gl) = &cc.gl {
+            spectrum_window.paint_eq_curves_with_gl(gl);
+        }
+        {
+            let mut eq = spectrum_window.eq_state.lock().unwrap();
+            eq.crossfeed = crossfeed_of(appearance.crossfeed);
+            // A room correction that no longer loads is left off, not an error at start.
+            eq.fir = appearance.room_fir.as_deref().and_then(|p| spectrum::fir::load(p).ok()).map(std::sync::Arc::new);
+        }
         let mut engine = Engine::new(spectrum_window.sample_buf.clone(), spectrum_window.stereo_buf.clone());
         if let Some(ref mut e) = engine {
             e.eq = Some(spectrum_window.eq_state.clone());
@@ -6477,6 +6538,7 @@ impl MoosikApp {
             },
             tag_window: tags::ui::TagWindow::default(),
             info_open: false,
+            measure: Default::default(),
             loop_mode: player_prefs.loop_mode,
             saved_player: player_prefs,
             player_save_at: None,
@@ -7674,6 +7736,51 @@ impl MoosikApp {
                     );
                 }
             }
+            // The song's parts (from Harmony's beats): a strip along the
+            // bottom, a colour and a letter a part.
+            if let (Some(parts), Some(dur)) = (self.current_sections(), self.current_duration().map(|d| d.as_secs_f32()).filter(|d| *d > 0.0)) {
+                let track_w = track_x1 - track_x0;
+                let hue = |l: char| [Color32::from_rgb(110, 150, 255), Color32::from_rgb(255, 160, 90), Color32::from_rgb(120, 210, 150), Color32::from_rgb(220, 120, 200), Color32::from_rgb(240, 210, 100)][(l as usize - 'A' as usize) % 5];
+                for s in parts {
+                    let (x0, x1) = (track_x0 + s.start / dur * track_w, track_x0 + (s.end / dur).min(1.0) * track_w);
+                    let strip = egui::Rect::from_min_max(egui::Pos2::new(x0 + 1.0, row_rect.bottom() - 3.0), egui::Pos2::new(x1 - 1.0, row_rect.bottom()));
+                    painter.rect_filled(strip, 1.0, hue(s.label).gamma_multiply(0.8));
+                    if x1 - x0 > 14.0 {
+                        painter.text(egui::Pos2::new(x0 + 3.0, row_rect.bottom() - 4.0), egui::Align2::LEFT_BOTTOM, s.label.to_string(),
+                            egui::FontId::proportional(9.0), hue(s.label));
+                    }
+                }
+            }
+            // A reminder that practice tempo or key is on.
+            let pr = self.practice_setting();
+            if !pr.is_normal() {
+                let mut what = Vec::new();
+                if pr.tempo != 1.0 {
+                    what.push(format!("{:.0}%", pr.tempo * 100.0));
+                }
+                if pr.semitones != 0.0 {
+                    what.push(format!("{:+.0}", pr.semitones));
+                }
+                painter.text(egui::Pos2::new(track_x1 - 2.0, row_rect.top() + 2.0), egui::Align2::RIGHT_TOP, what.join(" "),
+                    egui::FontId::proportional(10.0), self.track_accent_bright());
+            }
+            // A measurement of this track (Info → Measure): clipped runs full
+            // height, inter-sample overs as short ticks along the top.
+            if let (Some((p, Ok(r))), Some(i)) = (&self.measure.done, self.current_index)
+                && self.playlist.get(i).is_some_and(|t| t.path == *p)
+                && r.seconds > 0.0
+            {
+                let track_w = track_x1 - track_x0;
+                let at = |t: f32| track_x0 + (t as f64 / r.seconds) as f32 * track_w;
+                for &t in &r.clip_at {
+                    painter.line_segment([egui::Pos2::new(at(t), row_rect.top() + 1.0), egui::Pos2::new(at(t), row_rect.bottom() - 1.0)],
+                        egui::Stroke::new(1.5, pal::warn(dark)));
+                }
+                for &t in &r.over_at {
+                    painter.line_segment([egui::Pos2::new(at(t), row_rect.top() + 1.0), egui::Pos2::new(at(t), row_rect.top() + row_rect.height() * 0.35)],
+                        egui::Stroke::new(1.5, pal::amber(dark)));
+                }
+            }
             // Playhead line
             painter.line_segment(
                 [egui::Pos2::new(fill_x, row_rect.top() + 2.0),
@@ -8437,6 +8544,106 @@ impl MoosikApp {
 
     /// ReplayGain's choices: in the toolbar's menu, and in the shell's
     /// settings.
+    /// The practice setting, as the engine has it.
+    fn practice_setting(&self) -> crate::practice::Setting {
+        self.engine.as_ref().and_then(|e| e.practice.lock().ok().map(|s| *s)).unwrap_or_default()
+    }
+
+    /// Settings → Practice: tempo and key, for playing along.
+    pub(crate) fn practice_ui(&mut self, ui: &mut egui::Ui) {
+        let dark = ui.visuals().dark_mode;
+        let mut s = self.practice_setting();
+        let before = s;
+        ui.horizontal(|ui| {
+            ui.label("Tempo");
+            ui.add(egui::Slider::new(&mut s.tempo, 0.5..=1.5).step_by(0.05)
+                .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Key");
+            ui.add(egui::Slider::new(&mut s.semitones, -6.0..=6.0).step_by(1.0)
+                .custom_formatter(|v, _| if v == 0.0 { "as recorded".into() } else { format!("{v:+.0} semitones") }));
+        });
+        if !s.is_normal() && ui.small_button("Back to normal").clicked() {
+            s = crate::practice::Setting::default();
+        }
+        if s != before
+            && let Some(e) = self.engine.as_mut()
+        {
+            e.set_practice(s);
+        }
+        ui.label(RichText::new("Slower or faster keeps the key; a new key keeps the tempo. For this session only; not in bit-perfect output.")
+            .size(11.0).color(pal::text_faint(dark)));
+    }
+
+    /// Settings → Headphones: crossfeed.
+    pub(crate) fn crossfeed_ui(&mut self, ui: &mut egui::Ui) {
+        let dark = ui.visuals().dark_mode;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Crossfeed");
+            let mut pick = None;
+            if ui.selectable_label(self.appearance.crossfeed.is_none(), "Off").clicked() {
+                pick = Some(None);
+            }
+            for (i, (name, f, d)) in spectrum::eq::CROSSFEED.iter().enumerate() {
+                if ui.selectable_label(self.appearance.crossfeed == Some(i), *name)
+                    .on_hover_text(format!("{d} dB of the other channel below {f:.0} Hz"))
+                    .clicked()
+                {
+                    pick = Some(Some(i));
+                }
+            }
+            if let Some(p) = pick {
+                self.appearance.crossfeed = p;
+                let mut eq = self.spectrum_window.eq_state.lock().unwrap();
+                eq.crossfeed = crossfeed_of(p);
+                eq.bump();
+                drop(eq);
+                save_appearance(&moosik_dir(), &self.appearance);
+            }
+        });
+        ui.label(RichText::new("Each ear also hears a little of the other channel, as from speakers in front. Headphones only; not in bit-perfect output, which stays untouched.")
+            .size(11.0).color(pal::text_faint(dark)));
+        ui.add_space(8.0);
+        let current = self.spectrum_window.eq_state.lock().unwrap().fir.as_ref().map(|f| (f.name.clone(), f.rate, f.taps.len(), f.taps[0].len()));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Room correction");
+            match &current {
+                Some((name, rate, ch, n)) => {
+                    ui.label(RichText::new(format!("{name} ({} ch, {:.2} s at {rate} Hz)", ch, *n as f32 / *rate as f32)).size(11.5));
+                    if ui.small_button("Remove").clicked() {
+                        let mut eq = self.spectrum_window.eq_state.lock().unwrap();
+                        eq.fir = None;
+                        eq.bump();
+                        drop(eq);
+                        self.appearance.room_fir = None;
+                        save_appearance(&moosik_dir(), &self.appearance);
+                    }
+                }
+                None => {
+                    if ui.small_button("Load impulse response…")
+                        .on_hover_text("A WAV impulse response (one channel for both, or left and right) from REW or another room measurement tool")
+                        .clicked()
+                        && let Some(p) = rfd::FileDialog::new().add_filter("Impulse response", &["wav", "flac", "aiff", "aif"]).set_title("Room correction").pick_file()
+                    {
+                        match spectrum::fir::load(&p) {
+                            Ok(fir) => {
+                                let mut eq = self.spectrum_window.eq_state.lock().unwrap();
+                                eq.fir = Some(std::sync::Arc::new(fir));
+                                eq.bump();
+                                drop(eq);
+                                self.appearance.room_fir = Some(p);
+                                save_appearance(&moosik_dir(), &self.appearance);
+                            }
+                            Err(e) => self.set_transient(format!("Room correction: {e}")),
+                        }
+                    }
+                }
+            }
+        });
+        ui.label(RichText::new("Convolved after the EQ, about 21 ms late. Not in bit-perfect output.").size(11.0).color(pal::text_faint(dark)));
+    }
+
     pub(crate) fn rg_ui(&mut self, ui: &mut egui::Ui) {
         let on_bp_stream = self.engine.as_ref().is_some_and(|e| e.on_bp_stream());
         ui.label(RichText::new("ReplayGain — loudness normalization").strong().size(12.0));
@@ -9365,6 +9572,257 @@ fn section(ui: &mut egui::Ui, modern: bool, heading: &str) {
     ui.end_row();
 }
 
+/// Info → Compare: this track against another master of it. Says whether
+/// a blind test started, so the player can pause.
+fn compare_section(ui: &mut egui::Ui, modern: bool, st: &mut measure::State, t: &Track) -> bool {
+    use std::sync::atomic::Ordering;
+    let dark = ui.visuals().dark_mode;
+    if let Some(j) = &st.compare_job
+        && let Some(r) = j.poll()
+    {
+        st.compared = Some((j.path.clone(), r));
+        st.compare_job = None;
+    }
+    match st.compare_job.as_ref().filter(|j| j.path == t.path) {
+        Some(j) => {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            ui.horizontal(|ui| {
+                let q = j.progress.load(Ordering::Relaxed) as f32 / 1000.0;
+                ui.add(egui::ProgressBar::new(q).desired_width(220.0).text(egui::RichText::new("Comparing…").size(11.0)));
+                if ui.small_button("Cancel").clicked() {
+                    j.cancel.store(true, Ordering::Relaxed);
+                }
+            });
+        }
+        None => {
+            if ui.button("Compare with another file…")
+                .on_hover_text("Another master of this song: how much louder it is, and its tone once the loudness is matched")
+                .clicked()
+                && let Some(b) = rfd::FileDialog::new()
+                    .add_filter("Audio", &audio_formats::import_extensions())
+                    .set_title("Another master to compare with")
+                    .pick_file()
+            {
+                st.compare_job = Some(measure::Job::compare(t.path.clone(), b));
+            }
+        }
+    }
+    let Some((_, res)) = st.compared.as_ref().filter(|(p, _)| *p == t.path) else { return false };
+    let c = match res {
+        Ok(c) => c.clone(),
+        Err(e) => {
+            if e != "cancelled" {
+                ui.label(egui::RichText::new(format!("Could not compare: {e}")).size(12.0).color(pal::warn(dark)));
+            }
+            return false;
+        }
+    };
+    let other = c.b.file_name().and_then(|n| n.to_str()).unwrap_or("the other file");
+    let louder = match c.louder_db {
+        Some(d) if d.abs() < 0.05 => format!("{other} is as loud as this one."),
+        Some(d) => format!("{other} is {:.1} LU {} than this one.", d.abs(), if d > 0.0 { "louder" } else { "quieter" }),
+        None => format!("The loudness of {other} could not be measured."),
+    };
+    ui.label(egui::RichText::new(louder).size(12.0).color(pal::text(dark)));
+    ui.label(egui::RichText::new("Its tone against this one, loudness matched (dB per third octave):").size(11.0).color(pal::text_dim(dark)));
+    // The difference, 20 Hz to 20 kHz on a log axis, ±6 dB.
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(ui.available_width().min(420.0), 90.0), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 4.0, if modern { pal::text_faint(dark).gamma_multiply(0.12) } else { Color32::from_rgb(10, 12, 18) });
+    let x = |f: f32| rect.left() + ((f / 20.0).log10() / 3.0).clamp(0.0, 1.0) * rect.width();
+    let y = |d: f32| rect.center().y - (d / 6.0).clamp(-1.0, 1.0) * rect.height() * 0.45;
+    p.line_segment([egui::Pos2::new(rect.left(), y(0.0)), egui::Pos2::new(rect.right(), y(0.0))], egui::Stroke::new(1.0, pal::text_faint(dark)));
+    for (f, label) in [(100.0, "100"), (1000.0, "1k"), (10_000.0, "10k")] {
+        p.text(egui::Pos2::new(x(f), rect.bottom() - 2.0), egui::Align2::CENTER_BOTTOM, label, egui::FontId::proportional(9.0), pal::text_faint(dark));
+    }
+    p.text(rect.left_top() + egui::Vec2::new(3.0, 2.0), egui::Align2::LEFT_TOP, "+6", egui::FontId::proportional(9.0), pal::text_faint(dark));
+    p.text(rect.left_bottom() + egui::Vec2::new(3.0, -12.0), egui::Align2::LEFT_BOTTOM, "−6", egui::FontId::proportional(9.0), pal::text_faint(dark));
+    let pts: Vec<egui::Pos2> = c.diff.iter().map(|&(f, d)| egui::Pos2::new(x(f), y(d))).collect();
+    p.add(egui::Shape::line(pts, egui::Stroke::new(1.5, pal::accent(dark))));
+    ui.add_space(4.0);
+    abx_section(ui, st, &c)
+}
+
+/// Info → Compare → Blind test: ABX between the track and the other master.
+fn abx_section(ui: &mut egui::Ui, st: &mut measure::State, c: &measure::Comparison) -> bool {
+    use std::sync::atomic::Ordering;
+    let dark = ui.visuals().dark_mode;
+    let mut started = false;
+    if let Some(j) = &st.abx_loading
+        && let Some(r) = j.poll()
+    {
+        st.abx_loading = None;
+        match r.and_then(|(ca, cb)| abx::Session::start(c.a.clone(), c.b.clone(), ca, cb)) {
+            Ok(s) => {
+                st.abx = Some(s);
+                st.abx_error = None;
+                started = true;
+            }
+            Err(e) => st.abx_error = Some(e),
+        }
+    }
+    if st.abx.as_ref().is_some_and(|s| s.a != c.a || s.b != c.b) {
+        st.abx = None;
+    }
+    let Some(s) = st.abx.as_mut() else {
+        if st.abx_loading.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            ui.label(egui::RichText::new("Loading both for a blind test…").size(11.5).color(pal::text_dim(dark)));
+        } else if ui.button("Blind test (ABX)…")
+            .on_hover_text("Play A, B and an unknown X, levels matched, and say which X is. Enough right answers in a row show you really hear a difference.")
+            .clicked()
+        {
+            st.abx_loading = Some(measure::Job::abx(c.a.clone(), c.b.clone()));
+        }
+        if let Some(e) = &st.abx_error {
+            ui.label(egui::RichText::new(format!("Cannot run the test: {e}")).size(11.5).color(pal::warn(dark)));
+        }
+        return started;
+    };
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(format!("Blind test ({}:{:02} of each, looping)", s.seconds as u32 / 60, s.seconds as u32 % 60)).strong().size(13.0));
+    let (ta, tb) = s.trims;
+    if ta < -0.05 || tb < -0.05 {
+        let (which, by) = if ta < tb { ("A", -ta) } else { ("B", -tb) };
+        ui.label(egui::RichText::new(format!("{which} is turned down {by:.1} dB so both are equally loud.")).size(11.0).color(pal::text_dim(dark)));
+    }
+    let side = s.shared.side();
+    let playing = s.shared.playing.load(Ordering::Relaxed);
+    ui.horizontal(|ui| {
+        for (sd, label) in [(abx::Side::A, "A (this track)"), (abx::Side::B, "B (the other)"), (abx::Side::X, "X")] {
+            if ui.selectable_label(playing && side == sd, label).clicked() {
+                s.shared.set_side(sd);
+                s.shared.playing.store(true, Ordering::Relaxed);
+            }
+        }
+        if ui.small_button(if playing { "Stop" } else { "Play" }).clicked() {
+            s.shared.playing.store(!playing, Ordering::Relaxed);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("X is");
+        if ui.button("A").clicked() {
+            s.answer(true);
+        }
+        if ui.button("B").clicked() {
+            s.answer(false);
+        }
+        if ui.small_button("Back to the start").on_hover_text("Play from the beginning").clicked() {
+            s.shared.pos.store(0, Ordering::Relaxed);
+        }
+    });
+    let (right, n) = (s.right(), s.answers.len() as u32);
+    if n > 0 {
+        let p = abx::p_value(right, n);
+        let verdict = if n < 8 {
+            "keep going: a few trials prove little"
+        } else if p < 0.01 {
+            "very unlikely to be guessing: you hear a difference"
+        } else if p < 0.05 {
+            "unlikely to be guessing"
+        } else {
+            "could well be guessing"
+        };
+        ui.label(egui::RichText::new(format!("{right} of {n} right; {:.1} % chance by guessing — {verdict}", p * 100.0)).size(12.0).color(if p < 0.05 && n >= 8 { pal::ok(dark) } else { pal::text(dark) }));
+    }
+    if ui.small_button("End test").clicked() {
+        st.abx = None;
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    started
+}
+
+/// Info → Measure: run a whole-file measurement and show what it found.
+fn measure_section(ui: &mut egui::Ui, modern: bool, st: &mut measure::State, t: &Track, cutoff: Option<f32>) -> bool {
+    if let Some(j) = &st.job
+        && let Some(r) = j.poll()
+    {
+        st.done = Some((j.path.clone(), r));
+        st.job = None;
+    }
+    let dark = ui.visuals().dark_mode;
+    ui.add_space(12.0);
+    if modern {
+        ui.label(egui::RichText::new("MEASURED").size(11.0).strong().color(pal::text_dim(dark)).extra_letter_spacing(0.8));
+    } else {
+        ui.separator();
+        ui.label(egui::RichText::new("Measured").strong().size(13.0).color(pal::accent(dark)));
+    }
+    ui.add_space(4.0);
+    let mine = st.done.as_ref().filter(|(p, _)| *p == t.path).map(|(_, r)| r.clone());
+    match st.job.as_ref() {
+        Some(j) if j.path == t.path => {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            ui.horizontal(|ui| {
+                let q = j.progress.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                ui.add(egui::ProgressBar::new(q).desired_width(220.0).text(egui::RichText::new("Measuring…").size(11.0)));
+                if ui.small_button("Cancel").clicked() {
+                    j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        _ => {
+            let label = if mine.is_some() { "Measure again" } else { "Measure this file" };
+            if ui.button(label).on_hover_text("Loudness (BS.1770, EBU R128), true peak, clipping and overs, the bits it really uses, and FLAC's MD5 check").clicked() {
+                if let Some(j) = st.job.take() {
+                    j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                st.job = Some(measure::Job::start(t.path.clone()));
+            }
+        }
+    }
+    // The comparison comes after this file's own results.
+    let Some(r) = mine else { return compare_section(ui, modern, st, t) };
+    let r = match r {
+        Ok(r) => r,
+        Err(e) => {
+            if e != "cancelled" {
+                ui.label(egui::RichText::new(format!("Could not measure: {e}")).size(12.0).color(pal::warn(dark)));
+            }
+            return compare_section(ui, modern, st, t);
+        }
+    };
+    ui.add_space(4.0);
+    for (level, text) in measure::verdicts(&r, t.lossless, cutoff) {
+        let (mark, col) = match level {
+            measure::Level::Good => ("✔", pal::ok(dark)),
+            measure::Level::Note => ("•", pal::text_dim(dark)),
+            measure::Level::Warn => ("⚠", pal::amber(dark)),
+        };
+        ui.label(egui::RichText::new(format!("{mark} {text}")).size(12.0).color(col));
+    }
+    ui.add_space(4.0);
+    let lufs = |v: Option<f64>, unit: &str| v.map_or("—".to_string(), |v| format!("{v:.1} {unit}"));
+    let spacing = if modern { [20.0, 6.0] } else { [12.0, 4.0] };
+    egui::Grid::new("measure_grid").num_columns(2).spacing(spacing).striped(!modern).show(ui, |ui| {
+        row(ui, modern, "Integrated loudness", &lufs(r.integrated, "LUFS"));
+        row(ui, modern, "Loudness range", &lufs(r.lra, "LU"));
+        row(ui, modern, "Max short-term", &lufs(r.max_short_term, "LUFS"));
+        row(ui, modern, "Max momentary", &lufs(r.max_momentary, "LUFS"));
+        row(ui, modern, "True peak", &format!("{:+.1} dBTP", r.true_peak));
+        row(ui, modern, "Sample peak", &format!("{:+.1} dBFS", r.sample_peak));
+        row(ui, modern, "PLR / PSR", &format!("{} / {}", lufs(r.plr, "dB"), lufs(r.psr, "dB")));
+        row(ui, modern, "Crest factor", &format!("{:.1} dB", r.crest));
+        row(ui, modern, "Dynamic range", &r.dr.map_or("—".to_string(), |d| format!("DR{}  ({d:.1} dB)", d.round())));
+        let dc: Vec<String> = r.dc.iter().map(|d| format!("{:+.3} %", d * 100.0)).collect();
+        row(ui, modern, "DC offset", &dc.join("  "));
+        if let Some(c) = r.correlation {
+            row(ui, modern, "L/R correlation", &format!("{c:+.2}"));
+        }
+        if let (Some(d), Some(u)) = (r.declared_bits, r.used_bits) {
+            row(ui, modern, "Bits used", &format!("{u} of {d}"));
+        }
+        let times = |at: &[f32]| at.iter().take(5).map(|s| format!("{}:{:02}", *s as u32 / 60, *s as u32 % 60)).collect::<Vec<_>>().join(", ");
+        row(ui, modern, "Clipped runs", &if r.clips == 0 { "None".into() } else { format!("{}  ({}{})", r.clips, times(&r.clip_at), if r.clips > 5 { ", …" } else { "" }) });
+        row(ui, modern, "Inter-sample overs", &if r.overs == 0 { "None".into() } else { format!("{}  ({}{})", r.overs, times(&r.over_at), if r.overs > 5 { ", …" } else { "" }) });
+        if let Some(ok) = r.md5_ok {
+            row(ui, modern, "FLAC MD5", if ok { "Matches" } else { "Does not match" });
+        }
+    });
+    ui.add_space(10.0);
+    compare_section(ui, modern, st, t)
+}
+
 fn show_track_info(ui: &mut egui::Ui, modern: bool, t: &Track, stat: Option<PlayStat>, spectral_ceiling: Option<SpectralCeiling>, analysis: Option<&TrackAnalysis>) {
     use egui::Grid;
 
@@ -10045,11 +10503,14 @@ impl eframe::App for MoosikApp {
             save_appearance(&moosik_dir(), &self.appearance);
         }
 
+        self.headphone_eq_window(ctx);
+
         // --- Info window (separate OS viewport) ---
         if self.info_open
             && let Some(idx) = self.current_index {
             let track = self.playlist[idx].clone();
             let mut close = false;
+            let mut abx_started = false;
             let vp_id = egui::ViewportId::from_hash_of("moosik_info");
             let vp_builder = egui::ViewportBuilder::default()
                 .with_title(format!("Info — {}", track.title))
@@ -10063,10 +10524,21 @@ impl eframe::App for MoosikApp {
                 egui::CentralPanel::default().frame(self.window_frame(vp_ctx)).show(vp_ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         show_track_info(ui, self.appearance.visual.modern, &track, self.stats.get(&track.path).cloned(), self.spectrum_window.spectral_ceiling.clone(), self.spectrum_window.track_analysis.as_ref());
+                        // A sharp ceiling from the spectrum, for the lossy-source check.
+                        let cutoff = self.spectrum_window.spectral_ceiling.as_ref().filter(|c| c.rolloff_octaves < 0.35).map(|c| c.hz);
+                        abx_started |= measure_section(ui, self.appearance.visual.modern, &mut self.measure, &track, cutoff);
                     });
                 });
             });
-            if close { self.info_open = false; }
+            if close {
+                self.info_open = false;
+                // A blind test ends with the window.
+                self.measure.abx = None;
+            }
+            // A blind test plays on its own: the player pauses for it.
+            if abx_started && self.play_state == PlayState::Playing {
+                self.toggle_play_pause();
+            }
         }
 
         // ---------------------------------------------------------------

@@ -1,9 +1,14 @@
 pub mod eq;
+pub mod fir;
 pub mod art;
 pub mod aslt;
 pub mod cqt;
 mod cqt_ui;
 mod cqt_pipeline;
+mod hp;
+// Native-only: it drives the real route's faults and context checks.
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+mod hp_integration_tests;
 #[cfg(test)]
 mod cqt_integration_tests;
 #[cfg(test)]
@@ -41,6 +46,8 @@ mod live_workspace_tests;
 mod bar_capacity_tests;
 #[cfg(test)]
 mod level_tests;
+#[cfg(test)]
+mod eq_gain_tests;
 mod live_mapping;
 #[cfg(test)]
 mod realtime_padding_tests;
@@ -66,7 +73,7 @@ use std::time::{Duration, Instant};
 use eq::{BandKind, EqBand, EqOverlayMode, EqState, EqStateHandle,
          EqPreset, PresetScope, PresetRef, EqPresetLibrary, eq_band_color,
          eq_biquad_coeffs, biquad_response_db,
-         total_eq_response_db, bands_equal, KWeightFilter};
+         bands_equal, KWeightFilter};
 use art::{ArtFit, ArtSpectrumMode, ArtMaskMode, ArtDisplaySettings,
           ArtSettingsStore, art_dest_rect, draw_bars_art_mask};
 
@@ -378,12 +385,6 @@ fn fmt_eta(secs: usize) -> String {
             if m == 0 { format!("{h}h") } else { format!("{h}h {m}m") }
         }
     }
-}
-
-/// Log-spaced centre frequency for bar index `i` of `n` bars in [min, max].
-fn bar_center_freq(i: usize, n: usize, min_freq: f32, max_freq: f32) -> f32 {
-    let t = (i as f32 + 0.5) / n as f32;
-    10f32.powf(min_freq.log10() + t * (max_freq.log10() - min_freq.log10()))
 }
 
 /// Build a window coefficient vector of `size` samples for the given function.
@@ -1365,6 +1366,9 @@ pub enum PreMessage {
         meta: Box<DoneMeta>,
     },
     Error(String),
+    /// An HP attempt ended on its worker. Standard may be requested only after
+    /// that worker exits and only while this exact request is still wanted.
+    HpUnavailable { reason: String, device: bool, cancelled: bool },
     /// The user pressed Abort. Distinct from `Error` so the UI can drop back to
     /// the live view quietly instead of reporting a failure, and so nothing is
     /// written to the cache.
@@ -1524,6 +1528,7 @@ pub struct SpectrumAnalyzer {
     /// is answered by the selected view, and a track analysed in stereo keeps
     /// its channels whatever this says.
     pub pre_stereo_enabled: bool,
+    pub hp: hp::State,
     /// An explicit request to analyse channels for one particular track.
     ///
     /// A bare flag was not enough, twice over. `start_preprocess` returns early
@@ -1734,6 +1739,19 @@ pub struct SpectrumAnalyzer {
     pub(crate) cqt_plan_builds: usize,
 }
 
+/// |c| for the live ticks: the f32 parts squared exactly in f64, summed and
+/// rooted once. That is the value `Complex::norm` (`hypot`) gives here, at
+/// about half its cost; a non-finite part keeps `hypot`'s rules.
+#[inline]
+fn live_norm(c: &Complex<f32>) -> f32 {
+    if c.re.is_finite() && c.im.is_finite() {
+        let (re, im) = (c.re as f64, c.im as f64);
+        (re * re + im * im).sqrt() as f32
+    } else {
+        c.norm()
+    }
+}
+
 impl SpectrumAnalyzer {
     pub fn new(sample_buf: SampleBuf) -> Self {
         let fft_size = DEFAULT_FFT_SIZE;
@@ -1792,6 +1810,7 @@ impl SpectrumAnalyzer {
             #[cfg(test)]
             rt_disable_channel_reuse: false,
             pre_stereo_enabled: false,
+            hp: hp::State::default(),
             pre_stereo_request: None,
             #[cfg(test)]
             cache_dir_override: None,
@@ -2097,7 +2116,7 @@ impl SpectrumAnalyzer {
         #[cfg(test)]
         { self.rt_fft_computations += 1; }
         self.last_fft_norms.clear();
-        self.last_fft_norms.extend(self.rt_work[..padded / 2].iter().map(|c| c.norm()));
+        self.last_fft_norms.extend(self.rt_work[..padded / 2].iter().map(live_norm));
         true
     }
 
@@ -2138,7 +2157,7 @@ impl SpectrumAnalyzer {
         self.rt_scratch.resize(self.rt_fft_plan.get_inplace_scratch_len(), Complex::default());
         self.rt_fft_plan.process_with_scratch(&mut self.ch_scratch, &mut self.rt_scratch);
         self.ch_norms[side].clear();
-        self.ch_norms[side].extend(self.ch_scratch[..padded / 2].iter().map(|c| c.norm()));
+        self.ch_norms[side].extend(self.ch_scratch[..padded / 2].iter().map(live_norm));
         self.channel_ffts = self.channel_ffts.saturating_add(1);
     }
 
@@ -2796,6 +2815,7 @@ impl SpectrumAnalyzer {
     /// generation, other settings, a changed file or a pending request for
     /// this track's channels all answer no, and take the ordinary path.
     pub fn installed_matches(&mut self, path: &Path, sample_rate: u32) -> bool {
+        self.hp.current = Some(path.to_owned());
         if self.pre_frames.is_empty() || self.pre_stereo_request.as_deref() == Some(path) {
             return false;
         }
@@ -2823,11 +2843,34 @@ impl SpectrumAnalyzer {
 
     /// The settings in force now, as they would be launched for `track`.
     pub fn effective_settings(&self, track: &Path) -> AnalysisSettings {
-        settings_for(
+        self.hp.effective(self.requested_settings(track))
+    }
+
+    fn requested_settings(&self, track: &Path) -> AnalysisSettings {
+        self.hp.requested(settings_for(
             track, self.bar_count, self.pre_fft_size, self.pad_factor, self.overlap,
             &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping,
             &self.interp_mode, self.dsd_rate, &self.aslt_cfg, self.pre_fps,
-        )
+        ))
+    }
+
+    /// Exact requested mode first, then policy (a)'s honest Standard display.
+    /// Alternate discovery remains mode-separated; this lookup is explicit.
+    fn lookup_preferred(&mut self, settings: AnalysisSettings, bars: usize)
+        -> Option<(AnalysisSettings, cache::PreFrames, store::Installed)>
+    {
+        self.hp.current = Some(settings.track.clone());
+        if let Some((frames, installed)) = self.lookup_exact(&settings, bars) {
+            return Some((settings, frames, installed));
+        }
+        if settings.numerics() == Numerics::HighAccuracyGpu {
+            let standard = settings.clone().with_numerics(Numerics::Standard);
+            if let Some((frames, installed)) = self.lookup_exact(&standard, bars) {
+                self.hp.standard(settings, "Existing Standard analysis; HP reanalysis is optional".into());
+                return Some((standard, frames, installed));
+            }
+        }
+        None
     }
 
     /// Decide what a finished analysis is **before** anything is evicted, then
@@ -2899,16 +2942,16 @@ impl SpectrumAnalyzer {
     }
 
     fn request_preprocess(&mut self, path: PathBuf, explicit: bool, fresh: bool) {
+        self.hp.current = Some(path.clone());
         let n_bars = self.bar_count;
         let settings = self.effective_settings(&path);
-        let (identity, unit) = settings.key(&self.cache_dir());
 
         // Ordinary reuse. An explicit request falls through to the analysis
         // below even though the Mix is valid — the producer republishes that
         // Mix byte for byte with the channels beside it.
         if !explicit
             && !fresh
-            && let Some((frames, installed)) = self.lookup_exact(&settings, n_bars)
+            && let Some((settings, frames, installed)) = self.lookup_preferred(settings.clone(), n_bars)
         {
             // A job for anything else is obsolete now: its result must never
             // replace the picture installed here. A pending request for other
@@ -2929,9 +2972,12 @@ impl SpectrumAnalyzer {
             // whether channels this track already has can be *found*. With the
             // preference off, a track analysed in stereo appeared to have none.
             let record = settings.record(self.sample_rate);
+            let (identity, unit) = settings.key(&self.cache_dir());
             self.install_cached(frames, CacheRef::Store { unit, installed: Arc::new(installed), identity }, Some(record));
             return;
         }
+        let settings = self.effective_settings(&path);
+        let (_, unit) = settings.key(&self.cache_dir());
         // Either the standing preference, or the explicit request.
         let want_stereo = self.pre_stereo_enabled | explicit;
         if let Some(job) = &self.analysis_job {
@@ -2973,10 +3019,12 @@ impl SpectrumAnalyzer {
         #[cfg(test)]
         self.lifecycle_probe.launched.lock().unwrap().push((settings.clone(), self.sample_rate, want_stereo));
         let (tx, rx) = std::sync::mpsc::channel();
+        let numerics = settings.numerics();
         self.analysis_job = Some(AnalysisJob {
             settings,
             sample_rate: self.sample_rate,
             stereo: want_stereo,
+            explicit,
             rx,
             retired: false,
             done: false,
@@ -3015,6 +3063,7 @@ impl SpectrumAnalyzer {
         let calib_gate = self.calib_gate.clone();
         #[cfg(test)]
         let outcomes = Arc::clone(&self.lifecycle_probe.outcomes);
+        let hp_attempt = self.hp.attempt();
         let thread = std::thread::spawn(move || {
             // First, so it is the last thing this thread lets go of.
             #[cfg(test)]
@@ -3057,11 +3106,12 @@ impl SpectrumAnalyzer {
                 n_bars,
                 path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
             );
-            let result = preprocess_file(
+            let result = preprocess_file_mode(
                 &path, &unit, store, fresh, sr, n_bars, &progress,
                 fft_size, pad_factor, overlap, &window_fn, min_freq, max_freq, &interp_mode, &bar_mapping,
                 dsd_rate, &aslt_cfg, pre_fps, &abort, &eta,
                 if want_stereo { StereoRequest::Joint } else { StereoRequest::MixOnly },
+                numerics, &hp_attempt,
             );
             crate::mlog!(
                 "[analysis] {} after {:.1}s",
@@ -3069,6 +3119,7 @@ impl SpectrumAnalyzer {
                     PreMessage::Done { frames, .. } => format!("done, {} frames", frames.len()),
                     PreMessage::Aborted => "aborted".to_string(),
                     PreMessage::Error(e) => format!("error: {e}"),
+                    PreMessage::HpUnavailable { reason, cancelled, .. } => format!("HP {}: {reason}", if *cancelled { "cancelled" } else { "unavailable" }),
                 },
                 t0.elapsed().as_secs_f32(),
             );
@@ -3080,6 +3131,7 @@ impl SpectrumAnalyzer {
                 },
                 PreMessage::Aborted => WorkerOutcome { track: path.clone(), kind: "aborted", frames: 0, width: 0, stereo: false },
                 PreMessage::Error(_) => WorkerOutcome { track: path.clone(), kind: "error", frames: 0, width: 0, stereo: false },
+                PreMessage::HpUnavailable { cancelled, .. } => WorkerOutcome { track: path.clone(), kind: if *cancelled { "aborted" } else { "hp_unavailable" }, frames: 0, width: 0, stereo: false },
             });
             let _ = tx.send(result);
             // Sent, and the thread is still alive: the moment at which the
@@ -3148,7 +3200,7 @@ impl SpectrumAnalyzer {
     ) {
         let settings = self.effective_settings(path);
         self.analysis_job = Some(AnalysisJob {
-            settings, sample_rate: self.sample_rate, stereo: false, rx, retired: false, done: false, thread,
+            settings, sample_rate: self.sample_rate, stereo: false, explicit: false, rx, retired: false, done: false, thread,
         });
     }
 
@@ -3204,7 +3256,11 @@ impl SpectrumAnalyzer {
         if self.analysis_job.is_none() && let Some(next) = self.pending_request.take() {
             // Started at the descriptor it was made at, never at whatever is
             // selected by now: equal, or not started at all.
-            if next.sample_rate == self.sample_rate && next.settings == self.effective_settings(&next.path) {
+            let now = self.effective_settings(&next.path);
+            let session_fallback = next.settings.numerics() == Numerics::HighAccuracyGpu
+                && now.numerics() == Numerics::Standard
+                && next.settings.clone().with_numerics(Numerics::Standard) == now;
+            if next.sample_rate == self.sample_rate && (next.settings == now || session_fallback) {
                 self.request_preprocess(next.path, next.explicit, next.fresh);
             } else {
                 crate::mlog!(
@@ -3227,6 +3283,23 @@ impl SpectrumAnalyzer {
     /// cache it publishes is valid for the settings it was given, and
     /// returning to them finds it.
     fn finish_job(&mut self, job: &mut AnalysisJob, msg: PreMessage) {
+        if let PreMessage::HpUnavailable { reason, device, cancelled } = &msg {
+            // Check before changing the effective mode. A retired or settings-
+            // superseded request never creates a Standard retry.
+            let current = !job.retired && !*cancelled && !self.abort_analysis.load(Ordering::Relaxed)
+                && job.sample_rate == self.sample_rate
+                && job.settings == self.effective_settings(&job.settings.track);
+            if *device { self.hp.disable(reason.clone()); }
+            if current {
+                self.hp.standard(job.settings.clone(), reason.clone());
+                let settings = self.effective_settings(&job.settings.track);
+                self.pending_request = Some(PendingRequest {
+                    path: job.settings.track.clone(), explicit: job.explicit, fresh: false,
+                    settings, sample_rate: job.sample_rate,
+                });
+            }
+            return;
+        }
         #[cfg(test)]
         if self.lifecycle_probe.is("keep_job_on_error") && !matches!(msg, PreMessage::Done { .. }) {
             // The slot is never given back: a job whose channel stays open.
@@ -3971,6 +4044,7 @@ fn settings_for(
             aslt_cfg.scale,
         )),
         aslt: slt.then(|| (aslt_cfg.clone(), pre_fps)),
+        numerics: Numerics::Standard,
     }
 }
 
@@ -4492,6 +4566,8 @@ struct AnalysisJob {
     sample_rate: u32,
     /// Whether the worker also produces channels.
     stereo: bool,
+    /// An explicit request to add channels, distinct from the standing preference.
+    explicit: bool,
     rx: std::sync::mpsc::Receiver<PreMessage>,
     /// Cancelled or superseded: its completion is discarded, whatever it is.
     retired: bool,
@@ -4830,6 +4906,7 @@ struct Passes {
 enum PassFailed {
     Aborted,
     Failed(String),
+    HpUnavailable { reason: String, device: bool, cancelled: bool },
 }
 
 /// Left and right, collected alongside mono during the one decode pass.
@@ -4875,6 +4952,7 @@ impl Channels {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn preprocess_file(
     path: &Path,
     unit: &Path,
@@ -4898,7 +4976,34 @@ fn preprocess_file(
     eta_secs: &Arc<AtomicUsize>,
     stereo_request: StereoRequest,
 ) -> PreMessage {
+    preprocess_file_mode(path, unit, store, fresh, _sample_rate_hint, n_bars, progress,
+        fft_size, pad_factor, overlap, window_fn, min_freq, max_freq, interp_mode,
+        bar_mapping, dsd_rate, aslt_cfg, pre_fps, abort, eta_secs, stereo_request,
+        Numerics::Standard, &hp::Attempt::default())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preprocess_file_mode(
+    path: &Path, unit: &Path, store: Option<Arc<store::Store>>, fresh: bool,
+    _sample_rate_hint: u32, n_bars: usize, progress: &Arc<AtomicUsize>, fft_size: usize,
+    pad_factor: usize, overlap: f32, window_fn: &WindowFn, min_freq: f32, max_freq: f32,
+    interp_mode: &InterpolationMode, bar_mapping: &BarMappingMode, dsd_rate: u32,
+    aslt_cfg: &aslt::AsltConfig, pre_fps: f32, abort: &Arc<AtomicBool>,
+    eta_secs: &Arc<AtomicUsize>, stereo_request: StereoRequest, numerics: Numerics,
+    hp_attempt: &hp::Attempt,
+) -> PreMessage {
     let want_stereo = stereo_request.wants_channels();
+    let hp_requested = numerics == Numerics::HighAccuracyGpu;
+    let decode_pair = want_stereo || hp_requested;
+    if abort.load(Ordering::Relaxed) { return PreMessage::Aborted; }
+    if hp_requested {
+        let admission = if *bar_mapping == BarMappingMode::Superlet {
+            aslt::hp::admits(n_bars, min_freq, max_freq, aslt_cfg, pre_fps)
+        } else { Err("High-accuracy GPU requires Superlet".into()) };
+        if let Err(reason) = admission {
+            return PreMessage::HpUnavailable { reason, device: false, cancelled: abort.load(Ordering::Relaxed) };
+        }
+    }
     let mutant = stereo_request.redundant_mix_transform();
     // ── Phase 1: decode (0–39 %) ────────────────────────────────────────────
     //
@@ -4945,7 +5050,7 @@ fn preprocess_file(
         let mut digest = store::DecodedDigest::new("dsd-decimated-f32", ch, sr);
         let total_hint = (src.total_out_samples() / ch as u64) as usize;
         let mut mono: Vec<f32> = Vec::with_capacity(total_hint.max(1));
-        let mut pair = Channels::new(want_stereo && ch == 2, total_hint);
+        let mut pair = Channels::new(decode_pair && ch == 2, total_hint);
         let mut next_publish = if total_hint > 0 { 1usize } else { usize::MAX };
         loop {
             let mut sum = 0.0f32;
@@ -5005,7 +5110,7 @@ fn preprocess_file(
             .unwrap_or(0);
 
         let mut mono: Vec<f32> = Vec::with_capacity(total_hint.max(1));
-        let mut pair = Channels::new(want_stereo && ch == 2, total_hint);
+        let mut pair = Channels::new(decode_pair && ch == 2, total_hint);
         let mut next_publish = if total_hint > 0 { 1usize } else { usize::MAX };
         let mut raw_iter = decoder;
         loop {
@@ -5294,6 +5399,51 @@ fn preprocess_file(
     // renderer and the waterfall are all untouched.
     if is_aslt {
         use std::sync::atomic::AtomicU64;
+
+        if hp_requested {
+            let Some(right) = right else {
+                return Err(PassFailed::HpUnavailable {
+                    reason: "High-accuracy GPU requires a two-channel source".into(), device: false,
+                    cancelled: abort.load(Ordering::Relaxed),
+                });
+            };
+            let update = |bars: usize| {
+                if !abort.load(Ordering::Relaxed) {
+                    store_progress_max(progress, base + bars.min(n_bars) * span / n_bars.max(1));
+                }
+            };
+            let result = hp_attempt.run(signal, right, sample_rate, n_bars, min_freq, max_freq,
+                aslt_cfg, pre_fps, abort, &update);
+            let health = aslt::hp::take_device_failure();
+            return match result {
+                Ok(([mix, left, right], frames)) if !abort.load(Ordering::Relaxed) && health.is_none() => {
+                    if frames == 0 || mix.len() != frames * n_bars
+                        || left.len() != mix.len() || right.len() != mix.len()
+                        || mix.iter().chain(&left).chain(&right).any(|&c| c > 4095)
+                    {
+                        return Err(PassFailed::HpUnavailable {
+                            reason: "High-accuracy GPU returned invalid dimensions or codes".into(),
+                            device: true, cancelled: abort.load(Ordering::Relaxed),
+                        });
+                    }
+                    let plane = |v| cache::PreFrames::from_v4_codes(v, frames, n_bars);
+                    crate::mlog!("[analysis] High-accuracy GPU: {frames} frames; Standard calibration unchanged");
+                    Ok(Passes { mix: Vec::new(), left: Vec::new(), right: Vec::new(),
+                        codes: Some((plane(mix), want_stereo.then(|| plane(left)), want_stereo.then(|| plane(right)))),
+                        work: aslt::WorkCount::default() })
+                }
+                Ok(_) => match health {
+                    Some(reason) => Err(PassFailed::HpUnavailable { reason, device: true, cancelled: abort.load(Ordering::Relaxed) }),
+                    None => Err(PassFailed::Aborted),
+                },
+                Err(aslt::hp::HpError::Cancelled) if health.is_none() => Err(PassFailed::Aborted),
+                Err(error) => {
+                    let device = health.is_some() || matches!(error, aslt::hp::HpError::Device(_));
+                    let cancelled = abort.load(Ordering::Relaxed) || error == aslt::hp::HpError::Cancelled;
+                    Err(PassFailed::HpUnavailable { reason: health.unwrap_or_else(|| format!("{error:?}")), device, cancelled })
+                }
+            };
+        }
 
         // Same bar grid as the FFT path, Nyquist clamp included, so switching
         // modes does not shift the bars sideways.
@@ -5640,6 +5790,7 @@ fn preprocess_file(
         path, n_bars, fft_size, pad_factor, overlap, window_fn, min_freq, max_freq,
         bar_mapping, interp_mode, dsd_rate, aslt_cfg, pre_fps,
     )
+    .with_numerics(numerics)
     .identity();
     let span = 100 - PROG_LOUDNESS_END - 1;
     let base = PROG_LOUDNESS_END + 1;
@@ -5670,6 +5821,7 @@ fn preprocess_file(
         Ok(p) => p,
         Err(PassFailed::Aborted) => return PreMessage::Aborted,
         Err(PassFailed::Failed(e)) => return PreMessage::Error(e),
+        Err(PassFailed::HpUnavailable { reason, device, cancelled }) => return PreMessage::HpUnavailable { reason, device, cancelled },
     };
     // The signals are finished with. Dropped explicitly for the reason
     // `drop(mix)` is below — a rebinding would hold 40 MiB per minute of audio
@@ -5687,7 +5839,7 @@ fn preprocess_file(
     let settings = settings_for(
         path, n_bars, fft_size, pad_factor, overlap, window_fn, min_freq, max_freq,
         bar_mapping, interp_mode, dsd_rate, aslt_cfg, pre_fps,
-    );
+    ).with_numerics(numerics);
     let record = settings.record(sample_rate);
     debug_assert_eq!(settings.hop(sample_rate), hop, "the record's hop is not the one analysed");
     // Quantise once, here, and let the whole-track `f32` go before anything
@@ -5750,7 +5902,7 @@ fn preprocess_file(
         None => {
             // A cancelled analysis does not pay for an encode it will throw
             // away; with no store there is nothing to encode for.
-            let bytes = (store.is_some() && !cancelled() && !derived.is_empty()).then(|| derived.to_v4_with(record.as_bytes()));
+            let bytes = (store.is_some() && !cancelled() && !derived.is_empty()).then(|| derived.to_bytes_with(record.as_bytes(), None));
             // Compiles to nothing outside tests: the only trace of an encode.
             if bytes.is_some() {
                 cache::fault::run(cache::fault::Hook::CacheEncoded);
@@ -6419,14 +6571,297 @@ fn eq_node_pos(
     egui::Pos2::new(x, y)
 }
 
+/// Where a grid of the EQ's gains is worked out: the rate, how many pixel
+/// columns or bars, the range and the axis.
+type EqAt = (u32, usize, f32, f32, freq_scale::FreqScale);
+
+/// What a curve's tessellation depends on besides its points and stroke: the
+/// pixel scale, the clip and egui's tessellation options.
+type EqLook = (f32, Rect, egui::epaint::TessellationOptions);
+
+/// The overlay's pixel columns, `0..=w` across the range.
+fn column_freqs((_, w, lo, hi, scale): EqAt) -> Vec<f32> {
+    (0..=w).map(|px| scale.freq_at(px as f32 / w as f32, lo, hi)).collect()
+}
+
+/// The centres of `n` bars, where the analyser puts them on this axis.
+fn bar_freqs((_, n, lo, hi, scale): EqAt) -> Vec<f32> {
+    (0..n).map(|i| scale.bar_center(i, n, lo, hi)).collect()
+}
+
+/// The EQ's gain at each frequency of a grid, band by band, and all of them
+/// together, summed band by band in order as the overlay always did. A band
+/// is worked out again only when it changes, so a drag works out one, and
+/// the frequencies only when the rate, the size, the range or the axis do.
+#[derive(Default)]
+struct EqGrid {
+    at: Option<(EqAt, Vec<f32>)>,
+    /// Each enabled band, in order, and its gain at each frequency.
+    each: Vec<(EqBand, Vec<f32>)>,
+    total: Vec<f32>,
+}
+
+impl EqGrid {
+    fn update(&mut self, bands: &[EqBand], at: EqAt, freqs: fn(EqAt) -> Vec<f32>) {
+        let mut changed = false;
+        if self.at.as_ref().is_none_or(|(a, _)| *a != at) {
+            self.at = Some((at, freqs(at)));
+            self.each.clear();
+            changed = true;
+        }
+        let (sr, f) = (at.0, &self.at.as_ref().unwrap().1);
+        let mut k = 0;
+        for b in bands.iter().filter(|b| b.enabled) {
+            if self.each.get(k).is_none_or(|(kept, _)| kept != b) {
+                let (bv, av) = eq_biquad_coeffs(b, sr);
+                let g = (b.clone(), f.iter().map(|&x| biquad_response_db(bv, av, x, sr)).collect());
+                if k < self.each.len() { self.each[k] = g } else { self.each.push(g) }
+                changed = true;
+            }
+            k += 1;
+        }
+        if self.each.len() > k {
+            self.each.truncate(k);
+            changed = true;
+        }
+        if changed {
+            self.total = (0..f.len()).map(|i| self.each.iter().map(|(_, g)| g[i]).sum()).collect();
+        }
+    }
+}
+
+/// One of the overlay's curves: its points and stroke, and its segments
+/// tessellated as the frame tessellates them.
+struct EqCurve {
+    pts: Vec<egui::Pos2>,
+    stroke: egui::Stroke,
+    look: EqLook,
+    mesh: Arc<egui::Mesh>,
+}
+
+/// The EQ's gains as the overlay and "Apply" draw them, and the overlay's
+/// curves tessellated, kept until something they depend on changes. Worked
+/// out every frame instead (each band at each pixel and each bar, on a
+/// blended or lens axis with 40 bisection steps per pixel per band to find
+/// its frequency, and the curves tessellated again), they held the frame
+/// rate down for as long as the EQ was shown.
+#[derive(Default)]
+struct EqGains {
+    columns: EqGrid,
+    bars: EqGrid,
+    curves: Vec<EqCurve>,
+    /// Set when the app paints with OpenGL that has vertex array objects
+    /// (`gl_curves_for`): the curves' triangles then stay on the graphics
+    /// card between frames (`paint_gl_curves`).
+    gl: Option<Arc<Mutex<GlCurves>>>,
+}
+
+/// The curves' kept triangles on the graphics card: a vertex and an index
+/// buffer per curve, filled when its mesh changes.
+#[derive(Default)]
+struct GlCurves {
+    held: Vec<GlCurve>,
+    /// A GL object could not be made; the meshes go through egui again.
+    failed: bool,
+}
+
+struct GlCurve {
+    mesh: Arc<egui::Mesh>,
+    bounds: Rect,
+    vao: eframe::glow::VertexArray,
+    buffers: [eframe::glow::Buffer; 2],
+}
+
+/// Room on the graphics card for the curves, if egui_glow draws with vertex
+/// array objects in `gl`. The test is egui_glow 0.31's own (its private
+/// `supports_vao`, the desktop and GL ES branches; the WebGL one does not
+/// apply here): OpenGL 3 and GL ES 3 have them, 2.x only with the
+/// extension. Where egui_glow has them it has made one and binds it every
+/// frame, so the calls `paint_gl_curves` makes are calls `gl` has. Where it
+/// has not, glow would panic at the first; the curves go to egui as meshes.
+fn gl_curves_for(gl: &eframe::glow::Context) -> Option<Arc<Mutex<GlCurves>>> {
+    use eframe::glow::HasContext as _;
+    let version = unsafe { gl.get_parameter_string(eframe::glow::VERSION) };
+    let (old, ext) = if version.contains("OpenGL ES ") {
+        (version.contains("2.0"), "OES_vertex_array_object")
+    } else {
+        (version.starts_with('2'), "ARB_vertex_array_object")
+    };
+    let exts = gl.supported_extensions();
+    (!old || exts.contains(ext) || exts.contains(&format!("GL_{ext}"))).then(Default::default)
+}
+
+/// Draws the curves' meshes as egui_glow's `paint_mesh` would have drawn
+/// them inside the frame's mesh, from buffers filled once per change instead
+/// of copied and sent every frame. egui_glow binds its program, blending and
+/// the clip's scissor before calling; this binds what `paint_mesh` binds for
+/// these meshes (the font atlas, for their white texel), lays the vertices
+/// out as its `Painter::new` does, puts back the whole-frame viewport its
+/// meshes use, and culls a mesh as the tessellator does. The same triangles
+/// in the same order, through the same program and state: the same pixels.
+fn paint_gl_curves(gl_curves: &Mutex<GlCurves>, meshes: &[Arc<egui::Mesh>], culling: bool, info: &egui::PaintCallbackInfo, painter: &eframe::egui_glow::Painter) {
+    use eframe::glow::{self, HasContext};
+    let gl = painter.gl();
+    let mut st = gl_curves.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(font) = painter.texture(egui::TextureId::default()) else { return };
+    let fill = |c: &mut GlCurve, mesh: &Arc<egui::Mesh>| unsafe {
+        gl.bind_vertex_array(Some(c.vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(c.buffers[0]));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&mesh.vertices), glow::STATIC_DRAW);
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(c.buffers[1]));
+        gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, bytemuck::cast_slice(&mesh.indices), glow::STATIC_DRAW);
+        c.mesh = mesh.clone();
+        c.bounds = mesh.calc_bounds();
+    };
+    let make = |mesh: &Arc<egui::Mesh>| -> Result<GlCurve, String> {
+        unsafe {
+            // egui_glow's program is the one bound.
+            let program = std::num::NonZeroU32::new(gl.get_parameter_i32(glow::CURRENT_PROGRAM) as u32).map(glow::NativeProgram).ok_or("no program")?;
+            let mut c = GlCurve { mesh: mesh.clone(), bounds: Rect::NOTHING, vao: gl.create_vertex_array()?, buffers: [gl.create_buffer()?, gl.create_buffer()?] };
+            gl.bind_vertex_array(Some(c.vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(c.buffers[0]));
+            use egui::epaint::Vertex;
+            for (name, size, kind, at) in [("a_pos", 2, glow::FLOAT, std::mem::offset_of!(Vertex, pos)),
+                                          ("a_tc", 2, glow::FLOAT, std::mem::offset_of!(Vertex, uv)),
+                                          ("a_srgba", 4, glow::UNSIGNED_BYTE, std::mem::offset_of!(Vertex, color))] {
+                let loc = gl.get_attrib_location(program, name).ok_or(name)?;
+                gl.vertex_attrib_pointer_f32(loc, size, kind, false, std::mem::size_of::<Vertex>() as i32, at as i32);
+                gl.enable_vertex_attrib_array(loc);
+            }
+            fill(&mut c, mesh);
+            Ok(c)
+        }
+    };
+    unsafe {
+        gl.viewport(0, 0, info.screen_size_px[0] as i32, info.screen_size_px[1] as i32);
+        gl.bind_texture(glow::TEXTURE_2D, Some(font));
+        for (k, mesh) in meshes.iter().enumerate() {
+            if let Some(c) = st.held.get_mut(k) {
+                if !Arc::ptr_eq(&c.mesh, mesh) {
+                    fill(c, mesh);
+                }
+            } else {
+                match make(mesh) {
+                    Ok(c) => st.held.push(c),
+                    Err(_) => {
+                        st.failed = true;
+                        gl.bind_vertex_array(None);
+                        return;
+                    }
+                }
+            }
+            let c = &st.held[k];
+            if !culling || info.clip_rect.intersects(c.bounds) {
+                gl.bind_vertex_array(Some(c.vao));
+                gl.draw_elements(glow::TRIANGLES, c.mesh.indices.len() as i32, glow::UNSIGNED_INT, 0);
+            }
+        }
+        for c in st.held.drain(meshes.len()..) {
+            gl.delete_vertex_array(c.vao);
+            c.buffers.into_iter().for_each(|b| gl.delete_buffer(b));
+        }
+        gl.bind_vertex_array(None);
+    }
+}
+
+impl EqGains {
+    /// The gains at the overlay's pixel columns.
+    fn columns(&mut self, bands: &[EqBand], at: EqAt) -> &EqGrid {
+        self.columns.update(bands, at, column_freqs);
+        &self.columns
+    }
+
+    /// All the bands together at each bar's centre.
+    fn bars(&mut self, bands: &[EqBand], at: EqAt) -> &[f32] {
+        self.bars.update(bands, at, bar_freqs);
+        &self.bars.total
+    }
+
+    /// The overlay's curves, drawn with `painter` as they always were: a
+    /// segment per pixel column per curve. When `plain` (the painter draws
+    /// shapes as given: enabled and fully opaque), each curve's segments are
+    /// tessellated once, as the frame tessellates them, and those triangles
+    /// are drawn until the curve's points, its stroke, the pixel scale, the
+    /// clip or the tessellation options change: the frame gets the same
+    /// triangles in the same order. Tessellated with every frame instead,
+    /// some 50,000 segments at 32 bands, they cost more than the rest of the
+    /// plot. Painted with OpenGL, those triangles also stay on the graphics
+    /// card (`paint_gl_curves`); handed to egui, the frame still copied them
+    /// and sent them to the card every frame.
+    fn draw_curves(&mut self, painter: &egui::Painter, plain: bool, bands: &[EqBand], at: EqAt, preamp_db: f32, plot_rect: Rect) {
+        let curves = eq_curves(bands, self.columns(bands, at), preamp_db, plot_rect);
+        if !plain {
+            for (pts, stroke) in &curves {
+                for seg in pts.windows(2) {
+                    painter.line_segment([seg[0], seg[1]], *stroke);
+                }
+            }
+            return;
+        }
+        let ctx = painter.ctx();
+        let look = (ctx.pixels_per_point(), painter.clip_rect(), ctx.tessellation_options(|o| *o));
+        self.curves.truncate(curves.len());
+        for (k, (pts, stroke)) in curves.into_iter().enumerate() {
+            if self.curves.get(k).is_none_or(|c| c.pts != pts || c.stroke != stroke || c.look != look) {
+                let mut t = egui::epaint::Tessellator::new(look.0, look.2, ctx.fonts(|f| f.font_image_size()), Vec::new());
+                t.set_clip_rect(look.1);
+                let mut mesh = egui::Mesh::default();
+                for seg in pts.windows(2) {
+                    t.tessellate_shape(egui::Shape::line_segment([seg[0], seg[1]], stroke), &mut mesh);
+                }
+                let c = EqCurve { pts, stroke, look, mesh: Arc::new(mesh) };
+                if k < self.curves.len() { self.curves[k] = c } else { self.curves.push(c) }
+            }
+        }
+        let meshes: Vec<Arc<egui::Mesh>> = self.curves.iter().map(|c| c.mesh.clone()).collect();
+        match &self.gl {
+            Some(gl) if !gl.lock().unwrap_or_else(|e| e.into_inner()).failed => {
+                let (gl, culling) = (gl.clone(), look.2.coarse_tessellation_culling);
+                let paint = eframe::egui_glow::CallbackFn::new(move |info, p| paint_gl_curves(&gl, &meshes, culling, &info, p));
+                painter.add(egui::PaintCallback { rect: painter.clip_rect(), callback: Arc::new(paint) });
+            }
+            _ => meshes.into_iter().for_each(|m| { painter.add(egui::Shape::Mesh(m)); }),
+        }
+    }
+}
+
+/// The overlay's curves, their points and strokes: each enabled band's,
+/// dimmed, then all of them with the preamp, through every pixel column of
+/// `plot_rect`.
+fn eq_curves(bands: &[EqBand], grid: &EqGrid, preamp_db: f32, plot_rect: Rect) -> Vec<(Vec<egui::Pos2>, egui::Stroke)> {
+    use egui::{Color32, Pos2, Stroke};
+
+    let y_center = plot_rect.center().y;
+    let y_per_db = (plot_rect.height() * 0.5) / EQ_DB_RANGE;
+    let w = plot_rect.width() as usize;
+    let line = |db: &dyn Fn(usize) -> f32| -> Vec<Pos2> {
+        (0..=w).map(|px| {
+            let t = px as f32 / w as f32;
+            let db = db(px).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
+            Pos2::new(plot_rect.left() + t * plot_rect.width(),
+                      (y_center - db * y_per_db).clamp(plot_rect.top(), plot_rect.bottom()))
+        }).collect()
+    };
+
+    // Individual band curves (dimmed)
+    let on = bands.iter().enumerate().filter(|(_, b)| b.enabled).map(|(i, _)| i);
+    let mut curves: Vec<_> = grid.each.iter().zip(on).map(|((_, g), i)| {
+        (line(&|px| g[px]), Stroke::new(1.0, eq_band_color(i).linear_multiply(0.35)))
+    }).collect();
+
+    // Combined response curve
+    curves.push((line(&|px| grid.total[px] + preamp_db),
+        Stroke::new(2.0, Color32::from_rgba_unmultiplied(255, 220, 80, 220))));
+    curves
+}
+
 fn draw_eq_overlay(
     painter: &egui::Painter,
     bands: &[EqBand],
-    sr: u32,
+    curves: Option<(&mut EqGains, bool, EqAt, f32)>,
     plot_rect: Rect,
     min_freq: f32,
     max_freq: f32,
-    draw_curve: bool,
     hovered: Option<usize>,
     dragging: Option<usize>,
     scale: freq_scale::FreqScale,
@@ -6434,45 +6869,15 @@ fn draw_eq_overlay(
     use egui::{Color32, Pos2, Stroke};
 
     let y_center = plot_rect.center().y;
-    let y_per_db = (plot_rect.height() * 0.5) / EQ_DB_RANGE;
-    let w = plot_rect.width() as usize;
 
-    if draw_curve && !bands.is_empty() {
+    if let Some((gains, plain, at, preamp_db)) = curves {
         // 0 dB reference line
         painter.line_segment(
             [Pos2::new(plot_rect.left(), y_center), Pos2::new(plot_rect.right(), y_center)],
             Stroke::new(0.5, Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
         );
-
-        // Individual band curves (dimmed)
-        for (i, band) in bands.iter().enumerate() {
-            if !band.enabled { continue; }
-            let col = eq_band_color(i).linear_multiply(0.35);
-            let pts: Vec<Pos2> = (0..=w).map(|px| {
-                let t = px as f32 / w as f32;
-                let freq = scale.freq_at(t, min_freq, max_freq);
-                let (bv, av) = eq_biquad_coeffs(band, sr);
-                let db = biquad_response_db(bv, av, freq, sr).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
-                Pos2::new(plot_rect.left() + t * plot_rect.width(),
-                          (y_center - db * y_per_db).clamp(plot_rect.top(), plot_rect.bottom()))
-            }).collect();
-            for seg in pts.windows(2) {
-                painter.line_segment([seg[0], seg[1]], Stroke::new(1.0, col));
-            }
-        }
-
-        // Combined response curve
-        let pts: Vec<Pos2> = (0..=w).map(|px| {
-            let t = px as f32 / w as f32;
-            let freq = scale.freq_at(t, min_freq, max_freq);
-            let db = total_eq_response_db(bands, sr, freq).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
-            Pos2::new(plot_rect.left() + t * plot_rect.width(),
-                      (y_center - db * y_per_db).clamp(plot_rect.top(), plot_rect.bottom()))
-        }).collect();
-        for seg in pts.windows(2) {
-            painter.line_segment([seg[0], seg[1]],
-                Stroke::new(2.0, Color32::from_rgba_unmultiplied(255, 220, 80, 220)));
-        }
+        // Individual band curves (dimmed), then the combined one
+        gains.draw_curves(painter, plain, bands, at, preamp_db, plot_rect);
     }
 
     // Band nodes
@@ -7291,6 +7696,12 @@ struct SpectrumSettings {
     #[serde(default)] gpu_mode: gpu_calib::GpuMode,
     /// The exact NVIDIA lane for the 2^15 shared blocks (1.6.1, experimental).
     #[serde(default)] exact_gpu: bool,
+    /// The separately identified high-accuracy route. Missing in older files:
+    /// off, so upgrading never opts the user into a different analysis.
+    #[serde(default)] high_accuracy_gpu: bool,
+    /// New analyses are written in the compact (v5, lossless) cache form.
+    /// Missing in older files: off.
+    #[serde(default)] compact_cache: bool,
     /// Cores the pre-process may use. 0 = the default (`cores - 2`).
     #[serde(default)] worker_threads: usize,
     #[serde(default = "def_peak_accel")] peak_acceleration: f32,
@@ -7309,6 +7720,27 @@ fn def_peak_fall() -> f32 { 3.0 }
 fn def_peak_accel() -> f32 { 4.0 }
 fn def_peak_thick() -> u8 { 2 }
 fn def_peak_color() -> [u8; 3] { [255, 255, 255] }
+
+#[cfg(test)]
+mod high_accuracy_settings_tests {
+    use super::SpectrumSettings;
+
+    #[test]
+    fn older_spectrum_settings_do_not_enable_high_accuracy_gpu() {
+        let older: SpectrumSettings = serde_json::from_str(r#"{"exact_gpu":true,"bar_count":1024}"#).unwrap();
+        assert!(older.exact_gpu, "the older, separate assist preference is retained");
+        assert!(!older.high_accuracy_gpu, "a missing preference must not opt in");
+    }
+
+    #[test]
+    fn the_high_accuracy_preference_round_trips_without_enabling_exact_assist() {
+        let chosen: SpectrumSettings = serde_json::from_str(r#"{"high_accuracy_gpu":true}"#).unwrap();
+        let stored = serde_json::to_vec(&chosen).unwrap();
+        let restored: SpectrumSettings = serde_json::from_slice(&stored).unwrap();
+        assert!(restored.high_accuracy_gpu);
+        assert!(!restored.exact_gpu, "the two GPU routes have independent preferences");
+    }
+}
 
 // serde(default) needs Default impls for the enums used above.
 impl Default for SpectrumMode      { fn default() -> Self { SpectrumMode::PreProcess } }
@@ -7465,6 +7897,36 @@ pub struct AnalysisSettings {
     fft: Option<(usize, usize, f32, WindowFn, InterpolationMode, freq_scale::FreqScale)>,
     /// The transform (scale included) and the frame rate.
     aslt: Option<(aslt::AsltConfig, f32)>,
+    /// Superlet only: how it is computed, where that changes the result.
+    /// Standard everywhere else.
+    numerics: Numerics,
+}
+
+/// How a Superlet analysis is computed, where that changes its result.
+///
+/// The GPU assist and the exact NVIDIA assist are routes of the Standard
+/// transform, not identity. High-accuracy GPU is a different numerical method
+/// (see `aslt::hp`), so it is identity: its records carry `;num=gpu-hp1`, and
+/// Standard's stay byte for byte what they were.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Numerics {
+    #[default]
+    Standard,
+    /// High-accuracy GPU (experimental): opt-in, off by default.
+    HighAccuracyGpu,
+}
+
+impl AnalysisSettings {
+    /// These settings computed with `numerics`, where the method has a choice
+    /// (Superlet); any other method stays Standard.
+    pub fn with_numerics(mut self, numerics: Numerics) -> Self {
+        self.numerics = if self.mapping == BarMappingMode::Superlet { numerics } else { Numerics::Standard };
+        self
+    }
+
+    pub fn numerics(&self) -> Numerics {
+        self.numerics
+    }
 }
 
 /// How a legacy analysis is labelled, wherever it is offered or shown.
@@ -7675,6 +8137,8 @@ pub struct SpectrumWindow {
     pub eq_overlay:       EqOverlayMode,
     eq_dragging_node:     Option<usize>,
     eq_hovered_node:      Option<usize>,
+    /// The EQ's gains as the overlay and "Apply" draw them.
+    eq_gains:             EqGains,
 
     // ── EQ Presets ─────────────────────────────────────────────────────────
     pub preset_library:   EqPresetLibrary,
@@ -7692,6 +8156,10 @@ pub struct SpectrumWindow {
     eq_confirm_delete:    Option<PresetRef>,
     /// Whether the "Save As New" row is expanded.
     eq_save_new_open:     bool,
+    /// Why the last AutoEq import failed.
+    eq_import_msg:        Option<String>,
+    /// "Find your headphones…" was pressed: the app opens its window.
+    pub want_headphone_eq: bool,
     /// Scope selector for the "Save As New" row (Global vs Local).
     eq_save_new_scope:    PresetScope,
 
@@ -7752,6 +8220,23 @@ pub struct SpectrumWindow {
     peak_velocities:     Vec<f32>,
     /// Current alpha per bar (for FadeOut mode, 0–1).
     peak_alphas:         Vec<f32>,
+}
+
+/// Start a new row of a wrapped layout unless `label` and a slider after it
+/// both fit in what is left of this one. A slider is one block that cannot
+/// wrap (egui lays it out in a horizontal of its own), so a row that runs out
+/// of room half-way through one pushes it past the edge — and with it every
+/// row after, which then wraps at the widened width.
+fn slider_room(ui: &mut egui::Ui, label: &str) {
+    let text = ui.fonts(|f| {
+        f.layout_no_wrap(label.to_owned(), egui::TextStyle::Body.resolve(ui.style()), egui::Color32::WHITE)
+            .size().x
+    });
+    let need = text + 2.0 * ui.spacing().item_spacing.x + ui.spacing().slider_width + 72.0;
+    // What is left of this row; `available_width` would be the whole row.
+    if ui.available_size_before_wrap().x < need {
+        ui.end_row();
+    }
 }
 
 impl SpectrumWindow {
@@ -7830,6 +8315,12 @@ impl SpectrumWindow {
 
     pub fn new() -> Self {
         Self::with_presets(EqPresetLibrary::load(), load_spectrum_settings())
+    }
+
+    /// The app paints with OpenGL: keep the EQ curves' triangles on the
+    /// graphics card between frames, if `gl` has vertex array objects.
+    pub fn paint_eq_curves_with_gl(&mut self, gl: &eframe::glow::Context) {
+        self.eq_gains.gl = gl_curves_for(gl);
     }
 
     /// A window that neither reads nor writes the preset library on disk.
@@ -7950,6 +8441,7 @@ impl SpectrumWindow {
             eq_overlay: EqOverlayMode::Both,
             eq_dragging_node: None,
             eq_hovered_node: None,
+            eq_gains: EqGains::default(),
             preset_library,
             active_preset: None,
             preset_modified: false,
@@ -7958,6 +8450,8 @@ impl SpectrumWindow {
             eq_rename_state: None,
             eq_confirm_delete: None,
             eq_save_new_open: false,
+            eq_import_msg: None,
+            want_headphone_eq: false,
             eq_save_new_scope: PresetScope::Global,
             bit_perfect: false,
             dsd_fallback_rate: crate::dsd::decimate::DEFAULT_FALLBACK_RATE,
@@ -7989,6 +8483,62 @@ impl SpectrumWindow {
         w
     }
 
+    /// The separately identified high-accuracy analysis. Kept outside the
+    /// Standard assist controls: CUDA availability is not wgpu availability.
+    fn high_accuracy_gpu_ui(&mut self, ui: &mut egui::Ui) {
+        let mut enabled = self.analyzer.hp.enabled;
+        if ui.checkbox(&mut enabled, "High-accuracy GPU (experimental)")
+            .on_hover_text(
+                "Runs the Superlet analysis on an NVIDIA graphics card instead of the \
+                 cores: about five times faster. Off by default.\n\n\
+                 What it costs:\n\
+                 • Its result is not Standard's. Checked against a higher-precision \
+                 calculation on five songs (44.1 to 192 kHz) at seven of the settings it \
+                 takes, High-accuracy GPU stayed within one display step; Standard can be several steps off \
+                 at a handful of points. Made-up stress signals have put it two steps off \
+                 in Diff. The two never match bit for bit, so \
+                 High-accuracy GPU keeps its own cache. Tracks already analysed stay \
+                 Standard until you press \"Reanalyse with High-accuracy GPU\".\n\
+                 • Not every setup: it needs Superlet, 256 bars or more, 100 fps or \
+                 more, a window up to 1.2 s, a spread of 0.1 or more with two or more \
+                 wavelets (0.3 or more above 48 kHz), and a stereo track at 44.1, 48, \
+                 88.2, 96, 176.4 or 192 kHz that is not too long (5:10 at 1024 bars and 180 fps; shorter with more \
+                 bars or frames). Anything else is analysed with Standard, and the \
+                 reason is shown below.\n\
+                 • While it runs it uses about 0.6 GB of graphics memory (about \
+                 1.7 GB for a 3:47 track at 192 kHz) and more system memory than \
+                 Standard. Tested only on an RTX 2060 SUPER.\n\n\
+                 If it fails, that track is analysed once with Standard. After a \
+                 graphics card error it stays off until Moosik restarts.\n\n\
+                 With Exact NVIDIA assist also on: a track analysed here does not use \
+                 it; a track analysed with Standard still does.")
+            .changed()
+        {
+            self.analyzer.set_hp_enabled(enabled);
+            self.try_load_or_flag_reanalysis();
+        }
+
+        if let Some(label) = self.analyzer.hp_label() {
+            ui.label(egui::RichText::new(label).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
+        }
+
+        if self.analyzer.hp.enabled
+            && matches!(self.bar_mapping, BarMappingMode::Superlet)
+            && !self.analyzer.analysis_busy()
+            && let Some(path) = self.current_path.clone()
+            && ui.button("Reanalyse with High-accuracy GPU")
+                .on_hover_text(
+                    "Request a fresh high-accuracy analysis for this track. The \
+                     existing Standard cache is kept. If the GPU route is unavailable \
+                     or fails, this request falls back to Standard; cancelling never \
+                     restarts it on the CPU.")
+                .clicked()
+        {
+            self.needs_reanalysis = false;
+            self.analyzer.request_hp_reanalysis(path);
+        }
+    }
+
     /// Who computes the pre-process: how many cores, and whether the GPU helps.
     ///
     /// Both settings are visible and overridable rather than inferred silently,
@@ -8009,7 +8559,8 @@ impl SpectrumWindow {
         let busy = self.recalibrating.is_some();
 
         ui.separator();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            slider_room(ui, "Cores:");
             ui.label("Cores:");
             let cores = gpu_calib::core_count();
             let mut n = if self.worker_threads == 0 {
@@ -8043,13 +8594,17 @@ impl SpectrumWindow {
             }
         });
 
+        // The high-accuracy route uses CUDA directly, independently of the
+        // Standard wgpu assist. Its control must remain reachable without it.
+        self.high_accuracy_gpu_ui(ui);
+
         if !gpu_calib::device_present() {
-            ui.label(egui::RichText::new("No GPU available — CPU route only.")
+            ui.label(egui::RichText::new("Standard GPU assist is unavailable — no wgpu compute device.")
                 .size(10.0).color(txt_dim(dark)));
             return;
         }
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("GPU:");
             let mut m = self.gpu_mode;
             egui::ComboBox::from_id_salt("gpu_mode")
@@ -8108,7 +8663,10 @@ impl SpectrumWindow {
              The result is the same to the last bit; anything the card cannot do \
              stays on the CPU. Used only on cards of compute capability 7.5 \
              (Turing: the GeForce RTX 20 and GTX 16 series, among others); \
-             tested on an RTX 2060 SUPER.");
+             tested on an RTX 2060 SUPER.\n\n\
+             It speeds up Standard analysis only, so it can stay on with \
+             High-accuracy GPU: tracks that are analysed with Standard (other \
+             settings, longer tracks, a fallback) still use it.");
         if exact != self.exact_gpu {
             self.exact_gpu = exact;
             aslt::set_exact_gpu(exact);
@@ -8165,6 +8723,8 @@ impl SpectrumWindow {
             cache_budget_gb: self.analyzer.cache_budget_gb,
             gpu_mode:       self.gpu_mode,
             exact_gpu:      self.exact_gpu,
+            high_accuracy_gpu: self.analyzer.hp.enabled,
+            compact_cache: cache::compact(),
             worker_threads: self.worker_threads,
             show_fft:      self.show_fft_settings,
             show_peak:     self.show_peak_settings,
@@ -8235,6 +8795,8 @@ impl SpectrumWindow {
         gpu_calib::set_mode(s.gpu_mode);
         self.exact_gpu = s.exact_gpu;
         aslt::set_exact_gpu(s.exact_gpu);
+        self.analyzer.set_hp_enabled(s.high_accuracy_gpu);
+        cache::set_compact(s.compact_cache);
         self.worker_threads = s.worker_threads.min(gpu_calib::core_count());
         gpu_calib::set_workers(self.worker_threads);
         let (fallback, preprocess) = dsd_rates_from(s.dsd_rate, s.dsd_preprocess_rate);
@@ -8569,7 +9131,7 @@ impl SpectrumWindow {
     /// overlap, which only an FFT pre-process analysis uses. Live padding has
     /// its own bounded control and does not change a stored-analysis identity.
     fn fft_rows(&mut self, ui: &mut egui::Ui, rebuild: &mut bool, with_analysis_rows: bool) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("FFT size:");
             // The panel describes the consumer it shapes: the live FFT (the
             // Real-time view, and the "Live FFT preview" fold under Superlet)
@@ -8640,7 +9202,7 @@ impl SpectrumWindow {
             let lbl_hamming = wf_green(WindowFn::Hamming);
             let lbl_black   = wf_green(WindowFn::Blackman);
             let lbl_flat    = wf_green(WindowFn::FlatTop);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Window:");
                 let prev = self.window_fn.clone();
                 ui.selectable_value(&mut self.window_fn, WindowFn::Hann, lbl_hann)
@@ -8687,7 +9249,7 @@ impl SpectrumWindow {
             let lbl_pchip  = im_green(InterpolationMode::Pchip);
             let lbl_akima  = im_green(InterpolationMode::Akima);
             let lbl_lanc   = im_green(InterpolationMode::Lanczos);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Interpolation:");
                 let prev = self.interp_mode.clone();
                 ui.selectable_value(&mut self.interp_mode, InterpolationMode::None, lbl_none)
@@ -8722,7 +9284,7 @@ impl SpectrumWindow {
             });
         }
         if with_analysis_rows && self.mode == SpectrumMode::PreProcess {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Pre-process zero-padding:");
                 let prev_pad = self.pad_factor;
                 for &pf in &[1usize, 2, 4, 8, 16, 32, 64] {
@@ -8764,7 +9326,7 @@ impl SpectrumWindow {
                     self.try_load_or_flag_reanalysis();
                 }
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Pre-process overlap:");
                 for &(text, val) in &[("50%", 0.5f32), ("75%", 0.75), ("87.5%", 0.875)] {
                     let has_cache = self.current_path.as_ref().map(|p| {
@@ -8996,8 +9558,13 @@ impl SpectrumWindow {
     fn try_load_or_flag_inner(&mut self) {
         let Some(path) = self.current_path.clone() else { return; };
         let settings = self.settings_with(&path, &self.analyzer.aslt_cfg.clone());
-        let (identity, unit) = settings.key(&self.analyzer.cache_dir());
-        if let Some((frames, installed)) = self.analyzer.lookup_exact(&settings, self.bar_count) {
+        if self.analyzer.analysis_job.as_ref().is_some_and(|job|
+            job.settings.numerics() == Numerics::HighAccuracyGpu && job.settings != settings)
+        {
+            self.analyzer.retire_job();
+        }
+        if let Some((settings, frames, installed)) = self.analyzer.lookup_preferred(settings, self.bar_count) {
+            let (identity, unit) = settings.key(&self.analyzer.cache_dir());
             // Via pre_hop(), not fft_size: a superlet cache is spaced by frame
             // rate, and using the FFT hop here would drift the spectrum against
             // playback for the whole track.
@@ -9026,11 +9593,16 @@ impl SpectrumWindow {
     /// The descriptor for `track` at the user's settings, with the transform
     /// settings replaced by `cfg`.
     fn settings_with(&self, track: &Path, cfg: &aslt::AsltConfig) -> AnalysisSettings {
-        settings_for(
+        let at = |cfg| settings_for(
             track, self.bar_count, self.fft_size, self.pad_factor, self.overlap,
             &self.window_fn, self.min_freq, self.max_freq, &self.bar_mapping,
             &self.interp_mode, self.analyzer.dsd_rate, cfg, self.analyzer.pre_fps,
-        )
+        );
+        // The numerics are decided at the user's own transform and then held
+        // for `cfg`: a policy-(a) choice names that descriptor, not a candidate.
+        let hp = &self.analyzer.hp;
+        let numerics = hp.effective(hp.requested(at(&self.analyzer.aslt_cfg))).numerics();
+        at(cfg).with_numerics(numerics)
     }
 
     /// The exact key for `track` at the user's settings, with the transform
@@ -9569,9 +10141,10 @@ impl SpectrumWindow {
     fn apply_preset_ref(&mut self, r: PresetRef) {
         let key = self.track_key();
         if let Some(preset) = self.preset_library.find(&r, key.as_deref()) {
-            let bands = preset.bands.clone();
+            let (bands, preamp) = (preset.bands.clone(), preset.preamp_db);
             let mut eq = self.eq_state.lock().unwrap();
             eq.bands = bands;
+            eq.preamp_db = preamp;
             eq.bump();
         }
         self.active_preset = Some(r);
@@ -9580,13 +10153,13 @@ impl SpectrumWindow {
 
     /// Recompute `preset_modified` from the current EQ bands vs the active preset.
     fn refresh_preset_modified(&mut self) {
-        let current = self.eq_state.lock().unwrap().bands.clone();
+        let (current, preamp) = { let eq = self.eq_state.lock().unwrap(); (eq.bands.clone(), eq.preamp_db) };
         self.preset_modified = match &self.active_preset {
-            None => !current.is_empty(),
+            None => !current.is_empty() || preamp != 0.0,
             Some(r) => {
                 let key = self.track_key();
                 match self.preset_library.find(r, key.as_deref()) {
-                    Some(p) => !bands_equal(&current, &p.bands),
+                    Some(p) => !bands_equal(&current, &p.bands) || p.preamp_db != preamp,
                     None    => true,
                 }
             }
@@ -9596,10 +10169,11 @@ impl SpectrumWindow {
     /// Save current bands into the active preset (overwrite).
     fn overwrite_active_preset(&mut self) {
         let key = self.track_key();
-        let bands = self.eq_state.lock().unwrap().bands.clone();
+        let (bands, preamp) = { let eq = self.eq_state.lock().unwrap(); (eq.bands.clone(), eq.preamp_db) };
         if let Some(ref r) = self.active_preset.clone() {
             if let Some(p) = self.preset_library.find_mut(r, key.as_deref()) {
                 p.bands = bands;
+                p.preamp_db = preamp;
             }
             self.preset_library.save();
             self.preset_modified = false;
@@ -9607,11 +10181,25 @@ impl SpectrumWindow {
     }
 
     /// Create a new preset from current bands, return its PresetRef.
+    /// A headphone correction into the EQ: its bands and preamp, switched
+    /// on, and kept as a global preset under `name`.
+    pub fn apply_correction(&mut self, name: String, preamp: f32, bands: Vec<EqBand>) {
+        {
+            let mut eq = self.eq_state.lock().unwrap();
+            eq.bands = bands;
+            eq.preamp_db = preamp;
+            eq.enabled = true;
+            eq.bump();
+        }
+        self.save_as_new_preset(name, PresetScope::Global);
+        self.eq_import_msg = None;
+    }
+
     fn save_as_new_preset(&mut self, name: String, scope: PresetScope) -> PresetRef {
         let id = self.preset_library.alloc_id();
         let key = self.track_key();
-        let bands = self.eq_state.lock().unwrap().bands.clone();
-        let preset = EqPreset { id, name, bands };
+        let (bands, preamp_db) = { let eq = self.eq_state.lock().unwrap(); (eq.bands.clone(), eq.preamp_db) };
+        let preset = EqPreset { id, name, bands, preamp_db };
         match scope {
             PresetScope::Global => self.preset_library.global.push(preset),
             PresetScope::Local => {
@@ -10739,7 +11327,7 @@ impl SpectrumWindow {
 
     /// Render the spectrum as a separate OS window via `show_viewport_immediate`.
     pub fn show(&mut self, ctx: &egui::Context) {
-        // Drawn by the main window instead (see `embedded_ui`).
+        // Drawn by the main window instead (see `embedded_controls_ui`).
         if self.embedded {
             return;
         }
@@ -10797,19 +11385,6 @@ impl SpectrumWindow {
         self.draw_ms = self.draw_ms * 0.9 + ms * 0.1;
     }
 
-    /// The analyser drawn inside another window (the 1.6.0 shell's Analyze
-    /// mode) instead of its own viewport. Same body, same persistence.
-    pub fn embedded_ui(&mut self, ui: &mut egui::Ui) {
-        if !self.open {
-            return;
-        }
-        let show_start = Instant::now();
-        self.panel_ui(ui);
-        self.persist_settings_if_changed();
-        let ms = show_start.elapsed().as_secs_f32() * 1000.0;
-        self.draw_ms = self.draw_ms * 0.9 + ms * 0.1;
-    }
-
     /// The shell's Analyze mode with the controls in a drawer: the controls
     /// on their own. Draw them before the plot, which persists the settings.
     pub fn embedded_controls_ui(&mut self, ui: &mut egui::Ui) {
@@ -10840,6 +11415,9 @@ impl SpectrumWindow {
     /// The rows of controls and the open settings panels.
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
         // ── Row 1: mode + view + channels + loudness ──────────────
+        //
+        // Every row below wraps too: in the shell's drawer (300–380 px)
+        // the settings rows ran off its right edge, cut (1.6.1).
         //
         // Wrapped, not clipped. This is one row of about a dozen
         // controls and the window opens at 700 px with a 380 px
@@ -11057,6 +11635,7 @@ The Mix is unaffected.                                  Analysing the track agai
 
         // ── Row 2: bar count (+ bar gap for Bars) ─────────────────
         ui.horizontal_wrapped(|ui| {
+            slider_room(ui, "Bars:");
             ui.label("Bars:");
             let r = ui.add(egui::Slider::new(&mut self.bar_count,
                     MIN_BAR_COUNT..=MAX_BAR_COUNT)
@@ -11088,6 +11667,7 @@ The Mix is unaffected.                                  Analysing the track agai
             // longer needs a row of its own.
             if self.style == VizStyle::Bars {
                 ui.separator();
+                slider_room(ui, "Gap:");
                 ui.label("Gap:");
                 ui.add(egui::Slider::new(&mut self.bar_gap, 0.0..=12.0)
                     .step_by(1.0).suffix(" px"))
@@ -11134,7 +11714,7 @@ The Mix is unaffected.                                  Analysing the track agai
                         .and_then(|p| crate::dsd::parse_file(p).ok())
                         .map(|i| i.sample_rate);
                     let khz = khz_label;
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("DSD preprocessing rate:").on_hover_text(
                             "The rate DSD is decimated to for the pre-process analysis.                                      Analysis only: it does not change what you hear, the output                                      rate or the device. Superlet keeps its configured frame rate                                      at every rate. A lower rate analyses fewer samples with                                      shorter kernels — faster, smaller memory — and every rate                                      here covers the 24 kHz analysis band; a different rate gives                                      a close but not identical picture, so each rate keeps its                                      own cache.");
                         let mut chosen = None;
@@ -11171,7 +11751,7 @@ The Mix is unaffected.                                  Analysing the track agai
                             khz(self.analyzer.sample_rate), khz(self.analyzer.live_rate),
                         )).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
                     }
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("DSD PCM fallback (playback):").on_hover_text(
                             "Audio, not analysis: the rate DSD is decimated to for playback                                      when neither native DSD nor DoP can carry it. Takes effect                                      from the next track started.");
                         for &rate in &crate::dsd::decimate::FALLBACK_RATES {
@@ -11292,7 +11872,7 @@ The Mix is unaffected.                                  Analysing the track agai
                         let fft_sigma = aslt::fft_sigma_hz(
                             self.analyzer.sample_rate, self.fft_size);
                         let mut retune: Option<(Option<aslt::AsltPreset>, aslt::AsltConfig)> = None;
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Quality:");
                             for p in [
                                 aslt::AsltPreset::Fast, aslt::AsltPreset::Standard,
@@ -11330,7 +11910,8 @@ The Mix is unaffected.                                  Analysing the track agai
                         if self.analyzer.aslt_preset.is_none() {
                             let mut cfg = self.analyzer.aslt_cfg.clone();
                             let before = cfg.clone();
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                slider_room(ui, "Max window:");
                                 ui.label("Max window:");
                                 ui.add(egui::Slider::new(&mut cfg.max_window_s, aslt::MAX_WINDOW_RANGE)
                                     .logarithmic(true).suffix(" s"))
@@ -11365,7 +11946,8 @@ The Mix is unaffected.                                  Analysing the track agai
                                     ).clamp(0.1, 8.0);
                                 }
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                slider_room(ui, "Sharpness:");
                                 ui.label("Sharpness:");
                                 ui.add(egui::Slider::new(&mut cfg.q_ratio, aslt::Q_RATIO_RANGE)
                                     .suffix("× grid"))
@@ -11378,13 +11960,15 @@ The Mix is unaffected.                                  Analysing the track agai
                                          (a longer window) and reads tones between bar \
                                          centres lower.");
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                slider_room(ui, "Wavelets:");
                                 ui.label("Wavelets:");
                                 ui.add(egui::Slider::new(&mut cfg.n_wavelets, aslt::N_WAVELETS_RANGE))
                                     .on_hover_text(
                                         "Members per superlet. 1 is a plain wavelet transform \
                                          — sharpest peak, no cross-checking. More suppress \
                                          energy the set disagrees about.");
+                                slider_room(ui, "Spread:");
                                 ui.label("Spread:");
                                 ui.add(egui::Slider::new(&mut cfg.spread, aslt::SPREAD_RANGE))
                                     .on_hover_text(
@@ -11395,7 +11979,8 @@ The Mix is unaffected.                                  Analysing the track agai
                             });
                             let (lens_hz, lens_oct, lens_gain) =
                                 cfg.scale.lens().unwrap_or((1000.0, 2.0, 0.0));
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                slider_room(ui, "Bass width:");
                                 ui.label("Bass width:");
                                 let mut tilt = cfg.scale.tilt();
                                 // Reversed range so dragging right
@@ -11439,7 +12024,7 @@ The Mix is unaffected.                                  Analysing the track agai
                                         1.0, lens_hz, lens_oct, lens_gain);
                                 }
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Zoom:");
                                 let mut on = lens_gain > 0.0;
                                 if ui.checkbox(&mut on, "").changed() {
@@ -11455,9 +12040,11 @@ The Mix is unaffected.                                  Analysing the track agai
                                     let a = ui.add(egui::DragValue::new(&mut hz)
                                         .range(20.0..=20_000.0).speed(10.0).suffix(" Hz"))
                                         .on_hover_text("Where the extra detail goes.");
+                                    slider_room(ui, "");
                                     let b = ui.add(egui::Slider::new(&mut oct, 0.25..=6.0)
                                         .suffix(" oct").text(""))
                                         .on_hover_text("How wide the magnified region is.");
+                                    slider_room(ui, "×");
                                     let c = ui.add(egui::Slider::new(&mut gain, 0.5..=8.0)
                                         .text("×"))
                                         .on_hover_text(
@@ -11528,7 +12115,8 @@ The Mix is unaffected.                                  Analysing the track agai
                             )).size(10.0).color(txt_dim(ui.visuals().dark_mode)));
                             if cfg != before { retune = Some((None, cfg)); }
                         }
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            slider_room(ui, "Frame rate:");
                             ui.label("Frame rate:");
                             let mut fps = self.analyzer.pre_fps;
                             if ui.add(egui::Slider::new(&mut fps, 30.0..=240.0).step_by(30.0).suffix(" fps"))
@@ -11572,7 +12160,7 @@ The Mix is unaffected.                                  Analysing the track agai
                 } else if self.fft_knobs_apply() {
                     self.fft_rows(ui, &mut rebuild, true);
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     // One control, whichever mode is showing — but two
                     // values, persisted apart. They are not the same
                     // quantity: Real-time is retention per accepted
@@ -11581,6 +12169,7 @@ The Mix is unaffected.                                  Analysing the track agai
                     // Sharing one number made a fast display change what
                     // Real-time meant.
                     let pre = self.mode == SpectrumMode::PreProcess;
+                    slider_room(ui, "Smoothing (cached):");
                     ui.label(if pre { "Smoothing (cached):" } else { "Smoothing (live):" });
                     let value = if pre { &mut self.pre_smoothing } else { &mut self.smoothing };
                     let r = ui.add(
@@ -11615,7 +12204,7 @@ The Mix is unaffected.                                  Analysing the track agai
                     self.analyzer.pre_smoothing = self.pre_smoothing;
                 });
                 if self.channel_view == channels::ChannelView::Diff {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Diff layout:");
                         for o in [
                             channels::DiffOrientation::Horizontal,
@@ -11650,7 +12239,8 @@ The Mix is unaffected.                                  Analysing the track agai
                             );
                     });
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    slider_room(ui, "Waterfall history:");
                     ui.label("Waterfall history:");
                     let r = ui.add(
                         egui::Slider::new(
@@ -11716,7 +12306,7 @@ The Mix is unaffected.                                  Analysing the track agai
                          beside the slider instead of the value requested."
                     });
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Min Hz:");
                     let r = ui.add(egui::DragValue::new(&mut self.min_freq)
                         .range(10.0..=500.0).speed(1.0).suffix(" Hz"));
@@ -11728,7 +12318,8 @@ The Mix is unaffected.                                  Analysing the track agai
                         self.try_load_or_flag_reanalysis();
                     }
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    slider_room(ui, "Max FPS:");
                     ui.label("Max FPS:");
                     ui.add(egui::Slider::new(&mut self.max_fps, 1.0..=240.0)
                         .step_by(1.0).suffix(" fps"));
@@ -11745,7 +12336,7 @@ The Mix is unaffected.                                  Analysing the track agai
         if self.mode == SpectrumMode::PreProcess {
             // Banner when settings changed and no matching cache exists
             if self.needs_reanalysis && self.current_path.is_some() {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let analyzing = self.analyzer.analysis_busy();
                     let label = if analyzing {
                         "⚠ No cache for current settings — waiting for analysis to finish…"
@@ -11782,7 +12373,7 @@ The Mix is unaffected.                                  Analysing the track agai
             }
 
             if self.show_cache_settings { ui.group(|ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let analyzing = self.analyzer.analysis_busy();
                     let has_path  = self.current_path.is_some();
                     let free = self.cache_controls_free();
@@ -11820,7 +12411,23 @@ The Mix is unaffected.                                  Analysing the track agai
                             .size(11.0).color(txt_dim(ui.visuals().dark_mode)));
                     }
                 });
-                ui.horizontal(|ui| {
+                let mut compact = cache::compact();
+                if ui.checkbox(&mut compact, "Smaller cache files (experimental)")
+                    .on_hover_text(
+                        "Writes new analyses in a compact form: the same picture, bit for                          bit, in about two thirds of the space. Off by default.
+
+                         What it costs:
+                         • Analyses already in the cache stay as they are until they are                          analysed again.
+                         • A compact analysis takes a little longer to save and to open.
+                         • Moosik 1.6.1 and earlier cannot read compact files and will                          analyse those tracks again.
+
+                         Every compact file is read back and compared before it is kept,                          and checked again each time it is opened; one that does not                          match is analysed again, never shown.")
+                    .changed()
+                {
+                    cache::set_compact(compact);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    slider_room(ui, "Budget:");
                     ui.label("Budget:");
                     let mut unlimited = self.analyzer.cache_budget_gb <= 0.0;
                     if ui.checkbox(&mut unlimited, "Unlimited")
@@ -11879,7 +12486,7 @@ The Mix is unaffected.                                  Analysing the track agai
                 } else {
                     format!("{:.0} KB", bytes as f64 / 1e3)
                 };
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new(
                         format!("Cache: {} analys{} — {}", count, if count == 1 { "is" } else { "es" }, size_str))
                         .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
@@ -11910,13 +12517,14 @@ The Mix is unaffected.                                  Analysing the track agai
             ui.group(|ui| {
                     ui.checkbox(&mut self.peak_config.enabled, "Enabled");
                     ui.add_enabled_ui(self.peak_config.enabled, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            slider_room(ui, "Hold time:");
                             ui.label("Hold time:");
                             ui.add(egui::Slider::new(&mut self.peak_config.hold_ms, 10.0..=1000.0)
                                 .suffix(" ms"))
                                 .on_hover_text("How long the peak line freezes before it starts to decay.");
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Decay mode:");
                             ui.selectable_value(&mut self.peak_config.decay_mode, PeakDecayMode::Linear,  "Linear")
                                 .on_hover_text("Peak falls at a constant speed.");
@@ -11929,21 +12537,24 @@ The Mix is unaffected.                                  Analysing the track agai
                             PeakDecayMode::FadeOut => "Fade speed:",
                             _                      => "Fall speed:",
                         };
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            slider_room(ui, speed_label);
                             ui.label(speed_label);
                             ui.add(egui::Slider::new(&mut self.peak_config.fall_speed, 0.05..=5.0)
                                 .logarithmic(true))
                                 .on_hover_text("Initial decay rate (normalized units/sec). For Fade Out this controls how fast the line disappears.");
                         });
                         if self.peak_config.decay_mode == PeakDecayMode::Gravity {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                slider_room(ui, "Acceleration:");
                                 ui.label("Acceleration:");
                                 ui.add(egui::Slider::new(&mut self.peak_config.acceleration, 0.5..=20.0)
                                     .logarithmic(true))
                                     .on_hover_text("How quickly the fall accelerates. Higher values make it feel heavier.");
                             });
                         }
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            slider_room(ui, "Thickness:");
                             ui.label("Thickness:");
                             let mut t = self.peak_config.peak_thickness as i32;
                             if ui.add(egui::Slider::new(&mut t, 1..=6).suffix(" px"))
@@ -11953,7 +12564,7 @@ The Mix is unaffected.                                  Analysing the track agai
                                 self.peak_config.peak_thickness = t as u8;
                             }
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Color:");
                             let mut rgb = [
                                 self.peak_config.color.r(),
@@ -11979,7 +12590,7 @@ The Mix is unaffected.                                  Analysing the track agai
                     .unwrap_or_default();
 
                 // ── Playlist thumbnails ──────────────────────────
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.art_settings.playlist_show, "Playlist thumbnails");
                     ui.add_space(6.0);
                     ui.add_enabled(
@@ -11990,7 +12601,7 @@ The Mix is unaffected.                                  Analysing the track agai
                         ),
                     );
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.checkbox(
                         &mut self.art_settings.spectrum_placeholder,
                         "Spectrum placeholder (no art)",
@@ -12000,7 +12611,7 @@ The Mix is unaffected.                                  Analysing the track agai
                 ui.separator();
 
                 // ── Spectrum scope: global vs per-track ──────────
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Spectrum:").size(11.0)
                         .color(txt_dim(ui.visuals().dark_mode)));
                     if !track_key.is_empty() {
@@ -12031,7 +12642,7 @@ The Mix is unaffected.                                  Analysing the track agai
                 };
 
                 ui.add_enabled_ui(art_enabled, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Mode:");
                         ui.selectable_value(
                             &mut cfg.spectrum_mode, ArtSpectrumMode::Hidden, "Hidden");
@@ -12044,7 +12655,7 @@ The Mix is unaffected.                                  Analysing the track agai
                     });
 
                     if cfg.spectrum_mode != ArtSpectrumMode::Hidden {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Fit:");
                             ui.selectable_value(&mut cfg.fit, ArtFit::Preserve, "Preserve ratio");
                             ui.selectable_value(&mut cfg.fit, ArtFit::Stretch, "Stretch to fill");
@@ -12053,14 +12664,15 @@ The Mix is unaffected.                                  Analysing the track agai
 
                     match cfg.spectrum_mode {
                         ArtSpectrumMode::Transparent => {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                slider_room(ui, "Opacity:");
                                 ui.label("Opacity:");
                                 ui.add(egui::Slider::new(&mut cfg.transparency, 0.0..=1.0)
                                     .step_by(0.01));
                             });
                         }
                         ArtSpectrumMode::Mask => {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Brightness:");
                                 ui.selectable_value(
                                     &mut cfg.mask_mode, ArtMaskMode::Dynamic, "Dynamic")
@@ -12070,7 +12682,8 @@ The Mix is unaffected.                                  Analysing the track agai
                                     .on_hover_text("Fixed brightness level, set by slider");
                             });
                             if cfg.mask_mode == ArtMaskMode::Fixed {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    slider_room(ui, "Level:");
                                     ui.label("Level:");
                                     ui.add(egui::Slider::new(&mut cfg.mask_brightness, 0.0..=1.0)
                                         .step_by(0.01));
@@ -12104,7 +12717,7 @@ The Mix is unaffected.                                  Analysing the track agai
                     // second is the defect. This says only what it
                     // knows.
                     if self.bit_perfect {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 egui::RichText::new(
                                     "\u{25C7} EQ is bypassed — this track plays on an \
@@ -12118,7 +12731,7 @@ The Mix is unaffected.                                  Analysing the track agai
                     }
 
                     // Global controls row
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let eq_on = { self.eq_state.lock().unwrap().enabled };
                         let on_label = egui::RichText::new(if eq_on { "ON" } else { "OFF" })
                             .color(if eq_on { txt_ok(ui.visuals().dark_mode) } else { txt_faint(ui.visuals().dark_mode) });
@@ -12158,7 +12771,7 @@ The Mix is unaffected.                                  Analysing the track agai
 
                         // ── Pending-switch prompt (Save / Discard / Cancel) ──
                         if let Some(pending) = self.pending_preset_switch.clone() {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new("⚠ Unsaved changes — ").color(txt_warn(ui.visuals().dark_mode)));
                                 if ui.button("Save & switch").clicked() {
                                     self.overwrite_active_preset();
@@ -12192,7 +12805,7 @@ The Mix is unaffected.                                  Analysing the track agai
                             }
                         };
 
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(egui::RichText::new("Preset:").size(11.0).color(txt_dim(ui.visuals().dark_mode)));
 
                             // ── Global preset dropdown ──
@@ -12285,7 +12898,7 @@ The Mix is unaffected.                                  Analysing the track agai
 
                         // ── Save As New expanded row ──
                         if self.eq_save_new_open {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new("Name:").size(11.0));
                                 ui.add(egui::TextEdit::singleline(&mut self.eq_save_name_buf).desired_width(140.0));
                                 ui.label(egui::RichText::new("Scope:").size(11.0));
@@ -12307,12 +12920,51 @@ The Mix is unaffected.                                  Analysing the track agai
                             });
                         }
 
+                        // ── Headphone correction and preamp (1.6.2) ──
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.small_button("Find your headphones…")
+                                .on_hover_text("Search AutoEq's headphones and use one's correction here, or save it for other apps")
+                                .clicked()
+                            {
+                                self.want_headphone_eq = true;
+                            }
+                            if ui.small_button("Import AutoEq…")
+                                .on_hover_text("Load a headphone correction: an AutoEq or Equalizer APO ParametricEQ.txt. It becomes a global preset.")
+                                .clicked()
+                                && let Some(path) = rfd::FileDialog::new().add_filter("Parametric EQ", &["txt"]).set_title("AutoEq profile").pick_file()
+                            {
+                                match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| eq::parse_autoeq(&t)) {
+                                    Ok((preamp, bands)) => {
+                                        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("AutoEq").trim_end_matches(" ParametricEQ").to_string();
+                                        self.apply_correction(name, preamp, bands);
+                                    }
+                                    Err(e) => self.eq_import_msg = Some(format!("Could not import it: {e}")),
+                                }
+                            }
+                            let mut preamp = self.eq_state.lock().unwrap().preamp_db;
+                            ui.label(egui::RichText::new("Preamp").size(11.0));
+                            if ui.add(egui::DragValue::new(&mut preamp).range(-24.0..=12.0).speed(0.1).suffix(" dB"))
+                                .on_hover_text("Gain before the bands, so boosts do not clip")
+                                .changed()
+                            {
+                                {
+                                    let mut eq = self.eq_state.lock().unwrap();
+                                    eq.preamp_db = preamp;
+                                    eq.bump();
+                                }
+                                self.refresh_preset_modified();
+                            }
+                        });
+                        if let Some(m) = &self.eq_import_msg {
+                            ui.label(egui::RichText::new(m.as_str()).size(11.0).color(egui::Color32::from_rgb(220, 140, 80)));
+                        }
+
                         // ── Per-preset actions (Rename, Duplicate, Delete, Set Default) ──
                         if let Some(active_ref) = self.active_preset.clone() {
                             // Rename state
                             if let Some((ref rename_ref, ref mut rename_buf)) = self.eq_rename_state.clone()
                                 && *rename_ref == active_ref {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                         ui.label(egui::RichText::new("Rename:").size(11.0));
                                         // We need mutable access — pull from field
                                         if let Some((_, ref mut buf)) = self.eq_rename_state {
@@ -12320,7 +12972,7 @@ The Mix is unaffected.                                  Analysing the track agai
                                         }
                                         let new_name = rename_buf.trim().to_string();
                                         let ok = !new_name.is_empty();
-                                        if ui.add_enabled(ok, egui::Button::new("✓")).clicked() {
+                                        if ui.add_enabled(ok, egui::Button::new("✔")).clicked() {
                                             let key = self.track_key();
                                             if let Some(p) = self.preset_library.find_mut(&active_ref, key.as_deref()) { p.name = new_name; }
                                             self.preset_library.save();
@@ -12332,7 +12984,7 @@ The Mix is unaffected.                                  Analysing the track agai
                                     });
                             }
 
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 // Rename button
                                 if (self.eq_rename_state.is_none() || self.eq_rename_state.as_ref().map(|(r,_)| r) != Some(&active_ref))
                                     && ui.small_button("✏ Rename").clicked() {
@@ -12345,11 +12997,14 @@ The Mix is unaffected.                                  Analysing the track agai
                                 // Duplicate
                                 if ui.small_button("⧉ Duplicate").on_hover_text("Save a copy as a new preset").clicked() {
                                     let key = self.track_key();
-                                    let (cur_name, cur_bands) = self.preset_library.find(&active_ref, key.as_deref())
-                                        .map(|p| (format!("{} copy", p.name), p.bands.clone()))
-                                        .unwrap_or_else(|| (self.preset_library.auto_name(&active_ref.scope, key.as_deref()), self.eq_state.lock().unwrap().bands.clone()));
+                                    let (cur_name, cur_bands, preamp_db) = self.preset_library.find(&active_ref, key.as_deref())
+                                        .map(|p| (format!("{} copy", p.name), p.bands.clone(), p.preamp_db))
+                                        .unwrap_or_else(|| {
+                                            let eq = self.eq_state.lock().unwrap();
+                                            (self.preset_library.auto_name(&active_ref.scope, key.as_deref()), eq.bands.clone(), eq.preamp_db)
+                                        });
                                     let id = self.preset_library.alloc_id();
-                                    let new_preset = EqPreset { id, name: cur_name, bands: cur_bands };
+                                    let new_preset = EqPreset { id, name: cur_name, bands: cur_bands, preamp_db };
                                     let scope = active_ref.scope.clone();
                                     match &scope {
                                         PresetScope::Global => self.preset_library.global.push(new_preset),
@@ -12404,7 +13059,7 @@ The Mix is unaffected.                                  Analysing the track agai
                     let bands_snap: Vec<EqBand> = self.eq_state.lock().unwrap().bands.clone();
                     let sr = self.eq_state.lock().unwrap().sample_rate;
 
-                    egui::Grid::new("eq_band_grid")
+                    egui::ScrollArea::horizontal().id_salt("eq_band_grid_scroll").show(ui, |ui| egui::Grid::new("eq_band_grid")
                         .num_columns(8)
                         .striped(true)
                         .spacing([4.0, 2.0])
@@ -12452,10 +13107,16 @@ The Mix is unaffected.                                  Analysing the track agai
                                     ui.label("—");
                                 }
 
-                                // Q
-                                let q_changed = ui.add(egui::DragValue::new(&mut eq.bands[i].q)
-                                    .range(0.1..=10.0).speed(0.01)).changed();
-                                if q_changed { eq.bump(); }
+                                // Q, or a shelf's slope S. An imported value outside
+                                // the drag range is shown as it is, not clamped.
+                                let shelf = matches!(eq.bands[i].kind, BandKind::LowShelf | BandKind::HighShelf);
+                                let q = ui.add(egui::DragValue::new(&mut eq.bands[i].q)
+                                    .range(0.1..=10.0).clamp_existing_to_range(false).speed(0.01));
+                                let q = if shelf {
+                                    q.on_hover_text("For a shelf this is its slope S: 1 is the steepest without a bump. \
+                                        A shelf's Q from AutoEq or Equalizer APO is turned into the S that makes the same filter.")
+                                } else { q };
+                                if q.changed() { eq.bump(); }
 
                                 // Enable toggle
                                 let en_changed = ui.checkbox(&mut eq.bands[i].enabled, "").changed();
@@ -12475,12 +13136,12 @@ The Mix is unaffected.                                  Analysing the track agai
                                 let mut eq = self.eq_state.lock().unwrap();
                                 if idx < eq.bands.len() { eq.bands.remove(idx); eq.bump(); }
                             }
-                        });
+                        }));
 
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("➕ Add band").on_hover_text("Add a new peaking band at 1 kHz.\nYou can also click on the spectrum to add a band there.").clicked() {
                             let mut eq = self.eq_state.lock().unwrap();
-                            if eq.bands.len() < 16 {
+                            if eq.bands.len() < eq::MAX_BANDS {
                                 eq.bands.push(EqBand::default_peak(1000.0));
                                 eq.bump();
                             }
@@ -12491,7 +13152,7 @@ The Mix is unaffected.                                  Analysing the track agai
                             eq.bands.clear();
                             eq.bump();
                         }
-                        ui.label(egui::RichText::new(format!("{}/16 bands", band_count))
+                        ui.label(egui::RichText::new(format!("{}/{} bands", band_count, eq::MAX_BANDS))
                             .size(10.0).color(txt_faint(ui.visuals().dark_mode)));
                     });
 
@@ -12528,16 +13189,17 @@ The Mix is unaffected.                                  Analysing the track agai
             // the spectrum correctly shows what you hear without modification.
             let eq_snap = if self.show_eq && !self.bit_perfect {
                 let eq = self.eq_state.lock().unwrap();
-                if eq.is_active() { Some((eq.bands.clone(), eq.sample_rate, eq.enabled)) } else { None }
+                if eq.enabled && eq.is_active() { Some((eq.bands.clone(), eq.sample_rate, eq.preamp_db)) } else { None }
             } else { None };
 
             let owned_mags: Vec<f32>;
             let mut eq_boost = 0.0;
-            let mags: &[f32] = if let Some((ref bands, sr, _)) = eq_snap {
+            let mags: &[f32] = if let Some((ref bands, sr, preamp)) = eq_snap {
                 if matches!(self.eq_overlay, EqOverlayMode::ApplyToBars | EqOverlayMode::Both) {
-                    let (n, lo, hi) = (self.analyzer.magnitudes.len(), self.min_freq, self.analysis_max_freq());
-                    let (bars, boost) = eq_on_bars(&self.analyzer.magnitudes,
-                        |i| total_eq_response_db(bands, sr, bar_center_freq(i, n, lo, hi)));
+                    let at = (sr, self.analyzer.magnitudes.len(),
+                        self.min_freq, self.analysis_max_freq(), self.analysis_scale());
+                    let gains = self.eq_gains.bars(bands, at);
+                    let (bars, boost) = eq_on_bars(&self.analyzer.magnitudes, |i| gains[i] + preamp);
                     owned_mags = bars;
                     eq_boost = boost;
                     &owned_mags
@@ -12826,15 +13488,18 @@ The Mix is unaffected.                                  Analysing the track agai
             }
             // ── EQ overlay and node interaction ──────────────────────
             if self.show_eq && !drew_diff && !matches!(self.style, VizStyle::Phasescope | VizStyle::Waterfall | VizStyle::Spectrogram) {
-                let (bands, sr) = {
+                let (bands, sr, preamp) = {
                     let eq = self.eq_state.lock().unwrap();
-                    (eq.bands.clone(), eq.sample_rate)
+                    (eq.bands.clone(), eq.sample_rate, eq.preamp_db)
                 };
                 let draw_curve = matches!(self.eq_overlay, EqOverlayMode::Curve | EqOverlayMode::Both);
-                draw_eq_overlay(&painter, &bands, sr, plot_rect,
-                    self.min_freq, self.analysis_max_freq(), draw_curve,
-                    self.eq_hovered_node, self.eq_dragging_node,
-                    self.analysis_scale());
+                let (lo, hi, scale) = (self.min_freq, self.analysis_max_freq(), self.analysis_scale());
+                // Kept triangles only where the painter adds shapes as given.
+                let plain = ui.is_enabled() && painter.opacity() >= 1.0;
+                let at = (sr, plot_rect.width() as usize, lo, hi, scale);
+                let curves = (draw_curve && !bands.is_empty()).then_some((&mut self.eq_gains, plain, at, preamp));
+                draw_eq_overlay(&painter, &bands, curves, plot_rect, lo, hi,
+                    self.eq_hovered_node, self.eq_dragging_node, scale);
 
                 // Mouse hit-test: find nearest node within 14px
 
@@ -12892,7 +13557,7 @@ The Mix is unaffected.                                  Analysing the track agai
                     self.eq_hovered_node = None;
                 }
 
-                // Left-click on empty space → add band (up to 16)
+                // Left-click on empty space → add band (up to MAX_BANDS)
                 if spec_response.clicked() && self.eq_hovered_node.is_none() && self.eq_dragging_node.is_none()
                     && let Some(click) = spec_response.interact_pointer_pos()
                     && plot_rect.contains(click) {
@@ -12903,7 +13568,7 @@ The Mix is unaffected.                                  Analysing the track agai
                     let db_per_px = EQ_DB_RANGE / (plot_rect.height() * 0.5);
                     let gain = ((plot_rect.center().y - click.y) * db_per_px).clamp(-EQ_DB_RANGE, EQ_DB_RANGE);
                     let mut eq = self.eq_state.lock().unwrap();
-                    if eq.bands.len() < 16 {
+                    if eq.bands.len() < eq::MAX_BANDS {
                         let mut band = EqBand::default_peak(freq);
                         band.gain_db = gain;
                         eq.bands.push(band);
@@ -22413,6 +23078,44 @@ mod preprocess_stereo_tests {
         hold.store(false, Ordering::Relaxed);
     }
 
+    /// Policy (a) shows an existing Standard analysis while HP is requested;
+    /// the other Standard analyses of the track are then its alternates, store
+    /// and recorded legacy alike, and one is adopted as Standard without
+    /// starting anything or touching the preference. An HP analysis is not
+    /// offered beside them.
+    #[test]
+    fn standard_alternates_stay_standard_while_hp_shows_standard() {
+        let _calib = super::gpu_calib::isolated_test_env("hp_alt_standard");
+        let b = Bench::new("hp_alt_standard");
+        let mut w = slt_window(&b);
+        let hold = hold_workers(&mut w);
+        w.analyzer.aslt_cfg = with_n(9);
+        let (_, n9, rows9) = plant_exact(&w, &b.wav, &with_n(9), 2);
+        let (_, n7, rows7) = plant_exact(&w, &b.wav, &with_n(7), 3);
+        let r5 = plant_legacy_record(&w, &b.wav, &with_n(5), 4).1;
+        let hp3 = w.settings_with(&b.wav, &with_n(3)).with_numerics(Numerics::HighAccuracyGpu);
+        let hp3 = seed_generation(&w.analyzer.cache_dir(), &hp3, SR, &tag_rows(5), None);
+
+        w.analyzer.set_hp_enabled(true);
+        w.on_play(&b.wav, SR);
+        assert_eq!(w.analyzer.pre_cache_path(), Some(n9.as_path()), "policy (a) did not show Standard n=9");
+        assert_eq!(*w.analyzer.pre_frames, rows9);
+        let got = offered(&w);
+        assert!(got.contains(&(n7.clone(), false)), "the Standard n=7 analysis was not offered: {got:?}");
+        assert!(got.contains(&(r5.clone(), true)), "the Standard recorded file was not offered: {got:?}");
+        assert!(!got.iter().any(|(p, _)| *p == hp3), "an HP analysis was offered beside Standard ones");
+
+        w.accept_alternate(&n7).expect("refused");
+        assert_eq!(w.analyzer.pre_cache_path(), Some(n7.as_path()));
+        assert_eq!(*w.analyzer.pre_frames, rows7);
+        assert!(w.analyzer.pre_record.as_deref().is_some_and(|r| !r.contains(";num=")), "adopted as HP");
+        assert!(!analysing(&w) && w.analyzer.hp.enabled);
+        w.accept_alternate(&r5).expect("the recorded Standard file was refused");
+        assert!(!analysing(&w) && w.analyzer.hp.enabled);
+        w.analyzer.retire_analysis();
+        hold.store(false, Ordering::Relaxed);
+    }
+
     /// Legacy analyses are never managed by this version (owner decision L1):
     /// a new analysis under a budget of nothing keeps its own generation
     /// (pinned by the display) and the legacy pair stays byte for byte.
@@ -22558,6 +23261,7 @@ mod joint_cost_bench {
                 }
                 PreMessage::Error(e) => panic!("{tag}: {e}"),
                 PreMessage::Aborted => panic!("{tag}: aborted"),
+                PreMessage::HpUnavailable { reason, .. } => panic!("{tag}: a Standard run reported High-accuracy GPU: {reason}"),
             };
             reset_published(&cache);
             (secs, frames, bytes)

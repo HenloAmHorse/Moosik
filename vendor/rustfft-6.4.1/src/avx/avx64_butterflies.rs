@@ -234,12 +234,84 @@ macro_rules! boilerplate_fft_simd_butterfly_with_scratch {
             ) {
                 crate::check_pruned(self, buffer.len(), scratch.len(), needed, out.len(), &work);
                 let done = unsafe {
-                    let b: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(buffer);
+                    let b: &[Complex<f64>] = crate::array_utils::workaround_transmute(buffer);
                     let s: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(scratch);
                     let o: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(out);
                     self.pruned_leaf(b, s, needed, o)
                 };
                 if !done {
+                    self.process_with_scratch(buffer, scratch);
+                    for (o, &i) in out.iter_mut().zip(needed) {
+                        *o = buffer[i];
+                    }
+                }
+            }
+            fn process_pruned_product_with_scratch(
+                &self,
+                s: &[Complex<T>],
+                h: &[Complex<T>],
+                buffer: &mut [Complex<T>],
+                scratch: &mut [Complex<T>],
+                needed: &[usize],
+                out: &mut [Complex<T>],
+                work: crate::PrunedWork<'_, T>,
+            ) {
+                crate::check_product(self.len(), Some(s.len()), h.len());
+                crate::check_pruned(self, buffer.len(), scratch.len(), needed, out.len(), &work);
+                let done = if self.leaf_prunes() {
+                    unsafe {
+                        let ts: &[Complex<f64>] = crate::array_utils::workaround_transmute(s);
+                        let th: &[Complex<f64>] = crate::array_utils::workaround_transmute(h);
+                        let tb: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(buffer);
+                        let sc: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(scratch);
+                        let o: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(out);
+                        self.pruned_leaf(
+                            super::avx_vector::ProductBuf { s: ts, h: th, out: tb },
+                            sc,
+                            needed,
+                            o,
+                        )
+                    }
+                } else {
+                    false
+                };
+                if !done {
+                    crate::product_into(s, h, buffer);
+                    self.process_with_scratch(buffer, scratch);
+                    for (o, &i) in out.iter_mut().zip(needed) {
+                        *o = buffer[i];
+                    }
+                }
+            }
+            fn process_pruned_inplace_product_with_scratch(
+                &self,
+                h: &[Complex<T>],
+                buffer: &mut [Complex<T>],
+                scratch: &mut [Complex<T>],
+                needed: &[usize],
+                out: &mut [Complex<T>],
+                work: crate::PrunedWork<'_, T>,
+            ) {
+                crate::check_product(self.len(), None, h.len());
+                crate::check_pruned(self, buffer.len(), scratch.len(), needed, out.len(), &work);
+                let done = if self.leaf_prunes() {
+                    unsafe {
+                        let th: &[Complex<f64>] = crate::array_utils::workaround_transmute(h);
+                        let tb: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(buffer);
+                        let sc: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(scratch);
+                        let o: &mut [Complex<f64>] = crate::array_utils::workaround_transmute_mut(out);
+                        self.pruned_leaf(
+                            super::avx_vector::InplaceProductBuf { h: th, out: tb },
+                            sc,
+                            needed,
+                            o,
+                        )
+                    }
+                } else {
+                    false
+                };
+                if !done {
+                    crate::product_in_place(h, buffer);
                     self.process_with_scratch(buffer, scratch);
                     for (o, &i) in out.iter_mut().zip(needed) {
                         *o = buffer[i];

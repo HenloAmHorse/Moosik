@@ -1,8 +1,8 @@
-MOOSIK 1.6.1: THIRD-PARTY NOTICES
+MOOSIK 1.6.2: THIRD-PARTY NOTICES
 ==============================================================================
 
 Moosik is licensed under the GNU Affero General Public License v3.0 (see LICENSE).
-This file covers the third-party code and data in the Moosik 1.6.1 Windows x86_64
+This file covers the third-party code and data in the Moosik 1.6.2 Windows x86_64
 release executable
 (default features: asio-dsd, alsa-dsd), built with rustc 1.94.0 (4a4ef493e 2026-03-02).
 
@@ -27,6 +27,7 @@ Files distributed alongside this one:
   third_party/MPL-2.0.txt                        (MPL-2.0 license text)
   third_party/opusic-sys-0.7.5-LICENSE.txt          (libopus BSD notice)
   third_party/lv-chordia-1.1.0-LICENSE              (lv-chordia MIT notice)
+  third_party/libbs2b-3.1.0-COPYING                 (libbs2b MIT notice)
 
 This file records license information; it is not a legal opinion.
 Optional local translation packs are downloaded only by explicit user action.
@@ -187,6 +188,37 @@ SOFTWARE.
 
 The model weights are not in this executable. They are downloaded from that wheel only
 when the user asks, each file checked against a pinned SHA-256.
+
+1.6 Code ported from libbs2b 3.1.0 (headphone crossfeed)
+
+Moosik's headphone crossfeed (src/spectrum/eq.rs, Crossfeed) follows libbs2b 3.1.0 by
+Boris Mikhaylov (bs2b, Bauer stereophonic-to-binaural DSP), MIT License: its low-pass
+and high-boost filters are derived as libbs2b's init() derives them, and the three
+strengths offered are libbs2b's default, Chu Moy and Jan Meier levels. It is not a
+Cargo package. The upstream COPYING, taken from libbs2b-3.1.0.tar.gz
+(SHA-256 6aaafd81aae3898ee40148dd1349aab348db9bfae9767d0e66e0b07ddd4b2528),
+is reproduced byte for byte in third_party/libbs2b-3.1.0-COPYING (SHA-256 dfd5a8d7dc501447...) and here:
+
+Copyright (c) 2005 Boris Mikhaylov
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------------
 PART 2. PACKAGES WITHOUT A COMPLETE LICENSE TEXT OF THEIR OWN

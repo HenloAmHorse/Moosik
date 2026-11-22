@@ -193,6 +193,7 @@ fn release_codec_screen() {
                     PreMessage::Done { frames, .. } => frames,
                     PreMessage::Error(e) => panic!("{e}"),
                     PreMessage::Aborted => panic!("aborted"),
+                    PreMessage::HpUnavailable { reason, .. } => panic!("a Standard run reported High-accuracy GPU: {reason}"),
                 };
                 let (codes, nf) = (frames.codes.clone(), frames.frames);
                 assert_eq!(frames.max_code, V4_MAX_CODE);

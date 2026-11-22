@@ -156,10 +156,8 @@ impl Profile {
     }
 
     #[inline]
-    pub fn record(&mut self, region: Region, start: Option<Instant>) {
-        let Some(start) = start else { return };
-        let nanos = start.elapsed().as_nanos();
-        let target = match region {
+    fn region_slot(&mut self, region: Region) -> &mut u128 {
+        match region {
             Region::Setup => &mut self.totals.setup_wall_ns,
             Region::Planning => &mut self.totals.planning_wall_ns,
             Region::Allocation => &mut self.totals.allocation_wall_ns,
@@ -168,8 +166,14 @@ impl Profile {
             Region::ParallelInverse => &mut self.totals.parallel_inverse_region_wall_ns,
             Region::ParallelFold => &mut self.totals.parallel_fold_progress_wall_ns,
             Region::SerialCombined => &mut self.totals.serial_inverse_fold_progress_wall_ns,
-        };
-        *target += nanos;
+        }
+    }
+
+    #[inline]
+    pub fn record(&mut self, region: Region, start: Option<Instant>) {
+        let Some(start) = start else { return };
+        let nanos = start.elapsed().as_nanos();
+        *self.region_slot(region) += nanos;
         match region {
             Region::Kernel => self.totals.kernel_batches += 1,
             Region::Source => self.totals.source_blocks += 1,
@@ -177,6 +181,13 @@ impl Profile {
             Region::SerialCombined => self.totals.serial_blocks += 1,
             _ => {}
         }
+    }
+
+    #[inline]
+    pub fn record_elapsed(&mut self, region: Region, start: Option<Instant>) {
+        let Some(start) = start else { return };
+        let nanos = start.elapsed().as_nanos();
+        *self.region_slot(region) += nanos;
     }
 
     pub fn begin_group(

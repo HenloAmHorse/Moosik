@@ -217,22 +217,21 @@ fn diag_whole_inverses_reach_both_leaves_and_the_fallback() {
 }
 
 
-/// K0: the standalone f32 AVX+FMA 256 and 512 plans report `prunes()`, so
-/// callers that consult it take their requested-output path; 128 does not
-/// (it has none), and the f64 butterflies are unchanged (no pruned path).
-/// Mixed-radix plans keep reporting true.
+/// K0: the standalone f32 AVX+FMA 128, 256, and 512 plans report `prunes()`, so
+/// callers that consult it take their requested-output path. Mixed-radix plans
+/// keep reporting true.
 #[test]
 fn leaf_capabilities_are_reported_accurately() {
     if !pruning_cpu() { return; }
     let mut p32 = rustfft::FftPlanner::<f32>::new();
     let mut p64 = rustfft::FftPlanner::<f64>::new();
-    for (n, want) in [(128usize, false), (256, true), (512, true), (2048, true), (16_384, true), (65_536, true)] {
+    for (n, want) in [(128usize, true), (256, true), (512, true), (2048, true), (16_384, true), (65_536, true)] {
         assert_eq!(p32.plan_fft_inverse(n).prunes(), want, "f32 inverse {n}");
         assert_eq!(p32.plan_fft_forward(n).prunes(), want, "f32 forward {n}");
     }
-    // 1.5.5 adds exact f64 requested leaves; f32 expectations above stay
-    // unchanged. Both directions report capability, while 128 stays whole.
-    for (n, want) in [(128usize, false), (256, true), (512, true)] {
+    // 1.5.5 adds exact f64 requested leaves (now including 128); f32
+    // expectations above stay unchanged.
+    for (n, want) in [(128usize, true), (256, true), (512, true)] {
         assert_eq!(p64.plan_fft_inverse(n).prunes(), want, "f64 inverse {n}");
         assert_eq!(p64.plan_fft_forward(n).prunes(), want, "f64 forward {n}");
     }

@@ -2,6 +2,102 @@
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-11-23
+
+Pro audio tools, a headphone EQ from AutoEq, an experimental High-accuracy
+GPU analysis, analysis that is faster with the same results, smaller caches
+if you want them, and a Storage page. No change to the bit-perfect playback
+contract. See [Pro audio tools](docs/PRO_AUDIO.md) and
+[High-accuracy GPU](docs/HIGH_ACCURACY_GPU.md).
+
+- **Info → Measure this file:** BS.1770-4 integrated loudness, EBU loudness
+  range, max short-term and momentary loudness, true peak (oversampled),
+  sample peak, PLR/PSR, crest factor, the DR meter's dynamic range ("DR8"),
+  DC offset, L/R correlation, bits used,
+  clipped runs and inter-sample overs with their times, and FLAC's MD5
+  check; matches ffmpeg's ebur128 on a test track.
+- **What the file really is,** in words: damaged FLAC, padded bit depth
+  ("fake 24-bit"), a lossless file cut off like a lossy encoder's ("fake
+  lossless"), clipping, overs, an inverted-looking channel, DC offset.
+- **Headphone EQ from AutoEq:** search AutoEq's headphones (forgiving of
+  spelling and spaces), pick the measurement, target and bass boost, and
+  use the correction in Moosik's EQ, or save it for other apps: Equalizer
+  APO and Peace, Wavelet and JamesDSP, 10- and 31-band equalizers, and USB
+  Audio Player PRO. No sample rate to choose. The headphone list is kept
+  on the computer and checked for changes at start (can be turned off).
+  The correction goes in when it arrives, with the window closed too, but
+  never over an EQ changed while autoeq.app was answering.
+- **EQ preamp and AutoEq import:** the parametric EQ gains a preamp and
+  holds up to 32 bands, and Import AutoEq… turns a ParametricEQ.txt into a
+  preset. A shelf's Q, from AutoEq or Equalizer APO, becomes the slope (S)
+  Moosik's shelves have always taken, so the filter is AutoEq's own, down
+  to Q 0.01; a filter with a lower Q is refused, not changed.
+- **Settings → Pro tools:** Measure this song, Headphone EQ, and BPM, beats
+  and sections, from one place.
+- **Experimental: High-accuracy GPU for the Pre-process** (off; Pre-process
+  settings → GPU). The whole superlet analysis of a stereo track runs on an
+  NVIDIA card (Turing or newer; only the driver is used). A 3:36 song at the
+  owner's settings takes about 12.5 s instead of two minutes; a 3:47 track at
+  192 kHz about 41 s instead of 14 minutes. Checked against a higher-precision
+  calculation on five songs at seven settings, it stays within one display
+  step. It keeps its own cache, since it never matches Standard bit for bit.
+  It takes 44.1 to 192 kHz and the settings listed in
+  [High-accuracy GPU](docs/HIGH_ACCURACY_GPU.md); anything else is analysed
+  with Standard, and the reason is shown.
+- **Faster, with exactly the same results:** the superlet analysis on the
+  cores (1.3 to 2.4 times, by preset), CQT (1.3 to 2 times), chord
+  recognition, DSD pre-processing (1.7 times), Measure (2.3 to 2.6 times),
+  writing compact caches, and the live spectrum. Practice tempo and key now
+  use about 0.2 % of a core instead of 11 %. Each was compared with the
+  previous version output for output.
+- **Experimental: smaller cache files** (off; Cache). New analyses are
+  saved in a lossless compact form, about two thirds of the size, checked
+  when written and when read. Opening one takes a little longer, and 1.6.1
+  cannot read them. See [the cache](docs/CACHE.md).
+- **Fixed:** Analyze's controls were cut off in a narrow window or drawer.
+  Settings' sections were laid out past the drawer's edge at the narrowest
+  width. Measure's true peak could read below the sample peak. Showing the
+  EQ no longer lowers the frame rate: its curves were worked out again and
+  drawn in one short piece per pixel every frame; now once per change, the
+  same pieces, so they look exactly as before, and kept on the graphics
+  card instead of sent to it with every frame. And "Apply" on an ERB,
+  blended or lens axis moves each bar by the EQ's gain at that bar's own
+  frequency, not at where the bar would sit on a log axis.
+- **Headphone crossfeed** (bs2b: Light, Chu Moy, Jan Meier), never in
+  bit-perfect output.
+- **Compare two masters:** how much louder another master is, and its tone
+  against this one with loudness matched, per third octave.
+- **Seek bar** marks a measured track's clipped runs and inter-sample overs.
+- **ABX blind tests** between a track and another master: instant,
+  level-matched switching from memory, random X, binomial score.
+- **Tempo and beats** in the Harmony panel: the tempo and a dot on every
+  beat, found once per track and cached.
+- **Sections** on the seek bar: the song's parts by harmony, lettered A, B, A….
+- **Practice tempo and key:** 50–150 % without changing the key, ±6
+  semitones without changing the tempo; the position and lyrics follow,
+  the seek bar reminds you, and at normal settings samples pass untouched.
+- **Room correction:** a WAV impulse response from REW or another tool,
+  convolved after the EQ (about 21 ms of delay), resampled when its rate
+  differs. Crossfeed and room correction stay on when the EQ is switched
+  off, and the signal-path report counts every stage that changes samples.
+- **Settings → Storage:** what Moosik keeps on this computer, part by part,
+  with the drive's free space: each translation model and any unfinished
+  model download, analyses, songs and videos played from YouTube, the
+  YouTube components, the chord model, settings and logs, and downloaded
+  songs. A model or an unfinished download can be removed (not while a
+  model is being installed or removed) and the YouTube cache cleared,
+  each on a
+  second click. Analyses keep their size limit
+  and clearing under Cache; downloaded songs are never deleted.
+- **Notices:** no package was added to the Windows build; the 1.6.1 notices
+  were carried forward after a check that the locked graph is unchanged (302
+  packages). New in them: the headphone crossfeed follows libbs2b's filter
+  design and levels (MIT), credited with its license. AutoEq's headphone list
+  and corrections are fetched from autoeq.app when asked, not bundled.
+- **Settings:** an older Moosik may not read everything 1.6.2 writes (EQ
+  presets with more than 16 bands or a preamp, compact cache files, the new
+  settings). Back up `~/.moosik` before going back to one.
+
 ## [1.6.1] - 2026-11-08
 
 YouTube and YouTube Music as a source, with music videos and playback while

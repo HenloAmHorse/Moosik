@@ -630,6 +630,11 @@ enum Pending {
     /// not ended yet. An active one is not a warning, only a reason to admit
     /// nothing else.
     Download(&'static str, std::sync::Arc<AtomicBool>),
+    /// An install, import or removal of a pack, from its admission to its
+    /// end, and what is being done to it: an install's staged files are in
+    /// use all along (hashed, unpacked, moved into place), not only while a
+    /// download runs. Not a warning either.
+    Change(&'static str, &'static str),
 }
 
 static OUTSTANDING: std::sync::Mutex<Vec<(u64, PathBuf, Pending)>> = std::sync::Mutex::new(Vec::new());
@@ -653,8 +658,11 @@ fn register(root: &Path, what: Pending) -> Registered {
 /// What is still outstanding under `root`, as sentences for the panel, or
 /// `None` when nothing is.
 pub fn outstanding(root: &Path) -> Option<String> {
-    let items: Vec<Pending> =
-        OUTSTANDING.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(_, r, _)| r == root).map(|(_, _, w)| w.clone()).collect();
+    outstanding_in(&OUTSTANDING.lock().unwrap_or_else(|e| e.into_inner()), root)
+}
+
+fn outstanding_in(all: &[(u64, PathBuf, Pending)], root: &Path) -> Option<String> {
+    let items: Vec<&Pending> = all.iter().filter(|(_, r, _)| r == root).map(|(_, _, w)| w).collect();
     let pids: Vec<String> = items.iter().filter_map(|w| match w { Pending::Process(p) => Some(p.to_string()), _ => None }).collect();
     let files: Vec<&str> = items.iter().filter_map(|w| match w {
         Pending::Download(f, retiring) if retiring.load(Ordering::Acquire) => Some(*f),
@@ -686,17 +694,33 @@ fn dedup<'a>(v: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Refuse to start anything under `root` while work there is outstanding,
-/// or while a download there is still running.
+/// or while a download, install or removal there is still running.
 fn admit(root: &Path) -> Result<(), String> {
-    if let Some(why) = outstanding(root) {
+    refuse(&OUTSTANDING.lock().unwrap_or_else(|e| e.into_inner()), root)
+}
+
+/// `admit`, and register the change under the same hold of the lock, so two
+/// can never both pass the check: installs, imports and removals each start
+/// here, and each keeps the others out until it has ended.
+fn admit_change(root: &Path, pack: &Pack, doing: &'static str) -> Result<Registered, String> {
+    let mut all = OUTSTANDING.lock().unwrap_or_else(|e| e.into_inner());
+    refuse(&all, root)?;
+    let id = NEXT_ITEM.fetch_add(1, Ordering::Relaxed);
+    all.push((id, root.to_path_buf(), Pending::Change(pack.label, doing)));
+    Ok(Registered(id))
+}
+
+fn refuse(all: &[(u64, PathBuf, Pending)], root: &Path) -> Result<(), String> {
+    if let Some(why) = outstanding_in(all, root) {
         return Err(format!("{why} Nothing was started."));
     }
-    let active: Vec<&str> = OUTSTANDING.lock().unwrap_or_else(|e| e.into_inner()).iter()
-        .filter(|(_, r, _)| r == root)
-        .filter_map(|(_, _, w)| match w { Pending::Download(f, _) => Some(*f), _ => None })
-        .collect();
+    let here = || all.iter().filter(|(_, r, _)| r == root).map(|(_, _, w)| w);
+    let active: Vec<&str> = here().filter_map(|w| match w { Pending::Download(f, _) => Some(*f), _ => None }).collect();
     if !active.is_empty() {
         return Err(format!("A download of {} is in progress. Nothing was started.", dedup(&active).join(", ")));
+    }
+    if let Some((p, doing)) = here().find_map(|w| match w { Pending::Change(p, doing) => Some((p, doing)), _ => None }) {
+        return Err(format!("{p} is being {doing}; wait for it to finish. Nothing was started."));
     }
     Ok(())
 }
@@ -1216,13 +1240,27 @@ pub fn install_reporting(
     fetch: &mut Fetch,
     cancel: &AtomicBool,
     runtime_from: Option<&Path>,
-    mut report: impl FnMut(Progress),
+    report: impl FnMut(Progress),
 ) -> Result<(), String> {
-    let io = |e: std::io::Error| format!("Installing the local pack failed: {e}");
     if !platform_supported() {
         return Err(UNSUPPORTED.into());
     }
-    admit(root)?;
+    let _installing = admit_change(root, pack, "installed")?;
+    install_admitted(root, pack, peers, fetch, cancel, runtime_from, report)
+}
+
+/// `install_reporting`, admitted and registered: by itself, or as the end of
+/// an import, which holds its own registration.
+fn install_admitted(
+    root: &Path,
+    pack: &Pack,
+    peers: &[&Pack],
+    fetch: &mut Fetch,
+    cancel: &AtomicBool,
+    runtime_from: Option<&Path>,
+    mut report: impl FnMut(Progress),
+) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("Installing the local pack failed: {e}");
     std::fs::create_dir_all(root).map_err(io)?;
     plain_or_create(&beneath(root, &[".staging"])?)?;
     let staging = beneath(root, &[".staging", pack.id])?;
@@ -1332,12 +1370,21 @@ pub fn install_reporting(
 /// Remove an installed pack and any staged download of it: only Moosik's own
 /// folders, and inside them only Moosik's own files.
 pub fn remove(root: &Path, pack: &Pack) -> Result<(), String> {
-    let fail = |e: String| format!("Removing the local pack failed: {e}");
-    admit(root).map_err(fail)?;
-    for parts in [&[pack.id][..], &[".staging", pack.id][..]] {
-        let dir = beneath(root, parts).map_err(fail)?;
+    retire_dirs(root, pack, &[&[pack.id], &[".staging", pack.id]]).map_err(|e| format!("Removing the local pack failed: {e}"))
+}
+
+/// Discard a pack's staged download and nothing else: one kept for resuming,
+/// or one an install left behind. An installed pack stays.
+pub fn discard_staged(root: &Path, pack: &Pack) -> Result<(), String> {
+    retire_dirs(root, pack, &[&[".staging", pack.id]]).map_err(|e| format!("Discarding the download failed: {e}"))
+}
+
+fn retire_dirs(root: &Path, pack: &Pack, dirs: &[&[&str]]) -> Result<(), String> {
+    let _removing = admit_change(root, pack, "removed")?;
+    for parts in dirs {
+        let dir = beneath(root, parts)?;
         if std::fs::symlink_metadata(&dir).is_ok() {
-            retire(root, &dir, pack).map_err(fail)?;
+            retire(root, &dir, pack)?;
         }
     }
     Ok(())
@@ -1571,7 +1618,7 @@ pub fn import(
     if !platform_supported() {
         return Err(UNSUPPORTED.into());
     }
-    admit(root)?;
+    let _importing = admit_change(root, pack, "installed")?;
     std::fs::create_dir_all(root).map_err(io)?;
     plain_or_create(&beneath(root, &[".staging"])?)?;
     let staging = beneath(root, &[".staging", pack.id])?;
@@ -1635,7 +1682,7 @@ pub fn import(
     let mut offline = |_: &FetchCtx, _: &str, _: u64, _: u64| -> Result<(Box<dyn Read + Send>, bool), String> {
         Err("Internal error: an import does not download.".into())
     };
-    install_reporting(root, pack, peers, &mut offline, cancel, runtime_dir.as_deref(), report)?;
+    install_admitted(root, pack, peers, &mut offline, cancel, runtime_dir.as_deref(), report)?;
     Ok(Imported::Installed)
 }
 

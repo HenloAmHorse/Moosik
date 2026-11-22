@@ -73,6 +73,15 @@ It is shown only if the track that is selected now is still the file that was an
 
 Every message says what was actually done. It counts only space that was really freed, and it names anything that could not be deleted, anything left for a later cleanup, and anything kept because it is in use.
 
+## Smaller cache files (1.6.2, experimental)
+
+Off by default: **Cache → "Smaller cache files (experimental)"**. New analyses are written in a compact, lossless form: the same picture, bit for bit, in about two thirds of the space (a 3:36 song at the owner's settings: 95.2 MB instead of 148.9 MB, Mix and Left/Right together).
+
+- Each compact file is read back and compared with what was analysed before it is kept, and each block carries a checksum that is checked every time it is opened. A file that does not match is analysed again, never shown.
+- It costs time: saving takes about 1.8 s longer for that song, and opening it shows the Mix in about 0.23 s instead of 0.14 s and the Left/Right channels in about 0.5 s instead of 0.25 s.
+- Analyses already in the cache stay as they are until they are analysed again.
+- Moosik 1.6.1 and earlier cannot read compact files and analyse those tracks again.
+
 ## Legacy analyses (files from earlier versions)
 
 Files directly in `.moosik/cache/` are legacy. When the analysis at your settings is not on screen, Moosik can offer a legacy analysis of the same track as an alternative:

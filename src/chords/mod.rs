@@ -22,6 +22,7 @@ use crate::spectrum::store::SourceSnapshot;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+pub use audio::{load as load_mono, resample};
 pub use cqt::SR;
 
 /// The weight files, in ensemble order.
@@ -161,6 +162,11 @@ fn file_key(s: &SourceSnapshot) -> u64 {
     b.extend(s.mtime_ns.to_le_bytes());
     b.extend(s.sample);
     crate::spectrum::identity::fnv64(&b)
+}
+
+/// Where a track's beats are kept beside its chords.
+pub fn beats_file(path: &Path, cache: &Path) -> Option<PathBuf> {
+    SourceSnapshot::of_path(path).ok().map(|s| cache.join(format!("{:016x}.beats2.json", file_key(&s))))
 }
 
 fn fix_file(cache: &Path, h: u64) -> PathBuf {

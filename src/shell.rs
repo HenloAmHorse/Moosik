@@ -19,6 +19,10 @@ use super::{apply_theme, lyrics, moosik_dir, save_appearance, save_playlist_stor
 
 #[path = "shell_youtube.rs"]
 pub(crate) mod youtube_ui;
+#[path = "shell_storage.rs"]
+pub(crate) mod storage_ui;
+#[path = "shell_autoeq.rs"]
+pub(crate) mod autoeq_ui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub(crate) enum UiMode {
@@ -194,6 +198,7 @@ const TOYS: &[Toy] = &[
     toy("rickroll", "Rickroll", "You know the rules.", true),
     toy("popcorn", "Popcorn", "Watch a music video in Listen.", true),
     toy("ticket", "Admit one", "Go to the theater.", true),
+    toy("disco", "Disco ball", "Play something at a house tempo with Harmony open.", true),
     toy("eyes", "Watching eyes", "Eyes on the analyser's controls that follow the pointer.", false),
     toy("six_seven", "6 7", "Palms up, see-sawing, at 67% volume or 6:07 into a track.", false),
 ];
@@ -284,7 +289,9 @@ impl MoosikApp {
                             self.shell.lock_clicks = Some((t.key, n, Instant::now()));
                         }
                     }
-                    ui.label(RichText::new(t.hint).size(12.0).italics().color(tok.faint));
+                    // Wrapped: a long hint would widen the drawer for every
+                    // section below it.
+                    ui.add(egui::Label::new(RichText::new(t.hint).size(12.0).italics().color(tok.faint)).wrap());
                 });
             }
         });
@@ -417,6 +424,9 @@ struct ChordAi {
     /// When the running job started; how long the last one took, and when it finished.
     job_at: Option<Instant>,
     took: Option<(f32, Instant)>,
+    /// The current track's beats (1.6.2), and the job finding them.
+    beats: Option<(PathBuf, Option<crate::beats::Beats>)>,
+    beats_job: Option<(PathBuf, Chan<Result<Option<crate::beats::Beats>, String>>)>,
 }
 
 /// Per-session animation state; nothing here is persisted.
@@ -586,6 +596,10 @@ pub(crate) struct ShellState {
     chord_ai: ChordAi,
     /// Library → Sources → YouTube.
     yt: youtube_ui::Yt,
+    /// Settings → Storage.
+    storage: storage_ui::Storage,
+    /// The headphone EQ window (AutoEq).
+    heq: autoeq_ui::HeadphoneEq,
     /// A music video's first picture in Listen: popcorn, from when.
     popcorn: Option<Instant>,
     /// Listen shows the music video whole, lyrics as subtitles.
@@ -1550,11 +1564,23 @@ impl MoosikApp {
                             });
                         });
                     }
+                    settings_section(ui, tok, "Pro tools", |ui| self.pro_tools_ui(ui, tok));
                     settings_section(ui, tok, "Output", |ui| {
                         ui.horizontal_wrapped(|ui| self.tb_bit_perfect(ui));
                         ui.label(RichText::new("The badge in the header has the full report.").size(11.0).color(tok.faint));
                     });
                     settings_section(ui, tok, "Loudness", |ui| self.rg_ui(ui));
+                    settings_section(ui, tok, "Headphones", |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Headphone EQ");
+                            if ui.button("Find your headphones…").on_hover_text("AutoEq's correction for your headphones, in Moosik's EQ or saved for other apps").clicked() {
+                                self.shell.heq.open = true;
+                            }
+                        });
+                        ui.add_space(6.0);
+                        self.crossfeed_ui(ui);
+                    });
+                    settings_section(ui, tok, "Practice", |ui| self.practice_ui(ui));
                     settings_section(ui, tok, "Visuals and motion", |ui| self.visual_settings_ui(ui));
                     settings_section(ui, tok, "Silly extras", |ui| self.toys_ui(ui, tok));
                     settings_section(ui, tok, "Appearance", |ui| self.look_ui(ui));
@@ -1577,6 +1603,7 @@ impl MoosikApp {
                     settings_section(ui, tok, "Files", |ui| {
                         ui.horizontal_wrapped(|ui| self.tb_files(ui));
                     });
+                    settings_section(ui, tok, "Storage", |ui| self.storage_ui(ui, tok));
                     if self.play_state != PlayState::Stopped {
                         settings_section(ui, tok, "Signal", |ui| {
                             ui.horizontal_wrapped(|ui| self.tb_format(ui));
@@ -2666,9 +2693,14 @@ impl MoosikApp {
         }
         let w = *w;
         if open && !wide {
-            // Too narrow for both side by side: the controls on top, as in the window.
+            // Too narrow for both side by side: the controls on top, as in the
+            // window, scrolling within the top half so the plot keeps the rest.
             let mut sui = ui.new_child(egui::UiBuilder::new().max_rect(body));
-            self.spectrum_window.embedded_ui(&mut sui);
+            sui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            egui::ScrollArea::vertical().id_salt("shell_tools_top").max_height((body.height() * 0.5).max(120.0))
+                .auto_shrink([false, true]).show(&mut sui, |ui| self.spectrum_window.embedded_controls_ui(ui));
+            sui.separator();
+            self.spectrum_window.embedded_plot_ui(&mut sui);
         } else {
             if w > 1.0 {
                 let drawer = Rect::from_min_max(Pos2::new(body.right() - w, body.top()), body.max);
@@ -2900,8 +2932,41 @@ impl MoosikApp {
 
     /// Moves the chord model along: load it once, finish an install, start or
     /// collect the current track's chords.
+    /// The current track's parts, once its beats are known.
+    pub(crate) fn current_sections(&self) -> Option<&[crate::sections::Section]> {
+        let here = self.current_index.and_then(|i| self.playlist.get(i)).map(|t| &t.path)?;
+        match &self.shell.chord_ai.beats {
+            Some((p, Some(b))) if p == here && b.sections.len() > 1 => Some(&b.sections),
+            _ => None,
+        }
+    }
+
+    /// Finds the current track's beats once (they need no model).
+    fn tick_beats(&mut self) {
+        let path = self.current_index.and_then(|i| self.playlist.get(i)).map(|t| t.path.clone());
+        let ai = &mut self.shell.chord_ai;
+        if let Some((p, rx)) = &ai.beats_job
+            && let Ok(r) = rx.try_recv()
+        {
+            ai.beats = Some((p.clone(), r.ok().flatten()));
+            ai.beats_job = None;
+        }
+        let Some(path) = path else { return };
+        let have = ai.beats.as_ref().is_some_and(|(p, _)| *p == path) || ai.beats_job.as_ref().is_some_and(|(p, _)| *p == path);
+        if !have && ai.beats_job.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let p = path.clone();
+            let _ = std::thread::Builder::new().name("beats".into()).spawn(move || {
+                let cache = moosik_dir().join("cache").join("chords");
+                let _ = tx.send(crate::beats::analyze(&p, &cache, &std::sync::atomic::AtomicBool::new(false)));
+            });
+            ai.beats_job = Some((path, rx));
+        }
+    }
+
     fn tick_chords(&mut self) {
         use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        self.tick_beats();
         let ai = &mut self.shell.chord_ai;
         if !ai.checked && ai.loading.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -2983,6 +3048,42 @@ impl MoosikApp {
         let p = ui.painter().with_clip_rect(r);
         p.rect(r, 12, tok.scrim, Stroke::new(1.0, tok.line), egui::StrokeKind::Inside);
         let title = p.text(r.left_top() + Vec2::new(12.0, 14.0), egui::Align2::LEFT_CENTER, "Harmony", egui::FontId::proportional(13.0), tok.ink);
+        // The tempo, and a dot that lands on every beat.
+        let here = self.current_index.and_then(|i| self.playlist.get(i)).map(|t| t.path.clone());
+        if let Some((_, Some(b))) = self.shell.chord_ai.beats.as_ref().filter(|(p, _)| Some(p) == here.as_ref()) {
+            let x = title.right() + 34.0;
+            let g = p.text(Pos2::new(x + 10.0, title.center().y), egui::Align2::LEFT_CENTER, format!("{:.0} BPM", b.bpm), egui::FontId::proportional(11.0), tok.dim);
+            let pulse = crate::beats::last_beat(&b.at, self.elapsed().as_secs_f32())
+                .filter(|_| self.play_state == PlayState::Playing)
+                .map_or(0.0, |(_, since)| (-since / 0.12).exp());
+            let c = Pos2::new(x + 2.0, g.center().y);
+            // House and disco tempos get a ball instead of a dot.
+            let playing = self.play_state == PlayState::Playing;
+            if playing && (118.0..=130.0).contains(&b.bpm) && self.toy("disco") {
+                self.found("disco");
+                self.shell.animating = true;
+                let t = self.elapsed().as_secs_f32();
+                let r = 5.0 + 1.0 * pulse;
+                p.circle_filled(c, r, Color32::from_rgb(0xc8, 0xcc, 0xd8));
+                // Mirror tiles: a few glints that turn with the ball.
+                for k in 0..6 {
+                    let a = t * 2.0 + k as f32 * std::f32::consts::TAU / 6.0;
+                    let q = Vec2::new(a.cos() * r * 0.6, (k as f32 - 2.5) * r * 0.28);
+                    if a.sin() > 0.0 {
+                        p.rect_filled(Rect::from_center_size(c + q, Vec2::splat(1.6)), 0, with_alpha(Color32::WHITE, 0.5 + 0.5 * a.sin()));
+                    }
+                }
+                p.line_segment([c - Vec2::new(0.0, r), c - Vec2::new(0.0, r + 4.0)], Stroke::new(1.0, tok.faint));
+                if pulse > 0.3 {
+                    for k in 0..4 {
+                        let a = k as f32 * std::f32::consts::FRAC_PI_2 + 0.4 + t;
+                        p.circle_filled(c + Vec2::angled(a) * (r + 5.0 + 6.0 * (1.0 - pulse)), 1.2, with_alpha(accent, pulse));
+                    }
+                }
+            } else {
+                p.circle_filled(c, 3.0 + 1.5 * pulse, with_alpha(accent, 0.25 + 0.75 * pulse));
+            }
+        }
         // Five chords corrected: an apple for the teacher.
         if self.shell.fixes_made >= 5 && self.toy("apple") {
             self.found("apple");
@@ -3498,6 +3599,8 @@ impl MoosikApp {
             }
         }
         ui.add_space(6.0);
+        // A solid bar: what is below is seen to be there.
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         egui::ScrollArea::vertical().id_salt("shell_tools_scroll").auto_shrink([false, false]).show(ui, |ui| {
             self.spectrum_window.embedded_controls_ui(ui);
             ui.add_space(18.0);

@@ -236,13 +236,77 @@ macro_rules! boilerplate_fft_simd_butterfly_with_scratch {
             ) {
                 crate::check_pruned(self, buffer.len(), scratch.len(), needed, out.len(), &work);
                 let done = unsafe {
-                    let b: &mut [Complex<f32>] = crate::array_utils::workaround_transmute_mut(buffer);
+                    let b: &[Complex<f32>] = crate::array_utils::workaround_transmute(buffer);
                     let s: &mut [Complex<f32>] = crate::array_utils::workaround_transmute_mut(scratch);
                     let o: &mut [Complex<f32>] = crate::array_utils::workaround_transmute_mut(out);
                     self.pruned_leaf(b, s, needed, o)
                 };
                 if !done {
                     // `pruned_by_full_transform` without its second check.
+                    self.process_with_scratch(buffer, scratch);
+                    for (o, &i) in out.iter_mut().zip(needed) {
+                        *o = buffer[i];
+                    }
+                }
+            }
+            fn process_pruned_product_with_scratch(
+                &self,
+                s: &[Complex<T>],
+                h: &[Complex<T>],
+                buffer: &mut [Complex<T>],
+                scratch: &mut [Complex<T>],
+                needed: &[usize],
+                out: &mut [Complex<T>],
+                work: crate::PrunedWork<'_, T>,
+            ) {
+                crate::check_product(self.len(), Some(s.len()), h.len());
+                crate::check_pruned(self, buffer.len(), scratch.len(), needed, out.len(), &work);
+                let done = unsafe {
+                    let ts: &[Complex<f32>] = crate::array_utils::workaround_transmute(s);
+                    let th: &[Complex<f32>] = crate::array_utils::workaround_transmute(h);
+                    let tb: &mut [Complex<f32>] = crate::array_utils::workaround_transmute_mut(buffer);
+                    let sc: &mut [Complex<f32>] = crate::array_utils::workaround_transmute_mut(scratch);
+                    let o: &mut [Complex<f32>] = crate::array_utils::workaround_transmute_mut(out);
+                    self.pruned_leaf(
+                        super::avx_vector::ProductBuf { s: ts, h: th, out: tb },
+                        sc,
+                        needed,
+                        o,
+                    )
+                };
+                if !done {
+                    crate::product_into(s, h, buffer);
+                    self.process_with_scratch(buffer, scratch);
+                    for (o, &i) in out.iter_mut().zip(needed) {
+                        *o = buffer[i];
+                    }
+                }
+            }
+            fn process_pruned_inplace_product_with_scratch(
+                &self,
+                h: &[Complex<T>],
+                buffer: &mut [Complex<T>],
+                scratch: &mut [Complex<T>],
+                needed: &[usize],
+                out: &mut [Complex<T>],
+                work: crate::PrunedWork<'_, T>,
+            ) {
+                crate::check_product(self.len(), None, h.len());
+                crate::check_pruned(self, buffer.len(), scratch.len(), needed, out.len(), &work);
+                let done = unsafe {
+                    let th: &[Complex<f32>] = crate::array_utils::workaround_transmute(h);
+                    let tb: &mut [Complex<f32>] = crate::array_utils::workaround_transmute_mut(buffer);
+                    let sc: &mut [Complex<f32>] = crate::array_utils::workaround_transmute_mut(scratch);
+                    let o: &mut [Complex<f32>] = crate::array_utils::workaround_transmute_mut(out);
+                    self.pruned_leaf(
+                        super::avx_vector::InplaceProductBuf { h: th, out: tb },
+                        sc,
+                        needed,
+                        o,
+                    )
+                };
+                if !done {
+                    crate::product_in_place(h, buffer);
                     self.process_with_scratch(buffer, scratch);
                     for (o, &i) in out.iter_mut().zip(needed) {
                         *o = buffer[i];
@@ -1455,9 +1519,25 @@ impl<T> Butterfly72Avx<T> {
     }
 }
 
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone)]
+struct Bf16PackedTwiddles {
+    i1: __m256,
+    i3: __m256,
+}
+
+#[target_feature(enable = "avx")]
+unsafe fn pack_bf16_twiddles(tw16: [__m256; 2]) -> Bf16PackedTwiddles {
+    Bf16PackedTwiddles {
+        i1: pack4_complex(tw16[0], tw16[0], tw16[1], tw16[1]),
+        i3: pack4_complex(tw16[1], tw16[1], tw16[0].neg(), tw16[0].neg()),
+    }
+}
+
 pub struct Butterfly128Avx<T> {
     twiddles: [__m256; 28],
     twiddles_butterfly16: [__m256; 2],
+    packed_bf16: Bf16PackedTwiddles,
     twiddles_butterfly4: Rotation90<__m256>,
     direction: FftDirection,
     _phantom_t: std::marker::PhantomData<T>,
@@ -1466,12 +1546,14 @@ boilerplate_fft_simd_butterfly_with_scratch!(Butterfly128Avx, 128);
 impl Butterfly128Avx<f32> {
     #[target_feature(enable = "avx")]
     unsafe fn new_with_avx(direction: FftDirection) -> Self {
+        let tw16 = [
+            AvxVector::broadcast_twiddle(1, 16, direction),
+            AvxVector::broadcast_twiddle(3, 16, direction),
+        ];
         Self {
             twiddles: gen_butterfly_twiddles_separated_columns!(8, 16, 0, direction),
-            twiddles_butterfly16: [
-                AvxVector::broadcast_twiddle(1, 16, direction),
-                AvxVector::broadcast_twiddle(3, 16, direction),
-            ],
+            twiddles_butterfly16: tw16,
+            packed_bf16: pack_bf16_twiddles(tw16),
             twiddles_butterfly4: AvxVector::make_rotation90(direction),
             direction,
             _phantom_t: PhantomData,
@@ -1532,9 +1614,39 @@ impl<T> Butterfly128Avx<T> {
 }
 
 #[allow(non_camel_case_types)]
+#[derive(Copy, Clone)]
+struct Bf32PackedTwiddles {
+    lo: [__m256; 3],
+    hi: [__m256; 3],
+}
+
+#[target_feature(enable = "avx")]
+unsafe fn pack4_complex(c0: __m256, c1: __m256, c2: __m256, c3: __m256) -> __m256 {
+    let t01 = _mm256_unpacklo_pd(_mm256_castps_pd(c0), _mm256_castps_pd(c1));
+    let t23 = _mm256_unpacklo_pd(_mm256_castps_pd(c2), _mm256_castps_pd(c3));
+    _mm256_castpd_ps(_mm256_permute2f128_pd::<0x20>(t01, t23))
+}
+
+#[target_feature(enable = "avx")]
+unsafe fn pack_bf32_twiddles(tw: [__m256; 6], rot: Rotation90<__m256>) -> Bf32PackedTwiddles {
+    Bf32PackedTwiddles {
+        lo: [
+            pack4_complex(tw[0], tw[0], tw[1], tw[2]),
+            pack4_complex(tw[0], tw[1], tw[0], tw[4]),
+            pack4_complex(tw[0], tw[2], tw[4], tw[0].rotate90(rot)),
+        ],
+        hi: [
+            pack4_complex(tw[0], tw[3], tw[4], tw[5]),
+            pack4_complex(tw[0], tw[1].rotate90(rot), tw[0], tw[4].rotate90(rot)),
+            pack4_complex(tw[0], tw[5].rotate90(rot), tw[1].neg(), tw[3].neg()),
+        ],
+    }
+}
+
 pub struct Butterfly256Avx<T> {
     twiddles: [__m256; 56],
     twiddles_butterfly32: [__m256; 6],
+    packed_bf32: Bf32PackedTwiddles,
     twiddles_butterfly4: Rotation90<__m256>,
     direction: FftDirection,
     _phantom_t: std::marker::PhantomData<T>,
@@ -1543,17 +1655,20 @@ boilerplate_fft_simd_butterfly_with_scratch!(Butterfly256Avx, 256);
 impl Butterfly256Avx<f32> {
     #[target_feature(enable = "avx")]
     unsafe fn new_with_avx(direction: FftDirection) -> Self {
+        let tw32 = [
+            AvxVector::broadcast_twiddle(1, 32, direction),
+            AvxVector::broadcast_twiddle(2, 32, direction),
+            AvxVector::broadcast_twiddle(3, 32, direction),
+            AvxVector::broadcast_twiddle(5, 32, direction),
+            AvxVector::broadcast_twiddle(6, 32, direction),
+            AvxVector::broadcast_twiddle(7, 32, direction),
+        ];
+        let rot = AvxVector::make_rotation90(direction);
         Self {
             twiddles: gen_butterfly_twiddles_separated_columns!(8, 32, 0, direction),
-            twiddles_butterfly32: [
-                AvxVector::broadcast_twiddle(1, 32, direction),
-                AvxVector::broadcast_twiddle(2, 32, direction),
-                AvxVector::broadcast_twiddle(3, 32, direction),
-                AvxVector::broadcast_twiddle(5, 32, direction),
-                AvxVector::broadcast_twiddle(6, 32, direction),
-                AvxVector::broadcast_twiddle(7, 32, direction),
-            ],
-            twiddles_butterfly4: AvxVector::make_rotation90(direction),
+            twiddles_butterfly32: tw32,
+            packed_bf32: pack_bf32_twiddles(tw32, rot),
+            twiddles_butterfly4: rot,
             direction,
             _phantom_t: PhantomData,
         }
@@ -1611,6 +1726,7 @@ impl<T> Butterfly256Avx<T> {
 pub struct Butterfly512Avx<T> {
     twiddles: [__m256; 120],
     twiddles_butterfly32: [__m256; 6],
+    packed_bf32: Bf32PackedTwiddles,
     twiddles_butterfly16: [__m256; 2],
     twiddles_butterfly4: Rotation90<__m256>,
     direction: FftDirection,
@@ -1620,21 +1736,24 @@ boilerplate_fft_simd_butterfly_with_scratch!(Butterfly512Avx, 512);
 impl Butterfly512Avx<f32> {
     #[target_feature(enable = "avx")]
     unsafe fn new_with_avx(direction: FftDirection) -> Self {
+        let tw32 = [
+            AvxVector::broadcast_twiddle(1, 32, direction),
+            AvxVector::broadcast_twiddle(2, 32, direction),
+            AvxVector::broadcast_twiddle(3, 32, direction),
+            AvxVector::broadcast_twiddle(5, 32, direction),
+            AvxVector::broadcast_twiddle(6, 32, direction),
+            AvxVector::broadcast_twiddle(7, 32, direction),
+        ];
+        let rot = AvxVector::make_rotation90(direction);
         Self {
             twiddles: gen_butterfly_twiddles_separated_columns!(16, 32, 0, direction),
-            twiddles_butterfly32: [
-                AvxVector::broadcast_twiddle(1, 32, direction),
-                AvxVector::broadcast_twiddle(2, 32, direction),
-                AvxVector::broadcast_twiddle(3, 32, direction),
-                AvxVector::broadcast_twiddle(5, 32, direction),
-                AvxVector::broadcast_twiddle(6, 32, direction),
-                AvxVector::broadcast_twiddle(7, 32, direction),
-            ],
+            twiddles_butterfly32: tw32,
+            packed_bf32: pack_bf32_twiddles(tw32, rot),
             twiddles_butterfly16: [
                 AvxVector::broadcast_twiddle(1, 16, direction),
                 AvxVector::broadcast_twiddle(3, 16, direction),
             ],
-            twiddles_butterfly4: AvxVector::make_rotation90(direction),
+            twiddles_butterfly4: rot,
             direction,
             _phantom_t: PhantomData,
         }
@@ -1758,6 +1877,106 @@ mod unit_tests {
     test_avx_butterfly!(test_avx_butterfly128, Butterfly128Avx, 128);
     test_avx_butterfly!(test_avx_butterfly256, Butterfly256Avx, 256);
     test_avx_butterfly!(test_avx_butterfly512, Butterfly512Avx, 512);
+
+    #[test]
+    fn f32_pruned_matches_full_bit_for_bit() {
+        use crate::{FftPlanner, PrunedWork};
+
+        fn assert_bits_f32(a: Complex<f32>, b: Complex<f32>, label: &str) {
+            let eq = |x: f32, y: f32| if y.is_nan() { x.is_nan() } else { x.to_bits() == y.to_bits() };
+            assert!(
+                eq(a.re, b.re) && eq(a.im, b.im),
+                "{label}: actual={a:?} [{:08x},{:08x}] expected={b:?} [{:08x},{:08x}]",
+                a.re.to_bits(),
+                a.im.to_bits(),
+                b.re.to_bits(),
+                b.im.to_bits()
+            );
+        }
+
+        let mut planner = FftPlanner::<f32>::new();
+        for dir in [FftDirection::Forward, FftDirection::Inverse] {
+            for &n in &[128usize, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
+                let fft = planner.plan_fft(n, dir);
+                let s: Vec<Complex<f32>> = (0..n)
+                    .map(|i| {
+                        Complex::new(
+                            ((i as f32 * 0.37).sin() + if i == n / 5 { f32::INFINITY } else { 0.0 }) * 1.1,
+                            ((i as f32 * 0.19).cos() - 0.25) * 0.9,
+                        )
+                    })
+                    .collect();
+                let s_finite: Vec<Complex<f32>> = (0..n)
+                    .map(|i| Complex::new((i as f32 * 0.37).sin() * 1.1, ((i as f32 * 0.19).cos() - 0.25) * 0.9))
+                    .collect();
+                let h: Vec<Complex<f32>> = (0..n)
+                    .map(|i| Complex::new((i as f32 * 0.13).cos() * 0.7, (i as f32 * 0.29).sin() * 0.6))
+                    .collect();
+
+                let mut full = s_finite.clone();
+                let mut full_scratch = vec![Complex::default(); fft.get_inplace_scratch_len()];
+                fft.process_with_scratch(&mut full, &mut full_scratch);
+
+                let mut prod_full: Vec<Complex<f32>> = s_finite.iter().zip(&h).map(|(a, b)| {
+                    let mut x = *a;
+                    x *= *b;
+                    x
+                }).collect();
+                fft.process_with_scratch(&mut prod_full, &mut full_scratch);
+
+                let cases: Vec<Vec<usize>> = if n <= 512 {
+                    vec![
+                        vec![0],
+                        vec![n - 1],
+                        vec![3, 19],
+                        vec![1, 5, 17, 63],
+                        (0..n).step_by(41).take(12).collect(),
+                    ]
+                } else {
+                    vec![
+                        vec![7],
+                        vec![n / 3, n - 5],
+                        (100..n).step_by(267).collect(),
+                    ]
+                };
+
+                for needed in cases {
+                    let u = fft.pruned_work_len(needed.len());
+                    let mut work_idx = vec![usize::MAX; 2 * u];
+                    let mut work_val = vec![Complex::new(f32::NAN, f32::INFINITY); u];
+                    let mut scratch = vec![Complex::new(f32::NAN, -f32::INFINITY); fft.get_inplace_scratch_len()];
+                    let mut out = vec![Complex::default(); needed.len()];
+
+                    let mut buf = s_finite.clone();
+                    fft.process_pruned_with_scratch(
+                        &mut buf,
+                        &mut scratch,
+                        &needed,
+                        &mut out,
+                        PrunedWork { idx: &mut work_idx, val: &mut work_val },
+                    );
+                    for (&idx_o, &got) in needed.iter().zip(&out) {
+                        assert_bits_f32(got, full[idx_o], &format!("n={n} dir={dir:?} idx={idx_o} needed_len={}", needed.len()));
+                    }
+
+                    let mut buf = vec![Complex::new(f32::NAN, -f32::INFINITY); n];
+                    fft.process_pruned_product_with_scratch(
+                        &s_finite,
+                        &h,
+                        &mut buf,
+                        &mut scratch,
+                        &needed,
+                        &mut out,
+                        PrunedWork { idx: &mut work_idx, val: &mut work_val },
+                    );
+                    for (&idx_o, &got) in needed.iter().zip(&out) {
+                        assert_bits_f32(got, prod_full[idx_o], &format!("prod n={n} dir={dir:?} idx={idx_o}"));
+                    }
+                }
+                let _ = s;
+            }
+        }
+    }
 }
 
 // ── Moosik (1.5.3 round 12-E): exact requested-output Butterfly256/512 ────
@@ -1794,7 +2013,7 @@ unsafe fn bf4_one<V: AvxVector>(rows: [V; 4], rotation: Rotation90<V>, p: usize)
 /// Output `p` of `AvxVector::column_butterfly8(rows, rotation)` (returned
 /// order `[o0, o2, o4, o6, o1, o3, o5, o7]`), by the same operations.
 #[inline(always)]
-unsafe fn bf8_one<V: AvxVector>(rows: [V; 8], rotation: Rotation90<V>, p: usize) -> V {
+pub(super) unsafe fn bf8_one<V: AvxVector>(rows: [V; 8], rotation: Rotation90<V>, p: usize) -> V {
     let i = p % 4;
     let a = bf4_one([rows[0], rows[2], rows[4], rows[6]], rotation, i);
     let mut b = bf4_one([rows[1], rows[3], rows[5], rows[7]], rotation, i);
@@ -1824,7 +2043,7 @@ impl<T> Butterfly256Avx<T> {
     #[inline]
     fn pruned_leaf(
         &self,
-        buffer: &mut [Complex<f32>],
+        input: impl AvxArray<f32>,
         scratch: &mut [Complex<f32>],
         needed: &[usize],
         out: &mut [Complex<f32>],
@@ -1834,7 +2053,7 @@ impl<T> Butterfly256Avx<T> {
         crate::moosik_diagnostics::count(if ok { 0 } else { 1 });
         if ok {
             // Safety: instances exist only after AVX and FMA detection (`new`).
-            unsafe { self.pruned256(buffer, scratch, needed, out) };
+            unsafe { self.pruned256(input, scratch, needed, out) };
         }
         ok
     }
@@ -1842,144 +2061,319 @@ impl<T> Butterfly256Avx<T> {
     #[target_feature(enable = "avx", enable = "fma")]
     unsafe fn pruned256(
         &self,
-        buffer: &mut [Complex<f32>],
-        scratch: &mut [Complex<f32>],
+        input: impl AvxArray<f32>,
+        _scratch: &mut [Complex<f32>],
         needed: &[usize],
         out: &mut [Complex<f32>],
     ) {
         let rot = self.twiddles_butterfly4;
-        // Phase 1 (`column_butterflies_and_transpose`): the 256 inputs as a
-        // 32x8 array; per column set of 4 columns, a butterfly-8 down the 8
-        // rows, row r twiddled by `twiddles[r - 1 + 7 * columnset]`, then
-        // transposed so (row r, column c) lands at scratch[c * 8 + r]. Only
-        // rows some requested output reads (r = o % 8) are formed.
-        let input: &[Complex<f32>] = buffer;
-        let mut formed = 0u8;
+        let rot128 = rot.lo();
+
+        let mut row_slot = [0u8; 8];
+        let mut row_list = [0u8; PRUNED_LEAF_MAX_NEEDED];
+        let mut num_rows = 0usize;
+        let mut mask = 0u8;
         for &o in needed {
-            let r = o % 8;
-            if formed >> r & 1 == 1 {
-                continue;
+            let r = o & 7;
+            if (mask >> r) & 1 == 0 {
+                mask |= 1 << r;
+                row_slot[r] = num_rows as u8;
+                row_list[num_rows] = r as u8;
+                num_rows += 1;
             }
-            formed |= 1 << r;
-            for columnset in 0..8 {
-                let mut rows = [AvxVector::zero(); 8];
-                for (q, row) in rows.iter_mut().enumerate() {
-                    *row = input.load_complex(columnset * 4 + 32 * q);
-                }
+        }
+
+        if num_rows == 1 {
+            let r = row_list[0] as usize;
+            let mut cols = [AvxVector::zero(); 8];
+            for (columnset, dst_col) in cols.iter_mut().enumerate() {
+                let rows = [
+                    input.load_complex(columnset * 4),
+                    input.load_complex(columnset * 4 + 32),
+                    input.load_complex(columnset * 4 + 64),
+                    input.load_complex(columnset * 4 + 96),
+                    input.load_complex(columnset * 4 + 128),
+                    input.load_complex(columnset * 4 + 160),
+                    input.load_complex(columnset * 4 + 192),
+                    input.load_complex(columnset * 4 + 224),
+                ];
                 let mut v: __m256 = bf8_one(rows, rot, r);
                 if r >= 1 {
                     v = AvxVector::mul_complex(v, self.twiddles[r - 1 + 7 * columnset]);
                 }
-                let mut lanes = [Complex::<f32> { re: 0.0, im: 0.0 }; 4];
-                _mm256_storeu_ps(lanes.as_mut_ptr() as *mut f32, v);
-                for (l, z) in lanes.iter().enumerate() {
-                    scratch[(columnset * 4 + l) * 8 + r] = *z;
+                *dst_col = v;
+            }
+            for (slot, &o) in out.iter_mut().zip(needed) {
+                let v = bf32_one_from_cols(cols, rot, rot128, &self.packed_bf32, o >> 3);
+                _mm_store_sd(slot as *mut Complex<f32> as *mut f64, _mm_castps_pd(v));
+            }
+            return;
+        }
+
+        let mut row_bufs = [MaybeUninit::<[Complex<f32>; 32]>::uninit(); PRUNED_LEAF_MAX_NEEDED];
+        for columnset in 0..8 {
+            let rows = [
+                input.load_complex(columnset * 4),
+                input.load_complex(columnset * 4 + 32),
+                input.load_complex(columnset * 4 + 64),
+                input.load_complex(columnset * 4 + 96),
+                input.load_complex(columnset * 4 + 128),
+                input.load_complex(columnset * 4 + 160),
+                input.load_complex(columnset * 4 + 192),
+                input.load_complex(columnset * 4 + 224),
+            ];
+            let mid = AvxVector::column_butterfly8(rows, rot);
+            for s in 0..num_rows {
+                let r = row_list[s] as usize;
+                let mut v = mid[r];
+                if r >= 1 {
+                    v = AvxVector::mul_complex(v, self.twiddles[r - 1 + 7 * columnset]);
                 }
+                let dst = row_bufs[s].as_mut_ptr() as *mut f32;
+                _mm256_storeu_ps(dst.add(columnset * 8), v);
             }
         }
-        // Phase 2 (`row_butterflies`): per column set cs2 of 4 rows, a
-        // butterfly-32 over the 32 columns (`column_butterfly32_loadfn!`,
-        // loads at cs2*4 + index*8); output index `ix` of that butterfly is
-        // stored at buffer[ix * 8 + row]. So output o is row o % 8 (column
-        // set (o % 8) / 4, lane o % 4) and butterfly-32 output o / 8, which
-        // is output `j = (o/8) / 4` of the i = (o/8) % 4 butterfly-8 over
-        // the twiddled butterfly-4 outputs `mid_m[i]`.
-        let tw = self.twiddles_butterfly32;
-        let s: &[Complex<f32>] = scratch;
+
         for (slot, &o) in out.iter_mut().zip(needed) {
-            let r = o % 8;
-            let cs2 = r / 4;
-            let ix = o / 8;
-            let (i, j) = (ix % 4, ix / 4);
-            let load = |index: usize| -> __m256 { s.load_complex(cs2 * 4 + index * 8) };
-            let mut mids = [AvxVector::zero(); 8];
-            for (m, mid) in mids.iter_mut().enumerate() {
-                let v: __m256 = bf4_one([load(m), load(m + 8), load(m + 16), load(m + 24)], rot, i);
-                // The twiddle `column_butterfly32_loadfn!` applies to
-                // mid{m}[i], verbatim.
-                *mid = match (m, i) {
-                    (_, 0) | (0, _) => v,
-                    (1, 1) => AvxVector::mul_complex(v, tw[0]),
-                    (1, 2) => AvxVector::mul_complex(v, tw[1]),
-                    (1, _) => AvxVector::mul_complex(v, tw[2]),
-                    (2, 1) => AvxVector::mul_complex(v, tw[1]),
-                    (2, 2) => avx_vector::apply_butterfly8_twiddle1(v, rot),
-                    (2, _) => AvxVector::mul_complex(v, tw[4]),
-                    (3, 1) => AvxVector::mul_complex(v, tw[2]),
-                    (3, 2) => AvxVector::mul_complex(v, tw[4]),
-                    (3, _) => AvxVector::mul_complex(v, tw[0].rotate90(rot)),
-                    (4, 1) => avx_vector::apply_butterfly8_twiddle1(v, rot),
-                    (4, 2) => v.rotate90(rot),
-                    (4, _) => avx_vector::apply_butterfly8_twiddle3(v, rot),
-                    (5, 1) => AvxVector::mul_complex(v, tw[3]),
-                    (5, 2) => AvxVector::mul_complex(v, tw[1].rotate90(rot)),
-                    (5, _) => AvxVector::mul_complex(v, tw[5].rotate90(rot)),
-                    (6, 1) => AvxVector::mul_complex(v, tw[4]),
-                    (6, 2) => avx_vector::apply_butterfly8_twiddle3(v, rot),
-                    (6, _) => AvxVector::mul_complex(v, tw[1].neg()),
-                    (7, 1) => AvxVector::mul_complex(v, tw[5]),
-                    (7, 2) => AvxVector::mul_complex(v, tw[4].rotate90(rot)),
-                    (_, _) => AvxVector::mul_complex(v, tw[3].neg()),
-                };
-            }
-            let v: __m256 = bf8_one(mids, rot, j);
-            let mut lanes = [Complex::<f32> { re: 0.0, im: 0.0 }; 4];
-            _mm256_storeu_ps(lanes.as_mut_ptr() as *mut f32, v);
-            *slot = lanes[r % 4];
+            let s = row_slot[o & 7] as usize;
+            let row_ptr = row_bufs[s].as_ptr() as *const f32;
+            let cols = [
+                _mm256_loadu_ps(row_ptr),
+                _mm256_loadu_ps(row_ptr.add(8)),
+                _mm256_loadu_ps(row_ptr.add(16)),
+                _mm256_loadu_ps(row_ptr.add(24)),
+                _mm256_loadu_ps(row_ptr.add(32)),
+                _mm256_loadu_ps(row_ptr.add(40)),
+                _mm256_loadu_ps(row_ptr.add(48)),
+                _mm256_loadu_ps(row_ptr.add(56)),
+            ];
+            let v = bf32_one_from_cols(cols, rot, rot128, &self.packed_bf32, o >> 3);
+            _mm_store_sd(slot as *mut Complex<f32> as *mut f64, _mm_castps_pd(v));
         }
     }
+}
+
+/// The butterfly-16 output `ix` over 4 column vectors `[col0..col3]` (4 complex
+/// lanes each), computing `bf4` down 4-element strides in one YMM register and
+/// collapsing the remaining 4-point stage in XMM registers without stack reloads.
+#[inline]
+#[target_feature(enable = "avx", enable = "fma")]
+unsafe fn bf16_one_from_cols(
+    cols: [__m256; 4],
+    rot: Rotation90<__m256>,
+    rot128: Rotation90<__m128>,
+    tw: &Bf16PackedTwiddles,
+    ix: usize,
+) -> __m128 {
+    let i = ix & 3;
+    let q = ix >> 2;
+    let v = bf4_one(cols, rot, i);
+    let mid = match i {
+        0 => v,
+        1 => {
+            let m = AvxVector::mul_complex(v, tw.i1);
+            let w = avx_vector::apply_butterfly8_twiddle1(v, rot);
+            let m01 = _mm256_blend_ps::<0x03>(m, v);
+            _mm256_blend_ps::<0x30>(m01, w)
+        }
+        2 => {
+            let t1 = avx_vector::apply_butterfly8_twiddle1(v, rot);
+            let t2 = v.rotate90(rot);
+            let t3 = avx_vector::apply_butterfly8_twiddle3(v, rot);
+            let a = _mm256_blend_ps::<0x0C>(v, t1);
+            let b = _mm256_blend_ps::<0x30>(a, t2);
+            _mm256_blend_ps::<0xC0>(b, t3)
+        }
+        _ => {
+            let m = AvxVector::mul_complex(v, tw.i3);
+            let w = avx_vector::apply_butterfly8_twiddle3(v, rot);
+            let m01 = _mm256_blend_ps::<0x03>(m, v);
+            _mm256_blend_ps::<0x30>(m01, w)
+        }
+    };
+    let lo = _mm256_castps256_ps128(mid);
+    let hi = _mm256_extractf128_ps::<1>(mid);
+    let p0 = lo;
+    let p1 = _mm_movehl_ps(lo, lo);
+    let p2 = hi;
+    let p3 = _mm_movehl_ps(hi, hi);
+    bf4_one([p0, p1, p2, p3], rot128, q)
 }
 
 impl<T> Butterfly128Avx<T> {
-    /// No requested-output leaf for 128.
+    /// This leaf has a requested-output path.
     #[inline(always)]
     fn leaf_prunes(&self) -> bool {
-        false
+        true
     }
 
-    /// No requested-output leaf for 128: always the full leaf and gather.
+    /// As `Butterfly256Avx::pruned_leaf`.
     #[inline]
-    fn pruned_leaf(&self, _: &mut [Complex<f32>], _: &mut [Complex<f32>], _: &[usize], _: &mut [Complex<f32>]) -> bool {
-        false
+    fn pruned_leaf(
+        &self,
+        input: impl AvxArray<f32>,
+        scratch: &mut [Complex<f32>],
+        needed: &[usize],
+        out: &mut [Complex<f32>],
+    ) -> bool {
+        let ok = !needed.is_empty() && needed.len() <= PRUNED_LEAF_MAX_NEEDED;
+        if ok {
+            // Safety: instances exist only after AVX and FMA detection (`new`).
+            unsafe { self.pruned128(input, scratch, needed, out) };
+        }
+        ok
+    }
+
+    #[target_feature(enable = "avx", enable = "fma")]
+    unsafe fn pruned128(
+        &self,
+        input: impl AvxArray<f32>,
+        _scratch: &mut [Complex<f32>],
+        needed: &[usize],
+        out: &mut [Complex<f32>],
+    ) {
+        let rot = self.twiddles_butterfly4;
+        let rot128 = rot.lo();
+
+        let mut row_slot = [0u8; 8];
+        let mut row_list = [0u8; PRUNED_LEAF_MAX_NEEDED];
+        let mut num_rows = 0usize;
+        let mut mask = 0u8;
+        for &o in needed {
+            let r = o & 7;
+            if (mask >> r) & 1 == 0 {
+                mask |= 1 << r;
+                row_slot[r] = num_rows as u8;
+                row_list[num_rows] = r as u8;
+                num_rows += 1;
+            }
+        }
+
+        if num_rows == 1 {
+            let r = row_list[0] as usize;
+            let mut cols = [AvxVector::zero(); 4];
+            for (columnset, dst_col) in cols.iter_mut().enumerate() {
+                let rows = [
+                    input.load_complex(columnset * 4),
+                    input.load_complex(columnset * 4 + 16),
+                    input.load_complex(columnset * 4 + 32),
+                    input.load_complex(columnset * 4 + 48),
+                    input.load_complex(columnset * 4 + 64),
+                    input.load_complex(columnset * 4 + 80),
+                    input.load_complex(columnset * 4 + 96),
+                    input.load_complex(columnset * 4 + 112),
+                ];
+                let mut v: __m256 = bf8_one(rows, rot, r);
+                if r >= 1 {
+                    v = AvxVector::mul_complex(v, self.twiddles[r - 1 + 7 * columnset]);
+                }
+                *dst_col = v;
+            }
+            for (slot, &o) in out.iter_mut().zip(needed) {
+                let v = bf16_one_from_cols(cols, rot, rot128, &self.packed_bf16, o >> 3);
+                _mm_store_sd(slot as *mut Complex<f32> as *mut f64, _mm_castps_pd(v));
+            }
+            return;
+        }
+
+        let mut row_bufs = [MaybeUninit::<[Complex<f32>; 16]>::uninit(); PRUNED_LEAF_MAX_NEEDED];
+        for columnset in 0..4 {
+            let rows = [
+                input.load_complex(columnset * 4),
+                input.load_complex(columnset * 4 + 16),
+                input.load_complex(columnset * 4 + 32),
+                input.load_complex(columnset * 4 + 48),
+                input.load_complex(columnset * 4 + 64),
+                input.load_complex(columnset * 4 + 80),
+                input.load_complex(columnset * 4 + 96),
+                input.load_complex(columnset * 4 + 112),
+            ];
+            let mid = AvxVector::column_butterfly8(rows, rot);
+            for s in 0..num_rows {
+                let r = row_list[s] as usize;
+                let mut v = mid[r];
+                if r >= 1 {
+                    v = AvxVector::mul_complex(v, self.twiddles[r - 1 + 7 * columnset]);
+                }
+                let dst = row_bufs[s].as_mut_ptr() as *mut f32;
+                _mm256_storeu_ps(dst.add(columnset * 8), v);
+            }
+        }
+
+        for (slot, &o) in out.iter_mut().zip(needed) {
+            let s = row_slot[o & 7] as usize;
+            let row_ptr = row_bufs[s].as_ptr() as *const f32;
+            let cols = [
+                _mm256_loadu_ps(row_ptr),
+                _mm256_loadu_ps(row_ptr.add(8)),
+                _mm256_loadu_ps(row_ptr.add(16)),
+                _mm256_loadu_ps(row_ptr.add(24)),
+            ];
+            let v = bf16_one_from_cols(cols, rot, rot128, &self.packed_bf16, o >> 3);
+            _mm_store_sd(slot as *mut Complex<f32> as *mut f64, _mm_castps_pd(v));
+        }
     }
 }
 
-/// The butterfly-32 output `ix` of `column_butterfly32_loadfn!` over
-/// `load(0..32)`, by the same operations: output `j = ix / 4` of the
-/// `i = ix % 4` butterfly-8 over the twiddled butterfly-4 outputs `mid_m[i]`.
-#[inline(always)]
-unsafe fn bf32_one(load: impl Fn(usize) -> __m256, tw: [__m256; 6], rot: Rotation90<__m256>, ix: usize) -> __m256 {
-    let (i, j) = (ix % 4, ix / 4);
-    let mut mids = [AvxVector::zero(); 8];
-    for (m, mid) in mids.iter_mut().enumerate() {
-        let v: __m256 = bf4_one([load(m), load(m + 8), load(m + 16), load(m + 24)], rot, i);
-        // The twiddle `column_butterfly32_loadfn!` applies to mid{m}[i], verbatim.
-        *mid = match (m, i) {
-            (_, 0) | (0, _) => v,
-            (1, 1) => AvxVector::mul_complex(v, tw[0]),
-            (1, 2) => AvxVector::mul_complex(v, tw[1]),
-            (1, _) => AvxVector::mul_complex(v, tw[2]),
-            (2, 1) => AvxVector::mul_complex(v, tw[1]),
-            (2, 2) => avx_vector::apply_butterfly8_twiddle1(v, rot),
-            (2, _) => AvxVector::mul_complex(v, tw[4]),
-            (3, 1) => AvxVector::mul_complex(v, tw[2]),
-            (3, 2) => AvxVector::mul_complex(v, tw[4]),
-            (3, _) => AvxVector::mul_complex(v, tw[0].rotate90(rot)),
-            (4, 1) => avx_vector::apply_butterfly8_twiddle1(v, rot),
-            (4, 2) => v.rotate90(rot),
-            (4, _) => avx_vector::apply_butterfly8_twiddle3(v, rot),
-            (5, 1) => AvxVector::mul_complex(v, tw[3]),
-            (5, 2) => AvxVector::mul_complex(v, tw[1].rotate90(rot)),
-            (5, _) => AvxVector::mul_complex(v, tw[5].rotate90(rot)),
-            (6, 1) => AvxVector::mul_complex(v, tw[4]),
-            (6, 2) => avx_vector::apply_butterfly8_twiddle3(v, rot),
-            (6, _) => AvxVector::mul_complex(v, tw[1].neg()),
-            (7, 1) => AvxVector::mul_complex(v, tw[5]),
-            (7, 2) => AvxVector::mul_complex(v, tw[4].rotate90(rot)),
-            (_, _) => AvxVector::mul_complex(v, tw[3].neg()),
-        };
-    }
-    bf8_one(mids, rot, j)
+/// The butterfly-32 output `ix` over 8 column vectors `[col0..col7]` (4 complex
+/// lanes each), computing `bf4` on even/odd 128-stride groups in YMMs and
+/// collapsing the 8-point stage in a single XMM vector without scalar reloads.
+#[inline]
+#[target_feature(enable = "avx", enable = "fma")]
+unsafe fn bf32_one_from_cols(
+    cols: [__m256; 8],
+    rot: Rotation90<__m256>,
+    rot128: Rotation90<__m128>,
+    tw: &Bf32PackedTwiddles,
+    ix: usize,
+) -> __m128 {
+    let i = ix & 3;
+    let j = ix >> 2;
+    let v_lo = bf4_one([cols[0], cols[2], cols[4], cols[6]], rot, i);
+    let v_hi = bf4_one([cols[1], cols[3], cols[5], cols[7]], rot, i);
+    let (mid_lo, mid_hi) = match i {
+        0 => (v_lo, v_hi),
+        1 => (
+            _mm256_blend_ps::<0xFC>(v_lo, AvxVector::mul_complex(v_lo, tw.lo[0])),
+            _mm256_blend_ps::<0x03>(
+                AvxVector::mul_complex(v_hi, tw.hi[0]),
+                avx_vector::apply_butterfly8_twiddle1(v_hi, rot),
+            ),
+        ),
+        2 => (
+            _mm256_blend_ps::<0x30>(
+                _mm256_blend_ps::<0xCC>(v_lo, AvxVector::mul_complex(v_lo, tw.lo[1])),
+                avx_vector::apply_butterfly8_twiddle1(v_lo, rot),
+            ),
+            _mm256_blend_ps::<0x30>(
+                _mm256_blend_ps::<0x03>(
+                    AvxVector::mul_complex(v_hi, tw.hi[1]),
+                    v_hi.rotate90(rot),
+                ),
+                avx_vector::apply_butterfly8_twiddle3(v_hi, rot),
+            ),
+        ),
+        _ => (
+            _mm256_blend_ps::<0xFC>(v_lo, AvxVector::mul_complex(v_lo, tw.lo[2])),
+            _mm256_blend_ps::<0x03>(
+                AvxVector::mul_complex(v_hi, tw.hi[2]),
+                avx_vector::apply_butterfly8_twiddle3(v_hi, rot),
+            ),
+        ),
+    };
+    let p0 = _mm256_castps256_ps128(mid_lo);
+    let p1 = _mm256_extractf128_ps::<1>(mid_lo);
+    let p2 = _mm256_castps256_ps128(mid_hi);
+    let p3 = _mm256_extractf128_ps::<1>(mid_hi);
+    let ab = bf4_one([p0, p1, p2, p3], rot128, j & 3);
+    let mut b = _mm_movehl_ps(ab, ab);
+    b = match j & 3 {
+        1 => avx_vector::apply_butterfly8_twiddle1(b, rot128),
+        2 => b.rotate90(rot128),
+        3 => avx_vector::apply_butterfly8_twiddle3(b, rot128),
+        _ => b,
+    };
+    if j < 4 { AvxVector::add(ab, b) } else { AvxVector::sub(ab, b) }
 }
 
 impl<T> Butterfly512Avx<T> {
@@ -1993,7 +2387,7 @@ impl<T> Butterfly512Avx<T> {
     #[inline]
     fn pruned_leaf(
         &self,
-        buffer: &mut [Complex<f32>],
+        input: impl AvxArray<f32>,
         scratch: &mut [Complex<f32>],
         needed: &[usize],
         out: &mut [Complex<f32>],
@@ -2003,7 +2397,7 @@ impl<T> Butterfly512Avx<T> {
         crate::moosik_diagnostics::count(if ok { 2 } else { 3 });
         if ok {
             // Safety: instances exist only after AVX and FMA detection (`new`).
-            unsafe { self.pruned512(buffer, scratch, needed, out) };
+            unsafe { self.pruned512(input, scratch, needed, out) };
         }
         ok
     }
@@ -2011,72 +2405,134 @@ impl<T> Butterfly512Avx<T> {
     #[target_feature(enable = "avx", enable = "fma")]
     unsafe fn pruned512(
         &self,
-        buffer: &mut [Complex<f32>],
-        scratch: &mut [Complex<f32>],
+        input: impl AvxArray<f32>,
+        _scratch: &mut [Complex<f32>],
         needed: &[usize],
         out: &mut [Complex<f32>],
     ) {
         let rot = self.twiddles_butterfly4;
+        let rot128 = rot.lo();
         let tw16 = self.twiddles_butterfly16;
-        // Phase 1 (`column_butterflies_and_transpose`): a 32x16 array; per
-        // column set of 4 columns, `column_butterfly16_loadfn!` down the 16
-        // rows (loads at columnset*4 + 32*index), row k (k >= 1) twiddled by
-        // `twiddles[15 * columnset + k - 1]`, transposed so (row k, column c)
-        // lands at scratch[c * 16 + k]. Row k is that macro's output stored
-        // at index k = i + 4q: butterfly-4 output q over the twiddled
-        // butterfly-4 outputs mid{m}[i].
-        let input: &[Complex<f32>] = buffer;
-        let mut formed = 0u16;
+
+        let mut row_slot = [0u8; 16];
+        let mut row_list = [0u8; PRUNED_LEAF_MAX_NEEDED];
+        let mut num_rows = 0usize;
+        let mut k_mask = 0u16;
+        let mut i_mask = 0u8;
         for &o in needed {
-            let k = o % 16;
-            if formed >> k & 1 == 1 {
-                continue;
+            let k = o & 15;
+            if (k_mask >> k) & 1 == 0 {
+                k_mask |= 1 << k;
+                i_mask |= 1 << (k & 3);
+                row_slot[k] = num_rows as u8;
+                row_list[num_rows] = k as u8;
+                num_rows += 1;
             }
-            formed |= 1 << k;
-            let (i, q) = (k % 4, k / 4);
-            for columnset in 0..8 {
+        }
+
+        let twiddle_mid = |v: __m256, m: usize, i: usize| -> __m256 {
+            match (m, i) {
+                (_, 0) | (0, _) => v,
+                (1, 1) => AvxVector::mul_complex(v, tw16[0]),
+                (1, 2) => avx_vector::apply_butterfly8_twiddle1(v, rot),
+                (1, _) => AvxVector::mul_complex(v, tw16[1]),
+                (2, 1) => avx_vector::apply_butterfly8_twiddle1(v, rot),
+                (2, 2) => v.rotate90(rot),
+                (2, _) => avx_vector::apply_butterfly8_twiddle3(v, rot),
+                (3, 1) => AvxVector::mul_complex(v, tw16[1]),
+                (3, 2) => avx_vector::apply_butterfly8_twiddle3(v, rot),
+                (_, _) => AvxVector::mul_complex(v, tw16[0].neg()),
+            }
+        };
+
+        if num_rows == 1 {
+            let k = row_list[0] as usize;
+            let (i, q) = (k & 3, k >> 2);
+            let mut cols = [AvxVector::zero(); 8];
+            for (columnset, dst_col) in cols.iter_mut().enumerate() {
                 let load = |index: usize| -> __m256 { input.load_complex(columnset * 4 + 32 * index) };
                 let mut mids = [AvxVector::zero(); 4];
-                for (m, mid) in mids.iter_mut().enumerate() {
-                    let v: __m256 = bf4_one([load(m), load(m + 4), load(m + 8), load(m + 12)], rot, i);
-                    // The twiddle `column_butterfly16_loadfn!` applies to mid{m}[i], verbatim.
-                    *mid = match (m, i) {
-                        (_, 0) | (0, _) => v,
-                        (1, 1) => AvxVector::mul_complex(v, tw16[0]),
-                        (1, 2) => avx_vector::apply_butterfly8_twiddle1(v, rot),
-                        (1, _) => AvxVector::mul_complex(v, tw16[1]),
-                        (2, 1) => avx_vector::apply_butterfly8_twiddle1(v, rot),
-                        (2, 2) => v.rotate90(rot),
-                        (2, _) => avx_vector::apply_butterfly8_twiddle3(v, rot),
-                        (3, 1) => AvxVector::mul_complex(v, tw16[1]),
-                        (3, 2) => avx_vector::apply_butterfly8_twiddle3(v, rot),
-                        (_, _) => AvxVector::mul_complex(v, tw16[0].neg()),
-                    };
+                for m in 0..4 {
+                    let v = bf4_one([load(m), load(m + 4), load(m + 8), load(m + 12)], rot, i);
+                    mids[m] = twiddle_mid(v, m, i);
                 }
-                let mut v: __m256 = bf4_one(mids, rot, q);
+                let mut v = bf4_one(mids, rot, q);
                 if k >= 1 {
                     v = AvxVector::mul_complex(v, self.twiddles[15 * columnset + k - 1]);
                 }
-                let mut lanes = [Complex::<f32> { re: 0.0, im: 0.0 }; 4];
-                _mm256_storeu_ps(lanes.as_mut_ptr() as *mut f32, v);
-                for (l, z) in lanes.iter().enumerate() {
-                    scratch[(columnset * 4 + l) * 16 + k] = *z;
+                *dst_col = v;
+            }
+            for (slot, &o) in out.iter_mut().zip(needed) {
+                let v = bf32_one_from_cols(cols, rot, rot128, &self.packed_bf32, o >> 4);
+                _mm_store_sd(slot as *mut Complex<f32> as *mut f64, _mm_castps_pd(v));
+            }
+            return;
+        }
+
+        let mut row_bufs = [MaybeUninit::<[Complex<f32>; 32]>::uninit(); PRUNED_LEAF_MAX_NEEDED];
+        if i_mask.count_ones() == 1 {
+            let i = i_mask.trailing_zeros() as usize;
+            for columnset in 0..8 {
+                let load = |index: usize| -> __m256 { input.load_complex(columnset * 4 + 32 * index) };
+                let mut mids = [AvxVector::zero(); 4];
+                for m in 0..4 {
+                    let v = bf4_one([load(m), load(m + 4), load(m + 8), load(m + 12)], rot, i);
+                    mids[m] = twiddle_mid(v, m, i);
+                }
+                for s in 0..num_rows {
+                    let k = row_list[s] as usize;
+                    let mut v = bf4_one(mids, rot, k >> 2);
+                    if k >= 1 {
+                        v = AvxVector::mul_complex(v, self.twiddles[15 * columnset + k - 1]);
+                    }
+                    let dst = row_bufs[s].as_mut_ptr() as *mut f32;
+                    _mm256_storeu_ps(dst.add(columnset * 8), v);
+                }
+            }
+        } else {
+            for columnset in 0..8 {
+                let load = |index: usize| -> __m256 { input.load_complex(columnset * 4 + 32 * index) };
+                let mut bf4_all = [[AvxVector::zero(); 4]; 4];
+                for m in 0..4 {
+                    bf4_all[m] = AvxVector::column_butterfly4(
+                        [load(m), load(m + 4), load(m + 8), load(m + 12)],
+                        rot,
+                    );
+                }
+                for s in 0..num_rows {
+                    let k = row_list[s] as usize;
+                    let (i, q) = (k & 3, k >> 2);
+                    let mids = [
+                        bf4_all[0][i],
+                        twiddle_mid(bf4_all[1][i], 1, i),
+                        twiddle_mid(bf4_all[2][i], 2, i),
+                        twiddle_mid(bf4_all[3][i], 3, i),
+                    ];
+                    let mut v = bf4_one(mids, rot, q);
+                    if k >= 1 {
+                        v = AvxVector::mul_complex(v, self.twiddles[15 * columnset + k - 1]);
+                    }
+                    let dst = row_bufs[s].as_mut_ptr() as *mut f32;
+                    _mm256_storeu_ps(dst.add(columnset * 8), v);
                 }
             }
         }
-        // Phase 2 (`row_butterflies`): per column set cs2 of 4 rows, the
-        // butterfly-32 over the 32 columns (loads at cs2*4 + index*16, output
-        // ix stored at ix*16 + row). Output o: row k = o % 16 (column set
-        // k / 4, lane k % 4), butterfly-32 output o / 16.
-        let tw = self.twiddles_butterfly32;
-        let s: &[Complex<f32>] = scratch;
+
         for (slot, &o) in out.iter_mut().zip(needed) {
-            let k = o % 16;
-            let cs2 = k / 4;
-            let v = bf32_one(|index: usize| -> __m256 { s.load_complex(cs2 * 4 + index * 16) }, tw, rot, o / 16);
-            let mut lanes = [Complex::<f32> { re: 0.0, im: 0.0 }; 4];
-            _mm256_storeu_ps(lanes.as_mut_ptr() as *mut f32, v);
-            *slot = lanes[k % 4];
+            let s = row_slot[o & 15] as usize;
+            let row_ptr = row_bufs[s].as_ptr() as *const f32;
+            let cols = [
+                _mm256_loadu_ps(row_ptr),
+                _mm256_loadu_ps(row_ptr.add(8)),
+                _mm256_loadu_ps(row_ptr.add(16)),
+                _mm256_loadu_ps(row_ptr.add(24)),
+                _mm256_loadu_ps(row_ptr.add(32)),
+                _mm256_loadu_ps(row_ptr.add(40)),
+                _mm256_loadu_ps(row_ptr.add(48)),
+                _mm256_loadu_ps(row_ptr.add(56)),
+            ];
+            let v = bf32_one_from_cols(cols, rot, rot128, &self.packed_bf32, o >> 4);
+            _mm_store_sd(slot as *mut Complex<f32> as *mut f64, _mm_castps_pd(v));
         }
     }
 }

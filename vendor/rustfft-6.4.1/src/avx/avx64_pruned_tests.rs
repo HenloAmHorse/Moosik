@@ -3,6 +3,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 fn leaf(n: usize, direction: FftDirection) -> Box<dyn Fft<f64>> {
     match n {
+        128 => Box::new(Butterfly128Avx64::<f64>::new(direction).unwrap()),
         256 => Box::new(Butterfly256Avx64::<f64>::new(direction).unwrap()),
         512 => Box::new(Butterfly512Avx64::<f64>::new(direction).unwrap()),
         _ => unreachable!(),
@@ -138,7 +139,7 @@ fn every_single_output_matches_full_bits_for_both_directions_and_fixtures() {
     if !supported() {
         return;
     }
-    for n in [256, 512] {
+    for n in [128, 256, 512] {
         for direction in [FftDirection::Forward, FftDirection::Inverse] {
             let plan = leaf(n, direction);
             assert!(plan.prunes());
@@ -160,8 +161,8 @@ fn shared_rows_mixed_rows_seeded_sets_and_whole_fallback_match_full_bits() {
     if !supported() {
         return;
     }
-    for n in [256, 512] {
-        let rows = if n == 256 { 8 } else { 16 };
+    for n in [128, 256, 512] {
+        let rows = if n == 512 { 16 } else { 8 };
         for direction in [FftDirection::Forward, FftDirection::Inverse] {
             let plan = leaf(n, direction);
             let mut replay = Replay::new(&*plan);
@@ -211,7 +212,7 @@ fn every_sorted_pair_matches_full_bits() {
         return;
     }
     let mut calls = 0u64;
-    for n in [256, 512] {
+    for n in [128, 256, 512] {
         for direction in [FftDirection::Forward, FftDirection::Inverse] {
             let plan = leaf(n, direction);
             let input = fixture(n, 2, 0x1234567);
@@ -225,7 +226,7 @@ fn every_sorted_pair_matches_full_bits() {
             }
         }
     }
-    assert_eq!(calls, 326912);
+    assert_eq!(calls, 343168);
     println!("f64_leaf_exhaustive_pairs,calls={calls},differences=0");
 }
 
@@ -234,7 +235,7 @@ fn product_entry_matches_old_mul_full_inverse_bits() {
     if !supported() {
         return;
     }
-    for n in [256, 512] {
+    for n in [128, 256, 512] {
         for direction in [FftDirection::Forward, FftDirection::Inverse] {
             let plan = leaf(n, direction);
             for kind in [0, 1, 2, 5, 6, 8] {
@@ -288,8 +289,8 @@ fn contract_failures_happen_before_any_write_and_128_stays_whole() {
         return;
     }
     let small = Butterfly128Avx64::<f64>::new(FftDirection::Inverse).unwrap();
-    assert!(!small.prunes());
-    for n in [256, 512] {
+    assert!(crate::Fft::<f64>::prunes(&small));
+    for n in [128, 256, 512] {
         let plan = leaf(n, FftDirection::Inverse);
         for case in 0..8 {
             let signal = fixture(n, 2, 0x123);

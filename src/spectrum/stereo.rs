@@ -391,6 +391,13 @@ pub fn payload_fingerprint(bytes: &[u8]) -> u64 {
 /// and the trailing remainder are the same words, because there is only one
 /// byte sequence involved. Nothing streams and nothing carries pending bytes.
 pub fn encode(id: Identity, mono: &PreFrames, pair: &Stereo) -> Vec<u8> {
+    encode_as(id, mono, pair, cache::compact())
+}
+
+/// [`encode`] with the channel form stated: compact (v5, each channel coded
+/// against `mono`) or plain v4. Compact falls back to v4 per channel if a
+/// channel does not take it.
+pub fn encode_as(id: Identity, mono: &PreFrames, pair: &Stereo, compact: bool) -> Vec<u8> {
     fn put32(b: &mut [u8], at: usize, v: u32) {
         b[at..at + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -398,8 +405,9 @@ pub fn encode(id: Identity, mono: &PreFrames, pair: &Stereo) -> Vec<u8> {
         b[at..at + 8].copy_from_slice(&v.to_le_bytes());
     }
 
-    let left = pair.left.to_v4();
-    let right = pair.right.to_v4();
+    let channel = |ch: &PreFrames| ch.to_bytes_as(&[], Some(mono), compact);
+    let left = channel(&pair.left);
+    let right = channel(&pair.right);
     let (left_len, right_len) = (left.len(), right.len());
 
     let mut out = Vec::with_capacity(HEADER + left_len + right_len);
@@ -529,16 +537,23 @@ pub fn decode_with(
     // The two channels are independent: Right is decoded on a second thread
     // while Left is decoded here (here alone if that thread cannot start).
     let _p = super::store::prof::span("lr.decode_channels");
-    let decode_right = || cache::decode_with(&raw[HEADER + left_len..declared], bars, max_bars, limits);
-    let (left, right) = std::thread::scope(|s| {
-        let r = std::thread::Builder::new().spawn_scoped(s, decode_right);
-        let l = cache::decode_with(&raw[HEADER..HEADER + left_len], bars, max_bars, limits);
-        let r = match r {
-            Ok(h) => h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
-            Err(_) => decode_right(),
-        };
-        (l, r)
-    });
+    let decode_right = || cache::decode_with_reference(&raw[HEADER + left_len..declared], bars, max_bars, limits, Some(mono));
+    let decode_left = || cache::decode_with_reference(&raw[HEADER..HEADER + left_len], bars, max_bars, limits, Some(mono));
+    // A compact channel decodes on several threads of its own, so the two go
+    // one after the other; plain ones side by side as before.
+    let (left, right) = if cache::is_compact(&raw[HEADER..]) {
+        (decode_left(), decode_right())
+    } else {
+        std::thread::scope(|s| {
+            let r = std::thread::Builder::new().spawn_scoped(s, decode_right);
+            let l = decode_left();
+            let r = match r {
+                Ok(h) => h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                Err(_) => decode_right(),
+            };
+            (l, r)
+        })
+    };
     let left = left.map_err(|err| SidecarError::Channel { side: Side::Left, err })?;
     let right = right.map_err(|err| SidecarError::Channel { side: Side::Right, err })?;
 
@@ -691,6 +706,38 @@ mod tests {
             missed.is_empty(),
             "left/right boundary remainders not covered: {missed:?}",
         );
+    }
+
+    /// The compact form: both channels coded against Mix (v5), in the same
+    /// sidecar container. It reads back to the same pair, it is smaller, and
+    /// it is bound to its Mix twice over: by the header's fingerprint and by
+    /// each channel's own reference.
+    #[test]
+    fn a_compact_sidecar_reads_back_and_is_bound_to_its_mix() {
+        for (frames, bars) in [(1usize, 1usize), (40, 64), (700, 33), (1100, 64)] {
+            let (mono, pair) = trio(frames, bars);
+            let (plain, compact) = (encode_as(ID, &mono, &pair, false), encode_as(ID, &mono, &pair, true));
+            assert_eq!(plain, encode(ID, &mono, &pair), "{frames}x{bars}: the setting is off, so `encode` writes the plain form");
+            let back = decode_with(&compact, ID, &mono, bars, Limits::default()).unwrap_or_else(|e| panic!("{frames}x{bars}: {e}"));
+            assert_eq!(back, pair, "{frames}x{bars}");
+            assert!(compact.len() <= plain.len(), "{frames}x{bars}: the smaller form is kept");
+        }
+        // Noise-like channels, as real analyses are: the compact form is the
+        // smaller, and is what gets written.
+        let noisy = |tag: u64| {
+            let mut s = tag | 1;
+            let rows: Vec<Vec<f32>> = (0..3000).map(|_| (0..128).map(|b| {
+                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                0.4 + 0.2 * (b as f32 / 128.0) + ((s >> 40) % 1000) as f32 / 9000.0
+            }).collect()).collect();
+            PreFrames::from_analysis(&rows)
+        };
+        let (mono, pair) = (noisy(1), Stereo::new(noisy(2), noisy(3)).expect("same shape"));
+        let (plain, compact) = (encode_as(ID, &mono, &pair, false), encode_as(ID, &mono, &pair, true));
+        assert!(cache::is_compact(&compact[HEADER..]) && compact.len() < plain.len(), "{} against {}", compact.len(), plain.len());
+        assert_eq!(decode_with(&compact, ID, &mono, 128, Limits::default()).as_ref(), Ok(&pair));
+        // Another Mix of the same shape: refused, by the fingerprint.
+        assert!(decode_with(&compact, ID, &noisy(9), 128, Limits::default()).is_err());
     }
 
     /// A damaged payload is still caught, wherever the damage lands.

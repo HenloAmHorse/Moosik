@@ -92,6 +92,16 @@ See also [BIT_PERFECT.md](BIT_PERFECT.md) and [SPECTRUM.md](SPECTRUM.md).
 - **Titles and artists** from Moosik's own record for these untagged files; the Info window shows the source link
 - Details: [YOUTUBE.md](YOUTUBE.md)
 
+## Pro audio tools and storage (1.6.2)
+
+- **Measure** (Info, or Settings → Pro tools) — BS.1770-4 loudness, loudness range, true and sample peak, PLR/PSR, crest factor, DR, DC offset, correlation, bits used, clipped runs and inter-sample overs (marked on the seek bar), FLAC's MD5 check, and what the file really is (fake lossless, padded bit depth)
+- **Compare and ABX** — how much louder another master is and its tone against this one, level-matched; ABX blind tests with a binomial score
+- **Headphone EQ** — search AutoEq's headphones and use the correction in the EQ (now 32 bands, with a preamp) or save it for other apps, USB Audio Player PRO included; crossfeed after bs2b; room correction from an impulse response
+- **Tempo, beats and sections** in the Harmony panel and on the seek bar; **practice tempo and key** (50–150 %, ±6 semitones)
+- **Settings → Storage** — what Moosik keeps on this computer, part by part, and removing what is not needed; optionally smaller, lossless cache files
+- **High-accuracy GPU** (experimental, off) — the whole superlet analysis on an NVIDIA card
+- Details: [PRO_AUDIO.md](PRO_AUDIO.md), [HIGH_ACCURACY_GPU.md](HIGH_ACCURACY_GPU.md), [CACHE.md](CACHE.md)
+
 ## Theme & Appearance
 
 - **Cohesive theme, light or dark** — built from the app's own identity colors (the **Eigengrau** #16161d base and **Kugelblitz** #94b1ff accent): a tinted surface ramp, rounded corners, and accent-coloured selection and hover, applied across both the egui widgets and the custom-painted surfaces (seek bar, playlist rows, status text). A light variant is a click away

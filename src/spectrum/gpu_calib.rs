@@ -1766,6 +1766,28 @@ pub fn workers() -> usize {
     match WORKERS.load(O::Relaxed) { 0 => default_workers(), n => n }
 }
 
+/// The analysis pool, built at the current budget if it is not yet: `None`
+/// when the lock is poisoned, `Some(None)` when the pool would not build.
+fn pool_slot() -> Option<Option<std::sync::Arc<rayon::ThreadPool>>> {
+    let mut g = POOL.lock().ok()?;
+    if g.is_none() {
+        *g = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers())
+            .thread_name(|i| format!("moosik-analyse-{i}"))
+            .build()
+            .ok()
+            .map(std::sync::Arc::new);
+    }
+    Some(g.clone())
+}
+
+/// The analysis pool itself, for a route that installs its own work in it
+/// (the High-accuracy GPU engine): the same thread budget, and nothing
+/// stamped for the calibration, which is Standard's alone.
+pub fn pool() -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    pool_slot().flatten()
+}
+
 /// Run `f` on the analysis pool, so it and everything it spawns are held to the
 /// thread budget.
 ///
@@ -1781,18 +1803,7 @@ pub fn install<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         let n = rayon::current_num_threads().max(1);
         return with_exec(n, f);
     }
-    let pool = {
-        let Ok(mut g) = POOL.lock() else { return f() };
-        if g.is_none() {
-            *g = rayon::ThreadPoolBuilder::new()
-                .num_threads(workers())
-                .thread_name(|i| format!("moosik-analyse-{i}"))
-                .build()
-                .ok()
-                .map(std::sync::Arc::new);
-        }
-        g.clone()
-    };
+    let Some(pool) = pool_slot() else { return f() };
     // A pool that would not build is no reason to refuse to analyse: the global
     // pool is capped too, it just cannot be resized without a restart. What
     // executed is then the global pool, and that is what is stamped — a

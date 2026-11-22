@@ -2305,6 +2305,19 @@ unsafe fn product4_f32(s: *const f32, h: *const f32) -> __m256 {
     _mm256_addsub_ps(t1, t2)
 }
 
+#[inline]
+#[target_feature(enable = "avx")]
+unsafe fn product2_f64(s: *const f64, h: *const f64) -> __m256d {
+    let a = _mm256_loadu_pd(s);
+    let b = _mm256_loadu_pd(h);
+    let a_re = _mm256_movedup_pd(a);
+    let a_im = _mm256_permute_pd(a, 0x0F);
+    let t1 = _mm256_mul_pd(a_re, b);
+    let b_sw = _mm256_permute_pd(b, 0x05);
+    let t2 = _mm256_mul_pd(a_im, b_sw);
+    _mm256_addsub_pd(t1, t2)
+}
+
 /// Moosik research (round 10): an `AvxArrayMut` whose loads are the products
 /// `s[i] * h[i]` -- computed as num-complex's `MulAssign` computes them,
 /// `re = s.re*h.re - s.im*h.im`, `im = s.im*h.re + s.re*h.im`, each operation
@@ -2353,9 +2366,14 @@ impl<'a, T: AvxNum> AvxArray<T> for ProductBuf<'a, T> {
     #[inline(always)]
     unsafe fn load_complex(&self, index: usize) -> T::VectorType {
         if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            assert!(index + 4 <= self.s.len() && index + 4 <= self.h.len());
+            debug_assert!(index + 4 <= self.s.len() && index + 4 <= self.h.len());
             let r = product4_f32(self.s.as_ptr().add(index) as *const f32, self.h.as_ptr().add(index) as *const f32);
             return std::mem::transmute_copy::<__m256, T::VectorType>(&r);
+        }
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>() {
+            debug_assert!(index + 2 <= self.s.len() && index + 2 <= self.h.len());
+            let r = product2_f64(self.s.as_ptr().add(index) as *const f64, self.h.as_ptr().add(index) as *const f64);
+            return std::mem::transmute_copy::<__m256d, T::VectorType>(&r);
         }
         let v = self.products::<4>(index, T::VectorType::COMPLEX_PER_VECTOR);
         T::VectorType::load_complex(v.as_ptr())
@@ -2457,9 +2475,14 @@ impl<'a, T: AvxNum> AvxArray<T> for InplaceProductBuf<'a, T> {
     #[inline(always)]
     unsafe fn load_complex(&self, index: usize) -> T::VectorType {
         if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
-            assert!(index + 4 <= self.out.len() && index + 4 <= self.h.len());
+            debug_assert!(index + 4 <= self.out.len() && index + 4 <= self.h.len());
             let r = product4_f32(self.out.as_ptr().add(index) as *const f32, self.h.as_ptr().add(index) as *const f32);
             return std::mem::transmute_copy::<__m256, T::VectorType>(&r);
+        }
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>() {
+            debug_assert!(index + 2 <= self.out.len() && index + 2 <= self.h.len());
+            let r = product2_f64(self.out.as_ptr().add(index) as *const f64, self.h.as_ptr().add(index) as *const f64);
+            return std::mem::transmute_copy::<__m256d, T::VectorType>(&r);
         }
         let v = self.products::<4>(index, T::VectorType::COMPLEX_PER_VECTOR);
         T::VectorType::load_complex(v.as_ptr())
@@ -2525,4 +2548,127 @@ impl Rotation90<__m256> {
         _mm256_storeu_ps(out.as_mut_ptr().cast(), self.0);
         out
     }
+}
+
+#[target_feature(enable = "avx")]
+unsafe fn product_ptrs_f32_avx(sp: *const f32, hp: *const f32, op: *mut f32, n: usize) {
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let base = i * 2;
+        let p0 = product4_f32(sp.add(base), hp.add(base));
+        let p1 = product4_f32(sp.add(base + 8), hp.add(base + 8));
+        let p2 = product4_f32(sp.add(base + 16), hp.add(base + 16));
+        let p3 = product4_f32(sp.add(base + 24), hp.add(base + 24));
+        _mm256_storeu_ps(op.add(base), p0);
+        _mm256_storeu_ps(op.add(base + 8), p1);
+        _mm256_storeu_ps(op.add(base + 16), p2);
+        _mm256_storeu_ps(op.add(base + 24), p3);
+        i += 16;
+    }
+    while i + 4 <= n {
+        let p = product4_f32(sp.add(i * 2), hp.add(i * 2));
+        _mm256_storeu_ps(op.add(i * 2), p);
+        i += 4;
+    }
+    while i < n {
+        let (ar, ai) = (*sp.add(i * 2), *sp.add(i * 2 + 1));
+        let (br, bi) = (*hp.add(i * 2), *hp.add(i * 2 + 1));
+        let mut re = ar * br;
+        re = re - ai * bi;
+        let mut im = ai * br;
+        im = im + ar * bi;
+        *op.add(i * 2) = re;
+        *op.add(i * 2 + 1) = im;
+        i += 1;
+    }
+}
+
+#[target_feature(enable = "avx")]
+unsafe fn product_ptrs_f64_avx(sp: *const f64, hp: *const f64, op: *mut f64, n: usize) {
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let base = i * 2;
+        let p0 = product2_f64(sp.add(base), hp.add(base));
+        let p1 = product2_f64(sp.add(base + 4), hp.add(base + 4));
+        let p2 = product2_f64(sp.add(base + 8), hp.add(base + 8));
+        let p3 = product2_f64(sp.add(base + 12), hp.add(base + 12));
+        _mm256_storeu_pd(op.add(base), p0);
+        _mm256_storeu_pd(op.add(base + 4), p1);
+        _mm256_storeu_pd(op.add(base + 8), p2);
+        _mm256_storeu_pd(op.add(base + 12), p3);
+        i += 8;
+    }
+    while i + 2 <= n {
+        let p = product2_f64(sp.add(i * 2), hp.add(i * 2));
+        _mm256_storeu_pd(op.add(i * 2), p);
+        i += 2;
+    }
+    while i < n {
+        let (ar, ai) = (*sp.add(i * 2), *sp.add(i * 2 + 1));
+        let (br, bi) = (*hp.add(i * 2), *hp.add(i * 2 + 1));
+        let mut re = ar * br;
+        re = re - ai * bi;
+        let mut im = ai * br;
+        im = im + ar * bi;
+        *op.add(i * 2) = re;
+        *op.add(i * 2 + 1) = im;
+        i += 1;
+    }
+}
+
+pub(crate) fn product_into_avx<T: crate::FftNum>(
+    s: &[Complex<T>],
+    h: &[Complex<T>],
+    out: &mut [Complex<T>],
+) -> bool {
+    if !is_x86_feature_detected!("avx") {
+        return false;
+    }
+    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+        unsafe {
+            product_ptrs_f32_avx(
+                s.as_ptr() as *const f32,
+                h.as_ptr() as *const f32,
+                out.as_mut_ptr() as *mut f32,
+                out.len(),
+            );
+        }
+        return true;
+    }
+    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>() {
+        unsafe {
+            product_ptrs_f64_avx(
+                s.as_ptr() as *const f64,
+                h.as_ptr() as *const f64,
+                out.as_mut_ptr() as *mut f64,
+                out.len(),
+            );
+        }
+        return true;
+    }
+    false
+}
+
+pub(crate) fn product_in_place_avx<T: crate::FftNum>(
+    h: &[Complex<T>],
+    buffer: &mut [Complex<T>],
+) -> bool {
+    if !is_x86_feature_detected!("avx") {
+        return false;
+    }
+    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>() {
+        unsafe {
+            let op = buffer.as_mut_ptr() as *mut f32;
+            product_ptrs_f32_avx(op as *const f32, h.as_ptr() as *const f32, op, buffer.len());
+        }
+        return true;
+    }
+    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>() {
+        unsafe {
+            let op = buffer.as_mut_ptr() as *mut f64;
+            product_ptrs_f64_avx(op as *const f64, h.as_ptr() as *const f64, op, buffer.len());
+        }
+        return true;
+    }
+    false
 }

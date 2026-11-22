@@ -922,3 +922,1695 @@ fn bounded_release_probe() {
         }
     }
 }
+
+#[test]
+fn sync_code_map_matches_dyn_code_map_bit_for_bit() {
+    let frequencies = [
+        180.0, 210.0, 250.0, 310.0, 440.0, 620.0, 880.0, 1200.0, 1800.0, 3200.0, 6000.0, 11000.0,
+    ];
+    let left = signal(48_000, 96_000, 4);
+    let right = signal(48_000, 96_000, 2);
+    let cfg = config(Window::Blackman);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    for input in [Input::Mono(&left), Input::Joint { left: &left, right: &right }] {
+        let (true_de4fcb3_out, mod_ref_out, ref_out, sync_out) = pool.install(|| {
+            let t = true_de4fcb3_analyze_input_codes(
+                input,
+                48_000,
+                &frequencies,
+                &cfg,
+                Limits::default(),
+                &|| true,
+                &|_| {},
+                &code,
+            )
+            .unwrap();
+            let o = modified_serial_prep_ref_analyze_input_codes(
+                input,
+                48_000,
+                &frequencies,
+                &cfg,
+                Limits::default(),
+                &|| true,
+                &|_| {},
+                &code,
+            )
+            .unwrap();
+            let a = analyze_input_codes(
+                input,
+                48_000,
+                &frequencies,
+                &cfg,
+                Limits::default(),
+                &|| true,
+                &|_| {},
+                &code,
+            )
+            .unwrap();
+            let b = analyze_input_codes_sync(
+                input,
+                48_000,
+                &frequencies,
+                &cfg,
+                Limits::default(),
+                &|| true,
+                &|_| {},
+                &code,
+            )
+            .unwrap();
+            (t, o, a, b)
+        });
+        assert_eq!(sync_out.codes, true_de4fcb3_out.codes);
+        assert_eq!(sync_out.codes, mod_ref_out.codes);
+        assert_eq!(sync_out.codes, ref_out.codes);
+        assert_eq!(sync_out.frames, true_de4fcb3_out.frames);
+        assert_eq!(sync_out.bars, true_de4fcb3_out.bars);
+        assert_eq!(sync_out.work, ref_out.work);
+        assert_work_counts_eq(&mod_ref_out.work, &true_de4fcb3_out.work);
+        assert_work_counts_eq(&sync_out.work, &true_de4fcb3_out.work);
+    }
+}
+
+fn assert_work_counts_eq(a: &WorkStats, b: &WorkStats) {
+    assert_eq!(a.column_convolutions, b.column_convolutions);
+    assert_eq!(a.kernel_ffts, b.kernel_ffts);
+    assert!(a.input_ffts <= b.input_ffts, "new input_ffts {} > old {}", a.input_ffts, b.input_ffts);
+    assert_eq!(a.inverse_ffts, b.inverse_ffts);
+    assert_eq!(a.inverses_pruned, b.inverses_pruned);
+    assert_eq!(a.inverses_full, b.inverses_full);
+    assert_eq!(a.pruned_output_values, b.pruned_output_values);
+    assert_eq!(a.pruning_workspace_fallbacks, b.pruning_workspace_fallbacks);
+    assert_eq!(a.parallel_groups, b.parallel_groups);
+    assert_eq!(a.max_inverse_workers, b.max_inverse_workers);
+    assert_eq!(a.parallel_allocation_fallbacks, b.parallel_allocation_fallbacks);
+    assert!(a.batches <= b.batches, "new batches {} > old {}", a.batches, b.batches);
+    assert_eq!(a.output_bytes, b.output_bytes);
+    assert!(a.peak_workspace_bytes <= Limits::default().workspace_bytes);
+    assert!(b.peak_workspace_bytes <= Limits::default().workspace_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// 1. True unmodified `de4fcb3` implementation (`true_de4fcb3_parallel` +
+//    `true_de4fcb3_analyze_input_codes`, including parallel `prepare_kernels`,
+//    original `Plan`, `Slot`, `Workspace`, `old_de4fcb3_kernel`, and
+//    `old_de4fcb3_fill_input`).
+// 2. Modified Round-1 reference route (`modified_serial_prep_ref_analyze_input_codes`,
+//    retained for historical traceability only; uses serial kernel prep).
+// ---------------------------------------------------------------------------
+fn old_de4fcb3_kernel(
+    bin: Bin,
+    n: usize,
+    sr: u32,
+    window: Window,
+    should_continue: &dyn Fn() -> bool,
+) -> Result<Vec<Complex<f64>>, Error> {
+    let mut spectrum = zeroed::<Complex<f64>>(n)?;
+    let mut sum = 0.0;
+    for i in 0..=2 * bin.half {
+        if i % 4096 == 0 {
+            poll(should_continue)?;
+        }
+        let j = i as f64 - bin.half as f64;
+        let w = window.at(PI * j / bin.half as f64);
+        sum += w;
+        let at = (n + bin.half - i) % n;
+        spectrum[at].re = w;
+    }
+    let gain = 2.0 / sum;
+    for i in 0..=2 * bin.half {
+        if i % 4096 == 0 {
+            poll(should_continue)?;
+        }
+        let j = i as f64 - bin.half as f64;
+        let at = (n + bin.half - i) % n;
+        let amplitude = gain * spectrum[at].re;
+        let angle = -TAU * bin.frequency * j / f64::from(sr);
+        spectrum[at] = Complex::new(amplitude * angle.cos(), amplitude * angle.sin());
+    }
+    Ok(spectrum)
+}
+
+fn old_de4fcb3_fill_input(
+    target: &mut [Complex<f64>],
+    source: &[f32],
+    start: usize,
+    half: usize,
+    should_continue: &dyn Fn() -> bool,
+) -> Result<(), Error> {
+    for (i, value) in target.iter_mut().enumerate() {
+        if i % 4096 == 0 {
+            poll(should_continue)?;
+        }
+        let source_at = if i >= half {
+            start.checked_add(i - half)
+        } else {
+            start.checked_sub(half - i)
+        };
+        let sample = source_at
+            .and_then(|at| source.get(at))
+            .copied()
+            .unwrap_or(0.0);
+        if !sample.is_finite() {
+            return Err(Error::Invalid("CQT input contains a non-finite sample"));
+        }
+        *value = Complex::new(f64::from(sample), 0.0);
+    }
+    Ok(())
+}
+
+mod true_de4fcb3_parallel {
+    use super::{
+        Bin, Error, Limits, Requested, Window, checked_product, frame_center, old_de4fcb3_kernel,
+        phases, poll, zeroed,
+    };
+    use rayon::prelude::*;
+    use rustfft::{Fft, num_complex::Complex};
+    use std::mem::size_of;
+
+    type C64 = Complex<f64>;
+    const MIN_PARALLEL_N: usize = 512;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Plan {
+        pub slots: usize,
+        pub batch_size: usize,
+        pub workspace_bytes: usize,
+        n: usize,
+        channels: usize,
+        scratch_len: usize,
+        coefficient_cap: usize,
+        requested_cap: Option<usize>,
+        frames: usize,
+        half: usize,
+        sample_rate: u32,
+        frame_rate: f32,
+    }
+
+    impl Plan {
+        #[allow(clippy::too_many_arguments)]
+        pub fn for_group(
+            n: usize,
+            channels: usize,
+            bins: usize,
+            frames: usize,
+            half: usize,
+            sample_rate: u32,
+            frame_rate: f32,
+            scratch_len: usize,
+            inverse: &dyn Fft<f64>,
+            limits: Limits,
+            allow_pruning: bool,
+        ) -> Option<Self> {
+            rayon::current_thread_index()?;
+            Self::with_workers(
+                n,
+                channels,
+                bins,
+                frames,
+                half,
+                sample_rate,
+                frame_rate,
+                scratch_len,
+                inverse,
+                limits,
+                allow_pruning,
+                rayon::current_num_threads(),
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn with_workers(
+            n: usize,
+            channels: usize,
+            bins: usize,
+            frames: usize,
+            half: usize,
+            sample_rate: u32,
+            frame_rate: f32,
+            scratch_len: usize,
+            inverse: &dyn Fft<f64>,
+            limits: Limits,
+            allow_pruning: bool,
+            workers: usize,
+        ) -> Option<Self> {
+            if n < MIN_PARALLEL_N
+                || inverse.len() != n
+                || !(1..=2).contains(&channels)
+                || bins < 2
+                || frames == 0
+                || workers < 2
+                || sample_rate == 0
+                || !frame_rate.is_finite()
+                || frame_rate <= 0.0
+                || scratch_len < inverse.get_inplace_scratch_len()
+            {
+                return None;
+            }
+            let payload = n.checked_sub(half.checked_mul(2)?)?;
+            if payload == 0 {
+                return None;
+            }
+            let cap = ((payload as f64 * f64::from(frame_rate) / f64::from(sample_rate)).ceil()
+                as usize)
+                .saturating_add(1)
+                .min(frames);
+            let dense = n.checked_mul(size_of::<C64>())?;
+            let sources = channels.checked_mul(dense)?;
+            let product_and_scratch = channels
+                .checked_mul(dense)?
+                .checked_add(scratch_len.checked_mul(size_of::<C64>())?)?;
+            let slab_per_bin = channels.checked_mul(cap)?.checked_mul(size_of::<C64>())?;
+            let per_bin = dense.checked_add(slab_per_bin)?;
+            let sparse_cap = cap.min(n / 4);
+            for requested_cap in [
+                (allow_pruning && inverse.prunes()).then_some(sparse_cap),
+                None,
+            ] {
+                let requested = match requested_cap {
+                    Some(c) => Requested::bytes(inverse, c, channels).ok()?,
+                    None => 0,
+                };
+                let slot_bytes = product_and_scratch.checked_add(requested)?;
+                for slots in (2..=workers.min(bins)).rev() {
+                    let fixed = sources.checked_add(slots.checked_mul(slot_bytes)?)?;
+                    let Some(available) = limits.workspace_bytes.checked_sub(fixed) else {
+                        continue;
+                    };
+                    let batch_size = (available / per_bin).min(bins);
+                    if batch_size < slots {
+                        continue;
+                    }
+                    return Some(Self {
+                        slots,
+                        batch_size,
+                        workspace_bytes: fixed.checked_add(batch_size.checked_mul(per_bin)?)?,
+                        n,
+                        channels,
+                        scratch_len,
+                        coefficient_cap: cap,
+                        requested_cap,
+                        frames,
+                        half,
+                        sample_rate,
+                        frame_rate,
+                    });
+                }
+            }
+            None
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Block {
+        pub first: usize,
+        pub end: usize,
+        pub sample_rate: u32,
+        pub frame_rate: f32,
+        pub half: usize,
+        pub start: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) struct Stats {
+        pub inverse_ffts: u64,
+        pub inverses_pruned: u64,
+        pub inverses_full: u64,
+        pub pruned_output_values: u64,
+        pub worker_wall_ns: u128,
+        pub worker_tasks: u64,
+    }
+
+    impl Stats {
+        fn add(self, rhs: Self) -> Self {
+            Self {
+                inverse_ffts: self.inverse_ffts + rhs.inverse_ffts,
+                inverses_pruned: self.inverses_pruned + rhs.inverses_pruned,
+                inverses_full: self.inverses_full + rhs.inverses_full,
+                pruned_output_values: self.pruned_output_values + rhs.pruned_output_values,
+                worker_wall_ns: self.worker_wall_ns + rhs.worker_wall_ns,
+                worker_tasks: self.worker_tasks + rhs.worker_tasks,
+            }
+        }
+    }
+
+    struct Slot {
+        product_left: Vec<C64>,
+        product_right: Vec<C64>,
+        scratch: Vec<C64>,
+        requested: Option<Requested>,
+        stats: Stats,
+    }
+
+    impl Slot {
+        fn new(plan: Plan, inverse: &dyn Fft<f64>) -> Result<Self, Error> {
+            Ok(Self {
+                product_left: zeroed(plan.n)?,
+                product_right: zeroed(if plan.channels == 2 { plan.n } else { 0 })?,
+                scratch: zeroed(plan.scratch_len)?,
+                requested: plan
+                    .requested_cap
+                    .map(|c| Requested::new(inverse, c, plan.channels))
+                    .transpose()?,
+                stats: Stats::default(),
+            })
+        }
+
+        fn prepare_kernels(
+            &mut self,
+            bins: &[Bin],
+            destination: &mut [Vec<C64>],
+            forward: &dyn Fft<f64>,
+            plan: Plan,
+            window: Window,
+            should_continue: &(dyn Fn() -> bool + Sync),
+        ) -> Result<u64, Error> {
+            let mut entered = 0;
+            for (&bin, out) in bins.iter().zip(destination.iter_mut()) {
+                poll(should_continue)?;
+                let mut values =
+                    old_de4fcb3_kernel(bin, plan.n, plan.sample_rate, window, should_continue)?;
+                poll(should_continue)?;
+                entered += 1;
+                forward.process_with_scratch(&mut values, &mut self.scratch);
+                *out = values;
+                poll(should_continue)?;
+            }
+            Ok(entered)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn run(
+            &mut self,
+            kernels: &[Vec<C64>],
+            destination: &mut [C64],
+            source_left: &[C64],
+            source_right: &[C64],
+            inverse: &dyn Fft<f64>,
+            plan: Plan,
+            block: Block,
+            should_continue: &(dyn Fn() -> bool + Sync),
+            phase_timing: bool,
+        ) -> Result<(), Error> {
+            let phase = phases::clock(phase_timing);
+            let count = block.end - block.first;
+            let prune = self.requested.as_mut().is_some_and(|r| {
+                r.prepare(
+                    block.first,
+                    block.end,
+                    block.sample_rate,
+                    block.frame_rate,
+                    block.half,
+                    block.start,
+                )
+            });
+            let bin_stride = plan.channels * plan.coefficient_cap;
+            for (kernel, out) in kernels.iter().zip(destination.chunks_exact_mut(bin_stride)) {
+                poll(should_continue)?;
+                if prune {
+                    let r = self.requested.as_mut().expect("prepared above");
+                    self.stats.inverse_ffts += 1;
+                    self.stats.inverses_pruned += 1;
+                    self.stats.pruned_output_values += count as u64;
+                    r.outputs(
+                        inverse,
+                        source_left,
+                        kernel,
+                        &mut self.product_left,
+                        &mut self.scratch,
+                        count,
+                        false,
+                    );
+                    if plan.channels == 2 {
+                        poll(should_continue)?;
+                        self.stats.inverse_ffts += 1;
+                        self.stats.inverses_pruned += 1;
+                        self.stats.pruned_output_values += count as u64;
+                        r.outputs(
+                            inverse,
+                            source_right,
+                            kernel,
+                            &mut self.product_right,
+                            &mut self.scratch,
+                            count,
+                            true,
+                        );
+                    }
+                    out[..count].copy_from_slice(&r.left[..count]);
+                    if plan.channels == 2 {
+                        out[plan.coefficient_cap..plan.coefficient_cap + count]
+                            .copy_from_slice(&r.right[..count]);
+                    }
+                } else {
+                    for i in 0..plan.n {
+                        if i % 4096 == 0 {
+                            poll(should_continue)?;
+                        }
+                        self.product_left[i] = source_left[i] * kernel[i];
+                        if plan.channels == 2 {
+                            self.product_right[i] = source_right[i] * kernel[i];
+                        }
+                    }
+                    self.stats.inverse_ffts += 1;
+                    self.stats.inverses_full += 1;
+                    inverse.process_with_scratch(&mut self.product_left, &mut self.scratch);
+                    if plan.channels == 2 {
+                        poll(should_continue)?;
+                        self.stats.inverse_ffts += 1;
+                        self.stats.inverses_full += 1;
+                        inverse.process_with_scratch(&mut self.product_right, &mut self.scratch);
+                    }
+                    for (offset, frame) in (block.first..block.end).enumerate() {
+                        let at = block.half
+                            + frame_center(frame, block.sample_rate, block.frame_rate)
+                            - block.start;
+                        out[offset] = self.product_left[at];
+                        if plan.channels == 2 {
+                            out[plan.coefficient_cap + offset] = self.product_right[at];
+                        }
+                    }
+                }
+            }
+            if phase_timing {
+                self.stats.worker_wall_ns += phases::elapsed(phase);
+                self.stats.worker_tasks += 1;
+            }
+            Ok(())
+        }
+    }
+
+    pub(super) struct Workspace {
+        plan: Plan,
+        source_left: Vec<C64>,
+        source_right: Vec<C64>,
+        slots: Vec<Slot>,
+        coefficients: Vec<C64>,
+        active_bins: usize,
+        active_count: usize,
+        phase_timing: bool,
+    }
+
+    impl Workspace {
+        pub fn new(plan: Plan, inverse: &dyn Fft<f64>) -> Result<Self, Error> {
+            let mut slots = Vec::new();
+            slots
+                .try_reserve_exact(plan.slots)
+                .map_err(|_| Error::Allocation)?;
+            for _ in 0..plan.slots {
+                slots.push(Slot::new(plan, inverse)?);
+            }
+            Ok(Self {
+                plan,
+                source_left: zeroed(plan.n)?,
+                source_right: zeroed(if plan.channels == 2 { plan.n } else { 0 })?,
+                slots,
+                coefficients: zeroed(checked_product(
+                    checked_product(plan.batch_size, plan.channels)?,
+                    plan.coefficient_cap,
+                )?)?,
+                active_bins: 0,
+                active_count: 0,
+                phase_timing: false,
+            })
+        }
+
+        pub fn set_phase_timing(&mut self, enabled: bool) {
+            self.phase_timing = enabled;
+        }
+
+        pub fn source_buffers(&mut self) -> (&mut [C64], &mut [C64], &mut [C64]) {
+            (
+                &mut self.source_left,
+                &mut self.source_right,
+                &mut self.slots[0].scratch,
+            )
+        }
+
+        pub fn prepare_kernels(
+            &mut self,
+            bins: &[Bin],
+            forward: &dyn Fft<f64>,
+            window: Window,
+            should_continue: &(dyn Fn() -> bool + Sync),
+        ) -> Result<(Vec<Vec<C64>>, u64), Error> {
+            self.active_bins = 0;
+            self.active_count = 0;
+            poll(should_continue)?;
+            if bins.is_empty()
+                || bins.len() > self.plan.batch_size
+                || forward.len() != self.plan.n
+                || forward.fft_direction() != rustfft::FftDirection::Forward
+                || self.slots.len() != self.plan.slots
+                || self
+                    .slots
+                    .iter()
+                    .any(|slot| slot.scratch.len() < forward.get_inplace_scratch_len())
+                || bins.iter().any(|bin| {
+                    bin.half > self.plan.half
+                        || !bin.frequency.is_finite()
+                        || bin.frequency <= 0.0
+                        || bin.frequency >= f64::from(self.plan.sample_rate) * 0.5
+                })
+            {
+                return Err(Error::Invalid(
+                    "CQT kernel preparation does not match its admitted workspace",
+                ));
+            }
+            let mut kernels = Vec::new();
+            kernels
+                .try_reserve_exact(bins.len())
+                .map_err(|_| Error::Allocation)?;
+            kernels.resize_with(bins.len(), Vec::new);
+            let chunk = bins.len().div_ceil(self.plan.slots);
+            let plan = self.plan;
+            let entered = if rayon::current_thread_index().is_some() && self.plan.slots > 1 {
+                self.slots
+                    .par_iter_mut()
+                    .zip(bins.par_chunks(chunk))
+                    .zip(kernels.par_chunks_mut(chunk))
+                    .map(|((slot, bins), destination)| {
+                        slot.prepare_kernels(
+                            bins,
+                            destination,
+                            forward,
+                            plan,
+                            window,
+                            should_continue,
+                        )
+                    })
+                    .try_reduce(|| 0, |left, right| Ok(left + right))?
+            } else {
+                let mut entered = 0;
+                for ((slot, bins), destination) in self
+                    .slots
+                    .iter_mut()
+                    .zip(bins.chunks(chunk))
+                    .zip(kernels.chunks_mut(chunk))
+                {
+                    entered += slot.prepare_kernels(
+                        bins,
+                        destination,
+                        forward,
+                        plan,
+                        window,
+                        should_continue,
+                    )?;
+                }
+                entered
+            };
+            poll(should_continue)?;
+            Ok((kernels, entered))
+        }
+
+        pub fn process_block(
+            &mut self,
+            kernels: &[Vec<C64>],
+            inverse: &dyn Fft<f64>,
+            block: Block,
+            should_continue: &(dyn Fn() -> bool + Sync),
+        ) -> Result<Stats, Error> {
+            self.active_bins = 0;
+            self.active_count = 0;
+            poll(should_continue)?;
+            let count = block
+                .end
+                .checked_sub(block.first)
+                .ok_or(Error::Invalid("CQT block runs backwards"))?;
+            if count == 0
+                || block.end > self.plan.frames
+                || count > self.plan.coefficient_cap
+                || kernels.is_empty()
+                || kernels.len() > self.plan.batch_size
+                || kernels.iter().any(|h| h.len() != self.plan.n)
+                || inverse.len() != self.plan.n
+                || block.half != self.plan.half
+                || block.sample_rate != self.plan.sample_rate
+                || block.frame_rate.to_bits() != self.plan.frame_rate.to_bits()
+                || block.start != frame_center(block.first, block.sample_rate, block.frame_rate)
+            {
+                return Err(Error::Invalid("CQT parallel block does not match its plan"));
+            }
+            let last = block
+                .half
+                .checked_add(
+                    frame_center(block.end - 1, block.sample_rate, block.frame_rate)
+                        .checked_sub(block.start)
+                        .ok_or(Error::Invalid("CQT block center precedes its input"))?,
+                )
+                .ok_or(Error::Resource("CQT block center overflows"))?;
+            if last >= self.plan.n {
+                return Err(Error::Invalid(
+                    "CQT requested sample is outside its transform",
+                ));
+            }
+            for slot in &mut self.slots {
+                slot.stats = Stats::default();
+            }
+            let bin_stride = self.plan.channels * self.plan.coefficient_cap;
+            let chunk_bins = kernels.len().div_ceil(self.plan.slots);
+            let chunk_stride = chunk_bins * bin_stride;
+            let slab = &mut self.coefficients[..kernels.len() * bin_stride];
+            let plan = self.plan;
+            let left = &self.source_left;
+            let right = &self.source_right;
+            let phase_timing = self.phase_timing;
+            if rayon::current_thread_index().is_some() && self.plan.slots > 1 {
+                self.slots
+                    .par_iter_mut()
+                    .zip(slab.par_chunks_mut(chunk_stride))
+                    .enumerate()
+                    .try_for_each(|(index, (slot, out))| {
+                        let begin = index * chunk_bins;
+                        let end = (begin + chunk_bins).min(kernels.len());
+                        slot.run(
+                            &kernels[begin..end],
+                            out,
+                            left,
+                            right,
+                            inverse,
+                            plan,
+                            block,
+                            should_continue,
+                            phase_timing,
+                        )
+                    })?;
+            } else {
+                for (index, (slot, out)) in self
+                    .slots
+                    .iter_mut()
+                    .zip(slab.chunks_mut(chunk_stride))
+                    .enumerate()
+                {
+                    let begin = index * chunk_bins;
+                    let end = (begin + chunk_bins).min(kernels.len());
+                    slot.run(
+                        &kernels[begin..end],
+                        out,
+                        left,
+                        right,
+                        inverse,
+                        plan,
+                        block,
+                        should_continue,
+                        phase_timing,
+                    )?;
+                }
+            }
+            poll(should_continue)?;
+            self.active_bins = kernels.len();
+            self.active_count = count;
+            Ok(self
+                .slots
+                .iter()
+                .fold(Stats::default(), |s, slot| s.add(slot.stats)))
+        }
+
+        pub fn coefficients(&self, bin: usize, channel: usize, count: usize) -> &[C64] {
+            assert!(
+                bin < self.active_bins
+                    && channel < self.plan.channels
+                    && count <= self.active_count
+            );
+            let at = (bin * self.plan.channels + channel) * self.plan.coefficient_cap;
+            &self.coefficients[at..at + count]
+        }
+    }
+}
+
+/// Verbatim unmodified `de4fcb3` `analyze_input_codes` (using `true_de4fcb3_parallel`
+/// with parallel `workspace.prepare_kernels`).
+#[allow(clippy::too_many_arguments)]
+fn true_de4fcb3_analyze_input_codes(
+    input: Input<'_>,
+    sample_rate: u32,
+    frequencies: &[f64],
+    config: &Config,
+    limits: Limits,
+    should_continue: &(dyn Fn() -> bool + Sync),
+    on_progress: &dyn Fn(f32),
+    map: &dyn Fn(f32) -> u16,
+) -> Result<Output, Error> {
+    let phase_timing = false;
+    let mut profile = phases::Profile::new(phase_timing);
+    let phase = profile.clock();
+    poll(should_continue)?;
+    let groups = layout(frequencies, sample_rate, config, limits)?;
+    let (left, right) = match input {
+        Input::Mono(signal) => (signal, None),
+        Input::Joint { left, right } => {
+            if left.len() != right.len() {
+                return Err(Error::Invalid(
+                    "CQT stereo channels must have the same length",
+                ));
+            }
+            (left, Some(right))
+        }
+    };
+    let frames = frame_count(left.len(), sample_rate, config.frame_rate)?;
+    if frames == 0 {
+        return Err(Error::Invalid("CQT input is empty"));
+    }
+    let bars = frequencies.len();
+    let cells = checked_product(frames, bars)?;
+    let channels = if right.is_some() { 2 } else { 1 };
+    let planes = if right.is_some() { 3 } else { 1 };
+    let output_bytes = checked_product(checked_product(cells, planes)?, size_of::<u16>())?;
+    if output_bytes > limits.output_bytes {
+        return Err(Error::Resource("returned code planes exceed output_bytes"));
+    }
+    for &n in groups.keys() {
+        let dense_bytes = checked_product(n, size_of::<Complex<f64>>())?;
+        let minimum = checked_product(dense_bytes, channels * 2 + 1)?;
+        if minimum > limits.workspace_bytes {
+            return Err(Error::Resource(
+                "one full kernel and source/product buffers exceed workspace_bytes",
+            ));
+        }
+    }
+    let mut codes = [zeroed(cells)?, Vec::new(), Vec::new()];
+    if right.is_some() {
+        codes[1] = zeroed(cells)?;
+        codes[2] = zeroed(cells)?;
+    }
+    let mut work = WorkStats {
+        output_bytes,
+        ..WorkStats::default()
+    };
+    profile.record(phases::Region::Setup, phase);
+    let mut completed = 0usize;
+    on_progress(0.0);
+    for (n, bins) in groups {
+        let group_phase = profile.begin_group(n, bins.len(), work);
+        poll(should_continue)?;
+        let dense_bytes = checked_product(n, size_of::<Complex<f64>>())?;
+        let base_vectors = channels * 2;
+        let minimum = checked_product(dense_bytes, base_vectors + 1)?;
+        if minimum > limits.workspace_bytes {
+            return Err(Error::Resource(
+                "one full kernel and source/product buffers exceed workspace_bytes",
+            ));
+        }
+        let phase = profile.clock();
+        let mut planner = FftPlanner::<f64>::new();
+        let forward = planner.plan_fft_forward(n);
+        let inverse = planner.plan_fft_inverse(n);
+        let scratch_len = forward
+            .get_inplace_scratch_len()
+            .max(inverse.get_inplace_scratch_len());
+        let base_bytes = checked_product(dense_bytes, base_vectors)?
+            .checked_add(checked_product(scratch_len, size_of::<Complex<f64>>())?)
+            .ok_or(Error::Resource("workspace size overflows"))?;
+        let half = bins
+            .iter()
+            .map(|bin| bin.half)
+            .max()
+            .expect("a nonempty group");
+        let payload = n - 2 * half;
+        profile.record(phases::Region::Planning, phase);
+        let allow_pruning = true;
+        let phase = profile.clock();
+        let parallel_plan = if allow_pruning {
+            true_de4fcb3_parallel::Plan::for_group(
+                n,
+                channels,
+                bins.len(),
+                frames,
+                half,
+                sample_rate,
+                config.frame_rate,
+                scratch_len,
+                &*inverse,
+                limits,
+                true,
+            )
+        } else {
+            None
+        };
+        profile.record(phases::Region::Planning, phase);
+        if let Some(plan) = parallel_plan {
+            let phase = profile.clock();
+            let workspace = true_de4fcb3_parallel::Workspace::new(plan, &*inverse);
+            profile.record(phases::Region::Allocation, phase);
+            match workspace {
+                Ok(mut workspace) => {
+                    workspace.set_phase_timing(phase_timing);
+                    work.parallel_groups += 1;
+                    work.max_inverse_workers = work.max_inverse_workers.max(plan.slots);
+                    work.peak_workspace_bytes =
+                        work.peak_workspace_bytes.max(plan.workspace_bytes);
+                    for batch in bins.chunks(plan.batch_size) {
+                        poll(should_continue)?;
+                        work.batches += 1;
+                        let phase = profile.clock();
+                        let (kernels, entered) = workspace.prepare_kernels(
+                            batch,
+                            &*forward,
+                            config.window,
+                            should_continue,
+                        )?;
+                        work.kernel_ffts += entered;
+                        profile.record(phases::Region::Kernel, phase);
+                        let mut first = 0;
+                        while first < frames {
+                            poll(should_continue)?;
+                            let start = frame_center(first, sample_rate, config.frame_rate);
+                            let mut end = first + 1;
+                            while end < frames
+                                && frame_center(end, sample_rate, config.frame_rate) - start
+                                    < payload
+                            {
+                                end += 1;
+                            }
+                            let phase = profile.clock();
+                            {
+                                let (source_left, source_right, scratch) =
+                                    workspace.source_buffers();
+                                old_de4fcb3_fill_input(
+                                    source_left,
+                                    left,
+                                    start,
+                                    half,
+                                    should_continue,
+                                )?;
+                                work.input_ffts += 1;
+                                forward.process_with_scratch(source_left, scratch);
+                                if let Some(right) = right {
+                                    old_de4fcb3_fill_input(
+                                        source_right,
+                                        right,
+                                        start,
+                                        half,
+                                        should_continue,
+                                    )?;
+                                    work.input_ffts += 1;
+                                    forward.process_with_scratch(source_right, scratch);
+                                }
+                            }
+                            profile.record(phases::Region::Source, phase);
+                            let phase = profile.clock();
+                            let stats = workspace.process_block(
+                                &kernels,
+                                &*inverse,
+                                true_de4fcb3_parallel::Block {
+                                    first,
+                                    end,
+                                    sample_rate,
+                                    frame_rate: config.frame_rate,
+                                    half,
+                                    start,
+                                },
+                                should_continue,
+                            )?;
+                            profile.record(phases::Region::ParallelInverse, phase);
+                            profile.workers(stats.worker_wall_ns, stats.worker_tasks);
+                            work.inverse_ffts += stats.inverse_ffts;
+                            work.inverses_pruned += stats.inverses_pruned;
+                            work.inverses_full += stats.inverses_full;
+                            work.pruned_output_values += stats.pruned_output_values;
+                            let phase = profile.clock();
+                            let norm = 1.0 / n as f64;
+                            for (local, bin) in batch.iter().enumerate() {
+                                poll(should_continue)?;
+                                if first == 0 {
+                                    work.column_convolutions += channels as u64;
+                                }
+                                let ls = workspace.coefficients(local, 0, end - first);
+                                let rs =
+                                    right.map(|_| workspace.coefficients(local, 1, end - first));
+                                for frame in first..end {
+                                    let l = ls[frame - first] * norm;
+                                    let r = rs.map(|values| values[frame - first] * norm);
+                                    let cell = frame * bars + bin.index;
+                                    if let Some(r) = r {
+                                        codes[0][cell] = map(((l + r) * 0.5).norm() as f32);
+                                        codes[1][cell] = map(l.norm() as f32);
+                                        codes[2][cell] = map(r.norm() as f32);
+                                    } else {
+                                        codes[0][cell] = map(l.norm() as f32);
+                                    }
+                                }
+                                completed += end - first;
+                                on_progress(completed as f32 / cells as f32);
+                            }
+                            profile.record(phases::Region::ParallelFold, phase);
+                            first = end;
+                        }
+                    }
+                    profile.finish_group(
+                        group_phase,
+                        plan.slots,
+                        plan.batch_size,
+                        plan.workspace_bytes,
+                        work,
+                    );
+                    continue;
+                }
+                Err(Error::Allocation) => {
+                    work.parallel_allocation_fallbacks += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let mut requested = None;
+        let mut requested_bytes = 0;
+        if allow_pruning && inverse.prunes() {
+            let cap = requested_cap(payload, n, frames, sample_rate, config.frame_rate);
+            let bytes = Requested::bytes(&*inverse, cap, channels)?;
+            let admitted = base_bytes
+                .checked_add(dense_bytes)
+                .and_then(|minimum| minimum.checked_add(bytes))
+                .is_some_and(|minimum| minimum <= limits.workspace_bytes);
+            if admitted {
+                if let Ok(buffers) = Requested::new(&*inverse, cap, channels) {
+                    requested = Some(buffers);
+                    requested_bytes = bytes;
+                } else {
+                    work.pruning_workspace_fallbacks += 1;
+                }
+            } else {
+                work.pruning_workspace_fallbacks += 1;
+            }
+        }
+        let base_bytes = base_bytes
+            .checked_add(requested_bytes)
+            .ok_or(Error::Resource("requested-output workspace overflows"))?;
+        let available = limits
+            .workspace_bytes
+            .checked_sub(base_bytes)
+            .ok_or(Error::Resource("FFT scratch exceeds workspace_bytes"))?;
+        let batch_size = (available / dense_bytes).min(bins.len());
+        if batch_size == 0 {
+            return Err(Error::Resource(
+                "FFT scratch leaves no room for a full kernel",
+            ));
+        }
+        let mut source_left = zeroed::<Complex<f64>>(n)?;
+        let mut source_right = zeroed::<Complex<f64>>(if right.is_some() { n } else { 0 })?;
+        let mut product_left = zeroed::<Complex<f64>>(n)?;
+        let mut product_right = zeroed::<Complex<f64>>(if right.is_some() { n } else { 0 })?;
+        let mut scratch = zeroed::<Complex<f64>>(scratch_len)?;
+        for batch in bins.chunks(batch_size) {
+            poll(should_continue)?;
+            work.batches += 1;
+            work.peak_workspace_bytes = work
+                .peak_workspace_bytes
+                .max(base_bytes + batch.len() * dense_bytes);
+            let mut kernels = Vec::new();
+            kernels
+                .try_reserve_exact(batch.len())
+                .map_err(|_| Error::Allocation)?;
+            for &bin in batch {
+                let mut spectrum =
+                    old_de4fcb3_kernel(bin, n, sample_rate, config.window, should_continue)?;
+                poll(should_continue)?;
+                work.kernel_ffts += 1;
+                forward.process_with_scratch(&mut spectrum, &mut scratch);
+                kernels.push(spectrum);
+            }
+            let mut first = 0;
+            while first < frames {
+                poll(should_continue)?;
+                let start = frame_center(first, sample_rate, config.frame_rate);
+                let mut end = first + 1;
+                while end < frames
+                    && frame_center(end, sample_rate, config.frame_rate) - start < payload
+                {
+                    end += 1;
+                }
+                let prune = requested.as_mut().is_some_and(|buffers| {
+                    buffers.prepare(first, end, sample_rate, config.frame_rate, half, start)
+                });
+                old_de4fcb3_fill_input(&mut source_left, left, start, half, should_continue)?;
+                work.input_ffts += 1;
+                forward.process_with_scratch(&mut source_left, &mut scratch);
+                if let Some(right) = right {
+                    old_de4fcb3_fill_input(
+                        &mut source_right,
+                        right,
+                        start,
+                        half,
+                        should_continue,
+                    )?;
+                    work.input_ffts += 1;
+                    forward.process_with_scratch(&mut source_right, &mut scratch);
+                }
+                for (&bin, spectrum) in batch.iter().zip(&kernels) {
+                    poll(should_continue)?;
+                    if first == 0 {
+                        work.column_convolutions += channels as u64;
+                    }
+                    if prune {
+                        let buffers = requested.as_mut().expect("a prepared request");
+                        work.inverse_ffts += 1;
+                        work.inverses_pruned += 1;
+                        work.pruned_output_values += (end - first) as u64;
+                        buffers.outputs(
+                            &*inverse,
+                            &source_left,
+                            spectrum,
+                            &mut product_left,
+                            &mut scratch,
+                            end - first,
+                            false,
+                        );
+                        if right.is_some() {
+                            poll(should_continue)?;
+                            work.inverse_ffts += 1;
+                            work.inverses_pruned += 1;
+                            work.pruned_output_values += (end - first) as u64;
+                            buffers.outputs(
+                                &*inverse,
+                                &source_right,
+                                spectrum,
+                                &mut product_right,
+                                &mut scratch,
+                                end - first,
+                                true,
+                            );
+                        }
+                    } else {
+                        for i in 0..n {
+                            if i % 4096 == 0 {
+                                poll(should_continue)?;
+                            }
+                            product_left[i] = source_left[i] * spectrum[i];
+                            if right.is_some() {
+                                product_right[i] = source_right[i] * spectrum[i];
+                            }
+                        }
+                        work.inverse_ffts += 1;
+                        work.inverses_full += 1;
+                        inverse.process_with_scratch(&mut product_left, &mut scratch);
+                        if right.is_some() {
+                            poll(should_continue)?;
+                            work.inverse_ffts += 1;
+                            work.inverses_full += 1;
+                            inverse.process_with_scratch(&mut product_right, &mut scratch);
+                        }
+                    }
+                    let norm = 1.0 / n as f64;
+                    for frame in first..end {
+                        let at = half + frame_center(frame, sample_rate, config.frame_rate) - start;
+                        let l = (if prune {
+                            requested.as_ref().expect("a prepared request").left[frame - first]
+                        } else {
+                            product_left[at]
+                        }) * norm;
+                        let r = right.map(|_| {
+                            (if prune {
+                                requested.as_ref().expect("a prepared request").right[frame - first]
+                            } else {
+                                product_right[at]
+                            }) * norm
+                        });
+                        let cell = frame * bars + bin.index;
+                        if let Some(r) = r {
+                            codes[0][cell] = map(((l + r) * 0.5).norm() as f32);
+                            codes[1][cell] = map(l.norm() as f32);
+                            codes[2][cell] = map(r.norm() as f32);
+                        } else {
+                            codes[0][cell] = map(l.norm() as f32);
+                        }
+                    }
+                    completed += end - first;
+                    on_progress(completed as f32 / cells as f32);
+                }
+                first = end;
+            }
+        }
+    }
+    poll(should_continue)?;
+    work.phases = profile.finish();
+    Ok(Output {
+        codes,
+        frames,
+        bars,
+        work,
+    })
+}
+
+/// Round-1 modified reference route (uses serial kernel preparation and new
+/// `parallel::Workspace`; retained for historical record per Codex Round 2 #2).
+#[allow(clippy::too_many_arguments)]
+fn modified_serial_prep_ref_analyze_input_codes(
+    input: Input<'_>,
+    sample_rate: u32,
+    frequencies: &[f64],
+    config: &Config,
+    limits: Limits,
+    should_continue: &(dyn Fn() -> bool + Sync),
+    on_progress: &dyn Fn(f32),
+    map: &dyn Fn(f32) -> u16,
+) -> Result<Output, Error> {
+    let phase_timing = false;
+    let mut profile = phases::Profile::new(phase_timing);
+    let phase = profile.clock();
+    poll(should_continue)?;
+    let groups = layout(frequencies, sample_rate, config, limits)?;
+    let (left, right) = match input {
+        Input::Mono(signal) => (signal, None),
+        Input::Joint { left, right } => {
+            if left.len() != right.len() {
+                return Err(Error::Invalid(
+                    "CQT stereo channels must have the same length",
+                ));
+            }
+            (left, Some(right))
+        }
+    };
+    let frames = frame_count(left.len(), sample_rate, config.frame_rate)?;
+    if frames == 0 {
+        return Err(Error::Invalid("CQT input is empty"));
+    }
+    let bars = frequencies.len();
+    let cells = checked_product(frames, bars)?;
+    let channels = if right.is_some() { 2 } else { 1 };
+    let planes = if right.is_some() { 3 } else { 1 };
+    let output_bytes = checked_product(checked_product(cells, planes)?, size_of::<u16>())?;
+    if output_bytes > limits.output_bytes {
+        return Err(Error::Resource("returned code planes exceed output_bytes"));
+    }
+    for &n in groups.keys() {
+        let dense_bytes = checked_product(n, size_of::<Complex<f64>>())?;
+        let minimum = checked_product(dense_bytes, channels * 2 + 1)?;
+        if minimum > limits.workspace_bytes {
+            return Err(Error::Resource(
+                "one full kernel and source/product buffers exceed workspace_bytes",
+            ));
+        }
+    }
+    let mut codes = [zeroed(cells)?, Vec::new(), Vec::new()];
+    if right.is_some() {
+        codes[1] = zeroed(cells)?;
+        codes[2] = zeroed(cells)?;
+    }
+    let mut work = WorkStats {
+        output_bytes,
+        ..WorkStats::default()
+    };
+    profile.record(phases::Region::Setup, phase);
+    let mut completed = 0usize;
+    on_progress(0.0);
+    for (n, bins) in groups {
+        let group_phase = profile.begin_group(n, bins.len(), work);
+        poll(should_continue)?;
+        let dense_bytes = checked_product(n, size_of::<Complex<f64>>())?;
+        let base_vectors = channels * 2;
+        let minimum = checked_product(dense_bytes, base_vectors + 1)?;
+        if minimum > limits.workspace_bytes {
+            return Err(Error::Resource(
+                "one full kernel and source/product buffers exceed workspace_bytes",
+            ));
+        }
+        let phase = profile.clock();
+        let mut planner = FftPlanner::<f64>::new();
+        let forward = planner.plan_fft_forward(n);
+        let inverse = planner.plan_fft_inverse(n);
+        let scratch_len = forward
+            .get_inplace_scratch_len()
+            .max(inverse.get_inplace_scratch_len());
+        let base_bytes = checked_product(dense_bytes, base_vectors)?
+            .checked_add(checked_product(scratch_len, size_of::<Complex<f64>>())?)
+            .ok_or(Error::Resource("workspace size overflows"))?;
+        let half = bins
+            .iter()
+            .map(|bin| bin.half)
+            .max()
+            .expect("a nonempty group");
+        let payload = n - 2 * half;
+        profile.record(phases::Region::Planning, phase);
+        let allow_pruning = true;
+        let phase = profile.clock();
+        let parallel_plan = if allow_pruning {
+            parallel::Plan::for_group(
+                n,
+                channels,
+                bins.len(),
+                frames,
+                half,
+                sample_rate,
+                config.frame_rate,
+                scratch_len,
+                &*inverse,
+                limits,
+                true,
+            )
+        } else {
+            None
+        };
+        profile.record(phases::Region::Planning, phase);
+        if let Some(plan) = parallel_plan {
+            let phase = profile.clock();
+            let workspace = parallel::Workspace::new(plan, &*inverse);
+            profile.record(phases::Region::Allocation, phase);
+            match workspace {
+                Ok(mut workspace) => {
+                    workspace.set_phase_timing(phase_timing);
+                    work.parallel_groups += 1;
+                    work.max_inverse_workers = work.max_inverse_workers.max(plan.slots);
+                    work.peak_workspace_bytes =
+                        work.peak_workspace_bytes.max(plan.workspace_bytes);
+                    for batch in bins.chunks(plan.batch_size) {
+                        poll(should_continue)?;
+                        work.batches += 1;
+                        let phase = profile.clock();
+                        let mut kernels = Vec::new();
+                        kernels.try_reserve_exact(batch.len()).map_err(|_| Error::Allocation)?;
+                        let mut k_scratch = zeroed::<Complex<f64>>(scratch_len)?;
+                        for &bin in batch {
+                            let mut sp = old_de4fcb3_kernel(bin, n, sample_rate, config.window, should_continue)?;
+                            poll(should_continue)?;
+                            work.kernel_ffts += 1;
+                            forward.process_with_scratch(&mut sp, &mut k_scratch);
+                            kernels.push(sp);
+                        }
+                        profile.record(phases::Region::Kernel, phase);
+                        let mut first = 0;
+                        while first < frames {
+                            poll(should_continue)?;
+                            let start = frame_center(first, sample_rate, config.frame_rate);
+                            let mut end = first + 1;
+                            while end < frames
+                                && frame_center(end, sample_rate, config.frame_rate) - start
+                                    < payload
+                            {
+                                end += 1;
+                            }
+                            let phase = profile.clock();
+                            {
+                                let (source_left, source_right, scratch) =
+                                    workspace.source_buffers();
+                                old_de4fcb3_fill_input(source_left, left, start, half, should_continue)?;
+                                work.input_ffts += 1;
+                                forward.process_with_scratch(source_left, scratch);
+                                if let Some(right) = right {
+                                    old_de4fcb3_fill_input(source_right, right, start, half, should_continue)?;
+                                    work.input_ffts += 1;
+                                    forward.process_with_scratch(source_right, scratch);
+                                }
+                            }
+                            profile.record(phases::Region::Source, phase);
+                            let phase = profile.clock();
+                            let stats = workspace.process_block(
+                                &kernels,
+                                &*inverse,
+                                parallel::Block {
+                                    first,
+                                    end,
+                                    sample_rate,
+                                    frame_rate: config.frame_rate,
+                                    half,
+                                    start,
+                                },
+                                should_continue,
+                            )?;
+                            profile.record(phases::Region::ParallelInverse, phase);
+                            profile.workers(stats.worker_wall_ns, stats.worker_tasks);
+                            work.inverse_ffts += stats.inverse_ffts;
+                            work.inverses_pruned += stats.inverses_pruned;
+                            work.inverses_full += stats.inverses_full;
+                            work.pruned_output_values += stats.pruned_output_values;
+                            let phase = profile.clock();
+                            let norm = 1.0 / n as f64;
+                            for (local, bin) in batch.iter().enumerate() {
+                                poll(should_continue)?;
+                                if first == 0 {
+                                    work.column_convolutions += channels as u64;
+                                }
+                                let ls = workspace.coefficients(local, 0, end - first);
+                                let rs =
+                                    right.map(|_| workspace.coefficients(local, 1, end - first));
+                                for frame in first..end {
+                                    let l = ls[frame - first] * norm;
+                                    let r = rs.map(|values| values[frame - first] * norm);
+                                    let cell = frame * bars + bin.index;
+                                    if let Some(r) = r {
+                                        codes[0][cell] = map(((l + r) * 0.5).norm() as f32);
+                                        codes[1][cell] = map(l.norm() as f32);
+                                        codes[2][cell] = map(r.norm() as f32);
+                                    } else {
+                                        codes[0][cell] = map(l.norm() as f32);
+                                    }
+                                }
+                                completed += end - first;
+                                on_progress(completed as f32 / cells as f32);
+                            }
+                            profile.record(phases::Region::ParallelFold, phase);
+                            first = end;
+                        }
+                    }
+                    profile.finish_group(group_phase, plan.slots, plan.batch_size, plan.workspace_bytes, work);
+                    continue;
+                }
+                Err(Error::Allocation) => {
+                    work.parallel_allocation_fallbacks += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let mut requested = None;
+        let mut requested_bytes = 0;
+        if allow_pruning && inverse.prunes() {
+            let cap = requested_cap(payload, n, frames, sample_rate, config.frame_rate);
+            let bytes = Requested::bytes(&*inverse, cap, channels)?;
+            let admitted = base_bytes
+                .checked_add(dense_bytes)
+                .and_then(|minimum| minimum.checked_add(bytes))
+                .is_some_and(|minimum| minimum <= limits.workspace_bytes);
+            if admitted {
+                if let Ok(buffers) = Requested::new(&*inverse, cap, channels) {
+                    requested = Some(buffers);
+                    requested_bytes = bytes;
+                } else {
+                    work.pruning_workspace_fallbacks += 1;
+                }
+            } else {
+                work.pruning_workspace_fallbacks += 1;
+            }
+        }
+        let base_bytes = base_bytes
+            .checked_add(requested_bytes)
+            .ok_or(Error::Resource("requested-output workspace overflows"))?;
+        let available = limits
+            .workspace_bytes
+            .checked_sub(base_bytes)
+            .ok_or(Error::Resource("FFT scratch exceeds workspace_bytes"))?;
+        let batch_size = (available / dense_bytes).min(bins.len());
+        if batch_size == 0 {
+            return Err(Error::Resource(
+                "FFT scratch leaves no room for a full kernel",
+            ));
+        }
+        let mut source_left = zeroed::<Complex<f64>>(n)?;
+        let mut source_right = zeroed::<Complex<f64>>(if right.is_some() { n } else { 0 })?;
+        let mut product_left = zeroed::<Complex<f64>>(n)?;
+        let mut product_right = zeroed::<Complex<f64>>(if right.is_some() { n } else { 0 })?;
+        let mut scratch = zeroed::<Complex<f64>>(scratch_len)?;
+        for batch in bins.chunks(batch_size) {
+            poll(should_continue)?;
+            work.batches += 1;
+            work.peak_workspace_bytes = work
+                .peak_workspace_bytes
+                .max(base_bytes + batch.len() * dense_bytes);
+            let mut kernels = Vec::new();
+            kernels
+                .try_reserve_exact(batch.len())
+                .map_err(|_| Error::Allocation)?;
+            for &bin in batch {
+                let mut spectrum = old_de4fcb3_kernel(bin, n, sample_rate, config.window, should_continue)?;
+                poll(should_continue)?;
+                work.kernel_ffts += 1;
+                forward.process_with_scratch(&mut spectrum, &mut scratch);
+                kernels.push(spectrum);
+            }
+            let mut first = 0;
+            while first < frames {
+                poll(should_continue)?;
+                let start = frame_center(first, sample_rate, config.frame_rate);
+                let mut end = first + 1;
+                while end < frames
+                    && frame_center(end, sample_rate, config.frame_rate) - start < payload
+                {
+                    end += 1;
+                }
+                let prune = requested.as_mut().is_some_and(|buffers| {
+                    buffers.prepare(first, end, sample_rate, config.frame_rate, half, start)
+                });
+                old_de4fcb3_fill_input(&mut source_left, left, start, half, should_continue)?;
+                work.input_ffts += 1;
+                forward.process_with_scratch(&mut source_left, &mut scratch);
+                if let Some(right) = right {
+                    old_de4fcb3_fill_input(&mut source_right, right, start, half, should_continue)?;
+                    work.input_ffts += 1;
+                    forward.process_with_scratch(&mut source_right, &mut scratch);
+                }
+                for (&bin, spectrum) in batch.iter().zip(&kernels) {
+                    poll(should_continue)?;
+                    if first == 0 {
+                        work.column_convolutions += channels as u64;
+                    }
+                    if prune {
+                        let buffers = requested.as_mut().expect("a prepared request");
+                        work.inverse_ffts += 1;
+                        work.inverses_pruned += 1;
+                        work.pruned_output_values += (end - first) as u64;
+                        buffers.outputs(
+                            &*inverse,
+                            &source_left,
+                            spectrum,
+                            &mut product_left,
+                            &mut scratch,
+                            end - first,
+                            false,
+                        );
+                        if right.is_some() {
+                            poll(should_continue)?;
+                            work.inverse_ffts += 1;
+                            work.inverses_pruned += 1;
+                            work.pruned_output_values += (end - first) as u64;
+                            buffers.outputs(
+                                &*inverse,
+                                &source_right,
+                                spectrum,
+                                &mut product_right,
+                                &mut scratch,
+                                end - first,
+                                true,
+                            );
+                        }
+                    } else {
+                        for i in 0..n {
+                            if i % 4096 == 0 {
+                                poll(should_continue)?;
+                            }
+                            product_left[i] = source_left[i] * spectrum[i];
+                            if right.is_some() {
+                                product_right[i] = source_right[i] * spectrum[i];
+                            }
+                        }
+                        work.inverse_ffts += 1;
+                        work.inverses_full += 1;
+                        inverse.process_with_scratch(&mut product_left, &mut scratch);
+                        if right.is_some() {
+                            poll(should_continue)?;
+                            work.inverse_ffts += 1;
+                            work.inverses_full += 1;
+                            inverse.process_with_scratch(&mut product_right, &mut scratch);
+                        }
+                    }
+                    let norm = 1.0 / n as f64;
+                    for frame in first..end {
+                        let at = half + frame_center(frame, sample_rate, config.frame_rate) - start;
+                        let l = if prune {
+                            requested.as_ref().expect("a prepared request").left[frame - first]
+                        } else {
+                            product_left[at]
+                        } * norm;
+                        let r = right.map(|_| if prune {
+                            requested.as_ref().expect("a prepared request").right[frame - first]
+                        } else { product_right[at] } * norm);
+                        let cell = frame * bars + bin.index;
+                        if let Some(r) = r {
+                            codes[0][cell] = map(((l + r) * 0.5).norm() as f32);
+                            codes[1][cell] = map(l.norm() as f32);
+                            codes[2][cell] = map(r.norm() as f32);
+                        } else {
+                            codes[0][cell] = map(l.norm() as f32);
+                        }
+                    }
+                    completed += end - first;
+                    on_progress(completed as f32 / cells as f32);
+                }
+                first = end;
+            }
+        }
+    }
+    poll(should_continue)?;
+    work.phases = profile.finish();
+    Ok(Output {
+        codes,
+        frames,
+        bars,
+        work,
+    })
+}
+
+#[test]
+fn real_music_cqt_sync_matches_unchanged_old_code_bit_for_bit() {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    let path = Path::new(r"C:\Users\PC\Documents\ASYN\Audio Archive\Vocaloid\01_02_退廃的人生讃歌.flac");
+    let cancel = AtomicBool::new(false);
+    let prog = AtomicU32::new(0);
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let mut sr = 48_000u32;
+    crate::measure::each_block(path, &cancel, &prog, |rate, ch, samples| {
+        sr = rate;
+        let start_frame = (rate as usize) * 30;
+        let keep_frames = (rate as usize) * 3; // 3.0s real music excerpt
+        for frame in samples.chunks(ch.max(1)) {
+            if left.len() < start_frame + keep_frames {
+                left.push(frame[0]);
+                right.push(if ch > 1 { frame[1] } else { frame[0] });
+            }
+        }
+    }).expect("decode real music");
+    let start_f = (sr as usize) * 30;
+    let l_slice = &left[start_f..];
+    let r_slice = &right[start_f..];
+
+    let bars = 128usize;
+    let frequencies: Vec<f64> = (0..bars)
+        .map(|i| 40.0 * (16_000.0_f64 / 40.0).powf((i as f64 + 0.5) / bars as f64))
+        .collect();
+    let cfg = Config {
+        bins_per_octave: 24,
+        window: Window::Blackman,
+        frame_rate: 180.0,
+        bass_limit_s: None,
+    };
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
+    let input = Input::Joint { left: l_slice, right: r_slice };
+    let (true_old_out, mod_ref_out, dyn_out, sync_out) = pool.install(|| {
+        let to = true_de4fcb3_analyze_input_codes(
+            input, sr, &frequencies, &cfg, Limits::default(), &|| true, &|_| {}, &code,
+        ).unwrap();
+        let mo = modified_serial_prep_ref_analyze_input_codes(
+            input, sr, &frequencies, &cfg, Limits::default(), &|| true, &|_| {}, &code,
+        ).unwrap();
+        let d = analyze_input_codes(
+            input, sr, &frequencies, &cfg, Limits::default(), &|| true, &|_| {}, &code,
+        ).unwrap();
+        let s = analyze_input_codes_sync(
+            input, sr, &frequencies, &cfg, Limits::default(), &|| true, &|_| {}, &code,
+        ).unwrap();
+        (to, mo, d, s)
+    });
+    assert_eq!(sync_out.frames, true_old_out.frames);
+    assert_eq!(sync_out.bars, true_old_out.bars);
+    assert_eq!(sync_out.codes[0], true_old_out.codes[0], "Mix codes differ vs true de4fcb3 on real music!");
+    assert_eq!(sync_out.codes[1], true_old_out.codes[1], "Left codes differ vs true de4fcb3 on real music!");
+    assert_eq!(sync_out.codes[2], true_old_out.codes[2], "Right codes differ vs true de4fcb3 on real music!");
+    assert_eq!(sync_out.codes, mod_ref_out.codes);
+    assert_eq!(sync_out.codes, dyn_out.codes);
+    assert_eq!(sync_out.work, dyn_out.work);
+    assert_work_counts_eq(&mod_ref_out.work, &true_old_out.work);
+    assert_work_counts_eq(&sync_out.work, &true_old_out.work);
+}
+
+#[test]
+#[ignore = "same-binary A/B benchmark on real music (1024 bars @ 180 fps)"]
+fn bench_cqt_ab_real_music() {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::time::Instant;
+
+    let path = Path::new(r"C:\Users\PC\Documents\ASYN\Audio Archive\Vocaloid\01_02_退廃的人生讃歌.flac");
+    let cancel = AtomicBool::new(false);
+    let prog = AtomicU32::new(0);
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let mut sr = 48_000u32;
+    crate::measure::each_block(path, &cancel, &prog, |rate, ch, samples| {
+        sr = rate;
+        let target_len = (rate as usize) * 50;
+        for frame in samples.chunks(ch.max(1)) {
+            if left.len() < target_len {
+                left.push(frame[0]);
+                right.push(if ch > 1 { frame[1] } else { frame[0] });
+            }
+        }
+    }).expect("decode real music");
+    // Take 20.0s active vocal/instrumental section (30.0s .. 50.0s)
+    let s0 = (sr as usize) * 30;
+    let s1 = (sr as usize) * 50;
+    let l20 = &left[s0..s1];
+    let r20 = &right[s0..s1];
+    let secs = l20.len() as f64 / sr as f64;
+
+    let bars = 1024usize;
+    let frequencies: Vec<f64> = (0..bars)
+        .map(|i| 20.0 * (24_000.0_f64 / 20.0).powf((i as f64 + 0.5) / bars as f64))
+        .collect();
+    let cfg = Config::default(); // 48 bpo, Blackman, 180 fps
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
+    let input = Input::Joint { left: l20, right: r20 };
+
+    // Record Round 1 modified reference route (serial kernel prep + new Plan/Workspace) separately:
+    let (d_mod_ref, mod_work) = pool.install(|| {
+        let t0 = Instant::now();
+        let mo = modified_serial_prep_ref_analyze_input_codes(
+            input, sr, &frequencies, &cfg, Limits::default(), &|| true, &|_| {}, &code,
+        ).unwrap();
+        (t0.elapsed().as_secs_f64(), mo.work)
+    });
+    println!(
+        "  [Round 1 modified reference route (serial kernel prep + new Plan/Workspace)]: {d_mod_ref:.3}s (work={mod_work:?})"
+    );
+
+    let mut old_s = Vec::new();
+    let mut new_s = Vec::new();
+    let mut verified_work = None;
+    for pair in 0..3 {
+        let (to, tn, order_str, o_work, n_work) = pool.install(|| {
+            if pair % 2 == 0 {
+                let t0 = Instant::now();
+                let o = true_de4fcb3_analyze_input_codes(
+                    input, sr, &frequencies, &cfg, Limits::default(), &|| true, &|_| {}, &code,
+                ).unwrap();
+                let d_old = t0.elapsed().as_secs_f64();
+
+                let t1 = Instant::now();
+                let n = analyze_input_codes_sync(
+                    input, sr, &frequencies, &cfg, Limits::default(), &|| true, &|_| {}, &code,
+                ).unwrap();
+                let d_new = t1.elapsed().as_secs_f64();
+
+                assert_eq!(n.codes, o.codes, "pair {}: CQT codes mismatch vs true de4fcb3!", pair + 1);
+                assert_work_counts_eq(&n.work, &o.work);
+                (d_old, d_new, "true_de4fcb3 -> new_sync", o.work, n.work)
+            } else {
+                let t1 = Instant::now();
+                let n = analyze_input_codes_sync(
+                    input, sr, &frequencies, &cfg, Limits::default(), &|| true, &|_| {}, &code,
+                ).unwrap();
+                let d_new = t1.elapsed().as_secs_f64();
+
+                let t0 = Instant::now();
+                let o = true_de4fcb3_analyze_input_codes(
+                    input, sr, &frequencies, &cfg, Limits::default(), &|| true, &|_| {}, &code,
+                ).unwrap();
+                let d_old = t0.elapsed().as_secs_f64();
+
+                assert_eq!(n.codes, o.codes, "pair {}: CQT codes mismatch vs true de4fcb3!", pair + 1);
+                assert_work_counts_eq(&n.work, &o.work);
+                (d_old, d_new, "new_sync -> true_de4fcb3", o.work, n.work)
+            }
+        });
+        verified_work = Some((o_work, n_work));
+        println!(
+            "  pair {} ({order_str}): true_de4fcb3={to:.3}s, new_sync={tn:.3}s [3 planes x 3600x1024 BIT-EXACT, work counts matched]",
+            pair + 1
+        );
+        old_s.push(to);
+        new_s.push(tn);
+    }
+    let (ow, nw) = verified_work.unwrap();
+    println!("  Verified WorkStats true_de4fcb3: {:?}", ow);
+    println!("  Verified WorkStats new_sync:     {:?}", nw);
+    old_s.sort_by(f64::total_cmp);
+    new_s.sort_by(f64::total_cmp);
+    let med_old = old_s[old_s.len() / 2];
+    let med_new = new_s[new_s.len() / 2];
+    let track216_old = med_old * (216.0 / secs);
+    let track216_new = med_new * (216.0 / secs);
+    println!(
+        "=== MEASURED 20.0s excerpt (48kHz stereo, 1024 bars @ 180fps, 6 threads): true_de4fcb3={med_old:.3}s -> new_sync={med_new:.3}s ({:.2}x, -{:.1}%) ===",
+        med_old / med_new, (1.0 - med_new / med_old) * 100.0
+    );
+    println!(
+        "  ESTIMATE (linear extrapolation to 216s track from 20.0s excerpt; not full-track measured): true_de4fcb3~={track216_old:.2}s -> new_sync~={track216_new:.2}s (estimated saving ~{:.2}s)",
+        track216_old - track216_new
+    );
+}

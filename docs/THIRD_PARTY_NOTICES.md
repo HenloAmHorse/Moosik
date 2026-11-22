@@ -1,10 +1,10 @@
 # Third-party notices: how they were assembled
 
 The notices themselves are in [`THIRD_PARTY_NOTICES.txt`](../THIRD_PARTY_NOTICES.txt),
-with four companion files in [`third_party/`](../third_party). This page says what
+with six companion files in [`third_party/`](../third_party). This page says what
 they cover and how the original open items were settled for 1.5.3, with
 the scope rechecked for 1.5.4, regenerated for 1.5.5 and carried forward,
-checked, for 1.6.0 and 1.6.1. It records license
+checked, for 1.6.0, 1.6.1 and 1.6.2. It records license
 information; it is not a legal opinion.
 
 **1.5.5:** the current locked Windows normal/build graph was enumerated
@@ -108,6 +108,22 @@ rustc 1.94.0. It changes only the version lines.
 | yt-dlp (The Unlicense, with its bundled Python and other components), Deno (MIT) | **Not distributed.** Separate programs the user downloads on request from their own GitHub releases, checked against the checksums those releases publish; not in the release assets, not linked into Moosik and not covered by these notices. The setup card names both and their licenses before anything is fetched, and a short notice is written beside them when installed. |
 | `rustfft` 6.4.1 (vendored, modified) | Gains read-only accessors for the coefficients of its f32 32768-point AVX plan, used by the exact GPU assist; listed in `vendor/rustfft-6.4.1/PATCH.md`. Still distributed under its MIT option. |
 | `src/spectrum/aslt_exact_gpu.ptx` | Moosik's own shader, derived by `tools/aslt_exact_gpu/derive_ptx.py` from Moosik's own exact-ASLT research (see [ASLT_EXACT_GPU.md](ASLT_EXACT_GPU.md)); no third-party code. It runs through the NVIDIA driver already on the machine; no NVIDIA library is bundled. |
+
+## Items for 1.6.2
+
+No package is added to the executable, so the 1.6.1 notices were carried
+forward: `research/v162/notices162.py` refuses to run unless the locked
+default Windows x86_64 normal/build graph is still exactly the 302 packages
+the notices list, `Cargo.lock` has gained and lost no package since v1.6.1,
+and the toolchain is the same rustc 1.94.0. It changes only the version
+lines. One item was added by hand, as section 1.6 of the notices.
+
+| Item | Disposition |
+|---|---|
+| libbs2b 3.1.0 (MIT), Boris Mikhaylov | **Ported, credited.** The headphone crossfeed derives its filters as libbs2b's `init()` does and offers its default, Chu Moy and Jan Meier levels. Its COPYING, from `libbs2b-3.1.0.tar.gz`, is reproduced in section 1.6 and byte for byte in `third_party/libbs2b-3.1.0-COPYING`. |
+| `rustfft` 6.4.1 (vendored, modified) | Faster AVX passes with outputs checked identical to 1.6.1's copy; listed in `vendor/rustfft-6.4.1/PATCH.md`. Still distributed under its MIT option. |
+| `src/spectrum/aslt_hp_sgemm.ptx`, `aslt_hp_dgemm.ptx`, `aslt_hp_sgemm_ranged.ptx` | Moosik's own matrix kernels for the High-accuracy GPU analysis, compiled by NVRTC 12.8 from Moosik's own research CUDA source (see [HIGH_ACCURACY_GPU.md](HIGH_ACCURACY_GPU.md)); no third-party code. They run through the NVIDIA driver already on the machine; no NVIDIA library is bundled. |
+| AutoEq (MIT), autoeq.app | **Not distributed.** The headphone list and the corrections are fetched from autoeq.app when the user asks; no AutoEq code or data is in the release assets. The ToneBoosters preset written for USB Audio Player PRO follows the file layout and value scaling the EqConverter project (Apache-2.0) uses; Moosik writes it with its own code. |
 
 ## Regenerating
 

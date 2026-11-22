@@ -21,18 +21,18 @@ professional-grade spectrum analyzer, and a parametric EQ, built in Rust.
 
 ## Build
 
-**Current release: [1.6.1](https://github.com/HenloAmHorse/Moosik-Player/releases/tag/v1.6.1).**
+**Current release: [1.6.2](https://github.com/HenloAmHorse/Moosik-Player/releases/tag/v1.6.2).**
 Download the Windows x86_64 `.exe` and the accompanying notices. There is no
 installer; local translation models are optional, separate downloads.
 
-1.6.1 adds [YouTube and YouTube Music](docs/YOUTUBE.md) as a source: songs
-play while they download, and music videos (up to 2160p) play behind Listen
-and the spectrum. Lyrics gain a third source and are looked up as a song
-starts; the spectrum draws every song to its loudness; and an experimental
-[exact NVIDIA assist](docs/ASLT_EXACT_GPU.md) shortens the superlet
-pre-process with the same result to the last bit. 1.6.0 redesigned the
-interface as one window with three modes (Listen, Library, Analyze) with
-live [Stereo and Harmony](docs/HARMONY.md) panels.
+1.6.2 adds [pro audio tools](docs/PRO_AUDIO.md): measure a file's loudness,
+true peak, DR and clipping, tell a fake lossless or padded file, compare two
+masters, ABX, crossfeed and room correction, and a headphone EQ that searches
+AutoEq's measurements. The analysis is faster with the same results, an
+experimental [High-accuracy GPU](docs/HIGH_ACCURACY_GPU.md) analysis runs the
+whole superlet transform on an NVIDIA card, and a Storage page shows what
+Moosik keeps on disk. 1.6.1 added [YouTube and YouTube Music](docs/YOUTUBE.md)
+as a source, with music videos behind Listen and the spectrum.
 
 Requires Rust (stable, edition 2024). Tagged releases attach a prebuilt Windows
 x86_64 executable (it needs the Microsoft Visual C++ 2015-2022 Redistributable,
@@ -111,8 +111,19 @@ first build so the compiled dictionary is kept there, and later build with
   while it downloads, its music video behind Listen and the spectrum (480p
   to 2160p); audio stays as delivered and is marked lossy
   ([docs/YOUTUBE.md](docs/YOUTUBE.md))
-- **Parametric EQ** — up to 16 bands, dragged directly on the spectrum, with
-  global and per-song presets
+- **Parametric EQ** — up to 32 bands, dragged directly on the spectrum, with
+  a preamp and global and per-song presets
+- **Pro audio tools** (1.6.2) — measure a file (BS.1770 loudness, loudness
+  range, true peak, DR, clipping, the bits it uses, FLAC's MD5), tell a fake
+  lossless or padded file, compare two masters, ABX, crossfeed, room
+  correction, tempo and sections, and practice tempo and key. A headphone EQ
+  searches AutoEq's measurements and saves the result for other apps too
+  ([docs/PRO_AUDIO.md](docs/PRO_AUDIO.md))
+- **High-accuracy GPU** (1.6.2, experimental) — the whole superlet analysis
+  on an NVIDIA card, several times faster, within one display step of a
+  higher-precision reference ([docs/HIGH_ACCURACY_GPU.md](docs/HIGH_ACCURACY_GPU.md))
+- **Storage** (1.6.2) — what Moosik keeps on the computer, part by part, and
+  removing what is not needed; optionally smaller, lossless cache files
 - **Lyrics** — synced `.lrc`, read from the file or looked up online, with a
   tap-along editor and karaoke highlighting where the sheet times its words.
   Japanese lyrics can be shown in romaji, with furigana, or both, word by word.
@@ -157,7 +168,7 @@ describes what the current release does.
 
 | | |
 |---|---|
-| **1.6.2** | Less disk: what caches, downloads and models take, and trimming it. Pro audio tools: fake-lossless and fake-hi-res detection, true peak, loudness range, DR, clipping, headphone EQ and crossfeed, room correction, A/B and ABX, tempo and sections. See [docs/ROADMAP.md](docs/ROADMAP.md). |
+| **1.6.3** | A real library: watched folders, albums, artists and genres, smart playlists (proposed; the owner has not chosen yet). See [docs/ROADMAP.md](docs/ROADMAP.md). |
 
 Principles that work is meant to hold to:
 
@@ -184,6 +195,8 @@ Principles that work is meant to hold to:
 | [docs/AUDIO_FORMATS.md](docs/AUDIO_FORMATS.md) | which containers and codecs are read, and their limits |
 | [docs/YOUTUBE.md](docs/YOUTUBE.md) | YouTube and YouTube Music: the optional components, videos, sizes and limits |
 | [docs/ASLT_EXACT_GPU.md](docs/ASLT_EXACT_GPU.md) | the experimental exact NVIDIA assist: what runs on the card, measurements, limits |
+| [docs/HIGH_ACCURACY_GPU.md](docs/HIGH_ACCURACY_GPU.md) | the experimental High-accuracy GPU analysis: speed, accuracy, what it needs |
+| [docs/PRO_AUDIO.md](docs/PRO_AUDIO.md) | the pro audio tools: Measure, comparing, ABX, headphone EQ, crossfeed, room correction, tempo, practice |
 | [docs/CACHE.md](docs/CACHE.md) | the analysis cache: what it guarantees, what it does not, and older versions' files |
 | [docs/RELEASE_COMPARISON_153.md](docs/RELEASE_COMPARISON_153.md) | 1.5.3 measured against 1.5.2.1: pre-processing time, CPU, memory, and loading a saved analysis |
 | [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) | third-party licenses and notices for the Windows executable ([how they were assembled](docs/THIRD_PARTY_NOTICES.md)) |

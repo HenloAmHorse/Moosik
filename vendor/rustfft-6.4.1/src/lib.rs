@@ -465,6 +465,10 @@ pub(crate) fn pruned_by_full_transform<T: FftNum, F: Fft<T> + ?Sized>(
 /// `buffer[i] = s[i] * h[i]` as num-complex `MulAssign` computes it. Lengths
 /// are the caller's to have checked.
 pub(crate) fn product_into<T: FftNum>(s: &[Complex<T>], h: &[Complex<T>], buffer: &mut [Complex<T>]) {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if avx::product_into_avx(s, h, buffer) {
+        return;
+    }
     for ((x, a), b) in buffer.iter_mut().zip(s).zip(h) {
         *x = mul_assign_ops(*a, *b);
     }
@@ -472,13 +476,17 @@ pub(crate) fn product_into<T: FftNum>(s: &[Complex<T>], h: &[Complex<T>], buffer
 
 /// `buffer[i] *= h[i]` as num-complex `MulAssign` computes it.
 pub(crate) fn product_in_place<T: FftNum>(h: &[Complex<T>], buffer: &mut [Complex<T>]) {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if avx::product_in_place_avx(h, buffer) {
+        return;
+    }
     for (x, b) in buffer.iter_mut().zip(h) {
         *x = mul_assign_ops(*x, *b);
     }
 }
 
 #[inline(always)]
-fn mul_assign_ops<T: FftNum>(a: Complex<T>, b: Complex<T>) -> Complex<T> {
+pub(crate) fn mul_assign_ops<T: FftNum>(a: Complex<T>, b: Complex<T>) -> Complex<T> {
     let mut re = a.re;
     re = re * b.re;
     re = re - a.im * b.im;

@@ -594,9 +594,10 @@ pub fn cached(dir: &Path, id: &str) -> Option<PathBuf> {
     })
 }
 
-/// Delete the oldest cached audio until the folder fits `CACHE_BYTES`,
-/// never a file in `keep` (on the playlist).
-pub fn prune(dir: &Path, keep: &[PathBuf]) {
+/// Delete the oldest cached files until the folder fits `budget` bytes
+/// (`CACHE_BYTES` after each arrival, 0 to clear it), never a file in `keep`
+/// (on the playlist).
+pub fn prune(dir: &Path, keep: &[PathBuf], budget: u64) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
         .flatten()
@@ -608,7 +609,7 @@ pub fn prune(dir: &Path, keep: &[PathBuf]) {
     let mut used: u64 = files.iter().map(|f| f.1).sum();
     files.sort();
     for (_, len, path) in files {
-        if used <= CACHE_BYTES {
+        if used <= budget {
             break;
         }
         if keep.contains(&path) {
@@ -870,10 +871,13 @@ mod tests {
             p
         };
         let (a, b, c) = (mk("a.webm", 100), mk("b.webm", 200), mk("c.webm", 300));
-        prune(&dir, &[a.clone()]);
+        prune(&dir, &[a.clone()], CACHE_BYTES);
         assert!(a.exists(), "on the playlist");
         assert!(!b.exists(), "oldest not kept");
         assert!(c.exists());
+        // Clearing (Settings → Storage) still spares the playlist.
+        prune(&dir, &[a.clone()], 0);
+        assert!(a.exists() && !c.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1288,6 +1288,12 @@ impl LyricsWindow {
 }
 
 impl LyricsWindow {
+    /// The model folders changed elsewhere (Settings → Storage): check the
+    /// installed state again.
+    pub(crate) fn local_files_changed(&mut self) {
+        self.translation.local.installed = None;
+    }
+
     /// Install or import progress and completion; refreshes the installed state.
     fn poll_local_install(&mut self) {
         let l = &mut self.translation.local;

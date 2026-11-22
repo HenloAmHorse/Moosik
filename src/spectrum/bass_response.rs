@@ -213,6 +213,7 @@ fn bass_response() {
         PreMessage::Done { frames, .. } => frames,
         PreMessage::Error(e) => panic!("refused: {e}"),
         PreMessage::Aborted => panic!("aborted"),
+        PreMessage::HpUnavailable { reason, .. } => panic!("a Standard run reported High-accuracy GPU: {reason}"),
     };
     let times: Vec<f64> = (0..frames.len())
         .map(|k| match &mapping {

@@ -542,35 +542,78 @@ pub struct Level {
 }
 
 impl Level {
-    /// Rows `start..end` at `k`, by doubling from the plane; `None` once
-    /// `cancel` is set.
+    /// Rows `start..end` at `k`, in linear time in the source cells read;
+    /// `None` once `cancel` is set. Only the returned rows are stored;
+    /// windows of at least four frames also allocate one bar row of scratch.
     pub fn build(plane: &PreFrames, data_bars: usize, k: u32, start: usize, end: usize, cancel: &AtomicBool) -> Option<Level> {
+        Self::build_cancellable(plane, data_bars, k, start, end, || cancel.load(Ordering::Relaxed))
+    }
+
+    fn build_cancellable(plane: &PreFrames, data_bars: usize, k: u32, start: usize, end: usize, mut cancelled: impl FnMut() -> bool) -> Option<Level> {
+        if cancelled() { return None; }
         let db = data_bars.min(plane.bars());
-        let n = (end - start + (1usize << k) - 1).min(plane.len() - start);
-        let mut rows = vec![0u16; n * db];
-        for i in 0..n {
-            if i % 256 == 0 && cancel.load(Ordering::Relaxed) {
-                return None;
-            }
-            rows[i * db..(i + 1) * db].copy_from_slice(&plane.row(start + i)?[..db]);
+        let count = end.checked_sub(start)?;
+        let available = plane.len().checked_sub(start)?;
+        if count > available { return None; }
+        let block = 1usize.checked_shl(k)?;
+        let mut rows = vec![0u16; count.checked_mul(db)?];
+        if count == 0 || db == 0 {
+            return Some(Level { k, start, end, db, rows });
         }
-        for step in 0..k {
-            if cancel.load(Ordering::Relaxed) {
-                return None;
+
+        // A one- or two-frame window needs no scan state. Keep the small
+        // zoom levels to one pass, rather than pay the block scans' overhead.
+        if block <= 2 {
+            for i in 0..count {
+                if i % 256 == 0 && cancelled() { return None; }
+                let src = &plane.row(start + i)?[..db];
+                let dst = &mut rows[i * db..(i + 1) * db];
+                if block == 2 && start + i + 1 < plane.len() {
+                    let next = &plane.row(start + i + 1)?[..db];
+                    for ((m, &a), &b) in dst.iter_mut().zip(src).zip(next) { *m = a.max(b); }
+                } else {
+                    dst.copy_from_slice(src);
+                }
             }
-            let s = 1usize << step;
-            // Ascending: row i + s is read before this pass changes it.
-            for i in 0..n.saturating_sub(s) {
-                let (a, b) = rows.split_at_mut((i + s) * db);
-                for (m, &c) in a[i * db..(i + 1) * db].iter_mut().zip(&b[..db]) {
-                    if c > *m {
-                        *m = c;
+        } else {
+            // A window of 2^k rows, k >= 2: the suffix maximum of its block
+            // and the prefix maximum of the next, each source row read at
+            // most twice whatever k is (the old doubling read it k times).
+            let source_count = count.saturating_add(block - 1).min(available);
+            let mut scan = vec![0u16; db];
+            // Finish each block's suffix and the next block's prefix while
+            // its output rows are still hot. The immutable source can be
+            // read twice, but no halo or second output buffer is stored.
+            for lo in (0..count).step_by(block) {
+                let right = lo.saturating_add(block).min(source_count);
+                for i in (lo..right).rev() {
+                    if (i % 256 == 0 || i + 1 == right) && cancelled() { return None; }
+                    let src = &plane.row(start + i)?[..db];
+                    if i + 1 == right {
+                        scan.copy_from_slice(src);
+                    } else {
+                        for (m, &c) in scan.iter_mut().zip(src) { *m = (*m).max(c); }
                     }
+                    if i < count { rows[i * db..(i + 1) * db].copy_from_slice(&scan); }
+                }
+                // A final partial block has no following prefix. Adding a
+                // prefix from inside it would include frames before i.
+                if right == source_count { continue; }
+                let mut loaded = right - 1;
+                for i in lo + 1..lo.saturating_add(block).min(count) {
+                    if (i % 256 == 0 || i == lo + 1) && cancelled() { return None; }
+                    let tail = i.saturating_add(block - 1).min(source_count - 1);
+                    while loaded < tail {
+                        loaded += 1;
+                        let src = &plane.row(start + loaded)?[..db];
+                        if loaded == right { scan.copy_from_slice(src); }
+                        else { for (m, &c) in scan.iter_mut().zip(src) { *m = (*m).max(c); } }
+                    }
+                    for (m, &c) in rows[i * db..(i + 1) * db].iter_mut().zip(&scan) { *m = (*m).max(c); }
                 }
             }
         }
-        rows.truncate((end - start) * db);
-        rows.shrink_to_fit();
+        if cancelled() { return None; }
         Some(Level { k, start, end, db, rows })
     }
 
@@ -1232,6 +1275,10 @@ impl Worker {
 #[cfg(test)]
 #[path = "wholetrack_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "wholetrack_level_tests.rs"]
+mod level_tests;
 
 #[cfg(test)]
 mod true_cqt_geometry_tests {

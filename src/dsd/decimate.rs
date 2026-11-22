@@ -114,13 +114,13 @@ const S1_CUTOFF: f64 = 0.45 / 8.0;
 /// where bit `i` of a history byte is the sample at lag `8g + i` (the
 /// reader's bytes are MSB-first, so the LSB is the newest sample of a byte).
 struct Stage1 {
-    luts: Vec<[f32; 256]>,
+    luts: Box<[[f32; 256]; S1_BYTES]>,
 }
 
 impl Stage1 {
     fn new() -> Self {
         let taps = design_lowpass(S1_TAPS, S1_CUTOFF);
-        let mut luts = vec![[0.0f32; 256]; S1_BYTES];
+        let mut luts = Box::new([[0.0f32; 256]; S1_BYTES]);
         for (g, lut) in luts.iter_mut().enumerate() {
             for (byte, slot) in lut.iter_mut().enumerate() {
                 let mut acc = 0.0f32;
@@ -134,14 +134,36 @@ impl Stage1 {
         Stage1 { luts }
     }
 
-    /// One channel's output for its history ring (`hist[0]` = newest byte).
+    /// Push one newest byte and evaluate the 128-tap filter without shifting the
+    /// 16-byte ring (`pos` wraps modulo power-of-two `S1_BYTES`).
     #[inline]
-    fn eval(&self, hist: &[u8; S1_BYTES]) -> f32 {
-        self.luts
-            .iter()
-            .zip(hist.iter())
-            .map(|(lut, &b)| lut[b as usize])
-            .sum()
+    fn push_eval(&self, hist: &mut Stage1Ring, byte: u8) -> f32 {
+        hist.pos = hist.pos.wrapping_sub(1) & (S1_BYTES - 1);
+        hist.bytes[hist.pos] = byte;
+        let p = hist.pos;
+        let b = &hist.bytes;
+        let mut acc = 0.0f32;
+        for g in 0..S1_BYTES {
+            acc += self.luts[g][b[(p + g) & (S1_BYTES - 1)] as usize];
+        }
+        acc
+    }
+}
+
+#[derive(Clone)]
+struct Stage1Ring {
+    bytes: [u8; S1_BYTES],
+    pos: usize,
+}
+
+impl Stage1Ring {
+    fn new_silenced() -> Self {
+        Stage1Ring { bytes: [DSD_SILENCE; S1_BYTES], pos: 0 }
+    }
+
+    fn reset(&mut self) {
+        self.bytes = [DSD_SILENCE; S1_BYTES];
+        self.pos = 0;
     }
 }
 
@@ -153,11 +175,11 @@ impl Stage1 {
 /// except the centre, so only ~N/4 multiplies survive per output.
 const HB_TAPS: usize = 63;
 
-/// One ÷2 half-band decimator: shared (index, coeff) pairs + per-instance
-/// delay line. `push` consumes one input and yields an output on every
-/// second sample.
+/// One ÷2 half-band decimator: mirrored double-length delay line eliminates
+/// modulo `% HB_TAPS` on every tap during convolution. `push` consumes one
+/// input and yields an output on every second sample.
 struct Halfband {
-    ring: Vec<f32>,
+    ring: [f32; 2 * HB_TAPS],
     pos: usize,
     phase: bool,
 }
@@ -183,7 +205,7 @@ impl HalfbandCoeffs {
 
 impl Halfband {
     fn new() -> Self {
-        Halfband { ring: vec![0.0; HB_TAPS], pos: 0, phase: false }
+        Halfband { ring: [0.0; 2 * HB_TAPS], pos: 0, phase: false }
     }
 
     fn reset(&mut self) {
@@ -195,16 +217,21 @@ impl Halfband {
     #[inline]
     fn push(&mut self, x: f32, co: &HalfbandCoeffs) -> Option<f32> {
         self.ring[self.pos] = x;
-        self.pos = (self.pos + 1) % HB_TAPS;
+        self.ring[self.pos + HB_TAPS] = x;
+        self.pos += 1;
+        if self.pos == HB_TAPS {
+            self.pos = 0;
+        }
         self.phase = !self.phase;
         if self.phase {
             return None;
         }
-        // ring[pos] is the oldest sample (lag HB_TAPS-1); taps are symmetric
-        // so ascending-lag vs descending-lag orientation is equivalent.
+        // `ring[pos..pos + HB_TAPS]` holds oldest-to-newest contiguously via
+        // the double-buffered mirror; taps are symmetric so orientation matches.
+        let win = &self.ring[self.pos..self.pos + HB_TAPS];
         let mut acc = 0.0f32;
         for &(j, t) in &co.pairs {
-            acc += t * self.ring[(self.pos + j) % HB_TAPS];
+            acc += t * win[j];
         }
         Some(acc)
     }
@@ -221,8 +248,8 @@ pub struct DsdPcmSource<R: Read + Seek> {
     reader: DsdReader<R>,
     stage1: Stage1,
     hb_coeffs: HalfbandCoeffs,
-    /// Per-channel stage-1 byte history, newest first.
-    hist: Vec<[u8; S1_BYTES]>,
+    /// Per-channel stage-1 byte history circular ring.
+    hist: Vec<Stage1Ring>,
     /// `cascade[k][ch]` — the k-th ÷2 stage's state for each channel.
     cascade: Vec<Vec<Halfband>>,
     channels: usize,
@@ -231,8 +258,9 @@ pub struct DsdPcmSource<R: Read + Seek> {
     inbuf: Vec<u8>,
     in_pos: usize,
     in_len: usize,
-    /// Finished output samples (interleaved), drained by the iterator.
-    outbuf: std::collections::VecDeque<f32>,
+    /// Finished output samples (interleaved), drained sequentially via `out_pos`.
+    outbuf: Vec<f32>,
+    out_pos: usize,
     eof: bool,
 }
 
@@ -260,7 +288,7 @@ impl<R: Read + Seek> DsdPcmSource<R> {
         }
         // Prime the bit history with DSD silence so the filter warm-up sits
         // at ≈0 instead of the −FS thump all-zero bits would produce.
-        let hist = vec![[DSD_SILENCE; S1_BYTES]; channels];
+        let hist = vec![Stage1Ring::new_silenced(); channels];
         let cascade = (0..halvings)
             .map(|_| (0..channels).map(|_| Halfband::new()).collect())
             .collect();
@@ -275,7 +303,8 @@ impl<R: Read + Seek> DsdPcmSource<R> {
             inbuf: vec![0u8; 4096 * channels],
             in_pos: 0,
             in_len: 0,
-            outbuf: std::collections::VecDeque::new(),
+            outbuf: Vec::with_capacity(4096 * channels),
+            out_pos: 0,
             eof: false,
         })
     }
@@ -303,7 +332,7 @@ impl<R: Read + Seek> DsdPcmSource<R> {
         let frame = (pos.as_secs_f64() * info.sample_rate as f64 / 8.0) as u64;
         self.reader.seek_to_frame(frame)?;
         for h in self.hist.iter_mut() {
-            *h = [DSD_SILENCE; S1_BYTES];
+            h.reset();
         }
         for stage in self.cascade.iter_mut() {
             for hb in stage.iter_mut() {
@@ -313,6 +342,7 @@ impl<R: Read + Seek> DsdPcmSource<R> {
         self.in_pos = 0;
         self.in_len = 0;
         self.outbuf.clear();
+        self.out_pos = 0;
         self.eof = false;
         Ok(())
     }
@@ -320,6 +350,8 @@ impl<R: Read + Seek> DsdPcmSource<R> {
     /// Process buffered input frames until the out queue has something or
     /// input is exhausted.
     fn pump(&mut self) {
+        self.outbuf.clear();
+        self.out_pos = 0;
         while self.outbuf.is_empty() {
             if self.in_pos >= self.in_len {
                 if self.eof {
@@ -335,10 +367,7 @@ impl<R: Read + Seek> DsdPcmSource<R> {
                 let frame = &self.inbuf[self.in_pos..self.in_pos + ch];
                 self.in_pos += ch;
                 for (c, &byte) in frame.iter().enumerate() {
-                    let h = &mut self.hist[c];
-                    h.copy_within(0..S1_BYTES - 1, 1);
-                    h[0] = byte;
-                    let mut v = self.stage1.eval(&self.hist[c]);
+                    let mut v = self.stage1.push_eval(&mut self.hist[c], byte);
                     let mut alive = true;
                     for stage in self.cascade.iter_mut() {
                         match stage[c].push(v, &self.hb_coeffs) {
@@ -347,7 +376,7 @@ impl<R: Read + Seek> DsdPcmSource<R> {
                         }
                     }
                     if alive {
-                        self.outbuf.push_back(v);
+                        self.outbuf.push(v);
                     }
                 }
                 if !self.outbuf.is_empty() && self.in_pos + ch > self.in_len {
@@ -365,10 +394,15 @@ impl<R: Read + Seek> Iterator for DsdPcmSource<R> {
     type Item = f32;
 
     fn next(&mut self) -> Option<f32> {
-        if self.outbuf.is_empty() {
+        if self.out_pos >= self.outbuf.len() {
             self.pump();
+            if self.out_pos >= self.outbuf.len() {
+                return None;
+            }
         }
-        self.outbuf.pop_front()
+        let v = self.outbuf[self.out_pos];
+        self.out_pos += 1;
+        Some(v)
     }
 }
 
@@ -551,5 +585,428 @@ mod tests {
             (got as i64 - expect as i64).unsigned_abs() <= HB_TAPS as u64,
             "expected ≈{expect} samples, got {got}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Verbatim old implementation from de4fcb3 (oracle for bit-for-bit test
+    // and same-binary A/B timing)
+    // -----------------------------------------------------------------------
+    struct OldStage1 {
+        luts: Vec<[f32; 256]>,
+    }
+
+    impl OldStage1 {
+        fn new() -> Self {
+            let taps = design_lowpass(S1_TAPS, S1_CUTOFF);
+            let mut luts = vec![[0.0f32; 256]; S1_BYTES];
+            for (g, lut) in luts.iter_mut().enumerate() {
+                for (byte, slot) in lut.iter_mut().enumerate() {
+                    let mut acc = 0.0f32;
+                    for (i, &tap) in taps[g * 8..g * 8 + 8].iter().enumerate() {
+                        let bit = (byte >> i) & 1;
+                        acc += if bit == 1 { tap } else { -tap };
+                    }
+                    *slot = acc;
+                }
+            }
+            OldStage1 { luts }
+        }
+
+        #[inline]
+        fn eval(&self, hist: &[u8; S1_BYTES]) -> f32 {
+            self.luts
+                .iter()
+                .zip(hist.iter())
+                .map(|(lut, &b)| lut[b as usize])
+                .sum()
+        }
+    }
+
+    struct OldHalfband {
+        ring: Vec<f32>,
+        pos: usize,
+        phase: bool,
+    }
+
+    impl OldHalfband {
+        fn new() -> Self {
+            OldHalfband { ring: vec![0.0; HB_TAPS], pos: 0, phase: false }
+        }
+
+        fn reset(&mut self) {
+            self.ring.fill(0.0);
+            self.pos = 0;
+            self.phase = false;
+        }
+
+        #[inline]
+        fn push(&mut self, x: f32, co: &HalfbandCoeffs) -> Option<f32> {
+            self.ring[self.pos] = x;
+            self.pos = (self.pos + 1) % HB_TAPS;
+            self.phase = !self.phase;
+            if self.phase {
+                return None;
+            }
+            let mut acc = 0.0f32;
+            for &(j, t) in &co.pairs {
+                acc += t * self.ring[(self.pos + j) % HB_TAPS];
+            }
+            Some(acc)
+        }
+    }
+
+    struct OldDsdPcmSource<R: Read + Seek> {
+        reader: DsdReader<R>,
+        stage1: OldStage1,
+        hb_coeffs: HalfbandCoeffs,
+        hist: Vec<[u8; S1_BYTES]>,
+        cascade: Vec<Vec<OldHalfband>>,
+        channels: usize,
+        out_rate: u32,
+        inbuf: Vec<u8>,
+        in_pos: usize,
+        in_len: usize,
+        outbuf: std::collections::VecDeque<f32>,
+        eof: bool,
+    }
+
+    impl<R: Read + Seek> OldDsdPcmSource<R> {
+        fn new(reader: DsdReader<R>, target_rate: u32) -> Result<Self, String> {
+            let info = reader.info().clone();
+            let channels = info.channels as usize;
+            let halvings = halvings_for(info.sample_rate, target_rate);
+            let out_rate = info.sample_rate / (8 << halvings);
+            if out_rate == 0 {
+                return Err("DSD rate too low to decimate".into());
+            }
+            let hist = vec![[DSD_SILENCE; S1_BYTES]; channels];
+            let cascade = (0..halvings)
+                .map(|_| (0..channels).map(|_| OldHalfband::new()).collect())
+                .collect();
+            Ok(OldDsdPcmSource {
+                reader,
+                stage1: OldStage1::new(),
+                hb_coeffs: HalfbandCoeffs::new(),
+                hist,
+                cascade,
+                channels,
+                out_rate,
+                inbuf: vec![0u8; 4096 * channels],
+                in_pos: 0,
+                in_len: 0,
+                outbuf: std::collections::VecDeque::new(),
+                eof: false,
+            })
+        }
+
+        fn seek_to_time(&mut self, pos: std::time::Duration) -> std::io::Result<()> {
+            let info = self.reader.info();
+            let frame = (pos.as_secs_f64() * info.sample_rate as f64 / 8.0) as u64;
+            self.reader.seek_to_frame(frame)?;
+            for h in self.hist.iter_mut() {
+                *h = [DSD_SILENCE; S1_BYTES];
+            }
+            for stage in self.cascade.iter_mut() {
+                for hb in stage.iter_mut() {
+                    hb.reset();
+                }
+            }
+            self.in_pos = 0;
+            self.in_len = 0;
+            self.outbuf.clear();
+            self.eof = false;
+            Ok(())
+        }
+
+        fn pump(&mut self) {
+            while self.outbuf.is_empty() {
+                if self.in_pos >= self.in_len {
+                    if self.eof {
+                        return;
+                    }
+                    match self.reader.read_frames(&mut self.inbuf) {
+                        Ok(0) | Err(_) => { self.eof = true; return; }
+                        Ok(n) => { self.in_len = n * self.channels; self.in_pos = 0; }
+                    }
+                }
+                let ch = self.channels;
+                while self.in_pos + ch <= self.in_len {
+                    let frame = &self.inbuf[self.in_pos..self.in_pos + ch];
+                    self.in_pos += ch;
+                    for (c, &byte) in frame.iter().enumerate() {
+                        let h = &mut self.hist[c];
+                        h.copy_within(0..S1_BYTES - 1, 1);
+                        h[0] = byte;
+                        let mut v = self.stage1.eval(&self.hist[c]);
+                        let mut alive = true;
+                        for stage in self.cascade.iter_mut() {
+                            match stage[c].push(v, &self.hb_coeffs) {
+                                Some(next) => v = next,
+                                None => { alive = false; break; }
+                            }
+                        }
+                        if alive {
+                            self.outbuf.push_back(v);
+                        }
+                    }
+                    if !self.outbuf.is_empty() && self.in_pos + ch > self.in_len {
+                        break;
+                    }
+                }
+                if !self.outbuf.is_empty() {
+                    return;
+                }
+            }
+        }
+    }
+
+    impl<R: Read + Seek> Iterator for OldDsdPcmSource<R> {
+        type Item = f32;
+
+        fn next(&mut self) -> Option<f32> {
+            if self.outbuf.is_empty() {
+                self.pump();
+            }
+            self.outbuf.pop_front()
+        }
+    }
+
+    fn old_source_from_bytes(
+        ch_bytes: &[Vec<u8>],
+        rate: u32,
+        target: u32,
+    ) -> OldDsdPcmSource<Cursor<Vec<u8>>> {
+        let block = ch_bytes[0].len();
+        let blocks = vec![ch_bytes
+            .iter()
+            .map(|b| b.iter().map(|x| x.reverse_bits()).collect())
+            .collect()];
+        let file = make_dsf(
+            ch_bytes.len() as u32, rate, 1,
+            (block * 8) as u64, block as u32, &blocks, None,
+        );
+        let info = parse_dsf(&mut Cursor::new(&file)).unwrap();
+        let reader = DsdReader::new(Cursor::new(file), info).unwrap();
+        OldDsdPcmSource::new(reader, target).unwrap()
+    }
+
+    #[test]
+    fn new_decimator_matches_unchanged_old_code_bit_for_bit() {
+        use std::time::Duration;
+        let dsd128_rate = DSD64_RATE * 2;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next_u8 = || -> u8 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 56) as u8
+        };
+
+        for &ch in &[1usize, 2, 6] {
+            for &(rate, target) in &[
+                (DSD64_RATE, 88_200u32),
+                (DSD64_RATE, 176_400),
+                (DSD64_RATE, 352_800),
+                (dsd128_rate, 88_200),
+                (dsd128_rate, 176_400),
+                (dsd128_rate, 352_800),
+            ] {
+                let n_bytes = 12_288usize;
+                let ch_bytes: Vec<Vec<u8>> = (0..ch)
+                    .map(|_| (0..n_bytes).map(|_| next_u8()).collect())
+                    .collect();
+
+                // 1. Full stream from start to EOF.
+                let new_out: Vec<f32> = source_from_bytes(&ch_bytes, rate, target).collect();
+                let old_out: Vec<f32> = old_source_from_bytes(&ch_bytes, rate, target).collect();
+                assert_eq!(new_out.len(), old_out.len(), "length mismatch ch={ch} rate={rate} target={target}");
+                for (i, (&n_val, &o_val)) in new_out.iter().zip(old_out.iter()).enumerate() {
+                    assert_eq!(
+                        n_val.to_bits(),
+                        o_val.to_bits(),
+                        "bit mismatch at sample {i} (ch={ch}, rate={rate}, target={target}): new={n_val} old={o_val}"
+                    );
+                }
+
+                // 2. Partial read, seek + reset at 25% and 65%, then drain to EOF.
+                let total_dur = Duration::from_secs_f64(n_bytes as f64 * 8.0 / rate as f64);
+                let mut new_src = source_from_bytes(&ch_bytes, rate, target);
+                let mut old_src = old_source_from_bytes(&ch_bytes, rate, target);
+                assert_eq!(new_src.out_rate(), old_src.out_rate);
+                for _ in 0..500 * ch {
+                    assert_eq!(
+                        new_src.next().map(f32::to_bits),
+                        old_src.next().map(f32::to_bits),
+                    );
+                }
+                for &frac in &[0.65, 0.25] {
+                    new_src.seek_to_time(total_dur.mul_f64(frac)).unwrap();
+                    old_src.seek_to_time(total_dur.mul_f64(frac)).unwrap();
+                    for _ in 0..300 * ch {
+                        assert_eq!(
+                            new_src.next().map(f32::to_bits),
+                            old_src.next().map(f32::to_bits),
+                        );
+                    }
+                }
+                let rem_new: Vec<u32> = new_src.map(f32::to_bits).collect();
+                let rem_old: Vec<u32> = old_src.map(f32::to_bits).collect();
+                assert_eq!(rem_new, rem_old, "post-seek remainder mismatch ch={ch} rate={rate} target={target}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "same-binary A/B benchmark on real music modulated to DSD64 and DSD128"]
+    fn bench_dsd_ab_real_music() {
+        use std::hint::black_box;
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+        use std::time::Instant;
+
+        let track_path = std::path::Path::new(r"C:\Users\PC\Documents\ASYN\Audio Archive\01 - Koi no Wana.flac");
+        let cancel = AtomicBool::new(false);
+        let prog = AtomicU32::new(0);
+        let mut pcm_l = Vec::new();
+        let mut pcm_r = Vec::new();
+        let mut pcm_sr = 44_100u32;
+        crate::measure::each_block(track_path, &cancel, &prog, |sr, ch, samples| {
+            pcm_sr = sr;
+            if pcm_l.len() < (sr as usize) * 10 {
+                for frame in samples.chunks(ch.max(1)) {
+                    if pcm_l.len() >= (sr as usize) * 10 {
+                        break;
+                    }
+                    pcm_l.push(frame[0]);
+                    pcm_r.push(if ch > 1 { frame[1] } else { frame[0] });
+                }
+            }
+        }).expect("read real music track");
+        assert!(!pcm_l.is_empty());
+        let secs = pcm_l.len() as f64 / pcm_sr as f64;
+        println!("Decoded {:.2}s real music ({} frames @ {} Hz) from {}", secs, pcm_l.len(), pcm_sr, track_path.display());
+
+        // Modulate real stereo PCM into 1-bit DSD bytes (1st-order sigma-delta with linear upsampling)
+        let modulate_stereo = |os_factor: usize| -> Vec<Vec<u8>> {
+            let total_bits = pcm_l.len() * os_factor;
+            let n_bytes = total_bits / 8;
+            let mut out = vec![vec![0u8; n_bytes]; 2];
+            for (ch_idx, src_pcm) in [&pcm_l, &pcm_r].into_iter().enumerate() {
+                let mut acc = 0.0f64;
+                for (bi, slot) in out[ch_idx].iter_mut().enumerate() {
+                    let mut b = 0u8;
+                    for k in 0..8 {
+                        let bit_idx = bi * 8 + k;
+                        let pcm_pos = bit_idx / os_factor;
+                        let x = (src_pcm[pcm_pos.min(src_pcm.len() - 1)] as f64) * 0.5;
+                        let y = if acc + x >= 0.0 { 1.0 } else { -1.0 };
+                        acc += x - y;
+                        b = (b << 1) | ((y > 0.0) as u8);
+                    }
+                    *slot = b;
+                }
+            }
+            out
+        };
+
+        for (label, dsd_rate, os_factor, target) in [
+            ("DSD64->88.2k (default preprocess)", DSD64_RATE, 64usize, 88_200u32),
+            ("DSD64->176.4k (default fallback)", DSD64_RATE, 64usize, 176_400u32),
+            ("DSD128->176.4k", DSD64_RATE * 2, 128usize, 176_400u32),
+        ] {
+            let ch_bytes = modulate_stereo(os_factor);
+            let blk_sz = 4096usize;
+            let n_blks = ch_bytes[0].len() / blk_sz;
+            let total_bytes = n_blks * blk_sz;
+            let blocks: Vec<Vec<Vec<u8>>> = (0..n_blks)
+                .map(|bi| {
+                    let s = bi * blk_sz;
+                    ch_bytes
+                        .iter()
+                        .map(|b| b[s..s + blk_sz].iter().map(|x| x.reverse_bits()).collect())
+                        .collect()
+                })
+                .collect();
+            let dsf_bytes = make_dsf(
+                2, dsd_rate, 1,
+                (total_bytes * 8) as u64, blk_sz as u32, &blocks, None,
+            );
+
+            // Verify bit-for-bit equality on the real music DSD stream first
+            {
+                let info1 = parse_dsf(&mut Cursor::new(&dsf_bytes)).unwrap();
+                let r1 = DsdReader::new(Cursor::new(dsf_bytes.clone()), info1).unwrap();
+                let new_v: Vec<u32> = DsdPcmSource::new(r1, target).unwrap().map(f32::to_bits).collect();
+
+                let info2 = parse_dsf(&mut Cursor::new(&dsf_bytes)).unwrap();
+                let r2 = DsdReader::new(Cursor::new(dsf_bytes.clone()), info2).unwrap();
+                let old_v: Vec<u32> = OldDsdPcmSource::new(r2, target).unwrap().map(f32::to_bits).collect();
+
+                assert_eq!(new_v.len(), old_v.len());
+                let diffs = new_v.iter().zip(&old_v).filter(|(a, b)| a != b).count();
+                assert_eq!(diffs, 0, "{label}: {diffs} bit differences on real music!");
+                println!("\n=== {label}: {} output samples ({:.2}s stereo), bit_diffs=0 ===", new_v.len(), secs);
+            }
+
+            let run_old = || -> (f64, u32) {
+                let info = parse_dsf(&mut Cursor::new(&dsf_bytes)).unwrap();
+                let r = DsdReader::new(Cursor::new(&dsf_bytes), info).unwrap();
+                let src = OldDsdPcmSource::new(r, target).unwrap();
+                let t0 = Instant::now();
+                let mut xor = 0u32;
+                for s in src {
+                    xor ^= black_box(s).to_bits();
+                }
+                (t0.elapsed().as_secs_f64() * 1e3, xor)
+            };
+
+            let run_new = || -> (f64, u32) {
+                let info = parse_dsf(&mut Cursor::new(&dsf_bytes)).unwrap();
+                let r = DsdReader::new(Cursor::new(&dsf_bytes), info).unwrap();
+                let src = DsdPcmSource::new(r, target).unwrap();
+                let t0 = Instant::now();
+                let mut xor = 0u32;
+                for s in src {
+                    xor ^= black_box(s).to_bits();
+                }
+                (t0.elapsed().as_secs_f64() * 1e3, xor)
+            };
+
+            // Warm-up pair
+            let _ = (run_old(), run_new());
+
+            let mut old_ms = Vec::new();
+            let mut new_ms = Vec::new();
+            for pair in 0..5 {
+                let (o, n, xo, xn) = if pair % 2 == 0 {
+                    let (o, xo) = run_old();
+                    let (n, xn) = run_new();
+                    (o, n, xo, xn)
+                } else {
+                    let (n, xn) = run_new();
+                    let (o, xo) = run_old();
+                    (o, n, xo, xn)
+                };
+                assert_eq!(xo, xn);
+                println!("  pair {}: old={o:.2}ms, new={n:.2}ms (xor={xo:#010x})", pair + 1);
+                old_ms.push(o);
+                new_ms.push(n);
+            }
+            old_ms.sort_by(f64::total_cmp);
+            new_ms.sort_by(f64::total_cmp);
+            let med_old = old_ms[old_ms.len() / 2];
+            let med_new = new_ms[new_ms.len() / 2];
+            let track216_old = med_old * (216.0 / secs);
+            let track216_new = med_new * (216.0 / secs);
+            let cpu_pct_old = (med_old / (secs * 1000.0)) * 100.0;
+            let cpu_pct_new = (med_new / (secs * 1000.0)) * 100.0;
+            println!(
+                "  MEDIAN ({:.1}s audio): old={med_old:.2}ms -> new={med_new:.2}ms ({:.2}x, -{:.1}%)",
+                secs, med_old / med_new, (1.0 - med_new / med_old) * 100.0
+            );
+            println!(
+                "  Per 216s track: old={track216_old:.1}ms -> new={track216_new:.1}ms (saves {:.1}ms) | Playback 1-core CPU: {cpu_pct_old:.2}% -> {cpu_pct_new:.2}%",
+                track216_old - track216_new
+            );
+        }
     }
 }

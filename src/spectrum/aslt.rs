@@ -95,6 +95,8 @@ pub(crate) mod r10t {
     /// `FULL_DEFAULT` seeds `Seams::production()`; only the ignored
     /// measurement harnesses write it, one test per process.
     pub static FULL_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub static DE4FCB3_REF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub fn de4fcb3_ref() -> bool { DE4FCB3_REF.load(O::Relaxed) }
     thread_local! {
         static FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -160,6 +162,9 @@ struct InvWork {
     idx: Vec<usize>,
     work_idx: Vec<usize>,
     work_val: Vec<C32>,
+    /// Key `(start_pos, hop, len)` of the currently populated `idx`, so a pair of
+    /// channels sharing a block skips rebuilding identical output indices.
+    last_idx: (usize, usize, usize),
 }
 
 impl InvWork {
@@ -172,7 +177,12 @@ impl InvWork {
 
     fn new(inv: &dyn rustfft::Fft<f32>, cap: usize) -> Self {
         let u = inv.pruned_work_len(cap);
-        InvWork { idx: Vec::with_capacity(cap), work_idx: vec![0; 2 * u], work_val: vec![C32 { re: 0.0, im: 0.0 }; u] }
+        InvWork {
+            idx: Vec::with_capacity(cap),
+            work_idx: vec![0; 2 * u],
+            work_val: vec![C32 { re: 0.0, im: 0.0 }; u],
+            last_idx: (usize::MAX, 0, 0),
+        }
     }
 
     /// What [`InvWork::new`] retains, in bytes.
@@ -200,8 +210,17 @@ impl InvWork {
                 self.work_idx.resize(2 * u, 0);
                 self.work_val.resize(u, C32 { re: 0.0, im: 0.0 });
             }
-            self.idx.clear();
-            self.idx.extend((0..out.len()).map(at));
+            if out.is_empty() {
+                self.idx.clear();
+                self.last_idx = (usize::MAX, 0, 0);
+            } else {
+                let key = (lo * hop + half - base, hop, out.len());
+                if self.last_idx != key || self.idx.len() != out.len() {
+                    self.idx.clear();
+                    self.idx.extend((0..out.len()).map(at));
+                    self.last_idx = key;
+                }
+            }
             let work = rustfft::PrunedWork { idx: &mut self.work_idx, val: &mut self.work_val };
             match op {
                 Operand::Product(s, h) => inv.process_pruned_product_with_scratch(s, h, buf, scratch, &self.idx, out, work),
@@ -544,6 +563,109 @@ pub fn fft_crossover_hz(sample_rate: u32, fft_size: usize, grid_q: f32) -> f32 {
 // Morlet kernel
 // ---------------------------------------------------------------------------
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn interior_parts_step4(
+    acc_re: &mut std::arch::x86_64::__m256d,
+    acc_im: &mut std::arch::x86_64::__m256d,
+    ptrs: [*const f32; 4],
+    t: usize,
+    vre: std::arch::x86_64::__m128,
+    vim: std::arch::x86_64::__m128,
+) {
+    use std::arch::x86_64::*;
+    // SAFETY: Caller guarantees `t + 4 <= len` for every pointer in `ptrs`.
+    unsafe {
+        let r0 = _mm_loadu_ps(ptrs[0].add(t));
+        let r1 = _mm_loadu_ps(ptrs[1].add(t));
+        let r2 = _mm_loadu_ps(ptrs[2].add(t));
+        let r3 = _mm_loadu_ps(ptrs[3].add(t));
+        let t0 = _mm_unpacklo_ps(r0, r1);
+        let t1 = _mm_unpackhi_ps(r0, r1);
+        let t2 = _mm_unpacklo_ps(r2, r3);
+        let t3 = _mm_unpackhi_ps(r2, r3);
+        let c0 = _mm_movelh_ps(t0, t2);
+        let c1 = _mm_movehl_ps(t2, t0);
+        let c2 = _mm_movelh_ps(t1, t3);
+        let c3 = _mm_movehl_ps(t3, t1);
+
+        macro_rules! accum_tap {
+            ($c:expr, $imm:literal) => {{
+                let br = _mm_shuffle_ps::<$imm>(vre, vre);
+                let bi = _mm_shuffle_ps::<$imm>(vim, vim);
+                let pr = _mm_mul_ps($c, br);
+                let pi = _mm_mul_ps($c, bi);
+                *acc_re = _mm256_add_pd(*acc_re, _mm256_cvtps_pd(pr));
+                *acc_im = _mm256_add_pd(*acc_im, _mm256_cvtps_pd(pi));
+            }};
+        }
+        accum_tap!(c0, 0x00);
+        accum_tap!(c1, 0x55);
+        accum_tap!(c2, 0xAA);
+        accum_tap!(c3, 0xFF);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn interior_parts_grouped<const G: usize>(
+    re: &[f32],
+    im: &[f32],
+    groups: [[&[f32]; 4]; G],
+) -> [[(f64, f64); 4]; G] {
+    use std::arch::x86_64::*;
+    let n = re.len();
+    debug_assert_eq!(im.len(), n);
+    let mut ptrs = [[std::ptr::null::<f32>(); 4]; G];
+    for g in 0..G {
+        for i in 0..4 {
+            debug_assert!(groups[g][i].len() >= n);
+            ptrs[g][i] = groups[g][i].as_ptr();
+        }
+    }
+    let mut acc_re = [_mm256_setzero_pd(); G];
+    let mut acc_im = [_mm256_setzero_pd(); G];
+    let mut t = 0usize;
+    // SAFETY: `t + 4 <= n`, and `re`, `im`, and every window in `ptrs` hold at least `n` elements.
+    unsafe {
+        let re_ptr = re.as_ptr();
+        let im_ptr = im.as_ptr();
+        while t + 4 <= n {
+            let vre = _mm_loadu_ps(re_ptr.add(t));
+            let vim = _mm_loadu_ps(im_ptr.add(t));
+            for g in 0..G {
+                interior_parts_step4(&mut acc_re[g], &mut acc_im[g], ptrs[g], t, vre, vim);
+            }
+            t += 4;
+        }
+    }
+    let mut out = [[(0.0f64, 0.0f64); 4]; G];
+    let mut tmp_re = [0.0f64; 4];
+    let mut tmp_im = [0.0f64; 4];
+    for g in 0..G {
+        // SAFETY: `tmp_re` and `tmp_im` have 4 `f64` elements.
+        unsafe {
+            _mm256_storeu_pd(tmp_re.as_mut_ptr(), acc_re[g]);
+            _mm256_storeu_pd(tmp_im.as_mut_ptr(), acc_im[g]);
+        }
+        for i in 0..4 {
+            out[g][i] = (tmp_re[i], tmp_im[i]);
+        }
+    }
+    while t < n {
+        let (wr, wi) = (re[t], im[t]);
+        for g in 0..G {
+            for i in 0..4 {
+                let s = groups[g][i][t];
+                out[g][i].0 += (s * wr) as f64;
+                out[g][i].1 += (s * wi) as f64;
+            }
+        }
+        t += 1;
+    }
+    out
+}
+
 /// Magnitudes of a complex column, in place of a second convolution.
 fn norms(c: Vec<C32>) -> Vec<f32> {
     c.into_iter().map(|c| (c.re * c.re + c.im * c.im).sqrt()).collect()
@@ -593,6 +715,93 @@ pub struct Morlet {
 }
 
 impl Morlet {
+    fn empty() -> Self {
+        Self { re: Vec::new(), im: Vec::new(), env: Vec::new(), half: 0 }
+    }
+
+    pub(crate) fn half_for(freq: f32, cycles: f32, sample_rate: f32) -> usize {
+        let sigma = sigma_samples(freq, cycles, sample_rate).max(0.5);
+        ((SUPPORT_SIGMAS * sigma).ceil() as usize).max(1)
+    }
+
+    /// Build or overwrite the wavelet tables in place, reusing vector capacities.
+    fn build_into(&mut self, freq: f32, cycles: f32, sample_rate: f32) {
+        let sigma = sigma_samples(freq, cycles, sample_rate).max(0.5);
+        let half = ((SUPPORT_SIGMAS * sigma).ceil() as usize).max(1);
+        let n = 2 * half + 1;
+        let denom = 2.0 * sigma * sigma;
+        let omega = std::f32::consts::TAU * freq / sample_rate;
+        self.half = half;
+
+        // When every index 0..n is exactly representable in f32 (half < 2^23),
+        // k - half is exact and even/odd symmetry around half computes half+1
+        // Gaussians and half sin/cos pairs instead of 2*half+1, bit-identically.
+        #[cfg(test)]
+        let use_sym = !r10t::de4fcb3_ref() && half < (1 << 23);
+        #[cfg(not(test))]
+        let use_sym = half < (1 << 23);
+        if use_sym {
+            self.env.resize(n, 0.0f32);
+            self.env[half] = 1.0f32;
+            for d in 1..=half {
+                let t = d as f32;
+                let g = (-(t * t) / denom).exp();
+                self.env[half - d] = g;
+                self.env[half + d] = g;
+            }
+            let mut sum = 0.0f64;
+            for &g in &self.env {
+                sum += g as f64;
+            }
+            let norm = if sum > 0.0 { (1.0 / sum) as f32 } else { 0.0 };
+            self.re.resize(n, 0.0f32);
+            self.im.resize(n, 0.0f32);
+            let g0 = self.env[half] * norm;
+            self.env[half] = g0;
+            self.re[half] = g0;
+            self.im[half] = -g0 * 0.0f32.sin();
+            for d in 1..=half {
+                let phase = omega * d as f32;
+                let c = phase.cos();
+                let s = phase.sin();
+                let g = self.env[half + d] * norm;
+                self.env[half - d] = g;
+                self.env[half + d] = g;
+                let gc = g * c;
+                let gs = g * s;
+                self.re[half - d] = gc;
+                self.re[half + d] = gc;
+                self.im[half - d] = gs;
+                self.im[half + d] = -gs;
+            }
+            return;
+        }
+
+        self.env.clear();
+        self.env.reserve(n);
+        let mut sum = 0.0f64;
+        for k in 0..n {
+            let t = k as f32 - half as f32;
+            let g = (-(t * t) / denom).exp();
+            sum += g as f64;
+            self.env.push(g);
+        }
+
+        let norm = if sum > 0.0 { (1.0 / sum) as f32 } else { 0.0 };
+        self.re.clear();
+        self.re.reserve(n);
+        self.im.clear();
+        self.im.reserve(n);
+        for (k, g) in self.env.iter_mut().enumerate() {
+            let t = k as f32 - half as f32;
+            let phase = omega * t;
+            *g *= norm;
+            let gn = *g;
+            self.re.push(gn * phase.cos());
+            self.im.push(-gn * phase.sin());
+        }
+    }
+
     /// Build the wavelet for `freq` spanning `cycles` cycles.
     ///
     /// The Gaussian envelope is L1-normalised, which makes the response to a
@@ -600,34 +809,9 @@ impl Morlet {
     /// (see `response`). Without that, changing preset would rescale the whole
     /// display and shift every bar against the ISO 226 weights.
     pub fn new(freq: f32, cycles: f32, sample_rate: f32) -> Self {
-        let sigma = sigma_samples(freq, cycles, sample_rate).max(0.5);
-        let half = ((SUPPORT_SIGMAS * sigma).ceil() as usize).max(1);
-        let n = 2 * half + 1;
-
-        let mut env = Vec::with_capacity(n);
-        let mut sum = 0.0f64;
-        for k in 0..n {
-            let t = k as f32 - half as f32;
-            let g = (-(t * t) / (2.0 * sigma * sigma)).exp();
-            sum += g as f64;
-            env.push(g);
-        }
-
-        let norm = if sum > 0.0 { (1.0 / sum) as f32 } else { 0.0 };
-        let omega = std::f32::consts::TAU * freq / sample_rate;
-        let mut re = Vec::with_capacity(n);
-        let mut im = Vec::with_capacity(n);
-        let mut env_n = Vec::with_capacity(n);
-        for (k, g) in env.into_iter().enumerate() {
-            let t = k as f32 - half as f32;
-            let phase = omega * t;
-            let g = g * norm;
-            re.push(g * phase.cos());
-            im.push(-g * phase.sin());
-            env_n.push(g);
-        }
-
-        Self { re, im, env: env_n, half }
+        let mut m = Self::empty();
+        m.build_into(freq, cycles, sample_rate);
+        m
     }
 
     /// Magnitude of the wavelet response centred on sample `centre`.
@@ -741,6 +925,29 @@ impl Morlet {
         let n = self.re.len();
         let (re, im) = (&self.re[..n], &self.im[..n]);
         let windows = windows.map(|w| &w[..n]);
+        #[cfg(target_arch = "x86_64")]
+        if {
+            #[cfg(test)]
+            { !r10t::de4fcb3_ref() }
+            #[cfg(not(test))]
+            { true }
+        } && n >= 4 && (K == 4 || K == 8) && std::is_x86_feature_detected!("avx2") {
+            if K == 4 {
+                let g: [[&[f32]; 4]; 1] = [[windows[0], windows[1], windows[2], windows[3]]];
+                // SAFETY: `avx2` was just verified, and `re`/`im`/all `windows` share length `n`.
+                let out = unsafe { interior_parts_grouped::<1>(re, im, g) };
+                return std::array::from_fn(|i| out[0][i]);
+            }
+            if K == 8 {
+                let g: [[&[f32]; 4]; 2] = [
+                    [windows[0], windows[1], windows[2], windows[3]],
+                    [windows[4], windows[5], windows[6], windows[7]],
+                ];
+                // SAFETY: `avx2` was just verified, and `re`/`im`/all `windows` share length `n`.
+                let out = unsafe { interior_parts_grouped::<2>(re, im, g) };
+                return std::array::from_fn(|i| out[i >> 2][i & 3]);
+            }
+        }
         let mut acc = [(0.0f64, 0.0f64); K];
         for t in 0..n {
             let (wr, wi) = (re[t], im[t]);
@@ -831,6 +1038,10 @@ impl Morlet {
                         let r = v.pop().expect("two columns");
                         (v.pop().expect("two columns"), r)
                     }
+                    _ if !fft_is_cheaper(k, hop) && ch.a.len() == right.len() => {
+                        work.column(2);
+                        self.direct_complex_pair(ch.a, right, hop, frames)
+                    }
                     _ => (one(ch.a, &shared.a), one(right, &shared.b)),
                 };
                 let mix = mix_norms(&l, &r);
@@ -857,6 +1068,201 @@ impl Morlet {
         }
     }
 
+    fn interior_frame_range(&self, n_sig: usize, hop: usize, frames: usize) -> std::ops::Range<usize> {
+        let k = self.re.len();
+        if hop == 0 || n_sig < k || frames == 0 {
+            return 0..0;
+        }
+        let lo = self.half.div_ceil(hop).min(frames);
+        let max_centre = n_sig - k + self.half;
+        let hi = (max_centre / hop + 1).min(frames).max(lo);
+        lo..hi
+    }
+
+    fn visit_direct_mono_parts<const CANCELLABLE: bool>(
+        &self, signal: &[f32], hop: usize, frames: usize, check_interval: usize,
+        mut abort: impl FnMut() -> bool,
+        mut emit: impl FnMut(usize, &[(f64, f64)], f64),
+    ) -> bool {
+        let range = self.interior_frame_range(signal.len(), hop, frames);
+        let mut next_chk = 0usize;
+        let mut poll = |fi: usize| -> bool {
+            if CANCELLABLE && fi >= next_chk {
+                next_chk = (fi / check_interval + 1) * check_interval;
+                if abort() { return true; }
+            }
+            false
+        };
+        for fi in 0..range.start {
+            if poll(fi) { return false; }
+            let (re, im, div) = self.response_parts(signal, (fi * hop) as isize);
+            emit(fi, &[(re, im)], div);
+        }
+        let mut fi = range.start;
+        while fi + 8 <= range.end {
+            if poll(fi) { return false; }
+            let ws: [&[f32]; 8] = std::array::from_fn(|j| self.window(signal, ((fi + j) * hop) as isize));
+            let parts = self.interior_parts(ws);
+            emit(fi, &parts, 1.0);
+            fi += 8;
+        }
+        if fi + 4 <= range.end {
+            if poll(fi) { return false; }
+            let ws: [&[f32]; 4] = std::array::from_fn(|j| self.window(signal, ((fi + j) * hop) as isize));
+            let parts = self.interior_parts(ws);
+            emit(fi, &parts, 1.0);
+            fi += 4;
+        }
+        for fi in fi..frames {
+            if poll(fi) { return false; }
+            let (re, im, div) = self.response_parts(signal, (fi * hop) as isize);
+            emit(fi, &[(re, im)], div);
+        }
+        true
+    }
+
+    fn visit_direct_mono(
+        &self, signal: &[f32], hop: usize, frames: usize, mut emit: impl FnMut(usize, &[C32]),
+    ) {
+        let _ = self.visit_direct_mono_parts::<false>(
+            signal, hop, frames, usize::MAX, || false,
+            |fi, parts, div| match parts.len() {
+                1 => emit(fi, &[Self::c_of(parts[0], div)]),
+                4 => {
+                    let out: [C32; 4] = std::array::from_fn(|j| Self::c_of(parts[j], div));
+                    emit(fi, &out);
+                }
+                _ => {
+                    let out: [C32; 8] = std::array::from_fn(|j| Self::c_of(parts[j], div));
+                    emit(fi, &out);
+                }
+            },
+        );
+    }
+
+    fn fold_direct_mono_cancellable(
+        &self, signal: &[f32], hop: usize, frames: usize, weight: f32, acc: &mut [f32],
+        check_interval: usize, abort: impl FnMut() -> bool,
+    ) -> bool {
+        self.visit_direct_mono_parts::<true>(
+            signal, hop, frames, check_interval, abort,
+            |fi, parts, div| {
+                for (j, &(re, im)) in parts.iter().enumerate() {
+                    let m = if div <= 0.0 { 0.0 } else { (2.0 * (re * re + im * im).sqrt() / div) as f32 };
+                    acc[fi + j] += weight * m.max(MAG_FLOOR).ln();
+                }
+            },
+        )
+    }
+
+    fn visit_direct_pair_cancellable<const CANCELLABLE: bool>(
+        &self, a: &[f32], b: &[f32], hop: usize, frames: usize, check_interval: usize,
+        mut abort: impl FnMut() -> bool, mut emit: impl FnMut(usize, &[C32], &[C32]),
+    ) -> bool {
+        debug_assert_eq!(a.len(), b.len());
+        let range = self.interior_frame_range(a.len(), hop, frames);
+        let mut next_chk = 0usize;
+        let mut poll = |fi: usize| -> bool {
+            if CANCELLABLE && fi >= next_chk {
+                next_chk = (fi / check_interval + 1) * check_interval;
+                if abort() { return true; }
+            }
+            false
+        };
+        let pair_at = |fi: usize| -> (C32, C32) {
+            let (p, div) = self.response_parts_pair([a, b], (fi * hop) as isize);
+            (Self::c_of(p[0], div), Self::c_of(p[1], div))
+        };
+        for fi in 0..range.start {
+            if poll(fi) { return false; }
+            let (l, r) = pair_at(fi);
+            emit(fi, &[l], &[r]);
+        }
+        let mut fi = range.start;
+        while fi + 4 <= range.end {
+            if poll(fi) { return false; }
+            let ws: [&[f32]; 8] = [
+                self.window(a, (fi * hop) as isize),
+                self.window(a, ((fi + 1) * hop) as isize),
+                self.window(a, ((fi + 2) * hop) as isize),
+                self.window(a, ((fi + 3) * hop) as isize),
+                self.window(b, (fi * hop) as isize),
+                self.window(b, ((fi + 1) * hop) as isize),
+                self.window(b, ((fi + 2) * hop) as isize),
+                self.window(b, ((fi + 3) * hop) as isize),
+            ];
+            let parts = self.interior_parts(ws);
+            let la: [C32; 4] = std::array::from_fn(|j| Self::c_of(parts[j], 1.0));
+            let rb: [C32; 4] = std::array::from_fn(|j| Self::c_of(parts[j + 4], 1.0));
+            emit(fi, &la, &rb);
+            fi += 4;
+        }
+        for fi in fi..frames {
+            if poll(fi) { return false; }
+            let (l, r) = pair_at(fi);
+            emit(fi, &[l], &[r]);
+        }
+        true
+    }
+
+    fn visit_direct_pair(
+        &self, a: &[f32], b: &[f32], hop: usize, frames: usize,
+        emit: impl FnMut(usize, &[C32], &[C32]),
+    ) {
+        let _ = self.visit_direct_pair_cancellable::<false>(
+            a, b, hop, frames, usize::MAX, || false, emit,
+        );
+    }
+
+    fn direct_complex(&self, signal: &[f32], hop: usize, frames: usize) -> Vec<C32> {
+        let mut out = Vec::with_capacity(frames);
+        self.visit_direct_mono(signal, hop, frames, |_, chunk| out.extend_from_slice(chunk));
+        out
+    }
+
+    fn direct_complex_pair(&self, a: &[f32], b: &[f32], hop: usize, frames: usize) -> (Vec<C32>, Vec<C32>) {
+        let mut la = Vec::with_capacity(frames);
+        let mut rb = Vec::with_capacity(frames);
+        self.visit_direct_pair(a, b, hop, frames, |_, l, r| {
+            la.extend_from_slice(l);
+            rb.extend_from_slice(r);
+        });
+        (la, rb)
+    }
+
+    /// Evaluate and fold one member directly into `acc`, avoiding column allocations on direct paths.
+    fn fold_member_cols(
+        &self, acc: &mut Cols, ch: &Chans, hop: usize, frames: usize, shared: &SharedSet,
+        work: &WorkCells, seams: &Seams, weight: f32,
+    ) {
+        let joint = ch.joint();
+        #[cfg(test)]
+        let fast_direct = !r10t::de4fcb3_ref();
+        #[cfg(not(test))]
+        let fast_direct = true;
+        if fast_direct && !fft_is_cheaper(self.re.len(), hop) && !(seams.redundant_mix_transform && ch.mean.is_some()) {
+            match ch.b {
+                None => {
+                    work.column(1);
+                    self.visit_direct_mono(ch.a, hop, frames, |lo, c| {
+                        fold_complex_weighted(acc, lo, c, None, weight);
+                    });
+                    return;
+                }
+                Some(right) if ch.a.len() == right.len() => {
+                    work.column(2);
+                    self.visit_direct_pair(ch.a, right, hop, frames, |lo, l, r| {
+                        fold_complex_weighted(acc, lo, l, Some(r), weight);
+                    });
+                    return;
+                }
+                Some(_) => {}
+            }
+        }
+        let col = self.member_cols(ch, hop, frames, shared, work, seams);
+        fold_cols_weighted(acc, &col, joint, weight);
+    }
+
     /// [`Morlet::magnitudes`], kept complex, by whichever route is cheaper.
     fn complex(&self, signal: &[f32], hop: usize, frames: usize) -> Vec<C32> {
         if fft_is_cheaper(self.re.len(), hop)
@@ -864,7 +1270,7 @@ impl Morlet {
         {
             return v;
         }
-        (0..frames).map(|fi| self.response_c(signal, (fi * hop) as isize)).collect()
+        self.direct_complex(signal, hop, frames)
     }
 
     /// Interior frames by overlap-save FFT convolution; edge frames by the
@@ -1018,14 +1424,800 @@ impl Morlet {
 
     /// Every edge frame — before `first`, after `last` — of each signal by the
     /// direct loop, and zeros elsewhere: each value [`Morlet::response_c`]'s.
-    fn edge_frames(&self, signals: &[&[f32]], hop: usize, frames: usize, first: usize, last: usize) -> Vec<Vec<C32>> {
-        let mut outs = vec![vec![C32 { re: 0.0, im: 0.0 }; frames]; signals.len()];
-        for fi in (0..frames).filter(|&fi| fi < first || fi > last) {
-            for (out, v) in outs.iter_mut().zip(self.edge_frame(signals, (fi * hop) as isize)) {
-                out[fi] = v;
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn transpose4_ps(r: [std::arch::x86_64::__m128; 4]) -> [std::arch::x86_64::__m128; 4] {
+        use std::arch::x86_64::*;
+        unsafe {
+            let t0 = _mm_unpacklo_ps(r[0], r[1]);
+            let t1 = _mm_unpackhi_ps(r[0], r[1]);
+            let t2 = _mm_unpacklo_ps(r[2], r[3]);
+            let t3 = _mm_unpackhi_ps(r[2], r[3]);
+            [
+                _mm_movelh_ps(t0, t2),
+                _mm_movehl_ps(t2, t0),
+                _mm_movelh_ps(t1, t3),
+                _mm_movehl_ps(t3, t1),
+            ]
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn edge_lead4_avx2<const PAIR: bool>(
+        a: &[f32], b: &[f32], re: &[f32], im: &[f32], env: &[f32], k0: [usize; 4], m: [usize; 4],
+    ) -> ([(f64, f64); 4], [(f64, f64); 4], [f64; 4]) {
+        let n4 = m[0] & !3;
+        let mut ra = [0.0f64; 4];
+        let mut ia = [0.0f64; 4];
+        let mut rb = [0.0f64; 4];
+        let mut ib = [0.0f64; 4];
+        let mut ev = [0.0f64; 4];
+        unsafe {
+            Self::edge_lead_chunk4_avx2::<PAIR>(
+                a, b, re, im, env, k0, 0, n4, &mut ra, &mut ia, &mut rb, &mut ib, &mut ev,
+            );
+        }
+        for j in 0..4 {
+            let off = k0[j];
+            for tt in n4..m[j] {
+                let s = a[tt];
+                let idx = off + tt;
+                let (wr, wi) = (re[idx], im[idx]);
+                ra[j] += (s * wr) as f64;
+                ia[j] += (s * wi) as f64;
+                if PAIR {
+                    let sb = b[tt];
+                    rb[j] += (sb * wr) as f64;
+                    ib[j] += (sb * wi) as f64;
+                }
+                ev[j] += env[idx] as f64;
             }
         }
+        ([(ra[0], ia[0]), (ra[1], ia[1]), (ra[2], ia[2]), (ra[3], ia[3])],
+         [(rb[0], ib[0]), (rb[1], ib[1]), (rb[2], ib[2]), (rb[3], ib[3])],
+         ev)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn edge_trail4_avx2<const PAIR: bool>(
+        a: &[f32], b: &[f32], re: &[f32], im: &[f32], base: [usize; 4], m: [usize; 4],
+    ) -> ([(f64, f64); 4], [(f64, f64); 4]) {
+        let n4 = m[3] & !3;
+        let mut ra = [0.0f64; 4];
+        let mut ia = [0.0f64; 4];
+        let mut rb = [0.0f64; 4];
+        let mut ib = [0.0f64; 4];
+        unsafe {
+            Self::edge_trail_chunk4_avx2::<PAIR>(
+                a, b, re, im, base, 0, n4, &mut ra, &mut ia, &mut rb, &mut ib,
+            );
+        }
+        for j in 0..4 {
+            let bj = base[j];
+            for tt in n4..m[j] {
+                let s = a[bj + tt];
+                let (wr, wi) = (re[tt], im[tt]);
+                ra[j] += (s * wr) as f64;
+                ia[j] += (s * wi) as f64;
+                if PAIR {
+                    let sb = b[bj + tt];
+                    rb[j] += (sb * wr) as f64;
+                    ib[j] += (sb * wi) as f64;
+                }
+            }
+        }
+        ([(ra[0], ia[0]), (ra[1], ia[1]), (ra[2], ia[2]), (ra[3], ia[3])],
+         [(rb[0], ib[0]), (rb[1], ib[1]), (rb[2], ib[2]), (rb[3], ib[3])])
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx", enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn edge_lead_chunk4_avx2<const PAIR: bool>(
+        a: &[f32], b: &[f32], re: &[f32], im: &[f32], env: &[f32],
+        k0: [usize; 4], t0: usize, t1: usize,
+        ra: &mut [f64; 4], ia: &mut [f64; 4], rb: &mut [f64; 4], ib: &mut [f64; 4], ev: &mut [f64; 4],
+    ) {
+        use std::arch::x86_64::*;
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        let rep = re.as_ptr();
+        let imp = im.as_ptr();
+        let evp = env.as_ptr();
+        let (k00, k01, k02, k03) = (k0[0], k0[1], k0[2], k0[3]);
+        unsafe {
+            let mut acc_ra = _mm256_loadu_pd(ra.as_ptr());
+            let mut acc_ia = _mm256_loadu_pd(ia.as_ptr());
+            let mut acc_rb = if PAIR { _mm256_loadu_pd(rb.as_ptr()) } else { _mm256_setzero_pd() };
+            let mut acc_ib = if PAIR { _mm256_loadu_pd(ib.as_ptr()) } else { _mm256_setzero_pd() };
+            let mut acc_ev = _mm256_loadu_pd(ev.as_ptr());
+            let mut t = t0;
+            while t + 4 <= t1 {
+                let cr = Self::transpose4_ps([
+                    _mm_loadu_ps(rep.add(k00 + t)), _mm_loadu_ps(rep.add(k01 + t)),
+                    _mm_loadu_ps(rep.add(k02 + t)), _mm_loadu_ps(rep.add(k03 + t)),
+                ]);
+                for m in 0..4 {
+                    let sa = _mm_broadcast_ss(&*ap.add(t + m));
+                    acc_ra = _mm256_add_pd(acc_ra, _mm256_cvtps_pd(_mm_mul_ps(sa, cr[m])));
+                }
+                if PAIR {
+                    for m in 0..4 {
+                        let sb = _mm_broadcast_ss(&*bp.add(t + m));
+                        acc_rb = _mm256_add_pd(acc_rb, _mm256_cvtps_pd(_mm_mul_ps(sb, cr[m])));
+                    }
+                }
+
+                let ci = Self::transpose4_ps([
+                    _mm_loadu_ps(imp.add(k00 + t)), _mm_loadu_ps(imp.add(k01 + t)),
+                    _mm_loadu_ps(imp.add(k02 + t)), _mm_loadu_ps(imp.add(k03 + t)),
+                ]);
+                for m in 0..4 {
+                    let sa = _mm_broadcast_ss(&*ap.add(t + m));
+                    acc_ia = _mm256_add_pd(acc_ia, _mm256_cvtps_pd(_mm_mul_ps(sa, ci[m])));
+                }
+                if PAIR {
+                    for m in 0..4 {
+                        let sb = _mm_broadcast_ss(&*bp.add(t + m));
+                        acc_ib = _mm256_add_pd(acc_ib, _mm256_cvtps_pd(_mm_mul_ps(sb, ci[m])));
+                    }
+                }
+
+                let ce = Self::transpose4_ps([
+                    _mm_loadu_ps(evp.add(k00 + t)), _mm_loadu_ps(evp.add(k01 + t)),
+                    _mm_loadu_ps(evp.add(k02 + t)), _mm_loadu_ps(evp.add(k03 + t)),
+                ]);
+                acc_ev = _mm256_add_pd(acc_ev, _mm256_cvtps_pd(ce[0]));
+                acc_ev = _mm256_add_pd(acc_ev, _mm256_cvtps_pd(ce[1]));
+                acc_ev = _mm256_add_pd(acc_ev, _mm256_cvtps_pd(ce[2]));
+                acc_ev = _mm256_add_pd(acc_ev, _mm256_cvtps_pd(ce[3]));
+                t += 4;
+            }
+            _mm256_storeu_pd(ra.as_mut_ptr(), acc_ra);
+            _mm256_storeu_pd(ia.as_mut_ptr(), acc_ia);
+            if PAIR {
+                _mm256_storeu_pd(rb.as_mut_ptr(), acc_rb);
+                _mm256_storeu_pd(ib.as_mut_ptr(), acc_ib);
+            }
+            _mm256_storeu_pd(ev.as_mut_ptr(), acc_ev);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx", enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn edge_lead_chunk8_mono_avx2(
+        a: &[f32], re: &[f32], im: &[f32], env: &[f32],
+        k0_a: [usize; 4], k0_b: [usize; 4], t0: usize, t1: usize,
+        acc_a: &mut [[f64; 4]; 5], acc_b: &mut [[f64; 4]; 5],
+    ) {
+        use std::arch::x86_64::*;
+        let ap = a.as_ptr();
+        let rep = re.as_ptr();
+        let imp = im.as_ptr();
+        let evp = env.as_ptr();
+        unsafe {
+            let mut ra0 = _mm256_loadu_pd(acc_a[0].as_ptr());
+            let mut ia0 = _mm256_loadu_pd(acc_a[1].as_ptr());
+            let mut ev0 = _mm256_loadu_pd(acc_a[4].as_ptr());
+            let mut ra1 = _mm256_loadu_pd(acc_b[0].as_ptr());
+            let mut ia1 = _mm256_loadu_pd(acc_b[1].as_ptr());
+            let mut ev1 = _mm256_loadu_pd(acc_b[4].as_ptr());
+
+            let mut t = t0;
+            while t + 4 <= t1 {
+                let cr0 = Self::transpose4_ps([
+                    _mm_loadu_ps(rep.add(k0_a[0] + t)), _mm_loadu_ps(rep.add(k0_a[1] + t)),
+                    _mm_loadu_ps(rep.add(k0_a[2] + t)), _mm_loadu_ps(rep.add(k0_a[3] + t)),
+                ]);
+                for m in 0..4 {
+                    let sa = _mm_broadcast_ss(&*ap.add(t + m));
+                    ra0 = _mm256_add_pd(ra0, _mm256_cvtps_pd(_mm_mul_ps(sa, cr0[m])));
+                }
+
+                let cr1 = Self::transpose4_ps([
+                    _mm_loadu_ps(rep.add(k0_b[0] + t)), _mm_loadu_ps(rep.add(k0_b[1] + t)),
+                    _mm_loadu_ps(rep.add(k0_b[2] + t)), _mm_loadu_ps(rep.add(k0_b[3] + t)),
+                ]);
+                for m in 0..4 {
+                    let sa = _mm_broadcast_ss(&*ap.add(t + m));
+                    ra1 = _mm256_add_pd(ra1, _mm256_cvtps_pd(_mm_mul_ps(sa, cr1[m])));
+                }
+
+                let ci0 = Self::transpose4_ps([
+                    _mm_loadu_ps(imp.add(k0_a[0] + t)), _mm_loadu_ps(imp.add(k0_a[1] + t)),
+                    _mm_loadu_ps(imp.add(k0_a[2] + t)), _mm_loadu_ps(imp.add(k0_a[3] + t)),
+                ]);
+                for m in 0..4 {
+                    let sa = _mm_broadcast_ss(&*ap.add(t + m));
+                    ia0 = _mm256_add_pd(ia0, _mm256_cvtps_pd(_mm_mul_ps(sa, ci0[m])));
+                }
+
+                let ci1 = Self::transpose4_ps([
+                    _mm_loadu_ps(imp.add(k0_b[0] + t)), _mm_loadu_ps(imp.add(k0_b[1] + t)),
+                    _mm_loadu_ps(imp.add(k0_b[2] + t)), _mm_loadu_ps(imp.add(k0_b[3] + t)),
+                ]);
+                for m in 0..4 {
+                    let sa = _mm_broadcast_ss(&*ap.add(t + m));
+                    ia1 = _mm256_add_pd(ia1, _mm256_cvtps_pd(_mm_mul_ps(sa, ci1[m])));
+                }
+
+                let ce0 = Self::transpose4_ps([
+                    _mm_loadu_ps(evp.add(k0_a[0] + t)), _mm_loadu_ps(evp.add(k0_a[1] + t)),
+                    _mm_loadu_ps(evp.add(k0_a[2] + t)), _mm_loadu_ps(evp.add(k0_a[3] + t)),
+                ]);
+                ev0 = _mm256_add_pd(ev0, _mm256_cvtps_pd(ce0[0]));
+                ev0 = _mm256_add_pd(ev0, _mm256_cvtps_pd(ce0[1]));
+                ev0 = _mm256_add_pd(ev0, _mm256_cvtps_pd(ce0[2]));
+                ev0 = _mm256_add_pd(ev0, _mm256_cvtps_pd(ce0[3]));
+
+                let ce1 = Self::transpose4_ps([
+                    _mm_loadu_ps(evp.add(k0_b[0] + t)), _mm_loadu_ps(evp.add(k0_b[1] + t)),
+                    _mm_loadu_ps(evp.add(k0_b[2] + t)), _mm_loadu_ps(evp.add(k0_b[3] + t)),
+                ]);
+                ev1 = _mm256_add_pd(ev1, _mm256_cvtps_pd(ce1[0]));
+                ev1 = _mm256_add_pd(ev1, _mm256_cvtps_pd(ce1[1]));
+                ev1 = _mm256_add_pd(ev1, _mm256_cvtps_pd(ce1[2]));
+                ev1 = _mm256_add_pd(ev1, _mm256_cvtps_pd(ce1[3]));
+                t += 4;
+            }
+
+            _mm256_storeu_pd(acc_a[0].as_mut_ptr(), ra0);
+            _mm256_storeu_pd(acc_a[1].as_mut_ptr(), ia0);
+            _mm256_storeu_pd(acc_a[4].as_mut_ptr(), ev0);
+            _mm256_storeu_pd(acc_b[0].as_mut_ptr(), ra1);
+            _mm256_storeu_pd(acc_b[1].as_mut_ptr(), ia1);
+            _mm256_storeu_pd(acc_b[4].as_mut_ptr(), ev1);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx", enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn edge_trail_chunk4_avx2<const PAIR: bool>(
+        a: &[f32], b: &[f32], re: &[f32], im: &[f32],
+        base: [usize; 4], t0: usize, t1: usize,
+        ra: &mut [f64; 4], ia: &mut [f64; 4], rb: &mut [f64; 4], ib: &mut [f64; 4],
+    ) {
+        use std::arch::x86_64::*;
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        let rep = re.as_ptr();
+        let imp = im.as_ptr();
+        let (b0, b1, b2, b3) = (base[0], base[1], base[2], base[3]);
+        unsafe {
+            let mut acc_ra = _mm256_loadu_pd(ra.as_ptr());
+            let mut acc_ia = _mm256_loadu_pd(ia.as_ptr());
+            let mut acc_rb = if PAIR { _mm256_loadu_pd(rb.as_ptr()) } else { _mm256_setzero_pd() };
+            let mut acc_ib = if PAIR { _mm256_loadu_pd(ib.as_ptr()) } else { _mm256_setzero_pd() };
+            let mut t = t0;
+            while t + 4 <= t1 {
+                let ca = Self::transpose4_ps([
+                    _mm_loadu_ps(ap.add(b0 + t)), _mm_loadu_ps(ap.add(b1 + t)),
+                    _mm_loadu_ps(ap.add(b2 + t)), _mm_loadu_ps(ap.add(b3 + t)),
+                ]);
+                for m in 0..4 {
+                    let wr = _mm_broadcast_ss(&*rep.add(t + m));
+                    let wi = _mm_broadcast_ss(&*imp.add(t + m));
+                    acc_ra = _mm256_add_pd(acc_ra, _mm256_cvtps_pd(_mm_mul_ps(ca[m], wr)));
+                    acc_ia = _mm256_add_pd(acc_ia, _mm256_cvtps_pd(_mm_mul_ps(ca[m], wi)));
+                }
+
+                if PAIR {
+                    let cb = Self::transpose4_ps([
+                        _mm_loadu_ps(bp.add(b0 + t)), _mm_loadu_ps(bp.add(b1 + t)),
+                        _mm_loadu_ps(bp.add(b2 + t)), _mm_loadu_ps(bp.add(b3 + t)),
+                    ]);
+                    for m in 0..4 {
+                        let wr = _mm_broadcast_ss(&*rep.add(t + m));
+                        let wi = _mm_broadcast_ss(&*imp.add(t + m));
+                        acc_rb = _mm256_add_pd(acc_rb, _mm256_cvtps_pd(_mm_mul_ps(cb[m], wr)));
+                        acc_ib = _mm256_add_pd(acc_ib, _mm256_cvtps_pd(_mm_mul_ps(cb[m], wi)));
+                    }
+                }
+                t += 4;
+            }
+            _mm256_storeu_pd(ra.as_mut_ptr(), acc_ra);
+            _mm256_storeu_pd(ia.as_mut_ptr(), acc_ia);
+            if PAIR {
+                _mm256_storeu_pd(rb.as_mut_ptr(), acc_rb);
+                _mm256_storeu_pd(ib.as_mut_ptr(), acc_ib);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx", enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn edge_trail_chunk8_avx2<const PAIR: bool>(
+        a: &[f32], b: &[f32], re: &[f32], im: &[f32],
+        base_a: [usize; 4], base_b: [usize; 4], t0: usize, t1: usize,
+        acc_a: &mut [[f64; 4]; 4], acc_b: &mut [[f64; 4]; 4],
+    ) {
+        use std::arch::x86_64::*;
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        let rep = re.as_ptr();
+        let imp = im.as_ptr();
+        unsafe {
+            let mut ra0 = _mm256_loadu_pd(acc_a[0].as_ptr());
+            let mut ia0 = _mm256_loadu_pd(acc_a[1].as_ptr());
+            let mut rb0 = if PAIR { _mm256_loadu_pd(acc_a[2].as_ptr()) } else { _mm256_setzero_pd() };
+            let mut ib0 = if PAIR { _mm256_loadu_pd(acc_a[3].as_ptr()) } else { _mm256_setzero_pd() };
+            let mut ra1 = _mm256_loadu_pd(acc_b[0].as_ptr());
+            let mut ia1 = _mm256_loadu_pd(acc_b[1].as_ptr());
+            let mut rb1 = if PAIR { _mm256_loadu_pd(acc_b[2].as_ptr()) } else { _mm256_setzero_pd() };
+            let mut ib1 = if PAIR { _mm256_loadu_pd(acc_b[3].as_ptr()) } else { _mm256_setzero_pd() };
+
+            let mut t = t0;
+            while t + 4 <= t1 {
+                let ca0 = Self::transpose4_ps([
+                    _mm_loadu_ps(ap.add(base_a[0] + t)), _mm_loadu_ps(ap.add(base_a[1] + t)),
+                    _mm_loadu_ps(ap.add(base_a[2] + t)), _mm_loadu_ps(ap.add(base_a[3] + t)),
+                ]);
+                for m in 0..4 {
+                    let wr = _mm_broadcast_ss(&*rep.add(t + m));
+                    let wi = _mm_broadcast_ss(&*imp.add(t + m));
+                    ra0 = _mm256_add_pd(ra0, _mm256_cvtps_pd(_mm_mul_ps(ca0[m], wr)));
+                    ia0 = _mm256_add_pd(ia0, _mm256_cvtps_pd(_mm_mul_ps(ca0[m], wi)));
+                }
+                if PAIR {
+                    let cb0 = Self::transpose4_ps([
+                        _mm_loadu_ps(bp.add(base_a[0] + t)), _mm_loadu_ps(bp.add(base_a[1] + t)),
+                        _mm_loadu_ps(bp.add(base_a[2] + t)), _mm_loadu_ps(bp.add(base_a[3] + t)),
+                    ]);
+                    for m in 0..4 {
+                        let wr = _mm_broadcast_ss(&*rep.add(t + m));
+                        let wi = _mm_broadcast_ss(&*imp.add(t + m));
+                        rb0 = _mm256_add_pd(rb0, _mm256_cvtps_pd(_mm_mul_ps(cb0[m], wr)));
+                        ib0 = _mm256_add_pd(ib0, _mm256_cvtps_pd(_mm_mul_ps(cb0[m], wi)));
+                    }
+                }
+
+                let ca1 = Self::transpose4_ps([
+                    _mm_loadu_ps(ap.add(base_b[0] + t)), _mm_loadu_ps(ap.add(base_b[1] + t)),
+                    _mm_loadu_ps(ap.add(base_b[2] + t)), _mm_loadu_ps(ap.add(base_b[3] + t)),
+                ]);
+                for m in 0..4 {
+                    let wr = _mm_broadcast_ss(&*rep.add(t + m));
+                    let wi = _mm_broadcast_ss(&*imp.add(t + m));
+                    ra1 = _mm256_add_pd(ra1, _mm256_cvtps_pd(_mm_mul_ps(ca1[m], wr)));
+                    ia1 = _mm256_add_pd(ia1, _mm256_cvtps_pd(_mm_mul_ps(ca1[m], wi)));
+                }
+                if PAIR {
+                    let cb1 = Self::transpose4_ps([
+                        _mm_loadu_ps(bp.add(base_b[0] + t)), _mm_loadu_ps(bp.add(base_b[1] + t)),
+                        _mm_loadu_ps(bp.add(base_b[2] + t)), _mm_loadu_ps(bp.add(base_b[3] + t)),
+                    ]);
+                    for m in 0..4 {
+                        let wr = _mm_broadcast_ss(&*rep.add(t + m));
+                        let wi = _mm_broadcast_ss(&*imp.add(t + m));
+                        rb1 = _mm256_add_pd(rb1, _mm256_cvtps_pd(_mm_mul_ps(cb1[m], wr)));
+                        ib1 = _mm256_add_pd(ib1, _mm256_cvtps_pd(_mm_mul_ps(cb1[m], wi)));
+                    }
+                }
+                t += 4;
+            }
+
+            _mm256_storeu_pd(acc_a[0].as_mut_ptr(), ra0);
+            _mm256_storeu_pd(acc_a[1].as_mut_ptr(), ia0);
+            _mm256_storeu_pd(acc_b[0].as_mut_ptr(), ra1);
+            _mm256_storeu_pd(acc_b[1].as_mut_ptr(), ia1);
+            if PAIR {
+                _mm256_storeu_pd(acc_a[2].as_mut_ptr(), rb0);
+                _mm256_storeu_pd(acc_a[3].as_mut_ptr(), ib0);
+                _mm256_storeu_pd(acc_b[2].as_mut_ptr(), rb1);
+                _mm256_storeu_pd(acc_b[3].as_mut_ptr(), ib1);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)]
+    fn visit_edge_frames_tiled_avx2<const PAIR: bool>(
+        &self, a: &[f32], b: &[f32], hop: usize, frames: usize,
+        lead_end: usize, trail_start: usize, mut emit: impl FnMut(usize, C32, Option<C32>),
+    ) {
+        const CHUNK: usize = 512;
+        struct EdgeBatch { fi: usize, off: [usize; 4], m: [usize; 4], vec_end: usize }
+        let k_len = self.re.len();
+        let n_sig = a.len() as isize;
+        let g_tile = (16_384 / (4 * hop.max(1))).clamp(4, 16);
+
+        let scalar_one = |fi: usize, emit: &mut dyn FnMut(usize, C32, Option<C32>)| {
+            let c = (fi * hop) as isize;
+            if PAIR {
+                let ([pa, pb], div) = self.response_parts_pair([a, b], c);
+                emit(fi, Self::c_of(pa, div), Some(Self::c_of(pb, div)));
+            } else {
+                let (re, im, div) = self.response_parts(a, c);
+                emit(fi, Self::c_of((re, im), div), None);
+            }
+        };
+
+        // 1. Tiled leading edges (`lo == 0 && end <= n_sig`), preserving exact `0..m[j]` order.
+        let mut batches: Vec<EdgeBatch> = Vec::with_capacity(lead_end / 4 + 1);
+        let mut fi = 0usize;
+        while fi + 4 <= lead_end {
+            let base3 = ((fi + 3) * hop) as isize - self.half as isize;
+            let end3 = base3 + k_len as isize;
+            if base3 >= 0 || end3 > n_sig { break; }
+            let off: [usize; 4] = std::array::from_fn(|j| (self.half as isize - ((fi + j) * hop) as isize) as usize);
+            let m: [usize; 4] = std::array::from_fn(|j| k_len - off[j]);
+            if m[0] < 4 { break; }
+            batches.push(EdgeBatch { fi, off, m, vec_end: m[0] & !3 });
+            fi += 4;
+        }
+        if !batches.is_empty() {
+            let nb = batches.len();
+            let mut accs = vec![[[0.0f64; 4]; 5]; nb];
+            for g0 in (0..nb).step_by(g_tile) {
+                let g1 = (g0 + g_tile).min(nb);
+                let tile_max_end = batches[g1 - 1].vec_end;
+                let mut g_first = g0;
+                let mut t0 = 0usize;
+                while t0 < tile_max_end && g_first < g1 {
+                    while g_first < g1 && batches[g_first].vec_end <= t0 { g_first += 1; }
+                    if g_first >= g1 { break; }
+                    let t1 = (t0 + CHUNK).min(tile_max_end);
+                    let mut g = g_first;
+                    while g < g1 {
+                        if !PAIR && g + 1 < g1 {
+                            let lim0 = t1.min(batches[g].vec_end);
+                            let lim1 = t1.min(batches[g + 1].vec_end);
+                            let (left, right) = accs.split_at_mut(g + 1);
+                            unsafe {
+                                Self::edge_lead_chunk8_mono_avx2(
+                                    a, &self.re, &self.im, &self.env,
+                                    batches[g].off, batches[g + 1].off, t0, lim0,
+                                    &mut left[g], &mut right[0],
+                                );
+                                if lim1 > lim0 {
+                                    let ac = &mut right[0];
+                                    let (r0, rest) = ac.split_at_mut(1);
+                                    let (i0, rest) = rest.split_at_mut(1);
+                                    let (rb0, rest) = rest.split_at_mut(1);
+                                    let (ib0, ev0) = rest.split_at_mut(1);
+                                    Self::edge_lead_chunk4_avx2::<false>(
+                                        a, b, &self.re, &self.im, &self.env,
+                                        batches[g + 1].off, lim0, lim1,
+                                        &mut r0[0], &mut i0[0], &mut rb0[0], &mut ib0[0], &mut ev0[0],
+                                    );
+                                }
+                            }
+                            g += 2;
+                        } else {
+                            let lim = t1.min(batches[g].vec_end);
+                            let ac = &mut accs[g];
+                            let (r0, rest) = ac.split_at_mut(1);
+                            let (i0, rest) = rest.split_at_mut(1);
+                            let (rb0, rest) = rest.split_at_mut(1);
+                            let (ib0, ev0) = rest.split_at_mut(1);
+                            unsafe {
+                                Self::edge_lead_chunk4_avx2::<PAIR>(
+                                    a, b, &self.re, &self.im, &self.env,
+                                    batches[g].off, t0, lim,
+                                    &mut r0[0], &mut i0[0], &mut rb0[0], &mut ib0[0], &mut ev0[0],
+                                );
+                            }
+                            g += 1;
+                        }
+                    }
+                    t0 += CHUNK;
+                }
+            }
+            for (batch, ac) in batches.iter().zip(accs.iter()) {
+                for j in 0..4 {
+                    let (mut ra, mut ia) = (ac[0][j], ac[1][j]);
+                    let (mut rb, mut ib) = (ac[2][j], ac[3][j]);
+                    let mut div = ac[4][j];
+                    let off = batch.off[j];
+                    for tt in batch.vec_end..batch.m[j] {
+                        let s = a[tt];
+                        let ki = off + tt;
+                        let (wr, wi) = (self.re[ki], self.im[ki]);
+                        ra += (s * wr) as f64;
+                        ia += (s * wi) as f64;
+                        if PAIR {
+                            let sb = b[tt];
+                            rb += (sb * wr) as f64;
+                            ib += (sb * wi) as f64;
+                        }
+                        div += self.env[ki] as f64;
+                    }
+                    let ca = Self::c_of((ra, ia), div);
+                    let cb = PAIR.then(|| Self::c_of((rb, ib), div));
+                    emit(batch.fi + j, ca, cb);
+                }
+            }
+        }
+        while fi < lead_end {
+            scalar_one(fi, &mut emit);
+            fi += 1;
+        }
+
+        // 2. Tiled trailing edges (`base >= 0 && end > n_sig`): `k0 = 0`, `O(k)` prefix `ev`.
+        batches.clear();
+        let mut ti = trail_start;
+        while ti < frames {
+            let base0 = (ti * hop) as isize - self.half as isize;
+            let end0 = base0 + k_len as isize;
+            if base0 >= 0 && end0 > n_sig { break; }
+            scalar_one(ti, &mut emit);
+            ti += 1;
+        }
+        while ti + 4 <= frames {
+            let base3 = ((ti + 3) * hop) as isize - self.half as isize;
+            if base3 >= n_sig { break; }
+            let m: [usize; 4] = std::array::from_fn(|j| {
+                let b_j = ((ti + j) * hop) as isize - self.half as isize;
+                (n_sig - b_j) as usize
+            });
+            if m[3] < 4 { break; }
+            let off: [usize; 4] = std::array::from_fn(|j| ((ti + j) * hop) - self.half);
+            batches.push(EdgeBatch { fi: ti, off, m, vec_end: m[3] & !3 });
+            ti += 4;
+        }
+        if !batches.is_empty() {
+            let nb = batches.len();
+            let mut evs = vec![[0.0f64; 4]; nb];
+            let mut env_acc = 0.0f64;
+            let mut env_t = 0usize;
+            for g in (0..nb).rev() {
+                for j in (0..4).rev() {
+                    let target = batches[g].m[j];
+                    while env_t < target {
+                        env_acc += self.env[env_t] as f64;
+                        env_t += 1;
+                    }
+                    evs[g][j] = env_acc;
+                }
+            }
+
+            let mut accs = vec![[[0.0f64; 4]; 4]; nb];
+            for g0 in (0..nb).step_by(g_tile) {
+                let g1 = (g0 + g_tile).min(nb);
+                let tile_max_end = batches[g0].vec_end;
+                let mut active_hi = g1;
+                let mut t0 = 0usize;
+                while t0 < tile_max_end && active_hi > g0 {
+                    while active_hi > g0 && batches[active_hi - 1].vec_end <= t0 { active_hi -= 1; }
+                    if active_hi <= g0 { break; }
+                    let t1 = (t0 + CHUNK).min(tile_max_end);
+                    let mut g = g0;
+                    while g < active_hi {
+                        if g + 1 < active_hi {
+                            let lim1 = t1.min(batches[g + 1].vec_end);
+                            let lim0 = t1.min(batches[g].vec_end);
+                            let (left, right) = accs.split_at_mut(g + 1);
+                            unsafe {
+                                Self::edge_trail_chunk8_avx2::<PAIR>(
+                                    a, b, &self.re, &self.im,
+                                    batches[g].off, batches[g + 1].off, t0, lim1,
+                                    &mut left[g], &mut right[0],
+                                );
+                                if lim0 > lim1 {
+                                    let ac = &mut left[g];
+                                    let (r0, rest) = ac.split_at_mut(1);
+                                    let (i0, rest) = rest.split_at_mut(1);
+                                    let (rb0, ib0) = rest.split_at_mut(1);
+                                    Self::edge_trail_chunk4_avx2::<PAIR>(
+                                        a, b, &self.re, &self.im,
+                                        batches[g].off, lim1, lim0,
+                                        &mut r0[0], &mut i0[0], &mut rb0[0], &mut ib0[0],
+                                    );
+                                }
+                            }
+                            g += 2;
+                        } else {
+                            let lim = t1.min(batches[g].vec_end);
+                            let ac = &mut accs[g];
+                            let (r0, rest) = ac.split_at_mut(1);
+                            let (i0, rest) = rest.split_at_mut(1);
+                            let (rb0, ib0) = rest.split_at_mut(1);
+                            unsafe {
+                                Self::edge_trail_chunk4_avx2::<PAIR>(
+                                    a, b, &self.re, &self.im,
+                                    batches[g].off, t0, lim,
+                                    &mut r0[0], &mut i0[0], &mut rb0[0], &mut ib0[0],
+                                );
+                            }
+                            g += 1;
+                        }
+                    }
+                    t0 += CHUNK;
+                }
+            }
+            for ((batch, ac), ev) in batches.iter().zip(accs.iter()).zip(evs.iter()) {
+                for j in 0..4 {
+                    let (mut ra, mut ia) = (ac[0][j], ac[1][j]);
+                    let (mut rb, mut ib) = (ac[2][j], ac[3][j]);
+                    let bj = batch.off[j];
+                    for tt in batch.vec_end..batch.m[j] {
+                        let s = a[bj + tt];
+                        let (wr, wi) = (self.re[tt], self.im[tt]);
+                        ra += (s * wr) as f64;
+                        ia += (s * wi) as f64;
+                        if PAIR {
+                            let sb = b[bj + tt];
+                            rb += (sb * wr) as f64;
+                            ib += (sb * wi) as f64;
+                        }
+                    }
+                    let div = ev[j];
+                    let ca = Self::c_of((ra, ia), div);
+                    let cb = PAIR.then(|| Self::c_of((rb, ib), div));
+                    emit(batch.fi + j, ca, cb);
+                }
+            }
+        }
+        while ti < frames {
+            scalar_one(ti, &mut emit);
+            ti += 1;
+        }
+    }
+
+    fn visit_edge_frames(
+        &self, signals: &[&[f32]], hop: usize, frames: usize, first: usize, last: usize,
+        mut emit: impl FnMut(usize, C32, Option<C32>),
+    ) {
+        if signals.is_empty() { return; }
+        let lead_end = first.min(frames);
+        let trail_start = if first <= last { last.saturating_add(1).max(lead_end).min(frames) } else { lead_end };
+        let k_len = self.re.len();
+        let n_sig = signals[0].len() as isize;
+        let pair_b = if signals.len() == 2 && signals[1].len() as isize == n_sig { Some(signals[1]) } else { None };
+        let supported_avx2 = (signals.len() == 1 || pair_b.is_some()) && hop > 0 && {
+            #[cfg(test)]
+            { !r10t::de4fcb3_ref() }
+            #[cfg(not(test))]
+            { true }
+        } && {
+            #[cfg(target_arch = "x86_64")]
+            { std::is_x86_feature_detected!("avx2") }
+            #[cfg(not(target_arch = "x86_64"))]
+            { false }
+        };
+        if !supported_avx2 {
+            for fi in (0..lead_end).chain(trail_start..frames) {
+                let e = self.edge_frame(signals, (fi * hop) as isize);
+                if pair_b.is_some() { emit(fi, e[0], Some(e[1])); } else { emit(fi, e[0], None); }
+            }
+            return;
+        }
+        let a = signals[0];
+        let b_slice = pair_b.unwrap_or(&[]);
+        #[cfg(target_arch = "x86_64")]
+        if k_len >= 2048 {
+            if pair_b.is_some() {
+                self.visit_edge_frames_tiled_avx2::<true>(a, b_slice, hop, frames, lead_end, trail_start, emit);
+            } else {
+                self.visit_edge_frames_tiled_avx2::<false>(a, b_slice, hop, frames, lead_end, trail_start, emit);
+            }
+            return;
+        }
+        let scalar_one = |fi: usize, emit: &mut dyn FnMut(usize, C32, Option<C32>)| {
+            let c = (fi * hop) as isize;
+            if let Some(bb) = pair_b {
+                let ([pa, pb], div) = self.response_parts_pair([a, bb], c);
+                emit(fi, Self::c_of(pa, div), Some(Self::c_of(pb, div)));
+            } else {
+                let (re, im, div) = self.response_parts(a, c);
+                emit(fi, Self::c_of((re, im), div), None);
+            }
+        };
+
+        // Leading edges (`lo == 0 && end <= n_sig`): 4-frame AVX2 batches.
+        let mut fi = 0usize;
+        while fi + 4 <= lead_end {
+            let base3 = ((fi + 3) * hop) as isize - self.half as isize;
+            let end3 = base3 + k_len as isize;
+            if base3 >= 0 || end3 > n_sig { break; }
+            let k0: [usize; 4] = std::array::from_fn(|j| (self.half as isize - ((fi + j) * hop) as isize) as usize);
+            let m: [usize; 4] = std::array::from_fn(|j| k_len - k0[j]);
+            if m[0] < 4 { break; }
+            #[cfg(target_arch = "x86_64")]
+            {
+                let (pa, pb, ev) = unsafe {
+                    if pair_b.is_some() {
+                        Self::edge_lead4_avx2::<true>(a, b_slice, &self.re, &self.im, &self.env, k0, m)
+                    } else {
+                        Self::edge_lead4_avx2::<false>(a, b_slice, &self.re, &self.im, &self.env, k0, m)
+                    }
+                };
+                for j in 0..4 {
+                    let div = ev[j];
+                    let ca = Self::c_of(pa[j], div);
+                    let cb = pair_b.map(|_| Self::c_of(pb[j], div));
+                    emit(fi + j, ca, cb);
+                }
+            }
+            fi += 4;
+        }
+        while fi < lead_end {
+            scalar_one(fi, &mut emit);
+            fi += 1;
+        }
+
+        // Trailing edges (`base >= 0 && base < n_sig && end > n_sig`): `k0 == 0`.
+        let mut ti = trail_start;
+        while ti < frames {
+            let base = (ti * hop) as isize - self.half as isize;
+            let end = base + k_len as isize;
+            if base >= 0 && base < n_sig && end > n_sig { break; }
+            scalar_one(ti, &mut emit);
+            ti += 1;
+        }
+        let t_lo = ti;
+        while ti < frames {
+            let base = (ti * hop) as isize - self.half as isize;
+            let end = base + k_len as isize;
+            if !(base >= 0 && base < n_sig && end > n_sig) { break; }
+            ti += 1;
+        }
+        let t_hi = ti;
+        if t_hi > t_lo {
+            let count = t_hi - t_lo;
+            let mut env_sums = vec![0.0f64; count];
+            let mut env_acc = 0.0f64;
+            let mut pos = 0usize;
+            for idx in (t_lo..t_hi).rev() {
+                let base = ((idx * hop) as isize - self.half as isize) as usize;
+                let m = (a.len() - base).min(k_len);
+                while pos < m {
+                    env_acc += self.env[pos] as f64;
+                    pos += 1;
+                }
+                env_sums[idx - t_lo] = env_acc;
+            }
+            let mut tj = t_lo;
+            while tj + 4 <= t_hi {
+                let bases: [usize; 4] = std::array::from_fn(|j| (((tj + j) * hop) as isize - self.half as isize) as usize);
+                let ms: [usize; 4] = std::array::from_fn(|j| (a.len() - bases[j]).min(k_len));
+                if ms[3] < 4 { break; }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let (pa, pb) = unsafe {
+                        if pair_b.is_some() {
+                            Self::edge_trail4_avx2::<true>(a, b_slice, &self.re, &self.im, bases, ms)
+                        } else {
+                            Self::edge_trail4_avx2::<false>(a, b_slice, &self.re, &self.im, bases, ms)
+                        }
+                    };
+                    for j in 0..4 {
+                        let div = env_sums[tj + j - t_lo];
+                        let ca = Self::c_of(pa[j], div);
+                        let cb = pair_b.map(|_| Self::c_of(pb[j], div));
+                        emit(tj + j, ca, cb);
+                    }
+                }
+                tj += 4;
+            }
+            while tj < t_hi {
+                scalar_one(tj, &mut emit);
+                tj += 1;
+            }
+        }
+        for fk in t_hi..frames {
+            scalar_one(fk, &mut emit);
+        }
+    }
+
+    fn edge_frames(&self, signals: &[&[f32]], hop: usize, frames: usize, first: usize, last: usize) -> Vec<Vec<C32>> {
+        let mut outs = vec![vec![C32 { re: 0.0, im: 0.0 }; frames]; signals.len()];
+        self.visit_edge_frames(signals, hop, frames, first, last, |fi, ca, cb| {
+            outs[0][fi] = ca;
+            if let Some(v) = cb { outs[1][fi] = v; }
+        });
         outs
+    }
+
+    fn edge_frames_fold(&self, signals: &[&[f32]], hop: usize, frames: usize, first: usize, last: usize, acc: &mut Cols) {
+        self.visit_edge_frames(signals, hop, frames, first, last, |fi, ca, cb| {
+            fold_complex(acc, fi, &[ca], cb.as_ref().map(std::slice::from_ref));
+        });
     }
 
     /// One edge frame of each signal: the two signals of a pair in one pass
@@ -2230,6 +3422,18 @@ impl Superlet {
     /// weighting the paper uses existed to stop integer order steps showing as
     /// seams across the spectrum, and with Q varying continuously there are no
     /// steps left to hide.
+    pub(crate) fn max_half_for(freq: f32, q: f32, cfg: &AsltConfig, sample_rate: f32) -> usize {
+        let c_max = c_max_for_q(q, cfg);
+        let n = cfg.n_wavelets.max(1);
+        let a = cfg.spread.clamp(0.0, 1.0);
+        let mut h = 0usize;
+        for i in 0..n {
+            let frac = if n == 1 { 1.0 } else { a + (1.0 - a) * i as f32 / (n - 1) as f32 };
+            h = h.max(Morlet::half_for(freq, (c_max * frac).max(DEFAULT_C_MIN), sample_rate));
+        }
+        h
+    }
+
     fn new(freq: f32, q: f32, cfg: &AsltConfig, sample_rate: f32) -> Self {
         let c_max = c_max_for_q(q, cfg);
         let n = cfg.n_wavelets.max(1);
@@ -2378,12 +3582,7 @@ impl Superlet {
         let joint = ch.joint();
         let mut acc = Cols::zeroed(frames, joint);
         for (w, weight) in self.wavelets.iter().zip(self.weights.iter()) {
-            let c = w.member_cols(ch, hop, frames, shared, work, seams);
-            fold_logs(&mut acc.mix, &c.mix, *weight);
-            if joint {
-                fold_logs(&mut acc.left, &c.left, *weight);
-                fold_logs(&mut acc.right, &c.right, *weight);
-            }
+            w.fold_member_cols(&mut acc, ch, hop, frames, shared, work, seams, *weight);
         }
         let inv = 1.0 / self.total_weight;
         let finish = |v: Vec<f32>| v.into_iter().map(|a| (a * inv).exp()).collect();
@@ -2601,9 +3800,26 @@ fn run_size_sequential(
         let t = std::time::Instant::now();
         let mut set = SharedSet::default();
         r10t!(10, if pass > 0 {
-            set.a.insert(pass, std::sync::Arc::new(SignalBlocks::build(chans.a, pass)));
+            let par_build = {
+                #[cfg(test)]
+                { !r10t::de4fcb3_ref() }
+                #[cfg(not(test))]
+                { true }
+            };
             if let Some(right) = chans.b {
-                set.b.insert(pass, std::sync::Arc::new(SignalBlocks::build(right, pass)));
+                if par_build {
+                    let (sa, sb) = rayon::join(
+                        || std::sync::Arc::new(SignalBlocks::build(chans.a, pass)),
+                        || std::sync::Arc::new(SignalBlocks::build(right, pass)),
+                    );
+                    set.a.insert(pass, sa);
+                    set.b.insert(pass, sb);
+                } else {
+                    set.a.insert(pass, std::sync::Arc::new(SignalBlocks::build(chans.a, pass)));
+                    set.b.insert(pass, std::sync::Arc::new(SignalBlocks::build(right, pass)));
+                }
+            } else {
+                set.a.insert(pass, std::sync::Arc::new(SignalBlocks::build(chans.a, pass)));
             }
         });
         building += t.elapsed();
@@ -2612,12 +3828,29 @@ fn run_size_sequential(
         let gpu = exact_gpu_on() && pass == exact_gpu::N
             && run_pass_exact_gpu(plans, &mut accs, pass, chans, hop, frames, sr, &set, work, seams, &stop, on_bar_done);
         if !gpu {
-            accs.par_iter_mut().zip(plans.par_iter()).with_max_len(1).for_each(|(acc, p)| {
-                if !p.passes.contains(&pass) || stop() { return; }
+            let can_blocks = {
                 #[cfg(test)]
-                if let Some(f) = seams.pass_event { f(PassEvent::Bar(pass, p.bar)); }
-                run_bar_pass(acc, p, pass, 0, chans, hop, frames, sr, &set, work, seams, on_bar_done);
-            });
+                { !r10t::de4fcb3_ref() }
+                #[cfg(not(test))]
+                { true }
+            } && pass > 0
+                && !seams.redundant_mix_transform
+                && set.a.contains_key(&pass)
+                && (!joint || set.b.contains_key(&pass));
+            if can_blocks {
+                if !run_blocks_pass(
+                    plans, &mut accs, pass, chans, hop, frames, sr, &set, work, seams, &stop, on_bar_done,
+                ) {
+                    return (Vec::new(), building);
+                }
+            } else {
+                accs.par_iter_mut().zip(plans.par_iter()).with_max_len(1).for_each(|(acc, p)| {
+                    if !p.passes.contains(&pass) || stop() { return; }
+                    #[cfg(test)]
+                    if let Some(f) = seams.pass_event { f(PassEvent::Bar(pass, p.bar)); }
+                    run_bar_pass(acc, p, pass, 0, chans, hop, frames, sr, &set, work, seams, on_bar_done);
+                });
+            }
         }
         drop(set);
     }
@@ -2640,10 +3873,10 @@ fn run_bar_pass(
     set: &SharedSet, work: &WorkCells, seams: &Seams, on_bar_done: &(dyn Fn(usize) + Sync),
 ) {
     let joint = chans.joint();
+    let mut w = Morlet::empty();
     for c in pass_cycles(p, pass).skip(from) {
-        let w = Morlet::new(p.freq, c, sr);
-        let col = w.member_cols(chans, hop, frames, set, work, seams);
-        fold_cols(acc, &col, joint);
+        w.build_into(p.freq, c, sr);
+        w.fold_member_cols(acc, chans, hop, frames, set, work, seams, 1.0);
     }
     finish_bar_pass(acc, p, pass, joint, on_bar_done);
 }
@@ -2664,6 +3897,420 @@ fn finish_bar_pass(acc: &mut Cols, p: &SizeSeqBar, pass: usize, joint: bool, on_
     }
 }
 
+/// Worker-reused inverse/kernel buffers for a `pass > 0` [`SignalBlocks`] pass.
+struct BlockWorkerSlot {
+    buf: Vec<C32>,
+    scratch: Vec<C32>,
+    fwd_scratch: Vec<C32>,
+    kernel: Vec<C32>,
+    iw: InvWork,
+    cols: [Vec<C32>; 2],
+}
+
+impl BlockWorkerSlot {
+    fn new(
+        n: usize, inv_scratch_len: usize, fwd_scratch_len: usize, cap: usize, ch: usize,
+        inv: &dyn rustfft::Fft<f32>,
+    ) -> Self {
+        let zero = C32 { re: 0.0, im: 0.0 };
+        BlockWorkerSlot {
+            buf: vec![zero; n],
+            scratch: vec![zero; inv_scratch_len],
+            fwd_scratch: vec![zero; fwd_scratch_len],
+            kernel: vec![zero; n],
+            iw: InvWork::new(inv, cap),
+            cols: [vec![zero; cap], if ch == 2 { vec![zero; cap] } else { Vec::new() }],
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn eval_block_range(
+        &mut self, acc: &mut Cols, inv: &dyn rustfft::Fft<f32>, ext_kernel: Option<&[C32]>,
+        blk_a: &SignalBlocks, blk_b: Option<&SignalBlocks>,
+        n: usize, k: usize, half: usize, first: usize, last: usize,
+        stride: usize, num_blocks: usize, n_sig: usize, hop: usize, ch: usize,
+        scale: f32, b_lo: usize, b_hi: usize,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> bool {
+        let zero = C32 { re: 0.0f32, im: 0.0f32 };
+        let kernel = ext_kernel.unwrap_or(&self.kernel);
+        for b in b_lo..b_hi {
+            if stop() { return false; }
+            let base = b * stride;
+            if base >= n_sig { break; }
+            let Some((fi_lo, fi_hi)) =
+                block_frame_span(b, stride, n, k, half, n_sig, hop, first, last)
+            else {
+                continue;
+            };
+            // Match `complex_via_shared_multi` where later blocks overwrite earlier ones.
+            let eff_hi = if b + 1 < num_blocks {
+                match block_frame_span(b + 1, stride, n, k, half, n_sig, hop, first, last) {
+                    Some((nlo, _)) if nlo <= fi_lo => continue,
+                    Some((nlo, _)) => fi_hi.min(nlo - 1),
+                    None => fi_hi,
+                }
+            } else {
+                fi_hi
+            };
+            let len = eff_hi - fi_lo + 1;
+            if self.cols[0].len() < len {
+                self.cols[0].resize(len, zero);
+                if ch == 2 { self.cols[1].resize(len, zero); }
+            }
+            let (c0, c1) = self.cols.split_at_mut(1);
+            #[cfg(test)]
+            r10t::inv(n);
+            r10t!(7, self.iw.outputs(
+                inv, Operand::Product(blk_a.block(b), kernel),
+                &mut self.buf, &mut self.scratch,
+                fi_lo, hop, half, base, scale, &mut c0[0][..len],
+            ));
+            if let Some(b_blocks) = blk_b {
+                #[cfg(test)]
+                r10t::inv(n);
+                r10t!(7, self.iw.outputs(
+                    inv, Operand::Product(b_blocks.block(b), kernel),
+                    &mut self.buf, &mut self.scratch,
+                    fi_lo, hop, half, base, scale, &mut c1[0][..len],
+                ));
+                fold_complex(acc, fi_lo, &c0[0][..len], Some(&c1[0][..len]));
+            } else {
+                fold_complex(acc, fi_lo, &c0[0][..len], None);
+            }
+        }
+        true
+    }
+}
+
+#[inline]
+fn prepare_block_kernel(
+    w: &Morlet, k: usize, kernel: &mut [C32], fwd: &dyn rustfft::Fft<f32>, fwd_scratch: &mut [C32],
+) {
+    let zero = C32 { re: 0.0f32, im: 0.0f32 };
+    for (dst, (&re, &im)) in kernel[..k].iter_mut().zip(w.re[..k].iter().zip(&w.im[..k]).rev()) {
+        *dst = C32 { re, im };
+    }
+    kernel[k..].fill(zero);
+    fwd.process_with_scratch(kernel, fwd_scratch);
+}
+
+#[derive(Clone, Copy)]
+struct BlockJobMeta {
+    k: usize,
+    half: usize,
+    first: usize,
+    last: usize,
+}
+
+struct BlockSlotPool<'a> {
+    slots: &'a std::sync::Mutex<Vec<BlockWorkerSlot>>,
+    inv: &'a dyn rustfft::Fft<f32>,
+    n: usize,
+    inv_scratch_len: usize,
+    fwd_scratch_len: usize,
+    max_cap: usize,
+    ch: usize,
+    slot: Option<BlockWorkerSlot>,
+}
+
+impl<'a> BlockSlotPool<'a> {
+    fn new(
+        slots: &'a std::sync::Mutex<Vec<BlockWorkerSlot>>, inv: &'a dyn rustfft::Fft<f32>,
+        n: usize, inv_scratch_len: usize, fwd_scratch_len: usize, max_cap: usize, ch: usize,
+    ) -> Self {
+        Self { slots, inv, n, inv_scratch_len, fwd_scratch_len, max_cap, ch, slot: None }
+    }
+
+    fn get(&mut self) -> &mut BlockWorkerSlot {
+        self.slot.get_or_insert_with(|| {
+            self.slots.lock().unwrap().pop().unwrap_or_else(|| {
+                BlockWorkerSlot::new(
+                    self.n, self.inv_scratch_len, self.fwd_scratch_len, self.max_cap, self.ch, self.inv,
+                )
+            })
+        })
+    }
+}
+
+impl Drop for BlockSlotPool<'_> {
+    fn drop(&mut self) {
+        if let Some(s) = self.slot.take() {
+            self.slots.lock().unwrap().push(s);
+        }
+    }
+}
+
+/// Shared-block interior range `(k, half, first, last)` iff `w` matches `complex_via_shared_multi`.
+fn block_shared_geom(
+    w: &Morlet, n: usize, blk_a: &SignalBlocks, blk_b: Option<&SignalBlocks>,
+    chans: &Chans, hop: usize, frames: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let k = w.re.len();
+    let n_sig = chans.a.len();
+    if chans.b.is_some_and(|r| r.len() != n_sig) { return None; }
+    let stride = blk_a.stride;
+    if blk_a.n != n || blk_b.is_some_and(|b| b.n != n || b.stride != stride) { return None; }
+    if !fft_is_cheaper(k, hop) || fft_block_len(k) != n { return None; }
+    if n_sig <= k || hop == 0 || frames == 0 || n <= k || stride > n - k + 1 { return None; }
+    let half = w.half;
+    let first = half.div_ceil(hop);
+    let last_pos = (n_sig as isize) - 1 - (half as isize);
+    if last_pos < 0 { return None; }
+    let last = ((last_pos as usize) / hop).min(frames.saturating_sub(1));
+    if first > last { return None; }
+    Some((k, half, first, last))
+}
+
+/// Raw `[fi_lo, fi_hi]` interior frame span produced by shared block `b`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn block_frame_span(
+    b: usize, stride: usize, n: usize, k: usize, half: usize, n_sig: usize, hop: usize,
+    first: usize, last: usize,
+) -> Option<(usize, usize)> {
+    let base = b * stride;
+    if base >= n_sig { return None; }
+    let m_lo = base + k - 1;
+    let m_hi = (base + n).min(n_sig);
+    let fi_lo = ((m_lo as isize - half as isize).max(0) as usize).div_ceil(hop).max(first);
+    let fi_hi = if (m_hi as isize) - 1 - (half as isize) < 0 {
+        return None;
+    } else {
+        ((((m_hi as isize) - 1 - (half as isize)) as usize) / hop).min(last)
+    };
+    (fi_lo <= fi_hi).then_some((fi_lo, fi_hi))
+}
+
+/// Run a `pass > 0` [`SignalBlocks`] pass in one barrier-free parallel loop
+/// with worker-local [`BlockWorkerSlot`] buffer/plan reuse, preserving exact
+/// per-bar member order and bit-exact [`to_bits`] equivalence with
+/// [`run_bar_pass`].
+#[allow(clippy::too_many_arguments)]
+fn run_blocks_pass(
+    plans: &[SizeSeqBar], accs: &mut [Cols], pass: usize, chans: &Chans, hop: usize, frames: usize, sr: f32,
+    set: &SharedSet, work: &WorkCells, seams: &Seams, stop: &(dyn Fn() -> bool + Sync),
+    on_bar_done: &(dyn Fn(usize) + Sync),
+) -> bool {
+    use rayon::prelude::*;
+    use rustfft::num_complex::Complex;
+
+    if !plans.iter().any(|p| p.passes.contains(&pass)) { return true; }
+    if stop() { return false; }
+
+    let n = pass;
+    let Some(blk_a) = set.a.get(&n) else { return false };
+    let blk_b = set.b.get(&n);
+    let joint = chans.joint();
+    let sigs: Vec<&[f32]> = match chans.b { Some(b) => vec![chans.a, b], None => vec![chans.a] };
+    let ch = sigs.len();
+    let n_sig = chans.a.len();
+    let stride = blk_a.stride;
+    let num_blocks = blk_a.blocks();
+    let zero = Complex { re: 0.0f32, im: 0.0f32 };
+    let scale = 1.0 / n as f32;
+
+    let (fwd, inv) = ASLT_PLANNER.with(|p| {
+        let mut p = p.borrow_mut();
+        (p.plan_fft_forward(n), p.plan_fft_inverse(n))
+    });
+    let inv_scratch_len = inv.get_inplace_scratch_len();
+    let fwd_scratch_len = fwd.get_inplace_scratch_len();
+    let max_cap = n.div_ceil(hop.max(1)).max(1) + 2;
+
+    if num_blocks < 4 || n > 65_536 {
+        accs.par_iter_mut()
+            .zip(plans.par_iter())
+            .with_max_len(1)
+            .for_each_init(
+                || (None::<BlockWorkerSlot>, Morlet::empty()),
+                |(slot, w), (acc, p)| {
+                    if !p.passes.contains(&pass) || stop() { return; }
+                    #[cfg(test)]
+                    if let Some(f) = seams.pass_event { f(PassEvent::Bar(pass, p.bar)); }
+                    for c in pass_cycles(p, pass) {
+                        if stop() { return; }
+                        w.build_into(p.freq, c, sr);
+                        if let Some((k, half, first, last)) =
+                            block_shared_geom(w, n, blk_a, blk_b.map(|b| &**b), chans, hop, frames)
+                        {
+                            let wslot = slot.get_or_insert_with(|| {
+                                BlockWorkerSlot::new(n, inv_scratch_len, fwd_scratch_len, max_cap, ch, &*inv)
+                            });
+                            #[cfg(test)]
+                            let _full = r10t::scope(seams.full_inverse);
+                            let _tally = TallyFlush::new(work);
+                            work.column(ch as u64);
+                            w.edge_frames_fold(&sigs, hop, frames, first, last, acc);
+                            prepare_block_kernel(w, k, &mut wslot.kernel, &*fwd, &mut wslot.fwd_scratch);
+                            if !wslot.eval_block_range(
+                                acc, &*inv, None, blk_a, blk_b.map(|b| &**b),
+                                n, k, half, first, last, stride, num_blocks, n_sig, hop, ch,
+                                scale, 0, num_blocks, stop,
+                            ) {
+                                return;
+                            }
+                        } else {
+                            w.fold_member_cols(acc, chans, hop, frames, set, work, seams, 1.0);
+                        }
+                    }
+                    if stop() { return; }
+                    finish_bar_pass(acc, p, pass, joint, on_bar_done);
+                },
+            );
+        return !stop();
+    }
+
+    // L3 wave-batched execution for `n <= 65_536` with many active bars: keep
+    // signal block slices (~4 MiB) and batched kernels (~8 MiB) L3-resident across
+    // active bars, then hand off any sparse tail (`< 16` bars) barrier-free.
+    let k_cap = ((8 * 1024 * 1024) / (n * 8)).clamp(16, 128);
+    let w_blk = ((4 * 1024 * 1024) / (ch * n * 8)).clamp(1, 32);
+
+    let bar_cycles: Vec<Vec<f32>> = plans.iter().map(|p| pass_cycles(p, pass).collect()).collect();
+    let max_m = bar_cycles.iter().map(Vec::len).max().unwrap_or(0);
+    if max_m == 0 { return !stop(); }
+
+    let active_bars = bar_cycles.iter().filter(|cs| !cs.is_empty()).count();
+    let mut batch_kernels: Vec<Vec<C32>> = (0..active_bars.min(k_cap)).map(|_| vec![zero; n]).collect();
+    let pool = std::sync::Mutex::new(Vec::<BlockWorkerSlot>::new());
+    let mut tail_start_m = max_m;
+
+    for m_idx in 0..max_m {
+        if stop() { return false; }
+        let rem_bars = bar_cycles.iter().filter(|cs| cs.len() > m_idx).count();
+        if rem_bars < 16 {
+            tail_start_m = m_idx;
+            break;
+        }
+        let mut active: Vec<(&mut Cols, &SizeSeqBar, f32, bool)> = accs
+            .iter_mut()
+            .zip(bar_cycles.iter().zip(plans.iter()))
+            .filter_map(|(acc, (cs, p))| {
+                cs.get(m_idx).map(|&c| (acc, p, c, m_idx + 1 == cs.len()))
+            })
+            .collect();
+
+        let n_chunks = active.len().div_ceil(k_cap).max(1);
+        let chunk_cap = active.len().div_ceil(n_chunks);
+        for chunk in active.chunks_mut(chunk_cap) {
+            if stop() { return false; }
+            let clen = chunk.len();
+            let mut metas: Vec<Option<BlockJobMeta>> = vec![None; clen];
+
+            chunk.par_iter_mut()
+                .zip(metas.par_iter_mut())
+                .zip(batch_kernels[..clen].par_iter_mut())
+                .with_max_len(1)
+                .for_each_init(
+                    || (BlockSlotPool::new(&pool, &*inv, n, inv_scratch_len, fwd_scratch_len, max_cap, ch), Morlet::empty()),
+                    |(sp, w), (((acc, p, c, _), meta), kernel)| {
+                        if stop() { return; }
+                        if m_idx == 0 {
+                            #[cfg(test)]
+                            if let Some(f) = seams.pass_event { f(PassEvent::Bar(pass, p.bar)); }
+                        }
+                        w.build_into(p.freq, *c, sr);
+                        if let Some((k, half, first, last)) =
+                            block_shared_geom(w, n, blk_a, blk_b.map(|b| &**b), chans, hop, frames)
+                        {
+                            work.column(ch as u64);
+                            w.edge_frames_fold(&sigs, hop, frames, first, last, acc);
+                            let wslot = sp.get();
+                            prepare_block_kernel(w, k, kernel, &*fwd, &mut wslot.fwd_scratch);
+                            *meta = Some(BlockJobMeta { k, half, first, last });
+                        } else {
+                            w.fold_member_cols(acc, chans, hop, frames, set, work, seams, 1.0);
+                        }
+                    },
+                );
+            if stop() { return false; }
+
+            if metas.iter().any(Option::is_some) {
+                for b0 in (0..num_blocks).step_by(w_blk) {
+                    if stop() { return false; }
+                    if b0 * stride >= n_sig { break; }
+                    let b1 = (b0 + w_blk).min(num_blocks);
+                    chunk.par_iter_mut()
+                        .zip(metas.par_iter())
+                        .zip(batch_kernels[..clen].par_iter())
+                        .with_max_len(1)
+                        .for_each_init(
+                            || BlockSlotPool::new(&pool, &*inv, n, inv_scratch_len, fwd_scratch_len, max_cap, ch),
+                            |sp, (((acc, _, _, _), meta), kernel)| {
+                                let Some(m) = *meta else { return; };
+                                if stop() { return; }
+                                #[cfg(test)]
+                                let _full = r10t::scope(seams.full_inverse);
+                                let _tally = TallyFlush::new(work);
+                                let wslot = sp.get();
+                                wslot.eval_block_range(
+                                    acc, &*inv, Some(kernel.as_slice()), blk_a, blk_b.map(|b| &**b),
+                                    n, m.k, m.half, m.first, m.last, stride, num_blocks, n_sig, hop, ch,
+                                    scale, b0, b1, stop,
+                                );
+                            },
+                        );
+                    if stop() { return false; }
+                }
+            }
+
+            if stop() { return false; }
+            if chunk.iter().any(|(_, _, _, is_last)| *is_last) {
+                chunk.par_iter_mut().for_each(|(acc, p, _, is_last)| {
+                    if *is_last && !stop() {
+                        finish_bar_pass(acc, p, pass, joint, on_bar_done);
+                    }
+                });
+            }
+        }
+    }
+
+    if tail_start_m < max_m && !stop() {
+        accs.par_iter_mut()
+            .zip(plans.par_iter())
+            .zip(bar_cycles.par_iter())
+            .with_max_len(1)
+            .for_each_init(
+                || (BlockSlotPool::new(&pool, &*inv, n, inv_scratch_len, fwd_scratch_len, max_cap, ch), Morlet::empty()),
+                |(sp, w), ((acc, p), cs)| {
+                    if cs.len() <= tail_start_m || stop() { return; }
+                    if tail_start_m == 0 {
+                        #[cfg(test)]
+                        if let Some(f) = seams.pass_event { f(PassEvent::Bar(pass, p.bar)); }
+                    }
+                    for &c in &cs[tail_start_m..] {
+                        if stop() { return; }
+                        w.build_into(p.freq, c, sr);
+                        if let Some((k, half, first, last)) =
+                            block_shared_geom(w, n, blk_a, blk_b.map(|b| &**b), chans, hop, frames)
+                        {
+                            let wslot = sp.get();
+                            #[cfg(test)]
+                            let _full = r10t::scope(seams.full_inverse);
+                            let _tally = TallyFlush::new(work);
+                            work.column(ch as u64);
+                            w.edge_frames_fold(&sigs, hop, frames, first, last, acc);
+                            prepare_block_kernel(w, k, &mut wslot.kernel, &*fwd, &mut wslot.fwd_scratch);
+                            if !wslot.eval_block_range(
+                                acc, &*inv, None, blk_a, blk_b.map(|b| &**b),
+                                n, k, half, first, last, stride, num_blocks, n_sig, hop, ch,
+                                scale, 0, num_blocks, stop,
+                            ) {
+                                return;
+                            }
+                        } else {
+                            w.fold_member_cols(acc, chans, hop, frames, set, work, seams, 1.0);
+                        }
+                    }
+                    if stop() { return; }
+                    finish_bar_pass(acc, p, pass, joint, on_bar_done);
+                },
+            );
+    }
+    !stop()
+}
+
 // ---------------------------------------------------------------------------
 // The exact GPU lane's share of the 2^15 pass (1.6.1, experimental)
 // ---------------------------------------------------------------------------
@@ -2675,6 +4322,44 @@ mod exact_gpu;
 #[cfg(all(test, windows, target_arch = "x86_64"))]
 #[path = "aslt_exact_gpu_tests.rs"]
 mod exact_gpu_tests;
+
+// ---------------------------------------------------------------------------
+// The High-accuracy GPU route (experimental, opt-in, default off)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[path = "aslt_hp.rs"]
+pub(crate) mod hp;
+
+/// Elsewhere there is no route: the same shape, and nothing admitted.
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+pub(crate) mod hp {
+    use super::AsltConfig;
+    use std::sync::atomic::AtomicBool;
+
+    pub const REVISION: &str = "gpu-hp1";
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum HpError {
+        Unavailable(String),
+        Device(String),
+        Cancelled,
+    }
+
+    pub fn take_device_failure() -> Option<String> { None }
+
+    pub fn admits(_: usize, _: f32, _: f32, _: &AsltConfig, _: f32) -> Result<(), String> {
+        Err("needs Windows and an NVIDIA GPU".into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn analyze_on_this_thread(
+        _: &[f32], _: &[f32], _: u32, _: usize, _: f32, _: f32, _: &AsltConfig, _: f32,
+        _: &AtomicBool, _: &(dyn Fn(usize) + Sync),
+    ) -> Result<([Vec<u16>; 3], usize), HpError> {
+        Err(HpError::Unavailable("needs Windows and an NVIDIA GPU".into()))
+    }
+}
 
 /// Elsewhere there is no lane: these keep the callers' shape and admit nothing.
 #[cfg(not(all(windows, target_arch = "x86_64")))]
@@ -3170,10 +4855,14 @@ type MemberSlot<'m> = (&'m mut Cols, &'m SizeSeqBar);
 
 /// `run_size_sequential`'s fold of one member's finished columns.
 fn fold_cols(acc: &mut Cols, col: &Cols, joint: bool) {
-    fold_logs(&mut acc.mix, &col.mix, 1.0);
+    fold_cols_weighted(acc, col, joint, 1.0);
+}
+
+fn fold_cols_weighted(acc: &mut Cols, col: &Cols, joint: bool, weight: f32) {
+    fold_logs(&mut acc.mix, &col.mix, weight);
     if joint {
-        fold_logs(&mut acc.left, &col.left, 1.0);
-        fold_logs(&mut acc.right, &col.right, 1.0);
+        fold_logs(&mut acc.left, &col.left, weight);
+        fold_logs(&mut acc.right, &col.right, weight);
     }
 }
 
@@ -3182,18 +4871,28 @@ fn fold_cols(acc: &mut Cols, col: &Cols, joint: bool) {
 /// 1.0 — element by element, so with no temporaries. `b` is the right channel
 /// of a joint run.
 fn fold_complex(acc: &mut Cols, lo: usize, a: &[C32], b: Option<&[C32]>) {
+    fold_complex_weighted(acc, lo, a, b, 1.0);
+}
+
+fn fold_complex_weighted(acc: &mut Cols, lo: usize, a: &[C32], b: Option<&[C32]>, weight: f32) {
     let hi = lo + a.len();
-    let fold = |acc: &mut f32, m: f32| *acc += 1.0 * m.max(MAG_FLOOR).ln();
+    let fold = |acc: &mut f32, m: f32| *acc += weight * m.max(MAG_FLOOR).ln();
     let norm = |c: &C32| (c.re * c.re + c.im * c.im).sqrt();
     match b {
         Some(b) => {
-            for ((s, x), y) in acc.mix[lo..hi].iter_mut().zip(a).zip(b) {
+            for ((((sm, sl), sr), x), y) in acc.mix[lo..hi]
+                .iter_mut()
+                .zip(&mut acc.left[lo..hi])
+                .zip(&mut acc.right[lo..hi])
+                .zip(a)
+                .zip(b)
+            {
                 let re = 0.5 * (x.re + y.re);
                 let im = 0.5 * (x.im + y.im);
-                fold(s, (re * re + im * im).sqrt());
+                fold(sm, (re * re + im * im).sqrt());
+                fold(sl, norm(x));
+                fold(sr, norm(y));
             }
-            for (s, x) in acc.left[lo..hi].iter_mut().zip(a) { fold(s, norm(x)); }
-            for (s, y) in acc.right[lo..hi].iter_mut().zip(b) { fold(s, norm(y)); }
         }
         None => for (s, x) in acc.mix[lo..hi].iter_mut().zip(a) { fold(s, norm(x)); },
     }
@@ -3337,13 +5036,11 @@ fn shared_pass0_batches(
 /// Members on the unchanged route: `member_cols`, folded in order.
 fn own_route_members(ms: &mut [MemberSlot], i: usize, ctx: &ShareCtx, empty: &SharedSet) -> bool {
     use rayon::prelude::*;
-    let joint = ctx.chans.joint();
     ms.par_iter_mut().with_max_len(1).for_each(|(acc, p)| {
         if (ctx.stop)() { return; }
         r10t!(6, {
             let w = Morlet::new(p.freq, p.cycles[i], ctx.sr);
-            let col = w.member_cols(ctx.chans, ctx.hop, ctx.frames, empty, ctx.work, ctx.seams);
-            fold_cols(acc, &col, joint);
+            w.fold_member_cols(acc, ctx.chans, ctx.hop, ctx.frames, empty, ctx.work, ctx.seams, 1.0);
         });
     });
     !(ctx.stop)()
@@ -4555,41 +6252,78 @@ fn analyze_routed(
         let jobs: Vec<BarJob> = direct_bars.iter()
             .map(|&(bar, freq, q)| BarJob { bar, freq, q })
             .collect();
+        let redundant = seams.redundant_mix_transform && chans.mean.is_some();
         let done: Vec<(usize, Cols)> = bar_jobs(&jobs)
             .filter_map(|job| {
                 if cancelled.load(Ordering::Relaxed) { return None; }
                 let sl = Superlet::new(job.freq, job.q, cfg, sr);
-                let mut col = Cols::zeroed(0, joint);
-                col.mix.reserve(frames);
-                // Frames in runs (see `Superlet::frames_interior`); a run
-                // starts on a multiple of its length, which divides
-                // `CANCEL_CHECK_FRAMES`, so cancellation is polled before the
-                // same frames as one frame at a time.
-                let run = if joint { 2 } else { 4 };
-                for start in (0..frames).step_by(run) {
-                    if start % CANCEL_CHECK_FRAMES == 0
-                        && (cancelled.load(Ordering::Relaxed) || !should_continue())
-                    {
-                        cancelled.store(true, Ordering::Relaxed);
-                        // The bar is abandoned, so its slot stays empty and the
-                        // run ends with nothing, exactly as before.
-                        return None;
-                    }
-                    let end = (start + run).min(frames);
-                    let centres: Vec<isize> = (start..end).map(|fi| (fi * hop) as isize).collect();
-                    // Both channels and the mix from one pass over the members,
-                    // so the direct route pays for two convolutions and not
-                    // three, exactly as the transform routes do.
-                    let got = sl.frames_interior(&chans, &centres, &work, &seams).unwrap_or_else(|| {
-                        centres.iter().map(|&c| sl.frame(&chans, c, &work, &seams)).collect()
-                    });
-                    for (m, l, r) in got {
-                        col.mix.push(m);
-                        if joint {
-                            col.left.push(l);
-                            col.right.push(r);
+                if redundant {
+                    let mut col = Cols::zeroed(0, joint);
+                    col.mix.reserve(frames);
+                    // Frames in runs (see `Superlet::frames_interior`); a run
+                    // starts on a multiple of its length, which divides
+                    // `CANCEL_CHECK_FRAMES`, so cancellation is polled before the
+                    // same frames as one frame at a time.
+                    let run = if joint { 2 } else { 4 };
+                    for start in (0..frames).step_by(run) {
+                        if start % CANCEL_CHECK_FRAMES == 0
+                            && (cancelled.load(Ordering::Relaxed) || !should_continue())
+                        {
+                            cancelled.store(true, Ordering::Relaxed);
+                            // The bar is abandoned, so its slot stays empty and the
+                            // run ends with nothing, exactly as before.
+                            return None;
+                        }
+                        let end = (start + run).min(frames);
+                        let centres: Vec<isize> = (start..end).map(|fi| (fi * hop) as isize).collect();
+                        // Both channels and the mix from one pass over the members,
+                        // so the direct route pays for two convolutions and not
+                        // three, exactly as the transform routes do.
+                        let got = sl.frames_interior(&chans, &centres, &work, &seams).unwrap_or_else(|| {
+                            centres.iter().map(|&c| sl.frame(&chans, c, &work, &seams)).collect()
+                        });
+                        for (m, l, r) in got {
+                            col.mix.push(m);
+                            if joint {
+                                col.left.push(l);
+                                col.right.push(r);
+                            }
                         }
                     }
+                    on_bar_done(job.bar);
+                    return Some((job.bar, col));
+                }
+
+                let mut col = Cols::zeroed(frames, joint);
+                let mut check_cancel = || -> bool {
+                    if cancelled.load(Ordering::Relaxed) || !should_continue() {
+                        cancelled.store(true, Ordering::Relaxed);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                for (w, &weight) in sl.wavelets.iter().zip(sl.weights.iter()) {
+                    let ok = match chans.b {
+                        None => w.fold_direct_mono_cancellable(
+                            chans.a, hop, frames, weight, &mut col.mix,
+                            CANCEL_CHECK_FRAMES, &mut check_cancel,
+                        ),
+                        Some(right) => w.visit_direct_pair_cancellable::<true>(
+                            chans.a, right, hop, frames,
+                            CANCEL_CHECK_FRAMES, &mut check_cancel,
+                            |lo, l, r| fold_complex_weighted(&mut col, lo, l, Some(r), weight),
+                        ),
+                    };
+                    if !ok { return None; }
+                    work.frame((if joint { 2 } else { 1 }) as u64 * frames as u64);
+                }
+                let inv = 1.0 / sl.total_weight;
+                let finish = |v: &mut Vec<f32>| v.iter_mut().for_each(|a| *a = (*a * inv).exp());
+                finish(&mut col.mix);
+                if joint {
+                    finish(&mut col.left);
+                    finish(&mut col.right);
                 }
                 on_bar_done(job.bar);
                 Some((job.bar, col))
@@ -8456,6 +10190,342 @@ mod size_sequential_tests {
                 "setup: needs device and size-sequential groups in one run");
         assert_eq!(prod.work.device_failures, old.work.device_failures);
         assert_same("device failing", &prod, &old);
+    }
+
+    /// Verbatim `de4fcb3` `Morlet::new` constructor (sequential 0..n loop without symmetry).
+    fn old_de4fcb3_morlet_new(freq: f32, cycles: f32, sample_rate: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>, usize) {
+        let sigma = sigma_samples(freq, cycles, sample_rate).max(0.5);
+        let half = ((SUPPORT_SIGMAS * sigma).ceil() as usize).max(1);
+        let n = 2 * half + 1;
+        let mut env = Vec::with_capacity(n);
+        let mut sum = 0.0f64;
+        for k in 0..n {
+            let t = k as f32 - half as f32;
+            let g = (-(t * t) / (2.0 * sigma * sigma)).exp();
+            sum += g as f64;
+            env.push(g);
+        }
+        let norm = if sum > 0.0 { (1.0 / sum) as f32 } else { 0.0 };
+        let omega = std::f32::consts::TAU * freq / sample_rate;
+        let mut re = Vec::with_capacity(n);
+        let mut im = Vec::with_capacity(n);
+        let mut env_n = Vec::with_capacity(n);
+        for (k, g) in env.into_iter().enumerate() {
+            let t = k as f32 - half as f32;
+            let phase = omega * t;
+            let g = g * norm;
+            re.push(g * phase.cos());
+            im.push(-g * phase.sin());
+            env_n.push(g);
+        }
+        (re, im, env_n, half)
+    }
+
+    #[test]
+    fn morlet_build_into_matches_unchanged_de4fcb3_constructor_bit_for_bit() {
+        r10t::DE4FCB3_REF.store(false, Ordering::Relaxed);
+        let (sr, bars, lo, hi) = (48_000.0f32, 1024usize, 20.0f32, 24_000.0f32);
+        let gq = grid_q(bars, lo, hi);
+        let mut w_reused = Morlet::empty();
+        let mut total_wavelets = 0usize;
+        let mut total_taps = 0usize;
+        for preset in [AsltPreset::Standard, AsltPreset::High, AsltPreset::Extreme] {
+            let cfg = preset.config();
+            for b in (0..bars).step_by(4) {
+                let freq = bar_center_freq(b, bars, lo, hi);
+                let q = effective_q_at(freq, gq, &cfg);
+                for c in superlet_cycles(q, &cfg) {
+                    let (want_re, want_im, want_env, want_half) = old_de4fcb3_morlet_new(freq, c, sr);
+                    w_reused.build_into(freq, c, sr);
+                    assert_eq!(w_reused.half, want_half);
+                    assert_eq!(w_reused.re.len(), want_re.len());
+                    for k in 0..want_re.len() {
+                        assert_eq!(
+                            w_reused.re[k].to_bits(),
+                            want_re[k].to_bits(),
+                            "re mismatch at preset={} bar={b} c={c} k={k}/{}",
+                            preset.label(),
+                            want_re.len()
+                        );
+                        assert_eq!(
+                            w_reused.im[k].to_bits(),
+                            want_im[k].to_bits(),
+                            "im mismatch at preset={} bar={b} c={c} k={k}/{}",
+                            preset.label(),
+                            want_im.len()
+                        );
+                        assert_eq!(
+                            w_reused.env[k].to_bits(),
+                            want_env[k].to_bits(),
+                            "env mismatch at preset={} bar={b} c={c} k={k}/{}",
+                            preset.label(),
+                            want_env.len()
+                        );
+                    }
+                    total_wavelets += 1;
+                    total_taps += want_re.len();
+                }
+            }
+        }
+        eprintln!(
+            "morlet_build_into_matches_unchanged_de4fcb3_constructor_bit_for_bit: verified {total_wavelets} wavelets ({total_taps} taps) with 0 bit differences"
+        );
+    }
+
+    #[test]
+    #[ignore = "Piece F internal controlled ablation (DE4FCB3_REF toggle) across Standard, High, Extreme CPU presets"]
+    fn aslt_cpu_presets_ab_and_accuracy_vs_de4fcb3() {
+        let song_path = std::path::Path::new(r"C:\Users\PC\Documents\ASYN\Audio Archive\Vocaloid\01_02_退廃的人生讃歌.flac");
+        let cancel = AtomicBool::new(false);
+        let prog = std::sync::atomic::AtomicU32::new(0);
+        let mut sr = 48_000u32;
+        let max_frames = 10 * 48_000usize; // 10.0s real music stereo excerpt
+        let mut left = Vec::with_capacity(max_frames);
+        let mut right = Vec::with_capacity(max_frames);
+        crate::measure::each_block(song_path, &cancel, &prog, |r, ch, s| {
+            sr = r;
+            for f in s.chunks_exact(ch) {
+                if left.len() < max_frames {
+                    left.push(f[0]);
+                    right.push(if ch > 1 { f[1] } else { f[0] });
+                }
+            }
+        })
+        .unwrap();
+        let bars = 1024usize;
+        let (lo, hi) = (20.0f32, 24_000.0f32);
+        let hop = hop_for_fps(sr, 180.0);
+        let workers = rayon::current_num_threads();
+
+        eprintln!("=== ASLT CPU Internal Controlled Ablation (DE4FCB3_REF=true vs false; shares new rustfft, InvWork.last_idx, direct_complex) ===");
+        eprintln!("  Input: song1 10.0s stereo ({} frames @ {} Hz), bars={}, freq={}..{} Hz, hop={} (180 fps), rayon_workers={}", left.len(), sr, bars, lo, hi, hop, workers);
+        for preset in [AsltPreset::Standard, AsltPreset::High, AsltPreset::Extreme] {
+            let cfg = preset.config();
+            eprintln!(
+                "  Preset {:<8} config: q_ratio={}, max_window_s={}, n_wavelets={}, spread={}, scale={:?}",
+                preset.label(),
+                cfg.q_ratio,
+                cfg.max_window_s,
+                cfg.n_wavelets,
+                cfg.spread,
+                cfg.scale
+            );
+            let mut old_times = Vec::new();
+            let mut new_times = Vec::new();
+            for pair in 0..3 {
+                let ref_first = pair % 2 == 0;
+                let order_str = if ref_first { "ablation_ref -> new" } else { "new -> ablation_ref" };
+                let (old_out, dt_old, new_out, dt_new) = if ref_first {
+                    r10t::DE4FCB3_REF.store(true, Ordering::Relaxed);
+                    let t0 = std::time::Instant::now();
+                    let o = run(
+                        Input::Joint { left: &left, right: &right },
+                        sr,
+                        bars,
+                        lo,
+                        hi,
+                        hop,
+                        &cfg,
+                        never_gpu,
+                        Seams::production(),
+                        &|| true,
+                        &|_| {},
+                    );
+                    let d_o = t0.elapsed().as_secs_f64();
+
+                    r10t::DE4FCB3_REF.store(false, Ordering::Relaxed);
+                    let t1 = std::time::Instant::now();
+                    let n = run(
+                        Input::Joint { left: &left, right: &right },
+                        sr,
+                        bars,
+                        lo,
+                        hi,
+                        hop,
+                        &cfg,
+                        never_gpu,
+                        Seams::production(),
+                        &|| true,
+                        &|_| {},
+                    );
+                    let d_n = t1.elapsed().as_secs_f64();
+                    (o, d_o, n, d_n)
+                } else {
+                    r10t::DE4FCB3_REF.store(false, Ordering::Relaxed);
+                    let t1 = std::time::Instant::now();
+                    let n = run(
+                        Input::Joint { left: &left, right: &right },
+                        sr,
+                        bars,
+                        lo,
+                        hi,
+                        hop,
+                        &cfg,
+                        never_gpu,
+                        Seams::production(),
+                        &|| true,
+                        &|_| {},
+                    );
+                    let d_n = t1.elapsed().as_secs_f64();
+
+                    r10t::DE4FCB3_REF.store(true, Ordering::Relaxed);
+                    let t0 = std::time::Instant::now();
+                    let o = run(
+                        Input::Joint { left: &left, right: &right },
+                        sr,
+                        bars,
+                        lo,
+                        hi,
+                        hop,
+                        &cfg,
+                        never_gpu,
+                        Seams::production(),
+                        &|| true,
+                        &|_| {},
+                    );
+                    let d_o = t0.elapsed().as_secs_f64();
+                    r10t::DE4FCB3_REF.store(false, Ordering::Relaxed);
+                    (o, d_o, n, d_n)
+                };
+
+                // Recompute bit differences on EVERY pair (no cached counts from pair 0)
+                let bit_diffs_mix = bits_differing(&old_out.mix, &new_out.mix);
+                let bit_diffs_left = bits_differing(&old_out.left, &new_out.left);
+                let bit_diffs_right = bits_differing(&old_out.right, &new_out.right);
+                eprintln!(
+                    "  Preset {:<8} pair {} ({order_str}, workers={workers}): ablation_ref={dt_old:.3}s, new={dt_new:.3}s (bit_diffs mix={bit_diffs_mix}, L={bit_diffs_left}, R={bit_diffs_right})",
+                    preset.label(),
+                    pair + 1
+                );
+                assert_eq!(bit_diffs_mix, 0, "{} pair {} mix differed from ablation_ref", preset.label(), pair + 1);
+                assert_eq!(bit_diffs_left, 0, "{} pair {} left differed from ablation_ref", preset.label(), pair + 1);
+                assert_eq!(bit_diffs_right, 0, "{} pair {} right differed from ablation_ref", preset.label(), pair + 1);
+                old_times.push(dt_old);
+                new_times.push(dt_new);
+            }
+            old_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            new_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med_old = old_times[1];
+            let med_new = new_times[1];
+            eprintln!(
+                "  Preset {:<8} MEASURED 10.0s excerpt MEDIAN (internal ablation, workers={workers}): ablation_ref={med_old:.3}s -> new={med_new:.3}s ({:.2}x, {:.1}% faster)",
+                preset.label(),
+                med_old / med_new,
+                (1.0 - med_new / med_old) * 100.0
+            );
+            eprintln!(
+                "  Preset {:<8} ESTIMATE (linear 21.636x extrapolation from 10.0s excerpt to 216.36s; not full-track measured, ignores fixed long-window FFT padding amortization): ablation_ref~={:.1}s -> new~={:.1}s (est diff ~{:.1}s)",
+                preset.label(),
+                med_old * 21.636,
+                med_new * 21.636,
+                (med_old - med_new) * 21.636
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Two-binary true de4fcb3 vs candidate bit-identity oracle and single-pass timing"]
+    fn aslt_true_de4fcb3_two_binary_oracle_and_bench() {
+        use std::io::{Read, Write};
+        let song_path = std::path::Path::new(r"C:\Users\PC\Documents\ASYN\Audio Archive\Vocaloid\01_02_退廃的人生讃歌.flac");
+        let cancel = AtomicBool::new(false);
+        let prog = std::sync::atomic::AtomicU32::new(0);
+        let mut sr = 48_000u32;
+        let max_frames = 10 * 48_000usize; // 10.0s real music stereo excerpt
+        let mut left = Vec::with_capacity(max_frames);
+        let mut right = Vec::with_capacity(max_frames);
+        crate::measure::each_block(song_path, &cancel, &prog, |r, ch, s| {
+            sr = r;
+            for f in s.chunks_exact(ch) {
+                if left.len() < max_frames {
+                    left.push(f[0]);
+                    right.push(if ch > 1 { f[1] } else { f[0] });
+                }
+            }
+        })
+        .unwrap();
+        let bars = 1024usize;
+        let (lo, hi) = (20.0f32, 24_000.0f32);
+        let hop = hop_for_fps(sr, 180.0);
+        let workers = rayon::current_num_threads();
+
+        r10t::DE4FCB3_REF.store(false, Ordering::Relaxed);
+        let dump_path = std::env::var("MOOSIK_ASLT_DUMP_ORACLE").ok();
+        let verify_path = std::env::var("MOOSIK_ASLT_VERIFY_ORACLE").ok();
+        let mut dump_file = dump_path
+            .as_ref()
+            .map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("create oracle dump")));
+        let mut verify_file = verify_path
+            .as_ref()
+            .map(|p| std::io::BufReader::new(std::fs::File::open(p).expect("open oracle dump")));
+
+        for preset in [AsltPreset::Standard, AsltPreset::High, AsltPreset::Extreme] {
+            let cfg = preset.config();
+            let t0 = std::time::Instant::now();
+            let out = run(
+                Input::Joint { left: &left, right: &right },
+                sr,
+                bars,
+                lo,
+                hi,
+                hop,
+                &cfg,
+                never_gpu,
+                Seams::production(),
+                &|| true,
+                &|_| {},
+            );
+            let dt = t0.elapsed().as_secs_f64();
+
+            if let Some(w) = dump_file.as_mut() {
+                for plane in [&out.mix, &out.left, &out.right] {
+                    for row in plane {
+                        for &v in row {
+                            w.write_all(&v.to_bits().to_le_bytes()).unwrap();
+                        }
+                    }
+                }
+            }
+
+            let mut bit_diffs = [0usize; 3];
+            let mut total_floats = 0usize;
+            if let Some(r) = verify_file.as_mut() {
+                for (pi, plane) in [&out.mix, &out.left, &out.right].iter().enumerate() {
+                    for row in *plane {
+                        for &v in row {
+                            let mut buf = [0u8; 4];
+                            r.read_exact(&mut buf).unwrap();
+                            let want_bits = u32::from_le_bytes(buf);
+                            if v.to_bits() != want_bits {
+                                bit_diffs[pi] += 1;
+                            }
+                            total_floats += 1;
+                        }
+                    }
+                }
+                assert_eq!(bit_diffs[0], 0, "{} mix differed from true de4fcb3 binary!", preset.label());
+                assert_eq!(bit_diffs[1], 0, "{} left differed from true de4fcb3 binary!", preset.label());
+                assert_eq!(bit_diffs[2], 0, "{} right differed from true de4fcb3 binary!", preset.label());
+            }
+
+            eprintln!(
+                "  [Two-Binary Run] Preset {:<8} | workers={} | q_ratio={} max_win={}s n_wavelets={} spread={} scale={:?} | elapsed={dt:.3}s | verified_floats={} bit_diffs(mix,L,R)=({},{},{})",
+                preset.label(),
+                workers,
+                cfg.q_ratio,
+                cfg.max_window_s,
+                cfg.n_wavelets,
+                cfg.spread,
+                cfg.scale,
+                total_floats,
+                bit_diffs[0],
+                bit_diffs[1],
+                bit_diffs[2]
+            );
+        }
+        if let Some(mut w) = dump_file {
+            w.flush().unwrap();
+        }
     }
 }
 

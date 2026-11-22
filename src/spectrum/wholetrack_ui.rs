@@ -1371,6 +1371,7 @@ mod true_cqt_provenance_tests {
             dsd_rate: None,
             fft: None,
             aslt: None,
+            numerics: super::super::Numerics::Standard,
         };
         let mix = Arc::new(PreFrames::from_v4_codes(vec![100; 16], 4, 4));
         let snapshot = Snapshot {

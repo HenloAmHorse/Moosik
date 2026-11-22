@@ -134,8 +134,13 @@ impl MoosikApp {
         youtube::install::dir(&moosik_dir())
     }
 
-    fn yt_downloads(&self) -> PathBuf {
+    pub(super) fn yt_downloads(&self) -> PathBuf {
         self.appearance.youtube_dir.clone().unwrap_or_else(youtube::music_dir)
+    }
+
+    /// A song or video is still arriving into the cache.
+    pub(super) fn youtube_fetching(&self) -> bool {
+        !self.shell.yt.fetches.is_empty()
     }
 
     /// The YouTube part of the settings drawer.
@@ -166,15 +171,10 @@ impl MoosikApp {
         };
         ui.horizontal_wrapped(|ui| {
             ui.label(small(format!("Played from YouTube: {:.0} MB kept (up to {} MB)", size as f64 / 1e6, youtube::CACHE_BYTES / 1_000_000)));
-            if size > 0 && ui.small_button("Clear").on_hover_text("Delete played audio not on the playlist").clicked() {
-                let keep = self.youtube_keep();
-                if let Ok(rd) = std::fs::read_dir(&cache) {
-                    for e in rd.flatten() {
-                        if !keep.contains(&e.path()) {
-                            let _ = std::fs::remove_file(e.path());
-                        }
-                    }
-                }
+            if size > 0 && !self.youtube_fetching()
+                && ui.small_button("Clear").on_hover_text("Delete played audio not on the playlist").clicked()
+            {
+                youtube::prune(&cache, &self.youtube_keep(), 0);
                 self.shell.yt.cache_size = None;
             }
         });
@@ -646,7 +646,7 @@ impl MoosikApp {
 
     /// The cached files to keep: the playlist's songs, their videos, covers
     /// and saved lyrics.
-    fn youtube_keep(&self) -> Vec<PathBuf> {
+    pub(super) fn youtube_keep(&self) -> Vec<PathBuf> {
         self.playlist.iter().flat_map(|t| [t.path.clone(), t.path.with_extension("video.webm"), youtube::cover_path(&t.path), t.path.with_extension("lrc")]).collect()
     }
 
@@ -681,7 +681,7 @@ impl MoosikApp {
                 }
             }
         }
-        youtube::prune(&youtube::cache_dir(&moosik_dir()), &self.youtube_keep());
+        youtube::prune(&youtube::cache_dir(&moosik_dir()), &self.youtube_keep(), youtube::CACHE_BYTES);
         Some(path)
     }
 

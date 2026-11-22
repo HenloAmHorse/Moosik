@@ -425,3 +425,38 @@ fn the_channel_tick_does_not_trust_a_plan_from_another_geometry() {
     assert_eq!(bits(&prod.bars_right), bits(&frozen.bars_right));
     assert_eq!(prod.cqt_plan_builds, 2);
 }
+
+/// The live ticks' norm is `Complex::norm` bit for bit: specials, f32
+/// extremes and subnormals, pairs aimed at the f64 double-rounding midpoints,
+/// twelve known pairs where both round the same wrong way, and a million
+/// random bit patterns. Different bits would move bars, so none may differ.
+#[test]
+fn live_norm_is_complex_norm_bit_for_bit() {
+    let special = [0.0, -0.0, f32::from_bits(1), -f32::from_bits(1), f32::from_bits(0x007f_ffff),
+                   f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 1.0, -1.0, 1e-30, 1e30, f32::MAX, -f32::MAX,
+                   f32::INFINITY, f32::NEG_INFINITY, f32::NAN, f32::from_bits(0x7fc0_1234), f32::from_bits(0xff80_0001)];
+    let mut pairs: Vec<Complex<f32>> = special.iter().flat_map(|&a| special.iter().map(move |&b| Complex::new(a, b))).collect();
+    for exponent in [-120i32, -60, 0, 60, 120] {
+        for mantissa in 0..512u32 {
+            let bits = (((exponent + 127) as u32) << 23) | (mantissa * 16_381);
+            let (x, above) = (f32::from_bits(bits), f32::from_bits(bits + 1));
+            let mid = (x as f64 + above as f64) * 0.5;
+            let y = (mid * mid - x as f64 * x as f64).sqrt() as f32;
+            for y in [y.to_bits() - 1, y.to_bits(), y.to_bits() + 1].map(f32::from_bits) {
+                pairs.extend([Complex::new(x, y), Complex::new(-x, y), Complex::new(y, -x)]);
+            }
+        }
+    }
+    for (x, y) in [(0x2181_ffe2u32, 0x1bb6_6d81u32), (0x21aa_fd7b, 0x1bd1_389c), (0x21f2_f943, 0x1bf9_66dd),
+                   (0x3f81_ffe2, 0x39b6_6d81), (0x3faa_fd7b, 0x39d1_389c), (0x3ff2_f943, 0x39f9_66dd),
+                   (0x5d81_ffe2, 0x57b6_6d81), (0x5daa_fd7b, 0x57d1_389c), (0x5df2_f943, 0x57f9_66dd),
+                   (0x7b81_ffe2, 0x75b6_6d81), (0x7baa_fd7b, 0x75d1_389c), (0x7bf2_f943, 0x75f9_66dd)] {
+        pairs.push(Complex::new(f32::from_bits(x), f32::from_bits(y)));
+    }
+    let mut seed = 0x51ab_1625u32;
+    let mut next = || { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; f32::from_bits(seed) };
+    for _ in 0..1_000_000 { pairs.push(Complex::new(next(), next())); }
+    for c in &pairs {
+        assert_eq!(live_norm(c).to_bits(), c.norm().to_bits(), "{:08x} {:08x}", c.re.to_bits(), c.im.to_bits());
+    }
+}

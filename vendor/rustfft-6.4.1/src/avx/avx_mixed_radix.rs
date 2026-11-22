@@ -12,6 +12,46 @@ use super::{AvxNum, CommonSimdData};
 use super::avx_vector;
 use super::avx_vector::{AvxArray, AvxArrayMut, AvxVector, AvxVector128, AvxVector256, Rotation90};
 
+#[inline]
+fn prepare_pruned_row_scatter(
+    needed: &[usize],
+    rows: usize,
+    counts: &mut [usize; 32],
+    offs: &mut [usize; 32],
+    idx: &mut [usize],
+    slots: &mut [usize],
+) {
+    let mask = rows - 1;
+    let shift = rows.trailing_zeros();
+    for &o in needed {
+        counts[o & mask] += 1;
+    }
+    let mut acc = 0usize;
+    for r in 0..rows {
+        offs[r] = acc;
+        acc += counts[r];
+    }
+    let mut cursors = *offs;
+    for (slot, &o) in needed.iter().enumerate() {
+        let r = o & mask;
+        let p = cursors[r];
+        cursors[r] = p + 1;
+        idx[p] = o >> shift;
+        slots[p] = slot;
+    }
+}
+
+/// Separate complex point-multiply beats fused loads when a live-row column
+/// pass would stream multiple non-contiguous buffers past L2 without reuse.
+#[inline(always)]
+fn use_separate_pruned_prod<T>(len: usize) -> bool {
+    let elem_bytes = core::mem::size_of::<Complex<T>>();
+    let min_prod_len = if elem_bytes <= 8 { 1024 } else { 2048 };
+    (len >= min_prod_len && len <= 2048)
+        || (elem_bytes <= 8 && len >= 65536)
+        || (elem_bytes > 8 && len >= 524288)
+}
+
 macro_rules! boilerplate_mixedradix {
     () => {
         /// Moosik (1.5.3): this plan prunes; see `Fft::process_pruned_with_scratch`.
@@ -73,16 +113,30 @@ macro_rules! boilerplate_mixedradix {
             crate::check_product(self.len(), Some(s.len()), h.len());
             crate::check_pruned(self, buffer.len(), scratch.len(), needed, out.len(), &work);
             let live = self.live_rows(needed);
-            unsafe {
-                let ts: &[Complex<A>] = array_utils::workaround_transmute(s);
-                let th: &[Complex<A>] = array_utils::workaround_transmute(h);
-                let tb: &mut [Complex<A>] = array_utils::workaround_transmute_mut(buffer);
-                #[cfg(feature = "moosik-diagnostics")]
-                crate::moosik_diagnostics::level(self.len(), self.len() / self.common_data.inner_fft.len(), live, self.live_rows_ok(live), std::mem::size_of::<T>());
-                if self.live_rows_ok(live) {
-                    self.live_column_butterflies(avx_vector::ProductBuf { s: ts, h: th, out: tb }, live);
-                } else {
-                    self.perform_column_butterflies(avx_vector::ProductBuf { s: ts, h: th, out: tb });
+            #[cfg(feature = "moosik-diagnostics")]
+            crate::moosik_diagnostics::level(self.len(), self.len() / self.common_data.inner_fft.len(), live, self.live_rows_ok(live), std::mem::size_of::<T>());
+            if use_separate_pruned_prod::<T>(self.len())
+                && (!self.live_rows_ok(live) || live.count_ones() > 1)
+            {
+                crate::product_into(s, h, buffer);
+                unsafe {
+                    let tb: &mut [Complex<A>] = array_utils::workaround_transmute_mut(buffer);
+                    if self.live_rows_ok(live) {
+                        self.live_column_butterflies(tb, live);
+                    } else {
+                        self.perform_column_butterflies(tb);
+                    }
+                }
+            } else {
+                unsafe {
+                    let ts: &[Complex<A>] = array_utils::workaround_transmute(s);
+                    let th: &[Complex<A>] = array_utils::workaround_transmute(h);
+                    let tb: &mut [Complex<A>] = array_utils::workaround_transmute_mut(buffer);
+                    if self.live_rows_ok(live) {
+                        self.live_column_butterflies(avx_vector::ProductBuf { s: ts, h: th, out: tb }, live);
+                    } else {
+                        self.perform_column_butterflies(avx_vector::ProductBuf { s: ts, h: th, out: tb });
+                    }
                 }
             }
             self.pruned_rows(buffer, scratch, needed, out, work);
@@ -102,15 +156,29 @@ macro_rules! boilerplate_mixedradix {
             crate::check_product(self.len(), None, h.len());
             crate::check_pruned(self, buffer.len(), scratch.len(), needed, out.len(), &work);
             let live = self.live_rows(needed);
-            unsafe {
-                let th: &[Complex<A>] = array_utils::workaround_transmute(h);
-                let tb: &mut [Complex<A>] = array_utils::workaround_transmute_mut(buffer);
-                #[cfg(feature = "moosik-diagnostics")]
-                crate::moosik_diagnostics::level(self.len(), self.len() / self.common_data.inner_fft.len(), live, self.live_rows_ok(live), std::mem::size_of::<T>());
-                if self.live_rows_ok(live) {
-                    self.live_column_butterflies(avx_vector::InplaceProductBuf { h: th, out: tb }, live);
-                } else {
-                    self.perform_column_butterflies(avx_vector::InplaceProductBuf { h: th, out: tb });
+            #[cfg(feature = "moosik-diagnostics")]
+            crate::moosik_diagnostics::level(self.len(), self.len() / self.common_data.inner_fft.len(), live, self.live_rows_ok(live), std::mem::size_of::<T>());
+            if use_separate_pruned_prod::<T>(self.len())
+                && (!self.live_rows_ok(live) || live.count_ones() > 1)
+            {
+                crate::product_in_place(h, buffer);
+                unsafe {
+                    let tb: &mut [Complex<A>] = array_utils::workaround_transmute_mut(buffer);
+                    if self.live_rows_ok(live) {
+                        self.live_column_butterflies(tb, live);
+                    } else {
+                        self.perform_column_butterflies(tb);
+                    }
+                }
+            } else {
+                unsafe {
+                    let th: &[Complex<A>] = array_utils::workaround_transmute(h);
+                    let tb: &mut [Complex<A>] = array_utils::workaround_transmute_mut(buffer);
+                    if self.live_rows_ok(live) {
+                        self.live_column_butterflies(avx_vector::InplaceProductBuf { h: th, out: tb }, live);
+                    } else {
+                        self.perform_column_butterflies(avx_vector::InplaceProductBuf { h: th, out: tb });
+                    }
                 }
             }
             self.pruned_rows(buffer, scratch, needed, out, work);
@@ -166,27 +234,51 @@ macro_rules! boilerplate_mixedradix {
             let (idx, rest_idx) = work.idx.split_at_mut(2 * k);
             let (idx, slots) = idx.split_at_mut(k);
             let (vals, rest_val) = work.val.split_at_mut(k);
-            for r in 0..rows {
-                let mut j = 0;
-                for (slot, &o) in needed.iter().enumerate() {
-                    if o % rows == r {
-                        idx[j] = o / rows;
-                        slots[j] = slot;
-                        j += 1;
+            if rows <= 32 && rows.is_power_of_two() {
+                let mut counts = [0usize; 32];
+                let mut offs = [0usize; 32];
+                prepare_pruned_row_scatter(needed, rows, &mut counts, &mut offs, idx, slots);
+                for r in 0..rows {
+                    let cnt = counts[r];
+                    if cnt == 0 {
+                        continue;
+                    }
+                    let lo = offs[r];
+                    let hi = lo + cnt;
+                    inner.process_pruned_with_scratch(
+                        &mut buffer[r * m..(r + 1) * m],
+                        scratch,
+                        &idx[lo..hi],
+                        &mut vals[..cnt],
+                        crate::PrunedWork { idx: &mut *rest_idx, val: &mut *rest_val },
+                    );
+                    for (&slot, v) in slots[lo..hi].iter().zip(&vals[..cnt]) {
+                        out[slot] = *v;
                     }
                 }
-                if j == 0 {
-                    continue;
-                }
-                inner.process_pruned_with_scratch(
-                    &mut buffer[r * m..(r + 1) * m],
-                    scratch,
-                    &idx[..j],
-                    &mut vals[..j],
-                    crate::PrunedWork { idx: &mut *rest_idx, val: &mut *rest_val },
-                );
-                for (&slot, v) in slots[..j].iter().zip(&vals[..j]) {
-                    out[slot] = *v;
+            } else {
+                for r in 0..rows {
+                    let mut j = 0;
+                    for (slot, &o) in needed.iter().enumerate() {
+                        if o % rows == r {
+                            idx[j] = o / rows;
+                            slots[j] = slot;
+                            j += 1;
+                        }
+                    }
+                    if j == 0 {
+                        continue;
+                    }
+                    inner.process_pruned_with_scratch(
+                        &mut buffer[r * m..(r + 1) * m],
+                        scratch,
+                        &idx[..j],
+                        &mut vals[..j],
+                        crate::PrunedWork { idx: &mut *rest_idx, val: &mut *rest_val },
+                    );
+                    for (&slot, v) in slots[..j].iter().zip(&vals[..j]) {
+                        out[slot] = *v;
+                    }
                 }
             }
         }
@@ -367,37 +459,6 @@ unsafe fn bf4_live<V: AvxVector>(rows: [V; 4], rotation: Rotation90<V>, live: u3
     out
 }
 
-/// The rows of `AvxVector::column_butterfly8(rows, rotation)` set in `live`
-/// (returned order `[o0, o2, o4, o6, o1, o3, o5, o7]`); other entries are
-/// zero.
-#[inline(always)]
-unsafe fn bf8_live<V: AvxVector>(rows: [V; 8], rotation: Rotation90<V>, live: u32) -> [V; 8] {
-    // Position p is bf2(mid0[i], mid1[i]) with i = p % 4: add for p < 4,
-    // sub for p >= 4.
-    let need = (live | live >> 4) & 0xF;
-    let mid0 = bf4_live([rows[0], rows[2], rows[4], rows[6]], rotation, need);
-    let mut mid1 = bf4_live([rows[1], rows[3], rows[5], rows[7]], rotation, need);
-    if need & 0b0010 != 0 {
-        mid1[1] = avx_vector::apply_butterfly8_twiddle1(mid1[1], rotation);
-    }
-    if need & 0b0100 != 0 {
-        mid1[2] = mid1[2].rotate90(rotation);
-    }
-    if need & 0b1000 != 0 {
-        mid1[3] = avx_vector::apply_butterfly8_twiddle3(mid1[3], rotation);
-    }
-    let mut out = [V::zero(); 8];
-    for i in 0..4 {
-        if live >> i & 1 != 0 {
-            out[i] = V::add(mid0[i], mid1[i]);
-        }
-        if live >> (i + 4) & 1 != 0 {
-            out[i + 4] = V::sub(mid0[i], mid1[i]);
-        }
-    }
-    out
-}
-
 /// Live-row column pass for a radix-4 or radix-8 mixed-radix plan.
 macro_rules! mixedradix_live_columns {
     ($row_count: expr, $live_fn: ident) => {
@@ -410,9 +471,83 @@ macro_rules! mixedradix_live_columns {
         /// is no cheaper than the dense pass.
         #[inline]
         fn live_rows_ok(&self, live: u32) -> bool {
-            self.len() >= 8192
-                && 2 * live.count_ones() as usize <= $row_count
+            let n_live = live.count_ones() as usize;
+            ((self.len() >= 4096 && 2 * n_live <= $row_count)
+                || (self.len() >= 1024 && n_live == 1))
                 && (self.len() / $row_count) % A::VectorType::COMPLEX_PER_VECTOR == 0
+        }
+
+        /// Single-row live column pass with compile-time constant `R` and L1
+        /// cache-conflict tiling.
+        #[target_feature(enable = "avx", enable = "fma")]
+        unsafe fn live_column_butterfly_one<const R: usize>(
+            &self,
+            mut buffer: impl AvxArrayMut<A>,
+        ) {
+            const ROW_COUNT: usize = $row_count;
+            const TWIDDLES_PER_COLUMN: usize = ROW_COUNT - 1;
+            const TILE: usize = 2;
+            let len_per_row = self.len() / ROW_COUNT;
+            let chunk_count = len_per_row / A::VectorType::COMPLEX_PER_VECTOR;
+            let twiddles_len = self.common_data.twiddles.len();
+            let safe_chunks = chunk_count.min(twiddles_len / TWIDDLES_PER_COLUMN);
+            let tw_ptr = self.common_data.twiddles.as_ptr();
+            let live_const: u32 = 1u32 << R;
+            let rot = self.twiddles_butterfly4;
+
+            let mut c = 0usize;
+            if len_per_row * std::mem::size_of::<Complex<A>>() >= 4096
+                && chunk_count >= TILE
+                && safe_chunks >= TILE
+            {
+                let mut tile_in =
+                    [[std::mem::MaybeUninit::<A::VectorType>::uninit(); TILE]; ROW_COUNT];
+                let mut tile_out = [std::mem::MaybeUninit::<A::VectorType>::uninit(); TILE];
+                while c + TILE <= safe_chunks {
+                    let tile_col_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                    for i in 0..ROW_COUNT {
+                        let row_off = tile_col_base + len_per_row * i;
+                        for t in 0..TILE {
+                            tile_in[i][t].write(
+                                buffer.load_complex(row_off + t * A::VectorType::COMPLEX_PER_VECTOR),
+                            );
+                        }
+                    }
+                    for t in 0..TILE {
+                        let mut columns = [AvxVector::zero(); ROW_COUNT];
+                        for i in 0..ROW_COUNT {
+                            columns[i] = tile_in[i][t].assume_init();
+                        }
+                        let mut v = $live_fn(columns, rot, live_const)[R];
+                        if R >= 1 {
+                            let twiddle = *tw_ptr.add((c + t) * TWIDDLES_PER_COLUMN + (R - 1));
+                            v = AvxVector::mul_complex(twiddle, v);
+                        }
+                        tile_out[t].write(v);
+                    }
+                    let dst_off = tile_col_base + len_per_row * R;
+                    for t in 0..TILE {
+                        buffer.store_complex(
+                            tile_out[t].assume_init(),
+                            dst_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                        );
+                    }
+                    c += TILE;
+                }
+            }
+            for cc in c..safe_chunks {
+                let index_base = cc * A::VectorType::COMPLEX_PER_VECTOR;
+                let mut columns = [AvxVector::zero(); ROW_COUNT];
+                for i in 0..ROW_COUNT {
+                    columns[i] = buffer.load_complex(index_base + len_per_row * i);
+                }
+                let mut v = $live_fn(columns, rot, live_const)[R];
+                if R >= 1 {
+                    let twiddle = *tw_ptr.add(cc * TWIDDLES_PER_COLUMN + (R - 1));
+                    v = AvxVector::mul_complex(twiddle, v);
+                }
+                buffer.store_complex(v, index_base + len_per_row * R);
+            }
         }
 
         /// `perform_column_butterflies` computing only the rows set in `live`.
@@ -420,30 +555,97 @@ macro_rules! mixedradix_live_columns {
         unsafe fn live_column_butterflies(&self, mut buffer: impl AvxArrayMut<A>, live: u32) {
             const ROW_COUNT: usize = $row_count;
             const TWIDDLES_PER_COLUMN: usize = ROW_COUNT - 1;
+            const TILE: usize = 8;
+
+            if live.count_ones() == 1 {
+                let r = live.trailing_zeros() as usize;
+                match r {
+                    0 => return self.live_column_butterfly_one::<0>(buffer),
+                    1 => return self.live_column_butterfly_one::<1>(buffer),
+                    2 => return self.live_column_butterfly_one::<2>(buffer),
+                    3 => return self.live_column_butterfly_one::<3>(buffer),
+                    4 if ROW_COUNT > 4 => return self.live_column_butterfly_one::<4>(buffer),
+                    5 if ROW_COUNT > 5 => return self.live_column_butterfly_one::<5>(buffer),
+                    6 if ROW_COUNT > 6 => return self.live_column_butterfly_one::<6>(buffer),
+                    7 if ROW_COUNT > 7 => return self.live_column_butterfly_one::<7>(buffer),
+                    _ => unreachable!(),
+                }
+            }
+
+            let mut live_list = [0usize; ROW_COUNT];
+            let mut n_live = 0usize;
+            for r in 0..ROW_COUNT {
+                if (live >> r) & 1 != 0 {
+                    live_list[n_live] = r;
+                    n_live += 1;
+                }
+            }
+
             let len_per_row = self.len() / ROW_COUNT;
             let chunk_count = len_per_row / A::VectorType::COMPLEX_PER_VECTOR;
-            for (c, twiddle_chunk) in self
-                .common_data
-                .twiddles
-                .chunks_exact(TWIDDLES_PER_COLUMN)
-                .take(chunk_count)
-                .enumerate()
-            {
-                let index_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+            let safe_chunks = chunk_count.min(self.common_data.twiddles.len() / TWIDDLES_PER_COLUMN);
+            let tw_ptr = self.common_data.twiddles.as_ptr();
+            let rot = self.twiddles_butterfly4;
+
+            let mut c = 0usize;
+            if len_per_row * std::mem::size_of::<Complex<A>>() >= 4096 && safe_chunks >= TILE {
+                let mut tile =
+                    [[std::mem::MaybeUninit::<A::VectorType>::uninit(); TILE]; ROW_COUNT];
+                while c + TILE <= safe_chunks {
+                    let tile_col_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                    for i in 0..ROW_COUNT {
+                        let row_off = tile_col_base + len_per_row * i;
+                        for t in 0..TILE {
+                            tile[i][t].write(
+                                buffer.load_complex(row_off + t * A::VectorType::COMPLEX_PER_VECTOR),
+                            );
+                        }
+                    }
+                    for t in 0..TILE {
+                        let mut columns = [AvxVector::zero(); ROW_COUNT];
+                        for i in 0..ROW_COUNT {
+                            columns[i] = tile[i][t].assume_init();
+                        }
+                        let output = $live_fn(columns, rot, live);
+                        let tw_col = tw_ptr.add((c + t) * TWIDDLES_PER_COLUMN);
+                        for k in 0..n_live {
+                            let r = live_list[k];
+                            let mut v = output[r];
+                            if r >= 1 {
+                                v = AvxVector::mul_complex(*tw_col.add(r - 1), v);
+                            }
+                            tile[k][t].write(v);
+                        }
+                    }
+                    for k in 0..n_live {
+                        let r = live_list[k];
+                        let dst_off = tile_col_base + len_per_row * r;
+                        for t in 0..TILE {
+                            buffer.store_complex(
+                                tile[k][t].assume_init(),
+                                dst_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                            );
+                        }
+                    }
+                    c += TILE;
+                }
+            }
+
+            for cc in c..safe_chunks {
+                let index_base = cc * A::VectorType::COMPLEX_PER_VECTOR;
                 let mut columns = [AvxVector::zero(); ROW_COUNT];
                 for i in 0..ROW_COUNT {
                     columns[i] = buffer.load_complex(index_base + len_per_row * i);
                 }
-                let output = $live_fn(columns, self.twiddles_butterfly4, live);
-                if live & 1 != 0 {
-                    buffer.store_complex(output[0], index_base);
-                }
-                for i in 1..ROW_COUNT {
-                    if live >> i & 1 != 0 {
-                        let twiddle = twiddle_chunk[i - 1];
-                        let output = AvxVector::mul_complex(twiddle, output[i]);
-                        buffer.store_complex(output, index_base + len_per_row * i);
+                let output = $live_fn(columns, rot, live);
+                let tw_col = tw_ptr.add(cc * TWIDDLES_PER_COLUMN);
+                for k in 0..n_live {
+                    let r = live_list[k];
+                    let mut v = output[r];
+                    if r >= 1 {
+                        v = AvxVector::mul_complex(*tw_col.add(r - 1), v);
                     }
+                    buffer.store_complex(v, index_base + len_per_row * r);
                 }
             }
         }
@@ -516,19 +718,121 @@ macro_rules! mixedradix_column_butterflies {
             // How many rows this FFT has, ie 2 for 2xn, 4 for 4xn, etc
             const ROW_COUNT: usize = $row_count;
             const TWIDDLES_PER_COLUMN: usize = ROW_COUNT - 1;
+            const TILE: usize = 2;
 
             let len_per_row = self.len() / ROW_COUNT;
             let chunk_count = len_per_row / A::VectorType::COMPLEX_PER_VECTOR;
+            let safe_chunks = chunk_count.min(self.common_data.twiddles.len() / TWIDDLES_PER_COLUMN);
+            let tw_ptr = self.common_data.twiddles.as_ptr();
 
-            // process the column FFTs
-            for (c, twiddle_chunk) in self
+            let mut c = 0usize;
+            macro_rules! run_strip {
+                ($strip: expr, $stride: expr) => {{
+                    let mut strip =
+                        [std::mem::MaybeUninit::<A::VectorType>::uninit(); ROW_COUNT * $stride];
+                    while c + $strip <= safe_chunks {
+                        let tile_col_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                        for i in 0..ROW_COUNT {
+                            let row_off = tile_col_base + len_per_row * i;
+                            let dst = strip.as_mut_ptr().add(i * $stride);
+                            for t in 0..$strip {
+                                (*dst.add(t)).write(
+                                    input.load_complex(
+                                        row_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                                    ),
+                                );
+                            }
+                        }
+                        for t in 0..$strip {
+                            let mut columns = [AvxVector::zero(); ROW_COUNT];
+                            for i in 0..ROW_COUNT {
+                                columns[i] = strip[i * $stride + t].assume_init();
+                            }
+                            let output = $butterfly_fn(columns, self);
+                            strip[t].write(output[0]);
+                            let tw_col = tw_ptr.add((c + t) * TWIDDLES_PER_COLUMN);
+                            for i in 1..ROW_COUNT {
+                                let twiddle = *tw_col.add(i - 1);
+                                strip[i * $stride + t]
+                                    .write(AvxVector::mul_complex(twiddle, output[i]));
+                            }
+                        }
+                        for i in 0..ROW_COUNT {
+                            let row_off = tile_col_base + len_per_row * i;
+                            let src = strip.as_ptr().add(i * $stride);
+                            for t in 0..$strip {
+                                buffer.store_complex(
+                                    (*src.add(t)).assume_init(),
+                                    row_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                                );
+                            }
+                        }
+                        c += $strip;
+                    }
+                }};
+            }
+            let row_bytes = len_per_row * std::mem::size_of::<Complex<A>>();
+            if ROW_COUNT >= 4
+                && ROW_COUNT <= 16
+                && (row_bytes >= 131_072 || (ROW_COUNT >= 8 && row_bytes == 32_768))
+                && safe_chunks >= 8
+            {
+                run_strip!(8, 10);
+            } else if ROW_COUNT >= 4 && ROW_COUNT <= 16 && row_bytes >= 4096 && safe_chunks >= 16 {
+                run_strip!(16, 18);
+            }
+            if ROW_COUNT >= 4
+                && len_per_row * std::mem::size_of::<Complex<A>>() >= 4096
+                && c + TILE <= safe_chunks
+            {
+                let mut tile =
+                    [[std::mem::MaybeUninit::<A::VectorType>::uninit(); TILE]; ROW_COUNT];
+                while c + TILE <= safe_chunks {
+                    let tile_col_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                    for i in 0..ROW_COUNT {
+                        let row_off = tile_col_base + len_per_row * i;
+                        for t in 0..TILE {
+                            tile[i][t].write(
+                                input.load_complex(row_off + t * A::VectorType::COMPLEX_PER_VECTOR),
+                            );
+                        }
+                    }
+                    for t in 0..TILE {
+                        let mut columns = [AvxVector::zero(); ROW_COUNT];
+                        for i in 0..ROW_COUNT {
+                            columns[i] = tile[i][t].assume_init();
+                        }
+                        let output = $butterfly_fn(columns, self);
+                        tile[0][t].write(output[0]);
+                        let tw_col = tw_ptr.add((c + t) * TWIDDLES_PER_COLUMN);
+                        for i in 1..ROW_COUNT {
+                            let twiddle = *tw_col.add(i - 1);
+                            tile[i][t].write(AvxVector::mul_complex(twiddle, output[i]));
+                        }
+                    }
+                    for i in 0..ROW_COUNT {
+                        let row_off = tile_col_base + len_per_row * i;
+                        for t in 0..TILE {
+                            buffer.store_complex(
+                                tile[i][t].assume_init(),
+                                row_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                            );
+                        }
+                    }
+                    c += TILE;
+                }
+            }
+
+            // process any remaining column FFTs
+            for (cc, twiddle_chunk) in self
                 .common_data
                 .twiddles
                 .chunks_exact(TWIDDLES_PER_COLUMN)
                 .take(chunk_count)
                 .enumerate()
+                .skip(c)
             {
-                let index_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                let index_base = cc * A::VectorType::COMPLEX_PER_VECTOR;
 
                 // Load columns from the input into registers
                 let mut columns = [AvxVector::zero(); ROW_COUNT];
@@ -630,19 +934,121 @@ macro_rules! mixedradix_column_butterflies {
             // How many rows this FFT has, ie 2 for 2xn, 4 for 4xn, etc
             const ROW_COUNT: usize = $row_count;
             const TWIDDLES_PER_COLUMN: usize = ROW_COUNT - 1;
+            const TILE: usize = 2;
 
             let len_per_row = self.len() / ROW_COUNT;
             let chunk_count = len_per_row / A::VectorType::COMPLEX_PER_VECTOR;
+            let safe_chunks = chunk_count.min(self.common_data.twiddles.len() / TWIDDLES_PER_COLUMN);
+            let tw_ptr = self.common_data.twiddles.as_ptr();
 
-            // process the column FFTs
-            for (c, twiddle_chunk) in self
+            let mut c = 0usize;
+            macro_rules! run_strip {
+                ($strip: expr, $stride: expr) => {{
+                    let mut strip =
+                        [std::mem::MaybeUninit::<A::VectorType>::uninit(); ROW_COUNT * $stride];
+                    while c + $strip <= safe_chunks {
+                        let tile_col_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                        for i in 0..ROW_COUNT {
+                            let row_off = tile_col_base + len_per_row * i;
+                            let dst = strip.as_mut_ptr().add(i * $stride);
+                            for t in 0..$strip {
+                                (*dst.add(t)).write(
+                                    buffer.load_complex(
+                                        row_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                                    ),
+                                );
+                            }
+                        }
+                        for t in 0..$strip {
+                            let mut columns = [AvxVector::zero(); ROW_COUNT];
+                            for i in 0..ROW_COUNT {
+                                columns[i] = strip[i * $stride + t].assume_init();
+                            }
+                            let output = $butterfly_fn(columns, self);
+                            strip[t].write(output[0]);
+                            let tw_col = tw_ptr.add((c + t) * TWIDDLES_PER_COLUMN);
+                            for i in 1..ROW_COUNT {
+                                let twiddle = *tw_col.add(i - 1);
+                                strip[i * $stride + t]
+                                    .write(AvxVector::mul_complex(twiddle, output[i]));
+                            }
+                        }
+                        for i in 0..ROW_COUNT {
+                            let row_off = tile_col_base + len_per_row * i;
+                            let src = strip.as_ptr().add(i * $stride);
+                            for t in 0..$strip {
+                                buffer.store_complex(
+                                    (*src.add(t)).assume_init(),
+                                    row_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                                );
+                            }
+                        }
+                        c += $strip;
+                    }
+                }};
+            }
+            let row_bytes = len_per_row * std::mem::size_of::<Complex<A>>();
+            if ROW_COUNT >= 4
+                && ROW_COUNT <= 16
+                && (row_bytes >= 131_072 || (ROW_COUNT >= 8 && row_bytes == 32_768))
+                && safe_chunks >= 8
+            {
+                run_strip!(8, 10);
+            } else if ROW_COUNT >= 4 && ROW_COUNT <= 16 && row_bytes >= 4096 && safe_chunks >= 16 {
+                run_strip!(16, 18);
+            }
+            if ROW_COUNT >= 4
+                && len_per_row * std::mem::size_of::<Complex<A>>() >= 4096
+                && c + TILE <= safe_chunks
+            {
+                let mut tile =
+                    [[std::mem::MaybeUninit::<A::VectorType>::uninit(); TILE]; ROW_COUNT];
+                while c + TILE <= safe_chunks {
+                    let tile_col_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                    for i in 0..ROW_COUNT {
+                        let row_off = tile_col_base + len_per_row * i;
+                        for t in 0..TILE {
+                            tile[i][t].write(
+                                buffer.load_complex(row_off + t * A::VectorType::COMPLEX_PER_VECTOR),
+                            );
+                        }
+                    }
+                    for t in 0..TILE {
+                        let mut columns = [AvxVector::zero(); ROW_COUNT];
+                        for i in 0..ROW_COUNT {
+                            columns[i] = tile[i][t].assume_init();
+                        }
+                        let output = $butterfly_fn(columns, self);
+                        tile[0][t].write(output[0]);
+                        let tw_col = tw_ptr.add((c + t) * TWIDDLES_PER_COLUMN);
+                        for i in 1..ROW_COUNT {
+                            let twiddle = *tw_col.add(i - 1);
+                            tile[i][t].write(AvxVector::mul_complex(twiddle, output[i]));
+                        }
+                    }
+                    for i in 0..ROW_COUNT {
+                        let row_off = tile_col_base + len_per_row * i;
+                        for t in 0..TILE {
+                            buffer.store_complex(
+                                tile[i][t].assume_init(),
+                                row_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                            );
+                        }
+                    }
+                    c += TILE;
+                }
+            }
+
+            // process any remaining column FFTs
+            for (cc, twiddle_chunk) in self
                 .common_data
                 .twiddles
                 .chunks_exact(TWIDDLES_PER_COLUMN)
                 .take(chunk_count)
                 .enumerate()
+                .skip(c)
             {
-                let index_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                let index_base = cc * A::VectorType::COMPLEX_PER_VECTOR;
 
                 // Load columns from the buffer into registers
                 let mut columns = [AvxVector::zero(); ROW_COUNT];
@@ -1043,6 +1449,168 @@ impl<A: AvxNum, T: FftNum> MixedRadix7xnAvx<A, T> {
     mixedradix_no_live_columns!();
 }
 
+macro_rules! mixedradix8_live_columns {
+    () => {
+        #[inline]
+        fn live_rows_ok(&self, live: u32) -> bool {
+            let n_live = live.count_ones() as usize;
+            self.len() >= 1024
+                && 2 * n_live <= 8
+                && (self.len() / 8) % A::VectorType::COMPLEX_PER_VECTOR == 0
+        }
+
+        #[target_feature(enable = "avx", enable = "fma")]
+        unsafe fn live8_one<const R: usize>(&self, mut buffer: impl AvxArrayMut<A>) {
+            let len_per_row = self.len() / 8;
+            let chunk_count = len_per_row / A::VectorType::COMPLEX_PER_VECTOR;
+            let tw_ptr = self.common_data.twiddles.as_ptr();
+            let rot = self.twiddles_butterfly4;
+            let mut cc = 0usize;
+            while cc < chunk_count {
+                let index_base = cc * A::VectorType::COMPLEX_PER_VECTOR;
+                let columns = [
+                    buffer.load_complex(index_base),
+                    buffer.load_complex(index_base + len_per_row),
+                    buffer.load_complex(index_base + len_per_row * 2),
+                    buffer.load_complex(index_base + len_per_row * 3),
+                    buffer.load_complex(index_base + len_per_row * 4),
+                    buffer.load_complex(index_base + len_per_row * 5),
+                    buffer.load_complex(index_base + len_per_row * 6),
+                    buffer.load_complex(index_base + len_per_row * 7),
+                ];
+                let mut v = crate::avx::avx32_butterflies::bf8_one(columns, rot, R);
+                if R >= 1 {
+                    let tw_col = tw_ptr.add(cc * 7);
+                    v = AvxVector::mul_complex(*tw_col.add(R - 1), v);
+                }
+                buffer.store_complex(v, index_base + len_per_row * R);
+                cc += 1;
+            }
+        }
+
+        #[target_feature(enable = "avx", enable = "fma")]
+        unsafe fn live_column_butterflies(&self, mut buffer: impl AvxArrayMut<A>, live: u32) {
+            const STRIP: usize = 8;
+            const STRIP_STRIDE: usize = 10;
+            if live.count_ones() == 1 {
+                match live.trailing_zeros() {
+                    0 => return self.live8_one::<0>(buffer),
+                    1 => return self.live8_one::<1>(buffer),
+                    2 => return self.live8_one::<2>(buffer),
+                    3 => return self.live8_one::<3>(buffer),
+                    4 => return self.live8_one::<4>(buffer),
+                    5 => return self.live8_one::<5>(buffer),
+                    6 => return self.live8_one::<6>(buffer),
+                    _ => return self.live8_one::<7>(buffer),
+                }
+            }
+            let len_per_row = self.len() / 8;
+            let chunk_count = len_per_row / A::VectorType::COMPLEX_PER_VECTOR;
+            let tw_ptr = self.common_data.twiddles.as_ptr();
+            let rot = self.twiddles_butterfly4;
+            let mut cc = 0usize;
+            if len_per_row * std::mem::size_of::<Complex<A>>() >= 4096 && chunk_count >= STRIP {
+                let mut strip =
+                    [std::mem::MaybeUninit::<A::VectorType>::uninit(); 8 * STRIP_STRIDE];
+                while cc + STRIP <= chunk_count {
+                    let tile_col_base = cc * A::VectorType::COMPLEX_PER_VECTOR;
+                    for i in 0..8 {
+                        let row_off = tile_col_base + len_per_row * i;
+                        let dst = strip.as_mut_ptr().add(i * STRIP_STRIDE);
+                        for t in 0..STRIP {
+                            (*dst.add(t)).write(
+                                buffer.load_complex(row_off + t * A::VectorType::COMPLEX_PER_VECTOR),
+                            );
+                        }
+                    }
+                    for t in 0..STRIP {
+                        let columns = [
+                            strip[t].assume_init(),
+                            strip[STRIP_STRIDE + t].assume_init(),
+                            strip[2 * STRIP_STRIDE + t].assume_init(),
+                            strip[3 * STRIP_STRIDE + t].assume_init(),
+                            strip[4 * STRIP_STRIDE + t].assume_init(),
+                            strip[5 * STRIP_STRIDE + t].assume_init(),
+                            strip[6 * STRIP_STRIDE + t].assume_init(),
+                            strip[7 * STRIP_STRIDE + t].assume_init(),
+                        ];
+                        let output = AvxVector::column_butterfly8(columns, rot);
+                        let tw_col = tw_ptr.add((cc + t) * 7);
+                        if (live & 1) != 0 {
+                            strip[t].write(output[0]);
+                        }
+                        for i in 1..8 {
+                            if (live & (1 << i)) != 0 {
+                                let v = AvxVector::mul_complex(*tw_col.add(i - 1), output[i]);
+                                strip[i * STRIP_STRIDE + t].write(v);
+                            }
+                        }
+                    }
+                    for i in 0..8 {
+                        if (live & (1 << i)) != 0 {
+                            let row_off = tile_col_base + len_per_row * i;
+                            let src = strip.as_ptr().add(i * STRIP_STRIDE);
+                            for t in 0..STRIP {
+                                buffer.store_complex(
+                                    (*src.add(t)).assume_init(),
+                                    row_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                                );
+                            }
+                        }
+                    }
+                    cc += STRIP;
+                }
+            }
+            for c_rem in cc..chunk_count {
+                let index_base = c_rem * A::VectorType::COMPLEX_PER_VECTOR;
+                let columns = [
+                    buffer.load_complex(index_base),
+                    buffer.load_complex(index_base + len_per_row),
+                    buffer.load_complex(index_base + len_per_row * 2),
+                    buffer.load_complex(index_base + len_per_row * 3),
+                    buffer.load_complex(index_base + len_per_row * 4),
+                    buffer.load_complex(index_base + len_per_row * 5),
+                    buffer.load_complex(index_base + len_per_row * 6),
+                    buffer.load_complex(index_base + len_per_row * 7),
+                ];
+                let output = AvxVector::column_butterfly8(columns, rot);
+                let tw_col = tw_ptr.add(c_rem * 7);
+                if (live & (1 << 0)) != 0 {
+                    buffer.store_complex(output[0], index_base);
+                }
+                if (live & (1 << 1)) != 0 {
+                    let v = AvxVector::mul_complex(*tw_col.add(0), output[1]);
+                    buffer.store_complex(v, index_base + len_per_row);
+                }
+                if (live & (1 << 2)) != 0 {
+                    let v = AvxVector::mul_complex(*tw_col.add(1), output[2]);
+                    buffer.store_complex(v, index_base + len_per_row * 2);
+                }
+                if (live & (1 << 3)) != 0 {
+                    let v = AvxVector::mul_complex(*tw_col.add(2), output[3]);
+                    buffer.store_complex(v, index_base + len_per_row * 3);
+                }
+                if (live & (1 << 4)) != 0 {
+                    let v = AvxVector::mul_complex(*tw_col.add(3), output[4]);
+                    buffer.store_complex(v, index_base + len_per_row * 4);
+                }
+                if (live & (1 << 5)) != 0 {
+                    let v = AvxVector::mul_complex(*tw_col.add(4), output[5]);
+                    buffer.store_complex(v, index_base + len_per_row * 5);
+                }
+                if (live & (1 << 6)) != 0 {
+                    let v = AvxVector::mul_complex(*tw_col.add(5), output[6]);
+                    buffer.store_complex(v, index_base + len_per_row * 6);
+                }
+                if (live & (1 << 7)) != 0 {
+                    let v = AvxVector::mul_complex(*tw_col.add(6), output[7]);
+                    buffer.store_complex(v, index_base + len_per_row * 7);
+                }
+            }
+        }
+    };
+}
+
 pub struct MixedRadix8xnAvx<A: AvxNum, T> {
     twiddles_butterfly4: Rotation90<A::VectorType>,
     common_data: CommonSimdData<T, A::VectorType>,
@@ -1071,7 +1639,7 @@ impl<A: AvxNum, T: FftNum> MixedRadix8xnAvx<A, T> {
         0;1;2;3;4;5;6;7, 0;1;2;3;4;5
     );
     boilerplate_mixedradix!();
-    mixedradix_live_columns!(8, bf8_live);
+    mixedradix8_live_columns!();
 }
 
 pub struct MixedRadix9xnAvx<A: AvxNum, T> {
@@ -1245,19 +1813,107 @@ impl<A: AvxNum, T: FftNum> MixedRadix16xnAvx<A, T> {
         // How many rows this FFT has, ie 2 for 2xn, 4 for 4xn, etc
         const ROW_COUNT: usize = 16;
         const TWIDDLES_PER_COLUMN: usize = ROW_COUNT - 1;
+        const TILE: usize = 2;
+        const STRIP: usize = 8;
+        const STRIP_STRIDE: usize = 10;
 
         let len_per_row = self.len() / ROW_COUNT;
         let chunk_count = len_per_row / A::VectorType::COMPLEX_PER_VECTOR;
+        let safe_chunks = chunk_count.min(self.common_data.twiddles.len() / TWIDDLES_PER_COLUMN);
+        let tw_ptr = self.common_data.twiddles.as_ptr();
 
-        // process the column FFTs
-        for (c, twiddle_chunk) in self
+        let mut c = 0usize;
+        if len_per_row * std::mem::size_of::<Complex<A>>() >= 4096 && safe_chunks >= STRIP {
+            let mut strip =
+                [std::mem::MaybeUninit::<A::VectorType>::uninit(); ROW_COUNT * STRIP_STRIDE];
+            while c + STRIP <= safe_chunks {
+                let tile_col_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                for i in 0..ROW_COUNT {
+                    let row_off = tile_col_base + len_per_row * i;
+                    let dst = strip.as_mut_ptr().add(i * STRIP_STRIDE);
+                    for t in 0..STRIP {
+                        (*dst.add(t)).write(
+                            buffer.load_complex(row_off + t * A::VectorType::COMPLEX_PER_VECTOR),
+                        );
+                    }
+                }
+                for t in 0..STRIP {
+                    let tw_col = tw_ptr.add((c + t) * TWIDDLES_PER_COLUMN);
+                    column_butterfly16_loadfn!(
+                        |index: usize| strip[index * STRIP_STRIDE + t].assume_init(),
+                        |mut data, index: usize| {
+                            if index > 0 {
+                                data = AvxVector::mul_complex(data, *tw_col.add(index - 1));
+                            }
+                            strip[index * STRIP_STRIDE + t].write(data);
+                        },
+                        self.twiddles_butterfly16,
+                        self.twiddles_butterfly4
+                    );
+                }
+                for i in 0..ROW_COUNT {
+                    let row_off = tile_col_base + len_per_row * i;
+                    let src = strip.as_ptr().add(i * STRIP_STRIDE);
+                    for t in 0..STRIP {
+                        buffer.store_complex(
+                            (*src.add(t)).assume_init(),
+                            row_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                        );
+                    }
+                }
+                c += STRIP;
+            }
+        }
+        if len_per_row * std::mem::size_of::<Complex<A>>() >= 4096 && c + TILE <= safe_chunks {
+            let mut tile =
+                [[std::mem::MaybeUninit::<A::VectorType>::uninit(); TILE]; ROW_COUNT];
+            while c + TILE <= safe_chunks {
+                let tile_col_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                for i in 0..ROW_COUNT {
+                    let row_off = tile_col_base + len_per_row * i;
+                    for t in 0..TILE {
+                        tile[i][t].write(
+                            buffer.load_complex(row_off + t * A::VectorType::COMPLEX_PER_VECTOR),
+                        );
+                    }
+                }
+                for t in 0..TILE {
+                    let tw_col = tw_ptr.add((c + t) * TWIDDLES_PER_COLUMN);
+                    column_butterfly16_loadfn!(
+                        |index: usize| tile[index][t].assume_init(),
+                        |mut data, index: usize| {
+                            if index > 0 {
+                                data = AvxVector::mul_complex(data, *tw_col.add(index - 1));
+                            }
+                            tile[index][t].write(data);
+                        },
+                        self.twiddles_butterfly16,
+                        self.twiddles_butterfly4
+                    );
+                }
+                for i in 0..ROW_COUNT {
+                    let row_off = tile_col_base + len_per_row * i;
+                    for t in 0..TILE {
+                        buffer.store_complex(
+                            tile[i][t].assume_init(),
+                            row_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                        );
+                    }
+                }
+                c += TILE;
+            }
+        }
+
+        // process any remaining column FFTs
+        for (cc, twiddle_chunk) in self
             .common_data
             .twiddles
             .chunks_exact(TWIDDLES_PER_COLUMN)
             .take(chunk_count)
             .enumerate()
+            .skip(c)
         {
-            let index_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+            let index_base = cc * A::VectorType::COMPLEX_PER_VECTOR;
 
             column_butterfly16_loadfn!(
                 |index| buffer.load_complex(index_base + len_per_row * index),
@@ -1354,19 +2010,66 @@ impl<A: AvxNum, T: FftNum> MixedRadix16xnAvx<A, T> {
         // How many rows this FFT has, ie 2 for 2xn, 4 for 4xn, etc
         const ROW_COUNT: usize = 16;
         const TWIDDLES_PER_COLUMN: usize = ROW_COUNT - 1;
+        const TILE: usize = 2;
 
         let len_per_row = self.len() / ROW_COUNT;
         let chunk_count = len_per_row / A::VectorType::COMPLEX_PER_VECTOR;
+        let safe_chunks = chunk_count.min(self.common_data.twiddles.len() / TWIDDLES_PER_COLUMN);
+        let tw_ptr = self.common_data.twiddles.as_ptr();
 
-        // process the column FFTs
-        for (c, twiddle_chunk) in self
+        // Tile 2 contiguous vector columns per row in stack L1 storage before running column
+        // butterflies so power-of-2 row strides do not thrash 8-way L1D cache sets or spill.
+        let mut c = 0usize;
+        if len_per_row * std::mem::size_of::<Complex<A>>() >= 4096 && safe_chunks >= TILE {
+            let mut tile =
+                [[std::mem::MaybeUninit::<A::VectorType>::uninit(); TILE]; ROW_COUNT];
+            while c + TILE <= safe_chunks {
+                let tile_col_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+                for i in 0..ROW_COUNT {
+                    let row_off = tile_col_base + len_per_row * i;
+                    for t in 0..TILE {
+                        tile[i][t].write(
+                            input.load_complex(row_off + t * A::VectorType::COMPLEX_PER_VECTOR),
+                        );
+                    }
+                }
+                for t in 0..TILE {
+                    let tw_col = tw_ptr.add((c + t) * TWIDDLES_PER_COLUMN);
+                    column_butterfly16_loadfn!(
+                        |index: usize| tile[index][t].assume_init(),
+                        |mut data, index: usize| {
+                            if index > 0 {
+                                data = AvxVector::mul_complex(data, *tw_col.add(index - 1));
+                            }
+                            tile[index][t].write(data);
+                        },
+                        self.twiddles_butterfly16,
+                        self.twiddles_butterfly4
+                    );
+                }
+                for i in 0..ROW_COUNT {
+                    let row_off = tile_col_base + len_per_row * i;
+                    for t in 0..TILE {
+                        buffer.store_complex(
+                            tile[i][t].assume_init(),
+                            row_off + t * A::VectorType::COMPLEX_PER_VECTOR,
+                        );
+                    }
+                }
+                c += TILE;
+            }
+        }
+
+        // process any remaining column FFTs
+        for (cc, twiddle_chunk) in self
             .common_data
             .twiddles
             .chunks_exact(TWIDDLES_PER_COLUMN)
             .take(chunk_count)
             .enumerate()
+            .skip(c)
         {
-            let index_base = c * A::VectorType::COMPLEX_PER_VECTOR;
+            let index_base = cc * A::VectorType::COMPLEX_PER_VECTOR;
 
             column_butterfly16_loadfn!(
                 |index| input.load_complex(index_base + len_per_row * index),
@@ -1581,6 +2284,194 @@ mod unit_tests {
         MixedRadix16xnAvx,
         16
     );
+
+    #[test]
+    fn immut_mixed_radix_strip_reads_input_not_buffer() {
+        use crate::FftPlanner;
+        use num_traits::Zero;
+
+        fn check_f32_fft(fft: &dyn Fft<f32>, label: &str) {
+            let len = fft.len();
+            let immut_scratch_len = fft.get_immutable_scratch_len();
+            let inplace_scratch_len = fft.get_inplace_scratch_len();
+
+            // 1. Analytic unit impulse at index 0: DFT([1, 0, 0, ...]) == [1, 1, ..., 1]
+            let mut impulse0 = vec![Complex::<f32>::zero(); len];
+            impulse0[0] = Complex::new(1.0, 0.0);
+            let impulse0_orig = impulse0.clone();
+
+            // Case 1a: zeroed output and zeroed scratch buffer
+            let mut out_zero = vec![Complex::<f32>::zero(); len];
+            let mut scratch_zero = vec![Complex::<f32>::zero(); immut_scratch_len];
+            fft.process_immutable_with_scratch(&impulse0, &mut out_zero, &mut scratch_zero);
+            assert_eq!(impulse0, impulse0_orig, "{label}: input modified on impulse0 (zero buffer)");
+            for (k, &v) in out_zero.iter().enumerate() {
+                assert!(
+                    (v.re - 1.0).abs() < 1e-5 && v.im.abs() < 1e-5,
+                    "{label}: impulse0 with zero buffer failed at bin {k}/{len}: got {v:?}, expected 1+0i"
+                );
+            }
+
+            // Case 1b: dirty reused output and scratch buffer
+            let mut out_dirty = vec![Complex::new(777.0, -333.0); len];
+            let mut scratch_dirty = vec![Complex::new(-999.0, 444.0); immut_scratch_len];
+            fft.process_immutable_with_scratch(&impulse0, &mut out_dirty, &mut scratch_dirty);
+            assert_eq!(impulse0, impulse0_orig, "{label}: input modified on impulse0 (dirty buffer)");
+            for (k, &v) in out_dirty.iter().enumerate() {
+                assert_eq!(
+                    (v.re.to_bits(), v.im.to_bits()),
+                    (out_zero[k].re.to_bits(), out_zero[k].im.to_bits()),
+                    "{label}: dirty buffer changed output at bin {k}/{len}"
+                );
+            }
+
+            // 2. Analytic shifted impulse at index 1: DFT([0, 1, 0, ...])[k] = exp(-2*pi*i*k/N)
+            let mut impulse1 = vec![Complex::<f32>::zero(); len];
+            impulse1[1] = Complex::new(1.0, 0.0);
+            let impulse1_orig = impulse1.clone();
+            let mut out_imp1 = vec![Complex::<f32>::zero(); len];
+            let mut scratch_imp1 = vec![Complex::new(123.0, -456.0); immut_scratch_len];
+            fft.process_immutable_with_scratch(&impulse1, &mut out_imp1, &mut scratch_imp1);
+            assert_eq!(impulse1, impulse1_orig, "{label}: input modified on impulse1");
+            let sign = match fft.fft_direction() {
+                FftDirection::Forward => -1.0f64,
+                FftDirection::Inverse => 1.0f64,
+            };
+            for k in [0, 1, 2, 7, len / 4, len / 2, len - 1] {
+                let angle = sign * 2.0 * std::f64::consts::PI * (k as f64) / (len as f64);
+                let exp_re = angle.cos() as f32;
+                let exp_im = angle.sin() as f32;
+                let v = out_imp1[k];
+                assert!(
+                    (v.re - exp_re).abs() < 1e-4 && (v.im - exp_im).abs() < 1e-4,
+                    "{label}: impulse1 analytic mismatch at bin {k}/{len}: got {v:?}, expected ({exp_re}, {exp_im})"
+                );
+            }
+
+            // 3. Bit-for-bit equivalence between process_immutable_with_scratch and in-place process_with_scratch
+            let input_sig: Vec<Complex<f32>> = (0..len)
+                .map(|i| {
+                    let x = (i as f32) * 0.137;
+                    Complex::new(x.sin() * 1.7 - (x * 0.31).cos(), (x * 0.73).cos() + x.sin() * 0.29)
+                })
+                .collect();
+            let input_sig_orig = input_sig.clone();
+            let mut expected = input_sig.clone();
+            let mut inplace_scratch = vec![Complex::<f32>::zero(); inplace_scratch_len];
+            fft.process_with_scratch(&mut expected, &mut inplace_scratch);
+
+            let mut actual_zero = vec![Complex::<f32>::zero(); len];
+            let mut scratch_z = vec![Complex::<f32>::zero(); immut_scratch_len];
+            fft.process_immutable_with_scratch(&input_sig, &mut actual_zero, &mut scratch_z);
+            assert_eq!(input_sig, input_sig_orig, "{label}: input_sig modified (zero scratch)");
+
+            let mut actual_dirty = vec![Complex::new(-42.5, 91.25); len];
+            let mut scratch_d = vec![Complex::new(88.125, -17.75); immut_scratch_len];
+            fft.process_immutable_with_scratch(&input_sig, &mut actual_dirty, &mut scratch_d);
+            assert_eq!(input_sig, input_sig_orig, "{label}: input_sig modified (dirty scratch)");
+
+            for k in 0..len {
+                assert_eq!(
+                    (actual_zero[k].re.to_bits(), actual_zero[k].im.to_bits()),
+                    (expected[k].re.to_bits(), expected[k].im.to_bits()),
+                    "{label}: f32 immut (zero scratch) != inplace at bin {k}/{len}"
+                );
+                assert_eq!(
+                    (actual_dirty[k].re.to_bits(), actual_dirty[k].im.to_bits()),
+                    (expected[k].re.to_bits(), expected[k].im.to_bits()),
+                    "{label}: f32 immut (dirty scratch) != inplace at bin {k}/{len}"
+                );
+            }
+        }
+
+        fn check_f64_fft(fft: &dyn Fft<f64>, label: &str) {
+            let len = fft.len();
+            let immut_scratch_len = fft.get_immutable_scratch_len();
+            let inplace_scratch_len = fft.get_inplace_scratch_len();
+
+            let mut impulse0 = vec![Complex::<f64>::zero(); len];
+            impulse0[0] = Complex::new(1.0, 0.0);
+            let impulse0_orig = impulse0.clone();
+
+            let mut out_zero = vec![Complex::<f64>::zero(); len];
+            let mut scratch_zero = vec![Complex::<f64>::zero(); immut_scratch_len];
+            fft.process_immutable_with_scratch(&impulse0, &mut out_zero, &mut scratch_zero);
+            assert_eq!(impulse0, impulse0_orig, "{label}: f64 input modified");
+            for (k, &v) in out_zero.iter().enumerate() {
+                assert!(
+                    (v.re - 1.0).abs() < 1e-12 && v.im.abs() < 1e-12,
+                    "{label}: f64 impulse0 with zero buffer failed at bin {k}/{len}: got {v:?}"
+                );
+            }
+
+            let input_sig: Vec<Complex<f64>> = (0..len)
+                .map(|i| {
+                    let x = (i as f64) * 0.137;
+                    Complex::new(x.sin() * 1.7 - (x * 0.31).cos(), (x * 0.73).cos() + x.sin() * 0.29)
+                })
+                .collect();
+            let input_sig_orig = input_sig.clone();
+            let mut expected = input_sig.clone();
+            let mut inplace_scratch = vec![Complex::<f64>::zero(); inplace_scratch_len];
+            fft.process_with_scratch(&mut expected, &mut inplace_scratch);
+
+            let mut actual_dirty = vec![Complex::new(-42.5, 91.25); len];
+            let mut scratch_d = vec![Complex::new(88.125, -17.75); immut_scratch_len];
+            fft.process_immutable_with_scratch(&input_sig, &mut actual_dirty, &mut scratch_d);
+            assert_eq!(input_sig, input_sig_orig, "{label}: f64 input_sig modified");
+
+            for k in 0..len {
+                assert_eq!(
+                    (actual_dirty[k].re.to_bits(), actual_dirty[k].im.to_bits()),
+                    (expected[k].re.to_bits(), expected[k].im.to_bits()),
+                    "{label}: f64 immut != inplace at bin {k}/{len}"
+                );
+            }
+        }
+
+        // Default planner sizes that trigger run_strip!(16, 18) and run_strip!(8, 10)
+        let mut planner32 = FftPlanner::<f32>::new();
+        for &n in &[2048usize, 4096, 8192, 16384, 32768] {
+            let fwd = planner32.plan_fft_forward(n);
+            check_f32_fft(fwd.as_ref(), &format!("planner_f32_fwd_{n}"));
+            let inv = planner32.plan_fft_inverse(n);
+            check_f32_fft(inv.as_ref(), &format!("planner_f32_inv_{n}"));
+        }
+
+        let mut planner64 = FftPlanner::<f64>::new();
+        for &n in &[1024usize, 2048, 4096, 8192, 16384] {
+            let fwd = planner64.plan_fft_forward(n);
+            check_f64_fft(fwd.as_ref(), &format!("planner_f64_fwd_{n}"));
+            let inv = planner64.plan_fft_inverse(n);
+            check_f64_fft(inv.as_ref(), &format!("planner_f64_inv_{n}"));
+        }
+
+        // Direct MixedRadix8xnAvx and MixedRadix4xnAvx boundary sizes:
+        // - f32 len_per_row = 512 (exact 128 chunks = 8 * strip(16))
+        // - f32 len_per_row = 516 (129 chunks = 8 * strip(16) + 1 chunk scalar tail)
+        // - f32 len_per_row = 521 (130 chunks + 1 scalar = 8 * strip(16) + TILE(2) + 1 scalar tail)
+        // - f32 len_per_row = 4096 (1024 chunks, row_bytes == 32768 -> triggers run_strip!(8, 10))
+        for &inner_len in &[512usize, 516, 521, 4096] {
+            let inner = planner32.plan_fft_forward(inner_len);
+            let fft8 = MixedRadix8xnAvx::<f32, f32>::new(Arc::clone(&inner)).unwrap();
+            check_f32_fft(&fft8, &format!("MixedRadix8xnAvx_f32_8x{inner_len}"));
+            let fft4 = MixedRadix4xnAvx::<f32, f32>::new(inner).unwrap();
+            check_f32_fft(&fft4, &format!("MixedRadix4xnAvx_f32_4x{inner_len}"));
+        }
+
+        // Direct f64 boundary sizes:
+        // - f64 len_per_row = 256 (128 chunks = 8 * strip(16))
+        // - f64 len_per_row = 258 (129 chunks = 8 * strip(16) + 1 chunk tail)
+        // - f64 len_per_row = 261 (130 chunks + 1 scalar = 8 * strip(16) + TILE(2) + 1 scalar tail)
+        // - f64 len_per_row = 2048 (1024 chunks, row_bytes == 32768 -> triggers run_strip!(8, 10))
+        for &inner_len in &[256usize, 258, 261, 2048] {
+            let inner = planner64.plan_fft_forward(inner_len);
+            let fft8 = MixedRadix8xnAvx::<f64, f64>::new(Arc::clone(&inner)).unwrap();
+            check_f64_fft(&fft8, &format!("MixedRadix8xnAvx_f64_8x{inner_len}"));
+            let fft4 = MixedRadix4xnAvx::<f64, f64>::new(inner).unwrap();
+            check_f64_fft(&fft4, &format!("MixedRadix4xnAvx_f64_4x{inner_len}"));
+        }
+    }
 }
 
 /// Moosik 1.6.1: every stored coefficient of the f32 inverse (or forward)

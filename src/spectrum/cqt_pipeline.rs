@@ -46,7 +46,7 @@ pub(super) fn run(
     // Use the same bounded, owner-selected analysis pool as the other routes;
     // the core never silently creates work on Rayon's global pool.
     let output = gpu_calib::install(|| {
-        cqt::analyze_input_codes(
+        cqt::analyze_input_codes_sync(
             input,
             sample_rate,
             &frequencies,

@@ -90,6 +90,104 @@ fn screens161_music_video() {
     let _ = std::fs::remove_dir_all(&songs);
 }
 
+/// Every widget that starts inside the Controls drawer ends inside it: none
+/// runs past its right edge (the drawer is `clamp(0.3 · body, 300, 380)` wide,
+/// right-aligned with the Controls button).
+fn inside_the_drawer(h: &Harness<'_, crate::MoosikApp>, w: f32, what: &str) {
+    use egui_kittest::kittest::by;
+    let button = h.get_by_label("Analyzer controls").bounding_box().expect("bounds");
+    let (right, top) = (button.x1, button.y1);
+    let left = right - ((w as f64 - 44.0) * 0.3).clamp(300.0, 380.0);
+    // Between the Analyzer strip and the player bar: the window's own buttons
+    // above and below are not the drawer's.
+    let bottom = h.get_by_label("Play").bounding_box().expect("bounds").y0 - 40.0;
+    let past: Vec<String> = h.query_all(by())
+        .filter_map(|n| {
+            let b = n.bounding_box()?;
+            (b.x0 >= left - 0.5 && b.y0 >= top && b.y0 < bottom && b.x1 > right + 0.5)
+                .then(|| format!("{:?} ends at {:.0}", n.label(), b.x1))
+        })
+        .collect();
+    assert!(past.is_empty(), "{what}: past the drawer's edge at {right:.0}: {past:?}");
+}
+
+/// Analyze's controls at the default window size, a mid one and a large
+/// one: as opened, then with every settings section open. Nothing is cut
+/// off: the longest rows' last options are inside the drawer, and a window
+/// too narrow for it keeps a plot under the controls.
+#[test]
+#[ignore]
+fn screens161_analyze_controls() {
+    let dir = PathBuf::from(std::env::var("MOOSIK_SHOTS").expect("set MOOSIK_SHOTS"));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (w, ht) in [(800.0, 600.0), (1300.0, 860.0), (1920.0, 1080.0)] {
+        let mut h = Harness::builder().with_size(egui::vec2(w, ht)).wgpu().build_eframe(|cc| crate::MoosikApp::new(cc));
+        h.run_steps(5);
+        click(&mut h, "Analyze");
+        h.run_steps(60);
+        shot(&mut h, &dir, &format!("an-{w}x{ht}-1-opened"));
+        for chip in ["⚙ Analysis", "📌 Peak Hold", "🖼 Album Art", "🗄 Cache"] {
+            if h.query_by_label(chip).is_some() {
+                click(&mut h, chip);
+            }
+        }
+        h.run_steps(30);
+        shot(&mut h, &dir, &format!("an-{w}x{ht}-2-sections-open"));
+        if w > 1000.0 {
+            let right = h.get_by_label("Analyzer controls").bounding_box().expect("bounds").x1;
+            for label in ["32768 (743ms)", "Lanczos", "64×"] {
+                let end = h.get_by_label(label).bounding_box().expect("bounds").x1;
+                assert!(end <= right + 0.5, "{label} ends at {end}, past the drawer's edge at {right} ({w}×{ht})");
+            }
+            inside_the_drawer(&h, w, "FFT");
+        } else {
+            let plot = h.state().spectrum_window.canvas.expect("a plot");
+            assert!(plot.height() > 100.0, "the plot keeps room under the controls: {plot:?}");
+        }
+        // Superlet, with its own controls (Custom shows every slider).
+        click(&mut h, "Superlet (wavelets)");
+        click(&mut h, "Custom");
+        h.run_steps(30);
+        shot(&mut h, &dir, &format!("an-{w}x{ht}-3-superlet-custom"));
+        if w > 1000.0 {
+            inside_the_drawer(&h, w, "Superlet");
+        }
+    }
+    let _ = std::fs::remove_file(crate::moosik_dir().join("appearance.json"));
+}
+
+/// The High-accuracy GPU option in Analyze's Controls, switched on, with
+/// Superlet and the Analysis section open: nothing past the drawer's edge.
+#[test]
+#[ignore]
+fn screens_hp_option() {
+    let dir = PathBuf::from(std::env::var("MOOSIK_SHOTS").expect("set MOOSIK_SHOTS"));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (w, ht) in [(1300.0, 860.0), (800.0, 600.0)] {
+        let mut h = Harness::builder().with_size(egui::vec2(w, ht)).wgpu().build_eframe(|cc| crate::MoosikApp::new(cc));
+        h.run_steps(5);
+        click(&mut h, "Analyze");
+        h.run_steps(60);
+        click(&mut h, "⚙ Analysis");
+        click(&mut h, "Superlet (wavelets)");
+        click(&mut h, "High-accuracy GPU (experimental)");
+        h.run_steps(30);
+        shot(&mut h, &dir, &format!("hp-{w}x{ht}"));
+        if w > 1000.0 {
+            let right = h.get_by_label("Analyzer controls").bounding_box().expect("bounds").x1;
+            for label in ["High-accuracy GPU (experimental)", "Exact NVIDIA assist (experimental)"] {
+                if let Some(node) = h.query_by_label(label) {
+                    let end = node.bounding_box().expect("bounds").x1;
+                    assert!(end <= right + 0.5, "{label} ends at {end}, past the drawer's edge at {right}");
+                }
+            }
+            assert!(h.query_by_label("High-accuracy GPU (experimental)").is_some(), "the option is missing");
+        }
+    }
+    let _ = std::fs::remove_file(crate::moosik_dir().join("spectrum.json"));
+    let _ = std::fs::remove_file(crate::moosik_dir().join("appearance.json"));
+}
+
 /// Copy a tools folder (yt-dlp, its one-folder build or the exe, and
 /// Deno) into the test profile, the way an install leaves them.
 fn tools_into_profile(from: &std::path::Path) {
@@ -651,5 +749,228 @@ fn screens161_stream_flow() {
     h.run_steps(1);
     for n in ["player.json", "youtube.json", "last_playlist.json", "appearance.json"] {
         let _ = std::fs::remove_file(m.join(n));
+    }
+}
+
+/// Settings → Storage on a made-up profile (megabytes, not gigabytes): every
+/// part with its size; nothing past the window's edge with the narrowest and
+/// the widest drawer; Discard asks for a second click and then refuses a
+/// folder Moosik did not make; Clear empties the YouTube cache.
+#[test]
+#[ignore]
+fn screens162_storage() {
+    use crate::lyrics::local_ai;
+    let dir = PathBuf::from(std::env::var("MOOSIK_SHOTS").expect("set MOOSIK_SHOTS"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let put = |p: &std::path::Path, n: u64| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::File::create(p).unwrap().set_len(n).unwrap();
+    };
+    // The Storage section's button: the drawer's YouTube section above has a Clear too.
+    let click_last = |h: &mut Harness<'_, crate::MoosikApp>, label: &str| {
+        h.get_all_by_label(label).max_by(|a, b| a.bounding_box().unwrap().y0.total_cmp(&b.bounding_box().unwrap().y0)).unwrap().click();
+        h.run_steps(2);
+    };
+    let (models, moosik) = (local_ai::default_root(), crate::moosik_dir());
+    let downloads = std::env::temp_dir().join(format!("moosik_storage_downloads_{}", std::process::id()));
+    put(&local_ai::pack_dir(&models, local_ai::PACKS[2]).join("model.gguf"), 18_000_000);
+    put(&local_ai::pack_dir(&models, local_ai::PACKS[0]).join("model.gguf"), 4_400_000);
+    std::fs::write(models.join("chosen-model.txt"), local_ai::PACKS[2].id).unwrap();
+    // Not Moosik's own staging folder (no marker): Discard must leave it.
+    let staged = models.join(".staging").join(local_ai::PACKS[3].id).join("x.gguf.part");
+    put(&staged, 1_100_000);
+    let video = crate::youtube::cache_dir(&moosik).join("dQw4w9WgXcQ.video.webm");
+    put(&video, 30_000_000);
+    put(&moosik.join("cache/v2/a.mix"), 27_000_000);
+    put(&moosik.join("tools/youtube/yt-dlp.exe"), 1_700_000);
+    put(&downloads.join("a.opus"), 1_000_000);
+    for w in [800.0, 1920.0] {
+        // Tall enough for the whole drawer, Storage at its foot included.
+        let mut h = Harness::builder().with_size(egui::vec2(w, 7000.0)).wgpu().build_eframe(|cc| crate::MoosikApp::new(cc));
+        h.state_mut().appearance.youtube_dir = Some(downloads.clone());
+        h.run_steps(10);
+        click(&mut h, "All controls");
+        for _ in 0..100 {
+            if h.query_all_by_label("Refresh").next().is_some() {
+                break;
+            }
+            wait(&mut h, 50);
+        }
+        h.run_steps(5);
+        for part in ["Hy-MT2 30B-A3B · selected", "Unfinished download: Qwen2.5 7B Instruct", "Played from YouTube", "Downloaded songs"] {
+            assert!(h.query_all_by_label_contains(part).next().is_some(), "{w}: {part}");
+        }
+        shot(&mut h, &dir, &format!("st1-storage-{w}"));
+        let past: Vec<String> = h.query_all(egui_kittest::kittest::by())
+            .filter_map(|n| n.bounding_box().filter(|b| b.x1 > w as f64 + 0.5)
+                .map(|b| format!("{:?} {:?} {:.0}..{:.0}", n.role(), n.label(), b.x0, b.x1)))
+            .collect();
+        let close: Vec<String> = h.query_all_by_label("✕").filter_map(|n| n.bounding_box()).map(|b| format!("{:.0}", b.x1)).collect();
+        assert!(past.is_empty(), "{w}: past the window's edge (close buttons end at {close:?}): {past:?}");
+        if w < 1000.0 {
+            continue;
+        }
+        click_last(&mut h, "Discard");
+        assert!(h.query_by_label("Discard 1 MB?").is_some(), "armed");
+        shot(&mut h, &dir, "st2-armed");
+        click_last(&mut h, "Discard 1 MB?");
+        wait(&mut h, 300);
+        assert!(staged.exists(), "a folder Moosik did not make is kept");
+        assert!(h.query_all_by_label_contains("is not a folder Moosik made").next().is_some(), "the refusal is said");
+        click_last(&mut h, "Clear");
+        click_last(&mut h, "Clear 30 MB?");
+        wait(&mut h, 300);
+        assert!(!video.exists(), "nothing on the playlist, so the cache is cleared");
+        shot(&mut h, &dir, "st3-done");
+    }
+    let _ = std::fs::remove_dir_all(&models);
+    let _ = std::fs::remove_dir_all(&downloads);
+    for d in ["cache", "tools"] {
+        let _ = std::fs::remove_dir_all(moosik.join(d));
+    }
+}
+
+/// Settings → Pro tools and the headphone EQ window, against a stand-in for
+/// autoeq.app (no network): the list loads, "hd650" finds the HD 650, Use in
+/// Moosik puts its correction in the EQ as a preset, and Save for other apps
+/// writes every file and the read-me.
+#[test]
+#[ignore]
+fn screens162_headphone_eq() {
+    use crate::autoeq::{self, tests as fx};
+    let dir = PathBuf::from(std::env::var("MOOSIK_SHOTS").expect("set MOOSIK_SHOTS"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _turn = fx::TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = asked.clone();
+    *autoeq::FAKE.lock().unwrap() = Some(Box::new(move |url: &str, body: Option<&serde_json::Value>| {
+        let Some(b) = body else {
+            return Ok(if url.ends_with("/entries") { fx::ENTRIES_JSON.into() } else { fx::TARGETS_JSON.into() });
+        };
+        let what = b["parametric_eq_config"].as_str().or(b["fixed_band_eq_config"].as_str()).unwrap_or("graphic").to_string();
+        log.lock().unwrap().push(format!("{} {} {}", b["name"], b["target"], what));
+        Ok(match what.as_str() {
+            "graphic" => r#"{"graphic_eq": "GraphicEQ: 20 -0.8; 21 -1.1"}"#.into(),
+            "10_BAND_GRAPHIC_EQ" | "31_BAND_GRAPHIC_EQ" => fx::PEQ_JSON.replace("parametric_eq", "fixed_band_eq"),
+            "10_PEAKING" => fx::PEQ_JSON.replace("LOW_SHELF", "PEAKING").replace("HIGH_SHELF", "PEAKING"),
+            _ => fx::PEQ_JSON.into(),
+        })
+    }));
+    let _ = std::fs::remove_dir_all(autoeq::dir());
+    let mut h = Harness::builder().with_size(egui::vec2(1300.0, 1800.0)).wgpu().build_eframe(|cc| crate::MoosikApp::new(cc));
+    h.run_steps(10);
+    click(&mut h, "All controls");
+    h.run_steps(20);
+    assert!(h.query_all_by_label("PRO TOOLS").next().is_some(), "the section");
+    shot(&mut h, &dir, "heq1-pro-tools");
+    click(&mut h, "Headphone EQ (AutoEq)…");
+    for _ in 0..100 {
+        if h.query_all_by_label_contains("headphones and earphones from AutoEq").next().is_some() {
+            break;
+        }
+        wait(&mut h, 50);
+    }
+    h.get_by_label("Search AutoEq").type_text("hd650");
+    h.run_steps(5);
+    shot(&mut h, &dir, "heq2-search");
+    h.get_by_label_contains("Sennheiser HD 650   ").click();
+    h.run_steps(5);
+    // The target and the rest are checked in what is sent, below.
+    assert!(h.query_all_by_label("Measured by").next().is_some(), "picked");
+    shot(&mut h, &dir, "heq2b-picked");
+    click(&mut h, "Use in Moosik");
+    for _ in 0..100 {
+        if h.query_all_by_label_contains("In Moosik's EQ as the preset").next().is_some() {
+            break;
+        }
+        wait(&mut h, 50);
+    }
+    {
+        let eq = h.state().spectrum_window.eq_state.lock().unwrap();
+        assert!(eq.enabled && eq.bands.len() == 3 && (eq.preamp_db + 4.8169).abs() < 1e-4, "{} bands, {} dB", eq.bands.len(), eq.preamp_db);
+    }
+    shot(&mut h, &dir, "heq3-used");
+    click(&mut h, "Save for other apps");
+    for _ in 0..200 {
+        if h.query_all_by_label_contains("equalizers and a read-me").next().is_some() {
+            break;
+        }
+        wait(&mut h, 50);
+    }
+    shot(&mut h, &dir, "heq4-saved");
+    let folder = autoeq::dir().join("Sennheiser HD 650");
+    for f in ["Sennheiser HD 650 ParametricEQ.txt", "Sennheiser HD 650 GraphicEQ.txt", "Sennheiser HD 650 FixedBandEQ 10 bands.txt",
+              "Sennheiser HD 650 FixedBandEQ 31 bands.txt", "Sennheiser HD 650 USB Audio Player PRO.txt", "TBEQPresets/Sennheiser HD 650.xml", "Read me.txt"] {
+        assert!(folder.join(f).is_file(), "{f}");
+    }
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 7, "{asked:?}");
+    assert!(asked.iter().all(|a| a.starts_with("\"Sennheiser HD 650\" \"Harman over-ear 2018\"")), "{asked:?}");
+    *autoeq::FAKE.lock().unwrap() = None;
+    let _ = std::fs::remove_dir_all(autoeq::dir());
+}
+
+/// What showing the EQ costs a frame in Analyze: no song, a 1600×900 window,
+/// the overlay on "Both", ten and then 32 bands, and 32 with a gain moving
+/// every frame as a drag does, on the Log axis and on a blended one. Prints
+/// the app's frame and its tessellation, each per frame.
+/// Run by hand: `eq_overlay_frame_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn eq_overlay_frame_cost() {
+    use crate::spectrum::eq::{BandKind, EqBand};
+    use crate::spectrum::freq_scale::FreqScale;
+    use std::time::{Duration, Instant};
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 900.0)).wgpu().build_eframe(|cc| crate::MoosikApp::new(cc));
+    h.run_steps(10);
+    click(&mut h, "Analyze");
+    h.run_steps(10);
+    let bands = |k: usize| -> Vec<EqBand> {
+        (0..k)
+            .map(|i| EqBand {
+                freq: 25.0 * 1.25f32.powi(i as i32),
+                gain_db: if i % 2 == 0 { 3.0 } else { -2.5 },
+                q: 1.4,
+                kind: BandKind::Peaking,
+                enabled: true,
+            })
+            .collect()
+    };
+    for scale in [FreqScale::Log, FreqScale::Blend(0.5)] {
+        for (show, k, drag) in [(false, 10, false), (true, 10, false), (true, 32, false), (true, 32, true)] {
+            {
+                let s = &mut h.state_mut().spectrum_window;
+                s.show_eq = show;
+                s.analyzer.aslt_cfg.scale = scale;
+                let mut eq = s.eq_state.lock().unwrap();
+                eq.bands = bands(k);
+                eq.enabled = true;
+                eq.bump();
+            }
+            h.run_steps(5);
+            let (n, mut app, mut tess, mut shapes) = (40, Duration::ZERO, Duration::ZERO, 0);
+            for f in 0..n {
+                if drag {
+                    let mut eq = h.state_mut().spectrum_window.eq_state.lock().unwrap();
+                    eq.bands[3].gain_db = (f % 12) as f32 - 6.0;
+                    eq.bump();
+                }
+                let t = Instant::now();
+                h.step();
+                app += t.elapsed();
+                let (list, ppp) = (h.output().shapes.clone(), h.output().pixels_per_point);
+                shapes = list.len();
+                let t = Instant::now();
+                let _ = h.ctx.tessellate(list, ppp);
+                tess += t.elapsed();
+            }
+            println!(
+                "EQ {:5} {k:2} bands{} {scale:?}: frame {:6.2} ms, tessellation {:6.2} ms, {shapes} shapes",
+                if show { "shown" } else { "off" },
+                if drag { ", dragged" } else { "" },
+                app.as_secs_f64() * 1e3 / n as f64,
+                tess.as_secs_f64() * 1e3 / n as f64,
+            );
+        }
     }
 }

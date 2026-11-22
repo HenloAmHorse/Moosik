@@ -115,7 +115,7 @@ gestures.
 
 ## Parametric EQ
 
-- **Up to 16 bands** — Peaking, Low Shelf, High Shelf, High Pass, Low Pass, Notch
+- **Up to 32 bands** — Peaking, Low Shelf, High Shelf, High Pass, Low Pass, Notch
 - **Biquad IIR filters** (Audio EQ Cookbook) — applied in real time via a `rodio` Source wrapper
 - **Draggable nodes on the spectrum** — click to add a band, drag horizontally for frequency, drag vertically for gain, right-click to remove
 - **EQ overlay modes** — Curve (response curve drawn over spectrum), Apply (bar heights reflect EQ gain, in dB like the bars), Both. With Normalized level on, the top leaves room for the EQ's largest boost so a boosted band reaches it rather than running off it. Not in bit-perfect, where the EQ is not in the sound

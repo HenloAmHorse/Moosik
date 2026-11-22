@@ -8,7 +8,7 @@ use std::time::Duration;
 // Parametric EQ — types, biquad math, shared state
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub enum BandKind { Peaking, LowShelf, HighShelf, HighPass, LowPass, Notch }
 
 impl BandKind {
@@ -27,7 +27,7 @@ impl BandKind {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct EqBand {
     pub freq:    f32,
     pub gain_db: f32,   // ignored for HP / LP / Notch
@@ -56,6 +56,13 @@ pub enum EqOverlayMode {
 /// Shared EQ state between the UI thread and the audio thread.
 pub struct EqState {
     pub bands:       Vec<EqBand>,
+    /// Gain before the bands, dB (an AutoEq profile's "Preamp"), so boosts
+    /// do not clip.
+    pub preamp_db:   f32,
+    /// Headphone crossfeed: (cut-off Hz, feed dB), or off.
+    pub crossfeed:   Option<(f32, f32)>,
+    /// Room correction: an impulse response convolved after the bands.
+    pub fir:         Option<Arc<super::fir::Fir>>,
     pub enabled:     bool,
     pub sample_rate: u32,
     /// Incremented on every change so EqSource can detect updates cheaply.
@@ -64,13 +71,14 @@ pub struct EqState {
 
 impl EqState {
     pub fn new() -> Self {
-        Self { bands: Vec::new(), enabled: true, sample_rate: 44_100, version: 0 }
+        Self { bands: Vec::new(), preamp_db: 0.0, crossfeed: None, fir: None, enabled: true, sample_rate: 44_100, version: 0 }
     }
     /// Call after mutating bands or sample_rate.
     pub fn bump(&mut self) { self.version = self.version.wrapping_add(1); }
     /// True when EQ is enabled and at least one band is active.
     pub fn is_active(&self) -> bool {
-        self.enabled && self.bands.iter().any(|b| b.enabled)
+        // Crossfeed and room correction are not the EQ: its switch leaves them on.
+        (self.enabled && (self.bands.iter().any(|b| b.enabled) || self.preamp_db != 0.0)) || self.crossfeed.is_some() || self.fir.is_some()
     }
 }
 
@@ -85,6 +93,111 @@ pub struct EqPreset {
     pub id:    u64,
     pub name:  String,
     pub bands: Vec<EqBand>,
+    #[serde(default)] pub preamp_db: f32,
+}
+
+/// Crossfeed strengths: name, cut-off (Hz) and feed (dB), after bs2b's
+/// presets.
+pub const CROSSFEED: [(&str, f32, f32); 3] = [("Light", 700.0, 4.5), ("Chu Moy", 700.0, 6.0), ("Jan Meier", 650.0, 9.5)];
+
+/// Headphone crossfeed after Boris Mikhaylov's bs2b: each ear also hears
+/// the other channel, low-passed and quieter, and its own a little
+/// high-boosted, as from speakers in front. Stereo only.
+pub struct Crossfeed {
+    a0_lo: f64,
+    b1_lo: f64,
+    a0_hi: f64,
+    a1_hi: f64,
+    b1_hi: f64,
+    lo: [f64; 2],
+    hi: [f64; 2],
+    prev: [f64; 2],
+}
+
+impl Crossfeed {
+    pub fn new(rate: u32, fcut: f32, feed_db: f32) -> Self {
+        let fs = rate as f64;
+        let feed = feed_db as f64;
+        let gb_lo = feed * -5.0 / 6.0 - 3.0;
+        let gb_hi = feed / 6.0 - 3.0;
+        let g_lo = 10f64.powf(gb_lo / 20.0);
+        let g_hi = 1.0 - 10f64.powf(gb_hi / 20.0);
+        let fc_lo = fcut as f64;
+        let fc_hi = fc_lo * 2f64.powf((gb_lo - 20.0 * g_hi.log10()) / 12.0);
+        let x = (-2.0 * std::f64::consts::PI * fc_lo / fs).exp();
+        let (b1_lo, a0_lo) = (x, g_lo * (1.0 - x));
+        let x = (-2.0 * std::f64::consts::PI * fc_hi / fs).exp();
+        let (b1_hi, a0_hi, a1_hi) = (x, 1.0 - g_hi * (1.0 - x), -x);
+        Crossfeed { a0_lo, b1_lo, a0_hi, a1_hi, b1_hi, lo: [0.0; 2], hi: [0.0; 2], prev: [0.0; 2] }
+    }
+
+    /// One stereo frame.
+    pub fn frame(&mut self, l: f64, r: f64) -> (f64, f64) {
+        let x = [l, r];
+        for c in 0..2 {
+            self.lo[c] = self.a0_lo * x[c] + self.b1_lo * self.lo[c];
+            self.hi[c] = self.a0_hi * x[c] + self.a1_hi * self.prev[c] + self.b1_hi * self.hi[c];
+        }
+        self.prev = x;
+        (self.hi[0] + self.lo[1], self.hi[1] + self.lo[0])
+    }
+}
+
+/// The most bands the EQ holds.
+pub const MAX_BANDS: usize = 32;
+
+/// An AutoEq / Equalizer APO parametric profile ("ParametricEQ.txt"):
+/// its preamp and its filters as bands. Lines it does not know are skipped;
+/// a filter marked OFF is kept, switched off.
+pub fn parse_autoeq(text: &str) -> Result<(f32, Vec<EqBand>), String> {
+    let mut preamp = 0.0;
+    let mut bands = Vec::new();
+    let num = |w: &[&str], key: &str| -> Option<f32> {
+        w.iter().position(|t| t.eq_ignore_ascii_case(key)).and_then(|i| w.get(i + 1)).and_then(|v| v.parse().ok())
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Preamp:") {
+            preamp = rest.split_whitespace().next().and_then(|v| v.parse().ok()).ok_or("an unreadable Preamp line")?;
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("Filter") else { continue };
+        let Some((_, spec)) = rest.split_once(':') else { continue };
+        let w: Vec<&str> = spec.split_whitespace().collect();
+        if w.len() < 2 {
+            continue;
+        }
+        let enabled = w[0].eq_ignore_ascii_case("ON");
+        let kind = match w[1].to_ascii_uppercase().as_str() {
+            "PK" | "PEQ" => BandKind::Peaking,
+            "LS" | "LSC" | "LSQ" => BandKind::LowShelf,
+            "HS" | "HSC" | "HSQ" => BandKind::HighShelf,
+            "HP" | "HPQ" => BandKind::HighPass,
+            "LP" | "LPQ" => BandKind::LowPass,
+            "NO" => BandKind::Notch,
+            other => return Err(format!("a filter type Moosik does not have: {other}")),
+        };
+        let freq = num(&w, "Fc").ok_or("a filter without Fc")?;
+        let gain_db = num(&w, "Gain").unwrap_or(0.0);
+        let mut q = num(&w, "Q").unwrap_or(if matches!(kind, BandKind::Peaking | BandKind::Notch) { 1.0 } else { std::f32::consts::FRAC_1_SQRT_2 });
+        if !(freq > 0.0 && freq.is_finite() && q > 0.0 && q.is_finite() && gain_db.is_finite()) {
+            return Err("a filter with an impossible value".into());
+        }
+        if q < 0.01 {
+            return Err(format!("a filter with Q {q}; Moosik's EQ goes down to Q 0.01"));
+        }
+        if matches!(kind, BandKind::LowShelf | BandKind::HighShelf) {
+            q = shelf_slope(q as f64, gain_db);
+        }
+        bands.push(EqBand { freq, gain_db, q, kind, enabled });
+    }
+    if bands.is_empty() {
+        return Err("no filters in it: not a parametric EQ profile".into());
+    }
+    if bands.len() > MAX_BANDS {
+        return Err(format!("{} filters; Moosik's EQ holds {MAX_BANDS}", bands.len()));
+    }
+    Ok((preamp, bands))
 }
 
 /// Whether a preset lives in the global list or is track-specific.
@@ -200,6 +313,15 @@ pub fn eq_band_color(idx: usize) -> egui::Color32 {
 // Biquad math — Audio EQ Cookbook formulas (R. Bristow-Johnson)
 // ---------------------------------------------------------------------------
 
+/// Moosik's shelves take the cookbook's shelf slope S in `q`, as they always
+/// have, so presets keep their sound. AutoEq and Equalizer APO give a
+/// shelf's Q instead: this is the S that makes the same filter, coefficient
+/// for coefficient, at that gain.
+pub fn shelf_slope(q: f64, gain_db: f32) -> f32 {
+    let a = 10f64.powf(gain_db as f64 / 40.0);
+    (1.0 / (1.0 + (1.0 / (q * q) - 2.0) / (a + 1.0 / a))) as f32
+}
+
 /// Compute normalised biquad coefficients (b[3], a[2]) for one EQ band.
 /// The existing `Biquad` struct takes exactly these arrays.
 pub fn eq_biquad_coeffs(band: &EqBand, sr: u32) -> ([f64; 3], [f64; 2]) {
@@ -220,7 +342,7 @@ pub fn eq_biquad_coeffs(band: &EqBand, sr: u32) -> ([f64; 3], [f64; 2]) {
         }
         BandKind::LowShelf => {
             let a  = 10f64.powf(band.gain_db as f64 / 40.0);
-            let as_ = (sw / 2.0) * ((a + 1.0/a) * (1.0/q - 1.0) + 2.0).max(0.0).sqrt();
+            let as_ = (sw / 2.0) * shelf_root(a, band.q);
             ( a*((a+1.0)-(a-1.0)*cw+2.0*a.sqrt()*as_),
               2.0*a*((a-1.0)-(a+1.0)*cw),
               a*((a+1.0)-(a-1.0)*cw-2.0*a.sqrt()*as_),
@@ -230,7 +352,7 @@ pub fn eq_biquad_coeffs(band: &EqBand, sr: u32) -> ([f64; 3], [f64; 2]) {
         }
         BandKind::HighShelf => {
             let a  = 10f64.powf(band.gain_db as f64 / 40.0);
-            let as_ = (sw / 2.0) * ((a + 1.0/a) * (1.0/q - 1.0) + 2.0).max(0.0).sqrt();
+            let as_ = (sw / 2.0) * shelf_root(a, band.q);
             ( a*((a+1.0)+(a-1.0)*cw+2.0*a.sqrt()*as_),
               -2.0*a*((a-1.0)+(a+1.0)*cw),
               a*((a+1.0)+(a-1.0)*cw-2.0*a.sqrt()*as_),
@@ -254,6 +376,16 @@ pub fn eq_biquad_coeffs(band: &EqBand, sr: u32) -> ([f64; 3], [f64; 2]) {
     ([b0/a0, b1/a0, b2/a0], [a1/a0, a2/a0])
 }
 
+/// A shelf's `sqrt((A + 1/A)(1/S - 1) + 2)`, which is 1/Q for the shelf's
+/// Q. The slope is not floored at 0.01 as a peak's Q is: that took gentle
+/// shelves given by their Q (Q 0.05 at +6 dB is a slope of 0.0053) for
+/// steeper ones. This is bounded instead, at what that floor bounds a peak
+/// to (1/Q at most 100), so every shelf of Q 0.01 or more is made as given.
+/// From a slope of 0.01 up, the bound is never reached below 80 dB of gain.
+fn shelf_root(a: f64, s: f32) -> f64 {
+    ((a + 1.0/a) * (1.0/(s as f64).max(0.0) - 1.0) + 2.0).clamp(0.0, 1e4).sqrt()
+}
+
 /// Frequency response magnitude of a single normalised biquad in dB.
 pub fn biquad_response_db(b: [f64; 3], a: [f64; 2], freq: f32, sr: u32) -> f32 {
     let w  = std::f64::consts::TAU * freq as f64 / sr as f64;
@@ -265,14 +397,6 @@ pub fn biquad_response_db(b: [f64; 3], a: [f64; 2], freq: f32, sr: u32) -> f32 {
     let di = -(a[0]*sw + a[1]*s2);
     let gain_sq = (nr*nr + ni*ni) / (dr*dr + di*di).max(1e-30);
     (10.0 * gain_sq.max(1e-30).log10()) as f32
-}
-
-/// Total EQ response in dB at `freq`, summing all enabled bands.
-pub fn total_eq_response_db(bands: &[EqBand], sr: u32, freq: f32) -> f32 {
-    bands.iter()
-        .filter(|b| b.enabled)
-        .map(|b| { let (b_a, a_a) = eq_biquad_coeffs(b, sr); biquad_response_db(b_a, a_a, freq, sr) })
-        .sum()
 }
 
 /// True when two band lists are perceptually identical (within rounding tolerances).
@@ -300,6 +424,15 @@ pub struct EqSource<S: rodio::Source<Item = f32>> {
     local_version: u64,
     local_enabled: bool,
     channels:      u16,
+    /// The preamp as a factor.
+    gain:          f64,
+    crossfeed:     Option<Crossfeed>,
+    local_crossfeed: Option<(f32, f32)>,
+    conv:          Option<super::fir::Convolver>,
+    /// Which response `conv` was built from (by address).
+    local_fir:     usize,
+    /// With crossfeed, a frame's right sample waits here for its turn.
+    held:          Option<f32>,
     ch_idx:        u16,   // 0 = left, 1 = right (for stereo interleaving)
     // Check for EQ updates every N samples to avoid per-sample mutex contention.
     check_counter: u16,
@@ -317,6 +450,12 @@ where S: rodio::Source<Item = f32>
             local_version: u64::MAX,   // force resync on first sample
             local_enabled: false,
             channels,
+            gain: 1.0,
+            crossfeed: None,
+            local_crossfeed: None,
+            conv: None,
+            local_fir: 0,
+            held: None,
             ch_idx: 0,
             check_counter: 0,
         };
@@ -328,6 +467,13 @@ where S: rodio::Source<Item = f32>
             // Build filters inline so we never block in next().
             this.local_version = state.version;
             this.local_enabled = state.enabled;
+            this.gain = 10f64.powf(state.preamp_db as f64 / 20.0);
+            this.local_crossfeed = state.crossfeed.filter(|_| channels == 2);
+            this.crossfeed = this.local_crossfeed.map(|(f, d)| Crossfeed::new(sr, f, d));
+            if let Some(fir) = state.fir.as_ref() {
+                this.local_fir = Arc::as_ptr(fir) as usize;
+                this.conv = Some(super::fir::Convolver::new(fir, sr, channels.max(1) as usize));
+            }
             if state.enabled && !state.bands.is_empty() {
                 let active: Vec<&EqBand> = state.bands.iter().filter(|b| b.enabled).collect();
                 this.filters_l = active.iter().map(|b| { let (bv, av) = eq_biquad_coeffs(b, sr); Biquad::new(bv, av) }).collect();
@@ -345,6 +491,22 @@ where S: rodio::Source<Item = f32>
         if eq.version == self.local_version { return; } // nothing changed
         self.local_version = eq.version;
         self.local_enabled = eq.enabled;
+        self.gain = 10f64.powf(eq.preamp_db as f64 / 20.0);
+        let want = eq.crossfeed.filter(|_| self.channels == 2);
+        if want.is_none() {
+            self.crossfeed = None;
+        } else if self.crossfeed.is_none() || self.local_crossfeed != want {
+            self.crossfeed = want.map(|(f, d)| Crossfeed::new(eq.sample_rate, f, d));
+        }
+        self.local_crossfeed = want;
+        // A new room correction is built here, once, on the audio thread:
+        // a user's choice, not a per-buffer cost.
+        let fir = eq.fir.clone();
+        let addr = fir.as_ref().map_or(0, |f| Arc::as_ptr(f) as usize);
+        if addr != self.local_fir {
+            self.local_fir = addr;
+            self.conv = fir.map(|f| super::fir::Convolver::new(&f, eq.sample_rate, self.channels.max(1) as usize));
+        }
         if !eq.enabled || eq.bands.is_empty() {
             self.filters_l.clear();
             self.filters_r.clear();
@@ -358,10 +520,16 @@ where S: rodio::Source<Item = f32>
 
     #[inline]
     fn apply(&mut self, sample: f32, ch: u16) -> f32 {
-        if !self.local_enabled { return sample; }
-        let filters = if ch == 0 { &mut self.filters_l } else { &mut self.filters_r };
+        if !self.local_enabled && self.conv.is_none() { return sample; }
         let mut s = sample as f64;
-        for f in filters.iter_mut() { s = f.process(s); }
+        if self.local_enabled {
+            let filters = if ch == 0 { &mut self.filters_l } else { &mut self.filters_r };
+            s *= self.gain;
+            for f in filters.iter_mut() { s = f.process(s); }
+        }
+        if let Some(cv) = self.conv.as_mut() {
+            s = cv.process(ch as usize, s as f32) as f64;
+        }
         s.clamp(-1.0, 1.0) as f32
     }
 }
@@ -371,6 +539,29 @@ where S: rodio::Source<Item = f32>
 {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
+        // Crossfeed needs both samples of a frame: the left comes out now,
+        // the right is held for the next call.
+        if let Some(r) = self.held.take() {
+            self.ch_idx = 0;
+            return Some(r);
+        }
+        if self.crossfeed.is_some() && self.ch_idx == 0 {
+            let l = self.inner.next()?;
+            let Some(r) = self.inner.next() else { return Some(l) };
+            self.check_counter += 2;
+            if self.check_counter >= 512 {
+                self.check_counter = 0;
+                self.sync_filters();
+            }
+            let (l, r) = (self.apply(l, 0) as f64, self.apply(r, 1) as f64);
+            let (l, r) = match self.crossfeed.as_mut() {
+                Some(cf) => cf.frame(l, r),
+                None => (l, r),
+            };
+            self.held = Some(r.clamp(-1.0, 1.0) as f32);
+            self.ch_idx = 1;
+            return Some(l.clamp(-1.0, 1.0) as f32);
+        }
         let sample = self.inner.next()?;
         // Poll for EQ changes every 512 samples (~11 ms at 44.1 kHz).
         // sync_filters uses try_lock — the audio thread NEVER blocks on the
@@ -474,5 +665,171 @@ mod profile_tests {
         };
         l.save();
         assert_eq!(std::fs::read(&real).ok(), before, "a test wrote the owner's presets");
+    }
+
+    /// A shelf given by its Q (AutoEq's `autoeq/peq.py`, Equalizer APO's
+    /// LSC/HSC: alpha = sin(w0) / 2Q) is, through `shelf_slope`, that very
+    /// filter in Moosik, down to Q 0.01; taking the Q as the slope, as 1.6.2's
+    /// first builds did, was off by up to 0.77 dB, and flooring the slope at
+    /// 0.01 put a Q 0.05 shelf at +6 dB off by up to 0.47 dB.
+    #[test]
+    fn a_shelf_given_by_its_q_is_that_filter() {
+        let by_q = |high: bool, fc: f64, gain: f64, q: f64, sr: u32| -> ([f64; 3], [f64; 2]) {
+            let a = 10f64.powf(gain / 40.0);
+            let w0 = std::f64::consts::TAU * fc / sr as f64;
+            let (c, al, s) = (w0.cos(), w0.sin() / (2.0 * q), if high { -1.0 } else { 1.0 });
+            let a0 = (a + 1.0) + s * (a - 1.0) * c + 2.0 * a.sqrt() * al;
+            ([a * ((a + 1.0) - s * (a - 1.0) * c + 2.0 * a.sqrt() * al) / a0,
+              s * 2.0 * a * ((a - 1.0) - s * (a + 1.0) * c) / a0,
+              a * ((a + 1.0) - s * (a - 1.0) * c - 2.0 * a.sqrt() * al) / a0],
+             [-s * 2.0 * ((a - 1.0) + s * (a + 1.0) * c) / a0,
+              ((a + 1.0) + s * (a - 1.0) * c - 2.0 * a.sqrt() * al) / a0])
+        };
+        let worst = |b: &super::EqBand, (bq, aq): ([f64; 3], [f64; 2]), sr: u32| -> f32 {
+            let (bm, am) = super::eq_biquad_coeffs(b, sr);
+            (0..=400).map(|i| 20.0 * 1000f32.powf(i as f32 / 400.0))
+                .map(|f| (super::biquad_response_db(bm, am, f, sr) - super::biquad_response_db(bq, aq, f, sr)).abs())
+                .fold(0.0, f32::max)
+        };
+        let mut was = 0.0f32;
+        for (high, fc, gain, q) in [(false, 105.0, 6.4, 0.7), (false, 105.0, 9.5, 0.7), (false, 105.0, -6.0, 0.7),
+                                    (true, 10_000.0, -2.3, 0.7), (true, 8_000.0, 4.0, 0.5), (false, 200.0, 3.0, 0.4),
+                                    (false, 105.0, 6.0, 0.05), (false, 60.0, 20.0, 0.02), (true, 3_000.0, -12.0, 0.01)] {
+            for sr in [44_100, 48_000, 96_000] {
+                let kind = if high { super::BandKind::HighShelf } else { super::BandKind::LowShelf };
+                let band = |q| super::EqBand { freq: fc as f32, gain_db: gain as f32, q, kind: kind.clone(), enabled: true };
+                let want = by_q(high, fc as f32 as f64, gain as f32 as f64, q, sr);
+                let now = worst(&band(super::shelf_slope(q, gain as f32)), want, sr);
+                assert!(now < 1e-4, "{fc} Hz {gain:+} dB Q {q} at {sr}: off by {now} dB");
+                was = was.max(worst(&band(q as f32), want, sr));
+            }
+        }
+        assert!(was > 0.7, "the Q taken as the slope was off by {was} dB");
+    }
+
+    /// Above a slope of 0.01 (the band table offers 0.1 to 10), a shelf's
+    /// coefficients are what they were before the slope stopped being
+    /// floored, to the bit: presets keep their sound.
+    #[test]
+    fn a_shelf_above_slope_0_01_is_as_it_was() {
+        let old = |b: &super::EqBand, sr: u32| -> [f64; 5] {
+            let sr = sr as f64;
+            let f0 = (b.freq as f64).clamp(1.0, sr * 0.499);
+            let q = (b.q as f64).max(0.01);
+            let w0 = 2.0 * std::f64::consts::PI * f0 / sr;
+            let (cw, sw, a) = (w0.cos(), w0.sin(), 10f64.powf(b.gain_db as f64 / 40.0));
+            let as_ = (sw / 2.0) * ((a + 1.0/a) * (1.0/q - 1.0) + 2.0).max(0.0).sqrt();
+            let (b0, b1, b2, a0, a1, a2) = if b.kind == super::BandKind::LowShelf {
+                (a*((a+1.0)-(a-1.0)*cw+2.0*a.sqrt()*as_), 2.0*a*((a-1.0)-(a+1.0)*cw), a*((a+1.0)-(a-1.0)*cw-2.0*a.sqrt()*as_),
+                 (a+1.0)+(a-1.0)*cw+2.0*a.sqrt()*as_, -2.0*((a-1.0)+(a+1.0)*cw), (a+1.0)+(a-1.0)*cw-2.0*a.sqrt()*as_)
+            } else {
+                (a*((a+1.0)+(a-1.0)*cw+2.0*a.sqrt()*as_), -2.0*a*((a-1.0)+(a+1.0)*cw), a*((a+1.0)+(a-1.0)*cw-2.0*a.sqrt()*as_),
+                 (a+1.0)-(a-1.0)*cw+2.0*a.sqrt()*as_, 2.0*((a-1.0)-(a+1.0)*cw), (a+1.0)-(a-1.0)*cw-2.0*a.sqrt()*as_)
+            };
+            [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+        };
+        let mut n = 0;
+        for kind in [super::BandKind::LowShelf, super::BandKind::HighShelf] {
+            for q in [0.0101f32, 0.02, 0.1, 0.3, std::f32::consts::FRAC_1_SQRT_2, 1.0, 1.5, 3.0, 10.0] {
+                for gain_db in [-40.0f32, -24.0, -6.0, -0.5, 0.0, 0.5, 3.0, 12.0, 24.0, 40.0] {
+                    for freq in [20.0f32, 105.0, 1000.0, 10_000.0, 21_000.0] {
+                        for sr in [44_100, 48_000, 96_000, 192_000] {
+                            let b = super::EqBand { freq, gain_db, q, kind: kind.clone(), enabled: true };
+                            let (bn, an) = super::eq_biquad_coeffs(&b, sr);
+                            let now = [bn[0], bn[1], bn[2], an[0], an[1]];
+                            assert!(now.iter().zip(old(&b, sr)).all(|(x, y)| x.to_bits() == y.to_bits()), "slope {q}, {gain_db} dB, {freq} Hz at {sr}");
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(n, 3600);
+    }
+
+    #[test]
+    fn an_autoeq_profile_becomes_a_preamp_and_bands() {
+        let text = concat!("Preamp: -6.4 dB", "\r\n", "Filter 1: ON LSC Fc 105 Hz Gain 6.4 dB Q 0.70", "\r\n", "Filter 2: ON PK Fc 165 Hz Gain -3.1 dB Q 0.42", "\r\n", "Filter 3: OFF PK Fc 3000 Hz Gain 2.0 dB Q 1.2", "\r\n", "Filter 10: ON HSC Fc 10000 Hz Gain -2.3 dB Q 0.70", "\r\n");
+        let (pre, bands) = super::parse_autoeq(text).unwrap();
+        assert_eq!(pre, -6.4);
+        assert_eq!(bands.len(), 4);
+        assert!(bands[0].kind == super::BandKind::LowShelf && bands[0].freq == 105.0 && bands[0].gain_db == 6.4);
+        assert_eq!(bands[0].q, super::shelf_slope(0.70f32 as f64, 6.4), "a shelf's Q, as Moosik's slope");
+        assert!(bands[1].kind == super::BandKind::Peaking && bands[1].gain_db == -3.1 && bands[1].q == 0.42);
+        assert!(!bands[2].enabled, "OFF is kept, switched off");
+        assert!(bands[3].kind == super::BandKind::HighShelf);
+        // Equalizer APO's unnumbered form, and a filter type Moosik lacks.
+        assert_eq!(super::parse_autoeq("Filter: ON PK Fc 1000 Hz Gain 3 dB Q 2").unwrap().1.len(), 1);
+        assert!(super::parse_autoeq("Filter 1: ON BP Fc 1000 Hz").is_err());
+        // A gentle shelf is kept as given; a filter below Q 0.01 is refused, not changed.
+        assert_eq!(super::parse_autoeq("Filter: ON LSC Fc 105 Hz Gain 6 dB Q 0.05").unwrap().1[0].q, super::shelf_slope(0.05f32 as f64, 6.0));
+        assert!(super::parse_autoeq("Filter: ON PK Fc 1000 Hz Gain 3 dB Q 0.005").is_err_and(|e| e.contains("Q 0.01")));
+        assert!(super::parse_autoeq("hello").is_err());
+        let many: String = (1..=MAX_BANDS + 1).map(|i| format!("Filter {i}: ON PK Fc {} Hz Gain 1 dB Q 1\n", 100 * i)).collect();
+        assert!(super::parse_autoeq(&many).is_err());
+    }
+
+    #[test]
+    fn the_preamp_scales_what_is_heard() {
+        let mut st = super::EqState::new();
+        st.preamp_db = -6.0206;
+        assert!(st.is_active(), "a preamp alone puts the EQ in the path");
+        let eq = std::sync::Arc::new(std::sync::Mutex::new(st));
+        let src = rodio::buffer::SamplesBuffer::new(2, 48_000, vec![0.5f32; 2000]);
+        let out: Vec<f32> = super::EqSource::new(src, eq).collect();
+        assert_eq!(out.len(), 2000);
+        assert!(out.iter().all(|v| (v - 0.25).abs() < 1e-4), "{}", out[0]);
+    }
+
+    #[test]
+    fn crossfeed_leaks_a_quieter_low_passed_copy_to_the_other_ear() {
+        let mut cf = super::Crossfeed::new(48_000, 700.0, 4.5);
+        // Steady left-only signal: the right ear hears it 4.5 dB below the left.
+        let (mut l, mut r) = (0.0, 0.0);
+        for _ in 0..48_000 {
+            (l, r) = cf.frame(0.5, 0.0);
+        }
+        let feed = 20.0 * (l / r).log10();
+        assert!((feed - 4.5).abs() < 0.1, "{feed}");
+        // A 10 kHz tone in the left: almost nothing reaches the right.
+        let mut cf = super::Crossfeed::new(48_000, 700.0, 4.5);
+        let (mut pl, mut pr) = (0f64, 0f64);
+        for i in 0..48_000 {
+            let x = (2.0 * std::f64::consts::PI * 10_000.0 * i as f64 / 48_000.0).sin() * 0.5;
+            let (a, b) = cf.frame(x, 0.0);
+            if i > 4800 {
+                pl = pl.max(a.abs());
+                pr = pr.max(b.abs());
+            }
+        }
+        assert!(20.0 * (pl / pr).log10() > 20.0, "{pl} {pr}");
+    }
+
+    #[test]
+    fn crossfeed_runs_frame_by_frame_in_the_eq_path() {
+        let mut st = super::EqState::new();
+        st.crossfeed = Some((700.0, 4.5));
+        let eq = std::sync::Arc::new(std::sync::Mutex::new(st));
+        // Left only, steady: the right channel fills in.
+        let src = rodio::buffer::SamplesBuffer::new(2, 48_000, (0..96_000).map(|i| if i % 2 == 0 { 0.5f32 } else { 0.0 }).collect::<Vec<_>>());
+        let out: Vec<f32> = super::EqSource::new(src, eq).collect();
+        assert_eq!(out.len(), 96_000);
+        let (l, r) = (out[95_998], out[95_999]);
+        assert!(r > 0.1 && l > r, "{l} {r}");
+    }
+
+    #[test]
+    fn crossfeed_stays_on_when_the_eq_is_switched_off() {
+        let mut st = super::EqState::new();
+        st.enabled = false;
+        st.preamp_db = -20.0;
+        st.crossfeed = Some((700.0, 4.5));
+        assert!(st.is_active());
+        let eq = std::sync::Arc::new(std::sync::Mutex::new(st));
+        let src = rodio::buffer::SamplesBuffer::new(2, 48_000, (0..96_000).map(|i| if i % 2 == 0 { 0.5f32 } else { 0.0 }).collect::<Vec<_>>());
+        let out: Vec<f32> = super::EqSource::new(src, eq).collect();
+        let (l, r) = (out[95_998], out[95_999]);
+        assert!(r > 0.1, "crossfeed still on: {r}");
+        assert!(l > 0.3, "the EQ's preamp is off with the EQ: {l}");
     }
 }

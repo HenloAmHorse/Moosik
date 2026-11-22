@@ -236,6 +236,36 @@ fn a_pack_installs_verified_resumes_after_cancel_and_removes() {
 }
 
 #[test]
+fn discarding_a_staged_download_keeps_the_installed_pack() {
+    let root = private_root("discard");
+    let (pack, model, zip) = test_pack(&root);
+    let packs = root.join("packs");
+    let cancel = AtomicBool::new(false);
+    let mut fetch = |_: &FetchCtx, url: &str, off: u64, _: u64| -> Result<(Box<dyn Read + Send>, bool), String> {
+        let body = if url == "model" { &model } else { &zip };
+        Ok((Box::new(std::io::Cursor::new(body[off as usize..].to_vec())), true))
+    };
+    // A cancelled download keeps its part file for resuming, until discarded.
+    install(&packs, pack, &mut fetch, &cancel, |done, _| if done > 0 { cancel.store(true, Ordering::Release) }).unwrap_err();
+    wait_until(|| outstanding(&packs).is_none());
+    assert!(partial_bytes(&packs, pack) > 0);
+    discard_staged(&packs, pack).unwrap();
+    assert_eq!(partial_bytes(&packs, pack), 0);
+    assert!(!packs.join(".staging/test-pack").exists());
+    // Installed, with a download left behind beside it: only the leftover goes.
+    cancel.store(false, Ordering::Release);
+    install(&packs, pack, &mut fetch, &cancel, |_, _| {}).unwrap();
+    plain_or_create(&packs.join(".staging")).unwrap();
+    let staging = packs.join(".staging").join(pack.id);
+    own_dir(&staging, Role::Pack, pack).unwrap();
+    std::fs::write(staging.join("m.gguf.part"), b"left behind").unwrap();
+    assert_eq!(partial_bytes(&packs, pack), 11);
+    discard_staged(&packs, pack).unwrap();
+    assert!(installed(&packs, pack) && !staging.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn a_download_that_fails_its_checksum_is_deleted_and_nothing_is_installed() {
     let root = private_root("badsum");
     let (pack, model, zip) = test_pack(&root);
@@ -1433,6 +1463,65 @@ fn cancel_returns_at_once_and_a_stalled_connection_ends_within_the_window() {
         println!("transport {what}: returned after {:?}, connection gone after {ended:?} (window {:?})", returned - start, BODY_WINDOW);
         assert!(ended < BODY_WINDOW + Duration::from_millis(1500), "{what}: the connection outlived the window: {ended:?}");
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Remove and Discard (Settings → Storage, the translation window) wait for
+/// a whole install, not only its downloads: pressed while a finished
+/// download is hashed or the runtime unpacked, they took files the install
+/// still needed, and the download was lost.
+#[test]
+fn an_install_keeps_its_files_until_it_ends() {
+    let root = private_root("installing");
+    let (pack, model, zip) = test_pack(&root);
+    let packs = root.join("packs");
+    let served = RefCell::new(Vec::new());
+    let mut srv = server(&model, &zip, &served);
+    let mut tried = Vec::new();
+    install_reporting(&packs, pack, &[], &mut srv, &AtomicBool::new(false), None, |p| {
+        if matches!(p.phase, Phase::Check | Phase::Unpack) && p.fetched > 0 {
+            tried.push((p.phase, discard_staged(&packs, pack), remove(&packs, pack)));
+        }
+    }).unwrap();
+    assert!(tried.iter().any(|t| t.0 == Phase::Check) && tried.iter().any(|t| t.0 == Phase::Unpack), "{tried:?}");
+    for (phase, discard, remove) in &tried {
+        for e in [discard, remove] {
+            assert!(e.as_ref().is_err_and(|e| e.contains("being installed")), "{phase:?}: {e:?}");
+        }
+    }
+    assert!(installed(&packs, pack));
+    assert_eq!(remove(&packs, pack), Ok(()), "and once it has ended, they work");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Installs, imports and removals are admitted and registered in one hold of
+/// the lock: started at the same moment, exactly one of them gets in (an
+/// install and a Discard could both pass the check, then both touch the
+/// staged files), and the next only once it has ended.
+#[test]
+fn only_one_change_starts_at_a_time() {
+    let root = private_root("one-change");
+    let (pack, _, _) = test_pack(&root);
+    let packs = root.join("packs");
+    for _ in 0..100 {
+        let start = std::sync::Barrier::new(4);
+        let (start, packs) = (&start, &packs);
+        let got: Vec<Result<Registered, String>> = std::thread::scope(|s| {
+            let runs: Vec<_> = ["installed", "installed", "removed", "removed"]
+                .into_iter()
+                .map(|doing| s.spawn(move || {
+                    start.wait();
+                    admit_change(packs, pack, doing)
+                }))
+                .collect();
+            runs.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert_eq!(got.iter().filter(|g| g.is_ok()).count(), 1);
+        for e in got.iter().filter_map(|g| g.as_ref().err()) {
+            assert!(e.contains("is being installed") || e.contains("is being removed"), "{e}");
+        }
+    }
+    assert_eq!(admit(&packs), Ok(()), "each one's end let the next in");
     let _ = std::fs::remove_dir_all(&root);
 }
 

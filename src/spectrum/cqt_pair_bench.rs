@@ -348,6 +348,7 @@ fn production_pair() {
             panic!("production pre-process refused this arm; not a valid timing: {error}")
         }
         PreMessage::Aborted => panic!("production pre-process aborted; not a valid timing"),
+        PreMessage::HpUnavailable { reason, .. } => panic!("a Standard run reported High-accuracy GPU: {reason}"),
     };
     assert_eq!(progress.load(Ordering::Relaxed), 100);
     assert!(!frames.is_empty());
